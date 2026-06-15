@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
+from typing import Any, Awaitable, Callable
 
+import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import TelegramObject
-from typing import Any, Awaitable, Callable
 
-from config import BOT_TOKEN, YOOMARKET_TOKEN
-from api import YooMarketAPI
+from config import BOT_TOKEN
+from api.yoomarket import YooMarketAPI
+from storage import get_token
 from handlers import ads, balance, chats, orders, start
 
 logging.basicConfig(
@@ -21,14 +25,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Middleware — injects the YooMarketAPI instance into handler data
-# ---------------------------------------------------------------------------
-
-
 class YooMarketMiddleware:
-    def __init__(self, api: YooMarketAPI) -> None:
-        self.api = api
+    """Injects per-user YooMarketAPI instance into handler data."""
 
     async def __call__(
         self,
@@ -36,30 +34,39 @@ class YooMarketMiddleware:
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        data["api"] = self.api
+        user = data.get("event_from_user")
+        if user:
+            token = get_token(user.id)
+            if token:
+                api = YooMarketAPI(token)
+                await api.start()
+                try:
+                    data["api"] = api
+                    return await handler(event, data)
+                finally:
+                    await api.close()
+        data["api"] = None
         return await handler(event, data)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
 async def main() -> None:
-    api = YooMarketAPI(YOOMARKET_TOKEN)
-    await api.start()
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    session = AiohttpSession()
+    session._connector_init["ssl"] = ssl_ctx
 
     bot = Bot(
         token=BOT_TOKEN,
+        session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher(storage=MemoryStorage())
 
-    # Register middleware on both message and callback_query update types
-    dp.message.middleware(YooMarketMiddleware(api))
-    dp.callback_query.middleware(YooMarketMiddleware(api))
+    dp.message.middleware(YooMarketMiddleware())
+    dp.callback_query.middleware(YooMarketMiddleware())
 
-    # Include routers
     dp.include_router(start.router)
     dp.include_router(balance.router)
     dp.include_router(ads.router)
@@ -70,7 +77,6 @@ async def main() -> None:
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        await api.close()
         await bot.session.close()
         logger.info("Bot stopped.")
 

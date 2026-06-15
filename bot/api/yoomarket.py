@@ -10,8 +10,10 @@ class YooMarketAPI:
         self.session: aiohttp.ClientSession | None = None
 
     async def start(self) -> None:
+        connector = aiohttp.TCPConnector(ssl=False)
         self.session = aiohttp.ClientSession(
             headers={"Authorization": f"Bearer {self.token}"},
+            connector=connector,
         )
 
     async def close(self) -> None:
