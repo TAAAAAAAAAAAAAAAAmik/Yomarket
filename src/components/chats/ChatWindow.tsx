@@ -1,16 +1,16 @@
 import { useState, useRef, useEffect } from 'react'
 import { Send, MessageSquare, Loader2 } from 'lucide-react'
-import { useMessages, useSendMessage } from '../../hooks/useChats'
-import { useChats } from '../../hooks/useChats'
-import { Message } from '../../types/chat'
+import { useMessages, useSendMessage } from '../../hooks/useMessages'
+import { useOrders } from '../../hooks/useOrders'
+import { Message } from '../../types'
 
 interface ChatWindowProps {
   chatId: number | string | null
 }
 
 function MessageBubble({ message }: { message: Message }) {
-  const isSeller = message.sender === 'seller'
-  const isSystem = message.sender === 'system'
+  const isShop = message.sender_type === 'shop'
+  const isSystem = message.sender_type === 'system'
 
   const formattedTime = new Date(message.created_at).toLocaleTimeString('ru-RU', {
     hour: '2-digit',
@@ -28,20 +28,20 @@ function MessageBubble({ message }: { message: Message }) {
   }
 
   return (
-    <div className={`flex ${isSeller ? 'justify-end' : 'justify-start'}`}>
-      <div className={`max-w-[72%] group`}>
+    <div className={`flex ${isShop ? 'justify-end' : 'justify-start'}`}>
+      <div className="max-w-[72%] group">
         <div
           className={`rounded-2xl px-4 py-2.5 ${
-            isSeller
+            isShop
               ? 'bg-accent text-white rounded-br-sm'
               : 'bg-bg-elevated text-text-primary rounded-bl-sm'
           }`}
         >
           <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">{message.text}</p>
         </div>
-        <p className={`text-[10px] text-text-muted mt-1 ${isSeller ? 'text-right' : 'text-left'}`}>
+        <p className={`text-[10px] text-text-muted mt-1 ${isShop ? 'text-right' : 'text-left'}`}>
           {formattedTime}
-          {isSeller && message.read && <span className="ml-1 text-accent-light">✓✓</span>}
+          {isShop && message.is_read && <span className="ml-1 text-accent-light">&#10003;&#10003;</span>}
         </p>
       </div>
     </div>
@@ -53,13 +53,18 @@ export function ChatWindow({ chatId }: ChatWindowProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
-  const { data: chatsData } = useChats()
-  const currentChat = chatsData?.data?.find((c) => c.id === chatId)
+  // Find the order corresponding to this chatId
+  const { data: ordersData } = useOrders()
+  const allOrders = ordersData?.pages.flatMap((p) => p.data) ?? []
+  const currentOrder = allOrders.find(
+    (o) => (o.chat_id != null ? o.chat_id === chatId : o.id === chatId)
+  )
 
   const { data: messagesData, isLoading } = useMessages(chatId ?? '')
   const { mutate: send, isPending: isSending } = useSendMessage(chatId ?? '')
 
-  const messages = messagesData?.data ?? []
+  // Flatten infinite pages to a flat message list
+  const messages = messagesData?.pages.flatMap((p) => p.data) ?? []
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -91,7 +96,7 @@ export function ChatWindow({ chatId }: ChatWindowProps) {
       <div className="flex-1 flex items-center justify-center bg-bg-primary">
         <div className="text-center">
           <MessageSquare size={48} className="text-text-muted mx-auto mb-4" />
-          <p className="text-text-secondary text-sm">Select a chat to start messaging</p>
+          <p className="text-text-secondary text-sm">Select an order to open its chat</p>
         </div>
       </div>
     )
@@ -103,19 +108,19 @@ export function ChatWindow({ chatId }: ChatWindowProps) {
       <div className="px-5 py-3 border-b border-border bg-bg-secondary flex-shrink-0">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-full bg-accent/20 flex items-center justify-center text-accent text-xs font-bold flex-shrink-0">
-            {(currentChat?.buyer_name ?? 'B').charAt(0).toUpperCase()}
+            {(currentOrder?.buyer?.name ?? 'B').charAt(0).toUpperCase()}
           </div>
           <div>
             <p className="text-sm font-semibold text-text-primary">
-              {currentChat?.buyer_name ?? `Chat #${chatId}`}
+              {currentOrder?.buyer?.name ?? `Chat #${chatId}`}
             </p>
-            {currentChat?.order_id && (
-              <p className="text-xs text-text-muted">Order #{currentChat.order_id}</p>
+            {currentOrder?.id && (
+              <p className="text-xs text-text-muted">Order #{currentOrder.id}</p>
             )}
           </div>
-          {currentChat?.status && (
+          {currentOrder?.status && (
             <span className="ml-auto text-xs text-text-muted capitalize bg-bg-elevated px-2 py-0.5 rounded-full">
-              {currentChat.status}
+              {currentOrder.status.replace('_', ' ')}
             </span>
           )}
         </div>
@@ -169,7 +174,7 @@ export function ChatWindow({ chatId }: ChatWindowProps) {
           </button>
         </div>
         <p className="text-[10px] text-text-muted mt-1.5 pl-1">
-          Press Enter to send · Shift+Enter for new line
+          Press Enter to send &middot; Shift+Enter for new line
         </p>
       </div>
     </div>

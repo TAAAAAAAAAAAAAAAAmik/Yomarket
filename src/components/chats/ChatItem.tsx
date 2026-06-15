@@ -1,8 +1,8 @@
-import { MessageSquare } from 'lucide-react'
-import { Chat } from '../../types/chat'
+import { MessageSquare, ShoppingBag } from 'lucide-react'
+import { Order } from '../../types'
 
-interface ChatItemProps {
-  chat: Chat
+interface OrderChatItemProps {
+  order: Order
   selected: boolean
   onClick: () => void
 }
@@ -20,8 +20,19 @@ function timeAgo(dateStr: string): string {
   return `${diffDays}d`
 }
 
-export function ChatItem({ chat, selected, onClick }: ChatItemProps) {
-  const initials = (chat.buyer_name ?? 'B')
+function statusColor(status: string): string {
+  switch (status) {
+    case 'new': return 'bg-accent/20 text-accent'
+    case 'in_work': return 'bg-warning/20 text-warning'
+    case 'completed': return 'bg-success/20 text-success'
+    case 'refunded': return 'bg-danger/20 text-danger'
+    default: return 'bg-text-muted/20 text-text-muted'
+  }
+}
+
+export function OrderChatItem({ order, selected, onClick }: OrderChatItemProps) {
+  const buyerName = order.buyer?.name ?? `Buyer #${order.buyer?.id ?? '?'}`
+  const initials = buyerName
     .split(' ')
     .slice(0, 2)
     .map((w) => w[0])
@@ -43,27 +54,32 @@ export function ChatItem({ chat, selected, onClick }: ChatItemProps) {
       {/* Content */}
       <div className="flex-1 min-w-0">
         <div className="flex items-center justify-between gap-1 mb-0.5">
-          <p className="text-sm font-medium text-text-primary truncate">
-            {chat.buyer_name ?? `Order #${chat.order_id ?? chat.id}`}
-          </p>
-          <div className="flex items-center gap-1.5 flex-shrink-0">
-            {chat.last_message_at && (
-              <span className="text-xs text-text-muted">{timeAgo(chat.last_message_at)}</span>
-            )}
-            {(chat.unread_count ?? 0) > 0 && (
-              <span className="min-w-[18px] h-[18px] rounded-full bg-accent text-white text-[10px] font-bold flex items-center justify-center px-1">
-                {chat.unread_count}
-              </span>
-            )}
-          </div>
+          <p className="text-sm font-medium text-text-primary truncate">{buyerName}</p>
+          <span className="text-xs text-text-muted flex-shrink-0">{timeAgo(order.created_at)}</span>
         </div>
-        {chat.last_message && (
-          <p className="text-xs text-text-muted truncate">{chat.last_message}</p>
-        )}
-        {chat.order_id && (
-          <p className="text-xs text-text-muted mt-0.5">Order #{chat.order_id}</p>
-        )}
+        <div className="flex items-center gap-2">
+          <ShoppingBag size={11} className="text-text-muted flex-shrink-0" />
+          <p className="text-xs text-text-muted truncate">
+            {order.ad?.title ?? `Order #${order.id}`}
+          </p>
+        </div>
+        <div className="flex items-center gap-2 mt-1">
+          <span
+            className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${statusColor(order.status)}`}
+          >
+            {order.status.replace('_', ' ')}
+          </span>
+          <span className="text-xs text-text-muted">
+            {order.amount.toLocaleString('ru-RU', {
+              style: 'currency',
+              currency: order.currency ?? 'RUB',
+            })}
+          </span>
+        </div>
       </div>
     </button>
   )
 }
+
+// Legacy export alias for any remaining imports
+export { OrderChatItem as ChatItem }

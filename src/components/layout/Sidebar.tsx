@@ -10,7 +10,7 @@ import { useAuthStore } from '../../stores/authStore'
 
 const navItems = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
-  { to: '/products', label: 'Products', icon: Package, end: false },
+  { to: '/products', label: 'Ads', icon: Package, end: false },
   { to: '/chats', label: 'Chats', icon: MessageSquare, end: false },
   { to: '/settings', label: 'Settings', icon: Settings, end: false },
 ]

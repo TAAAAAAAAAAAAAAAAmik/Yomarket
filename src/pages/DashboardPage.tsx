@@ -1,9 +1,9 @@
 import { Package, MessageSquare, ShoppingBag } from 'lucide-react'
 import { Header } from '../components/layout/Header'
 import { BalanceCard } from '../components/balance/BalanceCard'
-import { useProducts } from '../hooks/useProducts'
-import { useChats } from '../hooks/useChats'
-import { ChatItem } from '../components/chats/ChatItem'
+import { useAds } from '../hooks/useAds'
+import { useOrders } from '../hooks/useOrders'
+import { OrderChatItem } from '../components/chats/ChatItem'
 
 function StatCard({
   label,
@@ -36,20 +36,21 @@ function StatCard({
 }
 
 export function DashboardPage() {
-  const { data: productsData, isLoading: productsLoading } = useProducts({ per_page: 1 })
-  const { data: chatsData, isLoading: chatsLoading } = useChats()
+  const { data: adsData, isLoading: adsLoading } = useAds({ per_page: 1 })
+  const { data: ordersData, isLoading: ordersLoading } = useOrders({ per_page: 5 })
 
-  const totalProducts = productsData?.total ?? 0
-  const activeProducts = productsData?.data?.filter((p) => p.status === 'active').length ?? 0
-  const unreadChats = chatsData?.data?.reduce((sum, c) => sum + (c.unread_count ?? 0), 0) ?? 0
-  const recentChats = chatsData?.data?.slice(0, 5) ?? []
+  const totalAds = adsData?.pages[0]?.data.length ?? 0
+  const activeAds =
+    adsData?.pages.flatMap((p) => p.data).filter((a) => a.status === 'active').length ?? 0
+  const recentOrders = ordersData?.pages.flatMap((p) => p.data).slice(0, 5) ?? []
+  const totalOrders = recentOrders.length
 
   return (
     <div className="flex flex-col flex-1 min-h-0">
       <Header title="Dashboard" subtitle="Overview of your YooMarket store" />
 
       <main className="flex-1 overflow-y-auto p-6 space-y-6">
-        {/* Balance */}
+        {/* Balance / Shop Info */}
         <div className="max-w-sm">
           <BalanceCard />
         </div>
@@ -57,35 +58,35 @@ export function DashboardPage() {
         {/* Quick stats */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <StatCard
-            label="Total Products"
-            value={totalProducts}
+            label="Total Ads"
+            value={totalAds}
             icon={Package}
             color="bg-accent/15 text-accent"
-            loading={productsLoading}
+            loading={adsLoading}
           />
           <StatCard
-            label="Active Products"
-            value={activeProducts}
+            label="Active Ads"
+            value={activeAds}
             icon={ShoppingBag}
             color="bg-success/15 text-success"
-            loading={productsLoading}
+            loading={adsLoading}
           />
           <StatCard
-            label="Unread Chats"
-            value={unreadChats}
+            label="Recent Orders"
+            value={totalOrders}
             icon={MessageSquare}
             color="bg-warning/15 text-warning"
-            loading={chatsLoading}
+            loading={ordersLoading}
           />
         </div>
 
-        {/* Recent chats */}
+        {/* Recent orders (order-based chats) */}
         <div>
           <h2 className="text-sm font-semibold text-text-secondary uppercase tracking-wider mb-3">
-            Recent Chats
+            Recent Orders
           </h2>
           <div className="bg-bg-card border border-border rounded-xl overflow-hidden">
-            {chatsLoading ? (
+            {ordersLoading ? (
               <div className="divide-y divide-border">
                 {[...Array(4)].map((_, i) => (
                   <div key={i} className="px-4 py-3 flex gap-3 items-center">
@@ -97,14 +98,14 @@ export function DashboardPage() {
                   </div>
                 ))}
               </div>
-            ) : recentChats.length === 0 ? (
+            ) : recentOrders.length === 0 ? (
               <div className="px-4 py-10 text-center text-text-muted text-sm">
-                No chats yet
+                No orders yet
               </div>
             ) : (
               <div className="divide-y divide-border">
-                {recentChats.map((chat) => (
-                  <ChatItem key={chat.id} chat={chat} selected={false} onClick={() => {}} />
+                {recentOrders.map((order) => (
+                  <OrderChatItem key={order.id} order={order} selected={false} onClick={() => {}} />
                 ))}
               </div>
             )}

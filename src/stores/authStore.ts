@@ -12,7 +12,7 @@ interface AuthState {
 export const useAuthStore = create<AuthState>()(
   persist(
     (set) => ({
-      token: import.meta.env.VITE_YOOMARKET_TOKEN ?? '',
+      token: (import.meta.env['VITE_YOOMARKET_TOKEN'] as string | undefined) ?? '',
       shopName: 'YooMarket Shop',
       setToken: (token) => set({ token }),
       setShopName: (shopName) => set({ shopName }),
