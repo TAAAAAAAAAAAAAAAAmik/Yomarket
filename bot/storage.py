@@ -15,6 +15,7 @@ _DEFAULT_SETTINGS = {
     "auto_restore": {"enabled": False},
     "auto_bump": {"enabled": False, "interval_hours": 24},
     "auto_withdraw": {"enabled": False, "min_amount": 500},
+    "responders": {},  # {"GameName": "message text"} - keyed by ad title/name
     "known_orders": {},  # {order_id: status}
     "known_order_ids": [],
     "plugins": {

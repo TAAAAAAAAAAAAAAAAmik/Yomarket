@@ -66,6 +66,7 @@ class TaskManager:
             ar = settings.get("auto_reply", {})
             ae = settings.get("auto_events", {})
             rules = settings.get("auto_rules", [])
+            responders = settings.get("responders", {})
 
             for order in orders:
                 oid = str(order.get("id", ""))
@@ -81,7 +82,7 @@ class TaskManager:
 
                 # NEW order
                 if prev_status is None and ar.get("enabled"):
-                    msg = self._pick_message(title, ar.get("message", "Спасибо за заказ!"), rules)
+                    msg = self._pick_message(title, ar.get("message", "Спасибо за заказ!"), rules, responders)
                     await self._send_chat(api, chat_id, msg)
                     await self._notify(user_id, (
                         f"🛒 <b>Новый заказ #{oid}</b>\n"
@@ -93,7 +94,7 @@ class TaskManager:
                 elif prev_status != status and status in ("confirmed", "completed", "done"):
                     ev = ae.get("on_confirmed", {})
                     if ev.get("enabled"):
-                        msg = self._pick_message(title, ev.get("message", "Заказ подтверждён!"), rules)
+                        msg = self._pick_message(title, ev.get("message", "Заказ подтверждён!"), rules, responders)
                         await self._send_chat(api, chat_id, msg)
                         await self._notify(user_id, f"✅ Заказ #{oid} подтверждён")
 
@@ -101,7 +102,7 @@ class TaskManager:
                 elif prev_status != status and status in ("refunded", "cancelled", "returned"):
                     ev = ae.get("on_refunded", {})
                     if ev.get("enabled"):
-                        msg = self._pick_message(title, ev.get("message", "Возврат оформлен."), rules)
+                        msg = self._pick_message(title, ev.get("message", "Возврат оформлен."), rules, responders)
                         await self._send_chat(api, chat_id, msg)
                         await self._notify(user_id, f"↩️ Заказ #{oid} — возврат")
 
@@ -114,8 +115,14 @@ class TaskManager:
         finally:
             await api.close()
 
-    def _pick_message(self, title: str, default: str, rules: list[dict]) -> str:
+    def _pick_message(self, title: str, default: str, rules: list[dict], responders: dict | None = None) -> str:
         title_lower = title.lower()
+        # Check specific responders first (by ad title match)
+        if responders:
+            for game_name, message in responders.items():
+                if game_name.lower() in title_lower:
+                    return message
+        # Then check rules (keyword-based)
         for rule in rules:
             kw = rule.get("keyword", "").lower()
             if kw and kw in title_lower:

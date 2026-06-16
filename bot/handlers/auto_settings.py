@@ -30,6 +30,7 @@ def _auto_text(s: dict) -> str:
     rules = s.get("auto_rules", [])
 
     lines = ["⚙️ <b>Авто-функции</b>\n"]
+    lines.append('📩 Нажми "Автоответчики" для настройки ответов по играм\n')
 
     on = ar.get("enabled", False)
     lines.append(f"📩 <b>Новый заказ</b> — {_st(on)}")
@@ -73,6 +74,8 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     ae = s.get("auto_events", {})
     aw = s.get("auto_withdraw", {})
     builder = InlineKeyboardBuilder()
+
+    builder.button(text="📩 Автоответчики", callback_data="resp:cats")
 
     ar_on = ar.get("enabled", False)
     builder.button(text=f"{'🔴 Выкл' if ar_on else '🟢 Вкл'} новый заказ", callback_data="auto:toggle:reply")
