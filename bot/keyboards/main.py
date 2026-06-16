@@ -40,7 +40,9 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="📦 Товары", callback_data="menu:ads")
     builder.button(text="🛒 Заказы", callback_data="menu:orders")
     builder.button(text="💬 Чаты", callback_data="menu:chats")
-    builder.adjust(2, 2)
+    builder.button(text="⚙️ Авто", callback_data="auto:menu")
+    builder.button(text="🔌 Плагины", callback_data="plugins:menu")
+    builder.adjust(2, 2, 2)
     return builder.as_markup()
 
 
