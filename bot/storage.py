@@ -18,6 +18,8 @@ _DEFAULT_SETTINGS = {
     "responders": {},  # {"GameName": "message text"} - keyed by ad title/name
     "known_orders": {},  # {order_id: status}
     "known_order_ids": [],
+    "known_order_details": {},  # {order_id: {title, buyer, price, chat_id}}
+    "known_messages": {},  # {order_id: last_msg_id}
     "plugins": {
         "auto_stars": {"enabled": False, "amount": 50, "note": ""},
         "auto_roblox": {"enabled": False, "robux": 0, "note": ""},
