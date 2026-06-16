@@ -17,7 +17,6 @@ class TaskManager:
         self._tasks: dict[int, asyncio.Task] = {}
 
     def start_for_user(self, user_id: int) -> None:
-        """Start background task for a user (cancels existing one first)."""
         if user_id in self._tasks and not self._tasks[user_id].done():
             self._tasks[user_id].cancel()
         self._tasks[user_id] = asyncio.create_task(self._user_loop(user_id))
@@ -28,7 +27,6 @@ class TaskManager:
             del self._tasks[user_id]
 
     async def start_all(self) -> None:
-        """Start tasks for all users that have tokens saved."""
         from storage import get_all_users
         for uid in get_all_users():
             self.start_for_user(uid)
@@ -40,7 +38,7 @@ class TaskManager:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Task error for user {user_id}: {e}")
+                logger.error("Task error for user %s: %s", user_id, e)
             await asyncio.sleep(60)
 
     async def _tick(self, user_id: int) -> None:
@@ -48,57 +46,90 @@ class TaskManager:
         if not token:
             return
         settings = get_settings(user_id)
+        has_any = (
+            settings.get("auto_reply", {}).get("enabled") or
+            settings.get("auto_events", {}).get("on_confirmed", {}).get("enabled") or
+            settings.get("auto_events", {}).get("on_refunded", {}).get("enabled")
+        )
+        if not has_any:
+            return
+        await self._process_orders(user_id, token, settings)
 
-        # Auto-reply on new orders
-        if settings.get("auto_reply", {}).get("enabled"):
-            await self._auto_reply(user_id, token, settings)
-
-    async def _auto_reply(self, user_id: int, token: str, settings: dict) -> None:
+    async def _process_orders(self, user_id: int, token: str, settings: dict) -> None:
         api = YooMarketAPI(token)
         await api.start()
         try:
             data = await api.get_orders()
             orders = data.get("data") or data.get("items") or []
-            known = set(str(x) for x in settings.get("known_order_ids", []))
-            reply_msg = settings["auto_reply"].get("message", "Спасибо за заказ!")
+
+            known: dict = settings.get("known_orders", {})  # {order_id: status}
+            ar = settings.get("auto_reply", {})
+            ae = settings.get("auto_events", {})
+            rules = settings.get("auto_rules", [])
 
             for order in orders:
                 oid = str(order.get("id", ""))
-                if not oid or oid in known:
+                if not oid:
                     continue
-                # New order found
-                known.add(oid)
-                chat_id = str(order.get("chat_id") or oid)
-                title = (
-                    order.get("title")
-                    or order.get("ad_title")
-                    or order.get("product_name")
-                    or "—"
-                )
+
+                status = str(order.get("status", ""))
+                prev_status = known.get(oid)
+                title = order.get("title") or order.get("ad_title") or order.get("product_name") or "—"
                 buyer = order.get("buyer_name") or (order.get("buyer") or {}).get("name") or "—"
                 price = order.get("price") or order.get("total") or "—"
+                chat_id = str(order.get("chat_id") or oid)
 
-                # Send auto-reply to chat
-                try:
-                    await api.send_message(chat_id, reply_msg)
-                except Exception as e:
-                    logger.warning(f"Auto-reply failed for order {oid}: {e}")
-
-                # Notify user in Telegram
-                try:
-                    await self.bot.send_message(
-                        user_id,
+                # NEW order
+                if prev_status is None and ar.get("enabled"):
+                    msg = self._pick_message(title, ar.get("message", "Спасибо за заказ!"), rules)
+                    await self._send_chat(api, chat_id, msg)
+                    await self._notify(user_id, (
                         f"🛒 <b>Новый заказ #{oid}</b>\n"
-                        f"📦 {title}\n"
-                        f"👤 {buyer}\n"
-                        f"💰 {price} ₽\n\n"
-                        f"✉️ Авто-ответ отправлен",
-                        parse_mode="HTML",
-                    )
-                except Exception as e:
-                    logger.warning(f"Notify failed for user {user_id}: {e}")
+                        f"📦 {title}\n👤 {buyer}\n💰 {price} ₽\n"
+                        f"✉️ Авто-ответ отправлен"
+                    ))
 
-            settings["known_order_ids"] = list(known)
+                # Status changed → confirmed
+                elif prev_status != status and status in ("confirmed", "completed", "done"):
+                    ev = ae.get("on_confirmed", {})
+                    if ev.get("enabled"):
+                        msg = self._pick_message(title, ev.get("message", "Заказ подтверждён!"), rules)
+                        await self._send_chat(api, chat_id, msg)
+                        await self._notify(user_id, f"✅ Заказ #{oid} подтверждён")
+
+                # Status changed → refunded
+                elif prev_status != status and status in ("refunded", "cancelled", "returned"):
+                    ev = ae.get("on_refunded", {})
+                    if ev.get("enabled"):
+                        msg = self._pick_message(title, ev.get("message", "Возврат оформлен."), rules)
+                        await self._send_chat(api, chat_id, msg)
+                        await self._notify(user_id, f"↩️ Заказ #{oid} — возврат")
+
+                known[oid] = status
+
+            settings["known_orders"] = known
+            # keep backward compat
+            settings["known_order_ids"] = list(known.keys())
             save_settings(user_id, settings)
         finally:
             await api.close()
+
+    def _pick_message(self, title: str, default: str, rules: list[dict]) -> str:
+        title_lower = title.lower()
+        for rule in rules:
+            kw = rule.get("keyword", "").lower()
+            if kw and kw in title_lower:
+                return rule.get("message", default)
+        return default
+
+    async def _send_chat(self, api: YooMarketAPI, chat_id: str, text: str) -> None:
+        try:
+            await api.send_message(chat_id, text)
+        except Exception as e:
+            logger.warning("Auto chat send failed (chat %s): %s", chat_id, e)
+
+    async def _notify(self, user_id: int, text: str) -> None:
+        try:
+            await self.bot.send_message(user_id, text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("Notify failed (user %s): %s", user_id, e)

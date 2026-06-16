@@ -13,231 +13,292 @@ router = Router()
 
 class AutoState(StatesGroup):
     waiting_reply_msg = State()
+    waiting_confirmed_msg = State()
+    waiting_refunded_msg = State()
     waiting_withdraw_amount = State()
+    waiting_rule_keyword = State()
+    waiting_rule_message = State()
 
 
-# ---------------------------------------------------------------------------
-# Keyboard helpers
-# ---------------------------------------------------------------------------
+def _st(on: bool) -> str:
+    return "🟢 ВКЛ" if on else "🔴 ВЫКЛ"
 
 
-def _auto_menu_keyboard(settings: dict) -> InlineKeyboardMarkup:
+def _auto_text(s: dict) -> str:
+    ar = s.get("auto_reply", {})
+    ae = s.get("auto_events", {})
+    rules = s.get("auto_rules", [])
+
+    lines = ["⚙️ <b>Авто-функции</b>\n"]
+
+    on = ar.get("enabled", False)
+    lines.append(f"📩 <b>Новый заказ</b> — {_st(on)}")
+    if on:
+        lines.append(f'   <i>"{ar.get("message","")[:50]}"</i>')
+
+    ev_conf = ae.get("on_confirmed", {})
+    on2 = ev_conf.get("enabled", False)
+    lines.append(f"\n✅ <b>Подтверждение заказа</b> — {_st(on2)}")
+    if on2:
+        lines.append(f'   <i>"{ev_conf.get("message","")[:50]}"</i>')
+
+    ev_ref = ae.get("on_refunded", {})
+    on3 = ev_ref.get("enabled", False)
+    lines.append(f"\n↩️ <b>Возврат</b> — {_st(on3)}")
+    if on3:
+        lines.append(f'   <i>"{ev_ref.get("message","")[:50]}"</i>')
+
+    rst_on = s.get("auto_restore", {}).get("enabled", False)
+    lines.append(f"\n🔄 <b>Авторестор</b> — {_st(rst_on)}")
+    bump_on = s.get("auto_bump", {}).get("enabled", False)
+    lines.append(f"⬆️ <b>Автоподнятие</b> — {_st(bump_on)}")
+
+    aw = s.get("auto_withdraw", {})
+    aw_on = aw.get("enabled", False)
+    lines.append(f"💸 <b>Автовывод</b> — {_st(aw_on)}")
+    if aw_on:
+        lines.append(f"   Мин. сумма: {aw.get('min_amount', 500)} ₽")
+
+    lines.append(f"\n🎮 <b>Правила по игре/категории</b> ({len(rules)} шт.)")
+    for i, rule in enumerate(rules[:5], 1):
+        lines.append(f"   {i}. [{rule.get('keyword','')}] → {rule.get('message','')[:30]}")
+    if len(rules) > 5:
+        lines.append(f"   … и ещё {len(rules)-5}")
+
+    return "\n".join(lines)
+
+
+def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
+    ar = s.get("auto_reply", {})
+    ae = s.get("auto_events", {})
+    aw = s.get("auto_withdraw", {})
     builder = InlineKeyboardBuilder()
 
-    ar = settings.get("auto_reply", {})
     ar_on = ar.get("enabled", False)
-    builder.button(
-        text=f"{'🟢' if ar_on else '🔴'} Автоответчик — {'ВКЛ' if ar_on else 'ВЫКЛ'}",
-        callback_data="auto:toggle:reply",
-    )
+    builder.button(text=f"{'🔴 Выкл' if ar_on else '🟢 Вкл'} новый заказ", callback_data="auto:toggle:reply")
     if ar_on:
-        builder.button(text="✏️ Изменить текст", callback_data="auto:set_reply_msg")
+        builder.button(text="✏️ Текст нового заказа", callback_data="auto:set:reply_msg")
 
-    rst = settings.get("auto_restore", {})
-    rst_on = rst.get("enabled", False)
-    builder.button(
-        text=f"{'🟢' if rst_on else '🔴'} Авторестор товаров — {'ВКЛ' if rst_on else 'ВЫКЛ'}",
-        callback_data="auto:toggle:restore",
-    )
+    conf_on = ae.get("on_confirmed", {}).get("enabled", False)
+    builder.button(text=f"{'🔴 Выкл' if conf_on else '🟢 Вкл'} подтверждение", callback_data="auto:toggle:confirmed")
+    if conf_on:
+        builder.button(text="✏️ Текст подтверждения", callback_data="auto:set:confirmed_msg")
 
-    bump = settings.get("auto_bump", {})
-    bump_on = bump.get("enabled", False)
-    builder.button(
-        text=f"{'🟢' if bump_on else '🔴'} Автоподнятие — {'ВКЛ' if bump_on else 'ВЫКЛ'}",
-        callback_data="auto:toggle:bump",
-    )
+    ref_on = ae.get("on_refunded", {}).get("enabled", False)
+    builder.button(text=f"{'🔴 Выкл' if ref_on else '🟢 Вкл'} возврат", callback_data="auto:toggle:refunded")
+    if ref_on:
+        builder.button(text="✏️ Текст возврата", callback_data="auto:set:refunded_msg")
 
-    aw = settings.get("auto_withdraw", {})
+    builder.button(text="🔄 Авторестор", callback_data="auto:toggle:restore")
+    builder.button(text="⬆️ Автоподнятие", callback_data="auto:toggle:bump")
+
     aw_on = aw.get("enabled", False)
-    builder.button(
-        text=f"{'🟢' if aw_on else '🔴'} Автовывод — {'ВКЛ' if aw_on else 'ВЫКЛ'}",
-        callback_data="auto:toggle:withdraw",
-    )
+    builder.button(text=f"{'🔴 Выкл' if aw_on else '🟢 Вкл'} автовывод", callback_data="auto:toggle:withdraw")
+    if aw_on:
+        builder.button(text="✏️ Мин. сумма вывода", callback_data="auto:set:withdraw_amount")
+
+    builder.button(text="➕ Добавить правило (игра/категория)", callback_data="auto:rule:add")
+    if s.get("auto_rules"):
+        builder.button(text="🗑 Удалить последнее правило", callback_data="auto:rule:del")
 
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
     builder.adjust(1)
     return builder.as_markup()
 
 
-def _auto_menu_text(settings: dict) -> str:
-    ar = settings.get("auto_reply", {})
-    ar_on = ar.get("enabled", False)
-    ar_msg = ar.get("message", "")
-
-    rst_on = settings.get("auto_restore", {}).get("enabled", False)
-    bump_on = settings.get("auto_bump", {}).get("enabled", False)
-    aw = settings.get("auto_withdraw", {})
-    aw_on = aw.get("enabled", False)
-    aw_min = aw.get("min_amount", 500)
-
-    lines = ["⚙️ <b>Авто-функции</b>\n"]
-
-    # Auto-reply block
-    status = "✅ <b>Автоответчик</b> — <b>ВКЛ</b>" if ar_on else "🔴 <b>Автоответчик</b> — ВЫКЛ"
-    lines.append(status)
-    if ar_on and ar_msg:
-        short = ar_msg[:40] + ("…" if len(ar_msg) > 40 else "")
-        lines.append(f'   Текст: "<i>{short}</i>"')
-    lines.append("")
-
-    # Auto-restore
-    status = "✅ <b>Авторестор товаров</b> — <b>ВКЛ</b>" if rst_on else "🔴 <b>Авторестор товаров</b> — ВЫКЛ"
-    lines.append(status)
-    lines.append("")
-
-    # Auto-bump
-    status = "✅ <b>Автоподнятие</b> — <b>ВКЛ</b>" if bump_on else "🔴 <b>Автоподнятие</b> — ВЫКЛ"
-    lines.append(status)
-    lines.append("")
-
-    # Auto-withdraw
-    status = "✅ <b>Автовывод</b> — <b>ВКЛ</b>" if aw_on else "🔴 <b>Автовывод</b> — ВЫКЛ"
-    lines.append(status)
-    if aw_on:
-        lines.append(f"   Мин. сумма: {aw_min} ₽")
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Handlers
-# ---------------------------------------------------------------------------
+async def _refresh(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    await callback.message.edit_text(_auto_text(s), reply_markup=_auto_keyboard(s))
+    await callback.answer()
 
 
 @router.callback_query(F.data == "auto:menu")
-async def auto_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    uid = callback.from_user.id
-    settings = get_settings(uid)
-    await callback.message.edit_text(
-        _auto_menu_text(settings),
-        reply_markup=_auto_menu_keyboard(settings),
-    )
-    await callback.answer()
+async def auto_menu(callback: CallbackQuery) -> None:
+    await _refresh(callback)
 
 
 @router.callback_query(F.data == "auto:toggle:reply")
-async def toggle_reply(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    uid = callback.from_user.id
-    settings = get_settings(uid)
-    settings["auto_reply"]["enabled"] = not settings["auto_reply"].get("enabled", False)
-    save_settings(uid, settings)
-    await callback.message.edit_text(
-        _auto_menu_text(settings),
-        reply_markup=_auto_menu_keyboard(settings),
-    )
-    await callback.answer()
+async def toggle_reply(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    s["auto_reply"]["enabled"] = not s["auto_reply"].get("enabled", False)
+    save_settings(callback.from_user.id, s)
+    await _refresh(callback)
 
 
-@router.callback_query(F.data == "auto:set_reply_msg")
-async def set_reply_msg_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == "auto:toggle:confirmed")
+async def toggle_confirmed(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    s["auto_events"]["on_confirmed"]["enabled"] = not s["auto_events"]["on_confirmed"].get("enabled", False)
+    save_settings(callback.from_user.id, s)
+    await _refresh(callback)
+
+
+@router.callback_query(F.data == "auto:toggle:refunded")
+async def toggle_refunded(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    s["auto_events"]["on_refunded"]["enabled"] = not s["auto_events"]["on_refunded"].get("enabled", False)
+    save_settings(callback.from_user.id, s)
+    await _refresh(callback)
+
+
+@router.callback_query(F.data == "auto:toggle:restore")
+async def toggle_restore(callback: CallbackQuery) -> None:
+    await callback.answer("⚠️ Авторестор появится после обновления API YooMarket", show_alert=True)
+
+
+@router.callback_query(F.data == "auto:toggle:bump")
+async def toggle_bump(callback: CallbackQuery) -> None:
+    await callback.answer("⚠️ Автоподнятие появится после обновления API YooMarket", show_alert=True)
+
+
+@router.callback_query(F.data == "auto:toggle:withdraw")
+async def toggle_withdraw(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    s["auto_withdraw"]["enabled"] = not s["auto_withdraw"].get("enabled", False)
+    save_settings(callback.from_user.id, s)
+    await _refresh(callback)
+
+
+def _cancel_kb(back: str = "auto:menu") -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data=back)
+    return b.as_markup()
+
+
+@router.callback_query(F.data == "auto:set:reply_msg")
+async def set_reply_msg(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AutoState.waiting_reply_msg)
-    await callback.message.answer(
-        "✏️ Введите новый текст автоответа на заказы:"
+    cur = get_settings(callback.from_user.id)["auto_reply"].get("message", "")
+    await callback.message.edit_text(
+        f"✏️ Текст ответа на <b>новый заказ</b>:\nТекущий: <i>{cur}</i>\n\nВведите новый:",
+        reply_markup=_cancel_kb()
     )
     await callback.answer()
 
 
 @router.message(AutoState.waiting_reply_msg)
-async def set_reply_msg_input(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("❌ Текст не может быть пустым. Попробуйте ещё раз:")
-        return
-    uid = message.from_user.id
-    settings = get_settings(uid)
-    settings["auto_reply"]["message"] = text
-    save_settings(uid, settings)
+async def save_reply_msg(message: Message, state: FSMContext) -> None:
+    s = get_settings(message.from_user.id)
+    s["auto_reply"]["message"] = message.text or ""
+    save_settings(message.from_user.id, s)
     await state.clear()
-    await message.answer(
-        f"✅ Текст автоответа обновлён:\n<i>{text}</i>\n\nВозврат в меню авто-функций:",
-        reply_markup=_auto_menu_keyboard(settings),
-    )
+    await message.answer(f"✅ Сохранено")
+    await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
 
 
-@router.callback_query(F.data == "auto:toggle:restore")
-async def toggle_restore(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id
-    settings = get_settings(uid)
-    currently_on = settings.get("auto_restore", {}).get("enabled", False)
-    if not currently_on:
-        # Trying to enable — not supported yet
-        await callback.answer(
-            "⚠️ Функция недоступна в текущей версии API YooMarket",
-            show_alert=True,
-        )
-        return
-    # Turning off is always allowed
-    settings["auto_restore"]["enabled"] = False
-    save_settings(uid, settings)
+@router.callback_query(F.data == "auto:set:confirmed_msg")
+async def set_confirmed_msg(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AutoState.waiting_confirmed_msg)
+    cur = get_settings(callback.from_user.id)["auto_events"]["on_confirmed"].get("message", "")
     await callback.message.edit_text(
-        _auto_menu_text(settings),
-        reply_markup=_auto_menu_keyboard(settings),
+        f"✏️ Текст ответа при <b>подтверждении заказа</b>:\nТекущий: <i>{cur}</i>\n\nВведите новый:",
+        reply_markup=_cancel_kb()
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "auto:toggle:bump")
-async def toggle_bump(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id
-    settings = get_settings(uid)
-    currently_on = settings.get("auto_bump", {}).get("enabled", False)
-    if not currently_on:
-        await callback.answer(
-            "⚠️ Функция недоступна в текущей версии API YooMarket",
-            show_alert=True,
-        )
-        return
-    settings["auto_bump"]["enabled"] = False
-    save_settings(uid, settings)
+@router.message(AutoState.waiting_confirmed_msg)
+async def save_confirmed_msg(message: Message, state: FSMContext) -> None:
+    s = get_settings(message.from_user.id)
+    s["auto_events"]["on_confirmed"]["message"] = message.text or ""
+    save_settings(message.from_user.id, s)
+    await state.clear()
+    await message.answer("✅ Сохранено")
+    await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
+
+
+@router.callback_query(F.data == "auto:set:refunded_msg")
+async def set_refunded_msg(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AutoState.waiting_refunded_msg)
+    cur = get_settings(callback.from_user.id)["auto_events"]["on_refunded"].get("message", "")
     await callback.message.edit_text(
-        _auto_menu_text(settings),
-        reply_markup=_auto_menu_keyboard(settings),
+        f"✏️ Текст ответа при <b>возврате</b>:\nТекущий: <i>{cur}</i>\n\nВведите новый:",
+        reply_markup=_cancel_kb()
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "auto:toggle:withdraw")
-async def toggle_withdraw(callback: CallbackQuery, state: FSMContext) -> None:
+@router.message(AutoState.waiting_refunded_msg)
+async def save_refunded_msg(message: Message, state: FSMContext) -> None:
+    s = get_settings(message.from_user.id)
+    s["auto_events"]["on_refunded"]["message"] = message.text or ""
+    save_settings(message.from_user.id, s)
     await state.clear()
-    uid = callback.from_user.id
-    settings = get_settings(uid)
-    currently_on = settings.get("auto_withdraw", {}).get("enabled", False)
-    settings["auto_withdraw"]["enabled"] = not currently_on
-    save_settings(uid, settings)
+    await message.answer("✅ Сохранено")
+    await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
 
-    if settings["auto_withdraw"]["enabled"]:
-        # Ask for minimum amount
-        await state.set_state(AutoState.waiting_withdraw_amount)
-        await callback.message.answer(
-            "💰 Введите минимальную сумму для автовывода (в рублях):"
-        )
-        await callback.answer()
-    else:
-        await callback.message.edit_text(
-            _auto_menu_text(settings),
-            reply_markup=_auto_menu_keyboard(settings),
-        )
-        await callback.answer()
+
+@router.callback_query(F.data == "auto:set:withdraw_amount")
+async def set_withdraw_amount(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AutoState.waiting_withdraw_amount)
+    cur = get_settings(callback.from_user.id)["auto_withdraw"].get("min_amount", 500)
+    await callback.message.edit_text(
+        f"✏️ Минимальная сумма для автовывода (сейчас: {cur} ₽)\n\nВведите число:",
+        reply_markup=_cancel_kb()
+    )
+    await callback.answer()
 
 
 @router.message(AutoState.waiting_withdraw_amount)
-async def set_withdraw_amount(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
+async def save_withdraw_amount(message: Message, state: FSMContext) -> None:
     try:
-        amount = int(text)
-        if amount <= 0:
-            raise ValueError
+        amount = int((message.text or "").strip())
+        s = get_settings(message.from_user.id)
+        s["auto_withdraw"]["min_amount"] = amount
+        save_settings(message.from_user.id, s)
+        await state.clear()
+        await message.answer(f"✅ Мин. сумма: <b>{amount} ₽</b>")
+        await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
     except ValueError:
-        await message.answer("❌ Введите целое положительное число (сумма в рублях):")
-        return
-    uid = message.from_user.id
-    settings = get_settings(uid)
-    settings["auto_withdraw"]["min_amount"] = amount
-    save_settings(uid, settings)
-    await state.clear()
-    await message.answer(
-        f"✅ Минимальная сумма автовывода: <b>{amount} ₽</b>",
-        reply_markup=_auto_menu_keyboard(settings),
+        await message.answer("❌ Введите число, например: 500")
+
+
+@router.callback_query(F.data == "auto:rule:add")
+async def add_rule_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AutoState.waiting_rule_keyword)
+    await callback.message.edit_text(
+        "🎮 <b>Правило по игре/категории</b>\n\n"
+        "Шаг 1/2: Введите ключевое слово (название игры или категории):\n"
+        "Пример: <code>Roblox</code>, <code>Minecraft</code>, <code>Steam Gift</code>",
+        reply_markup=_cancel_kb()
     )
+    await callback.answer()
+
+
+@router.message(AutoState.waiting_rule_keyword)
+async def rule_keyword(message: Message, state: FSMContext) -> None:
+    await state.update_data(keyword=message.text or "")
+    await state.set_state(AutoState.waiting_rule_message)
+    await message.answer(
+        f"🎮 Правило для: <b>{message.text}</b>\n\n"
+        f"Шаг 2/2: Введите текст авто-ответа для этой категории:",
+        reply_markup=_cancel_kb()
+    )
+
+
+@router.message(AutoState.waiting_rule_message)
+async def rule_message(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    keyword = data.get("keyword", "")
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    rules = s.get("auto_rules", [])
+    rules.append({"keyword": keyword, "message": message.text or ""})
+    s["auto_rules"] = rules
+    save_settings(message.from_user.id, s)
+    await message.answer(f"✅ Правило добавлено:\n[{keyword}] → {message.text}")
+    await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
+
+
+@router.callback_query(F.data == "auto:rule:del")
+async def del_last_rule(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    rules = s.get("auto_rules", [])
+    if rules:
+        removed = rules.pop()
+        s["auto_rules"] = rules
+        save_settings(callback.from_user.id, s)
+        await callback.answer(f"🗑 Удалено: [{removed.get('keyword','')}]", show_alert=True)
+    else:
+        await callback.answer("Правил нет", show_alert=True)
+    await _refresh(callback)

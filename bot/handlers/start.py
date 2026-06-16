@@ -6,20 +6,30 @@ from aiogram.types import CallbackQuery, Message
 
 from api.yoomarket import YooMarketAPI
 from keyboards.main import main_menu_keyboard
-from storage import delete_token, get_token, save_token
+from storage import delete_token, get_token, save_token, get_settings, save_settings, get_shop_name, save_shop_name
 
 router = Router()
-
-MENU_TEXT = "🏠 <b>Главное меню</b>\nВыберите раздел:"
 
 
 class AuthState(StatesGroup):
     waiting_for_token = State()
 
 
-async def _send_menu(target: Message | CallbackQuery, shop_name: str = "") -> None:
-    header = f"🏪 <b>{shop_name}</b>\n\n" if shop_name else ""
-    text = header + MENU_TEXT
+def _extract_shop(info: dict) -> tuple[str, str]:
+    """Returns (name, balance_str) from /check response."""
+    shop = info.get("shop") or info.get("data") or info
+    if isinstance(shop, dict):
+        name = shop.get("name") or shop.get("shop_name") or shop.get("title") or "Магазин"
+        balance = shop.get("balance") or shop.get("wallet") or shop.get("money") or "—"
+    else:
+        name = "Магазин"
+        balance = "—"
+    return str(name), str(balance)
+
+
+async def _send_menu(target: Message | CallbackQuery, user_id: int) -> None:
+    name = get_shop_name(user_id) or "Магазин"
+    text = f"🏪 <b>{name}</b>\n\n🏠 <b>Главное меню</b>\nВыберите раздел:"
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=main_menu_keyboard())
         await target.answer()
@@ -36,13 +46,13 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         await api.start()
         try:
             info = await api.check()
-            shop = info.get("shop") or info
-            name = shop.get("name") or shop.get("shop_name") or "Магазин"
+            name, _ = _extract_shop(info)
+            save_shop_name(message.from_user.id, name)
         except Exception:
-            name = ""
+            pass
         finally:
             await api.close()
-        await _send_menu(message, name)
+        await _send_menu(message, message.from_user.id)
         return
 
     await state.set_state(AuthState.waiting_for_token)
@@ -77,9 +87,8 @@ async def process_token(message: Message, state: FSMContext, **data) -> None:
     save_token(message.from_user.id, token)
     await state.clear()
 
-    shop = info.get("shop") or info
-    name = shop.get("name") or shop.get("shop_name") or "Магазин"
-    balance = shop.get("balance", "—")
+    name, balance = _extract_shop(info)
+    save_shop_name(message.from_user.id, name)
 
     await message.answer(
         f"✅ Авторизация успешна!\n\n"
@@ -91,20 +100,12 @@ async def process_token(message: Message, state: FSMContext, **data) -> None:
     if task_manager:
         task_manager.start_for_user(message.from_user.id)
 
-    await _send_menu(message, name)
+    await _send_menu(message, message.from_user.id)
 
 
 @router.callback_query(F.data == "menu:main")
-async def back_to_main(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    name = ""
-    if api:
-        try:
-            info = await api.check()
-            shop = info.get("shop") or info
-            name = shop.get("name") or shop.get("shop_name") or ""
-        except Exception:
-            pass
-    await _send_menu(callback, name)
+async def back_to_main(callback: CallbackQuery) -> None:
+    await _send_menu(callback, callback.from_user.id)
 
 
 @router.message(Command("logout"))

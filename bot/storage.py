@@ -5,10 +5,17 @@ _FILE = os.path.join(os.path.dirname(__file__), "data", "tokens.json")
 _SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "data", "settings.json")
 
 _DEFAULT_SETTINGS = {
+    "shop_name": "",
     "auto_reply": {"enabled": False, "message": "Спасибо за заказ! Скоро свяжемся с вами."},
+    "auto_events": {
+        "on_confirmed": {"enabled": False, "message": "✅ Ваш заказ подтверждён! Спасибо."},
+        "on_refunded": {"enabled": False, "message": "↩️ Возврат оформлен. Ожидайте 1-3 дня."},
+    },
+    "auto_rules": [],  # [{"keyword": "Roblox", "message": "🎮 Робуксы отправим в течение 15 минут!"}]
     "auto_restore": {"enabled": False},
     "auto_bump": {"enabled": False, "interval_hours": 24},
     "auto_withdraw": {"enabled": False, "min_amount": 500},
+    "known_orders": {},  # {order_id: status}
     "known_order_ids": [],
     "plugins": {
         "auto_stars": {"enabled": False, "amount": 50, "note": ""},
@@ -53,7 +60,6 @@ def _load_settings() -> dict:
 
 
 def _merge_defaults(settings: dict) -> dict:
-    """Deep-merge user settings over defaults so new keys always appear."""
     import copy
     result = copy.deepcopy(_DEFAULT_SETTINGS)
     for key, val in settings.items():
@@ -63,6 +69,12 @@ def _merge_defaults(settings: dict) -> dict:
                     result["plugins"][pkey].update(pval)
                 else:
                     result["plugins"][pkey] = pval
+        elif key == "auto_events" and isinstance(val, dict):
+            for ekey, eval_ in val.items():
+                if ekey in result["auto_events"] and isinstance(eval_, dict):
+                    result["auto_events"][ekey].update(eval_)
+                else:
+                    result["auto_events"][ekey] = eval_
         elif isinstance(val, dict) and key in result and isinstance(result[key], dict):
             result[key].update(val)
         else:
@@ -71,14 +83,12 @@ def _merge_defaults(settings: dict) -> dict:
 
 
 def get_settings(user_id: int) -> dict:
-    """Returns user settings dict with defaults."""
     all_settings = _load_settings()
     raw = all_settings.get(str(user_id), {})
     return _merge_defaults(raw)
 
 
 def save_settings(user_id: int, settings: dict) -> None:
-    """Saves user settings."""
     os.makedirs(os.path.dirname(_SETTINGS_FILE), exist_ok=True)
     all_settings = _load_settings()
     all_settings[str(user_id)] = settings
@@ -87,5 +97,14 @@ def save_settings(user_id: int, settings: dict) -> None:
 
 
 def get_all_users() -> list[int]:
-    """Returns all user IDs that have tokens saved."""
     return [int(uid) for uid in _load().keys()]
+
+
+def get_shop_name(user_id: int) -> str:
+    return get_settings(user_id).get("shop_name", "")
+
+
+def save_shop_name(user_id: int, name: str) -> None:
+    s = get_settings(user_id)
+    s["shop_name"] = name
+    save_settings(user_id, s)

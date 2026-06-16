@@ -114,10 +114,25 @@ async def show_ad_detail(
             f"👁 Просмотры: {views}\n\n"
             f"📝 <b>Описание:</b>\n{description}"
         )
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⬆️ Поднять товар", callback_data=f"ad_bump:{callback_data.ad_id}")
+        builder.button(text="⬅️ К товарам", callback_data="ads_load")
+        builder.adjust(1)
+        keyboard = builder.as_markup()
     except Exception as e:
         text = f"❌ Ошибка: {e}"
+        keyboard = back_keyboard()
 
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⬅️ К товарам", callback_data="ads_load")
-    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ad_bump:"))
+async def bump_ad(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    ad_id = callback.data.split(":", 1)[1]
+    await callback.answer("⏳ Поднимаю товар...", show_alert=False)
+    try:
+        await api.bump_ad(ad_id)
+        await callback.answer("✅ Товар поднят!", show_alert=True)
+    except Exception as e:
+        await callback.answer(f"❌ {e}", show_alert=True)
