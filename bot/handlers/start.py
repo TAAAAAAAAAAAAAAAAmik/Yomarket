@@ -54,7 +54,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 
 @router.message(AuthState.waiting_for_token)
-async def process_token(message: Message, state: FSMContext) -> None:
+async def process_token(message: Message, state: FSMContext, **data) -> None:
     token = (message.text or "").strip()
     if not token:
         await message.answer("❌ Токен не может быть пустым. Отправьте токен:")
@@ -86,6 +86,11 @@ async def process_token(message: Message, state: FSMContext) -> None:
         f"🏪 <b>{name}</b>\n"
         f"💰 Баланс: <b>{balance} ₽</b>"
     )
+
+    task_manager = data.get("task_manager")
+    if task_manager:
+        task_manager.start_for_user(message.from_user.id)
+
     await _send_menu(message, name)
 
 
