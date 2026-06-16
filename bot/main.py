@@ -16,7 +16,8 @@ from aiogram.types import TelegramObject
 from config import BOT_TOKEN
 from api.yoomarket import YooMarketAPI
 from storage import get_token
-from handlers import ads, balance, chats, orders, start
+from handlers import ads, auto_settings, balance, chats, orders, plugins, start
+from tasks import TaskManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,6 +65,9 @@ async def main() -> None:
     )
     dp = Dispatcher(storage=MemoryStorage())
 
+    task_manager = TaskManager(bot)
+    dp["task_manager"] = task_manager
+
     dp.message.middleware(YooMarketMiddleware())
     dp.callback_query.middleware(YooMarketMiddleware())
 
@@ -72,9 +76,12 @@ async def main() -> None:
     dp.include_router(ads.router)
     dp.include_router(orders.router)
     dp.include_router(chats.router)
+    dp.include_router(auto_settings.router)
+    dp.include_router(plugins.router)
 
     logger.info("Bot starting…")
     try:
+        await task_manager.start_all()
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await bot.session.close()
