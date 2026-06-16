@@ -2,7 +2,7 @@ from aiogram import F, Router
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 
 from api.yoomarket import YooMarketAPI
 from keyboards.main import main_menu_keyboard
@@ -34,6 +34,8 @@ async def _send_menu(target: Message | CallbackQuery, user_id: int) -> None:
         await target.message.edit_text(text, reply_markup=main_menu_keyboard())
         await target.answer()
     else:
+        # Remove old reply keyboard if present
+        await target.answer(".", reply_markup=ReplyKeyboardRemove())
         await target.answer(text, reply_markup=main_menu_keyboard())
 
 
