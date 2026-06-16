@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from aiogram import F, Router
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
@@ -16,17 +16,15 @@ from keyboards.main import (
 router = Router()
 
 STATUS_EMOJI = {
-    "active": "🟢",
-    "inactive": "🔴",
-    "blocked": "⛔",
-    "sold": "✅",
+    "active": "🟢 Активен",
+    "inactive": "🔴 Неактивен",
+    "blocked": "⛔ Заблокирован",
+    "sold": "✅ Продан",
 }
 
 
 def _status(raw: str) -> str:
-    emoji = STATUS_EMOJI.get(raw, "⚪")
-    labels = {"active": "Активен", "inactive": "Неактивен", "blocked": "Заблокирован", "sold": "Продан"}
-    return f"{emoji} {labels.get(raw, raw)}"
+    return STATUS_EMOJI.get(raw, f"⚪ {raw}")
 
 
 def _fmt_list(ads: list[dict], total: int | None) -> str:
@@ -44,19 +42,15 @@ def _fmt_list(ads: list[dict], total: int | None) -> str:
     return "\n".join(lines)
 
 
-# --- Кнопка "📦 Товары" → показывает подменю ---
-@router.message(F.text == "📦 Товары")
-async def ads_menu(message: Message, api: YooMarketAPI) -> None:
-    if not api:
-        await message.answer("⚠️ Сначала войдите через /start")
-        return
-    await message.answer(
-        "📦 <b>Раздел товаров</b>\n\nНажми кнопку чтобы загрузить все твои объявления с YooMarket:",
+@router.callback_query(F.data == "menu:ads")
+async def ads_menu(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "📦 <b>Товары</b>\n\nНажми кнопку чтобы загрузить все объявления с YooMarket:",
         reply_markup=ads_menu_keyboard(),
     )
+    await callback.answer()
 
 
-# --- Кнопка "📥 Загрузить товары" ---
 @router.callback_query(F.data == "ads_load")
 async def load_ads(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.message.edit_text("⏳ Загружаю товары...")
@@ -75,7 +69,6 @@ async def load_ads(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.answer()
 
 
-# --- Пагинация ---
 @router.callback_query(PaginationCallback.filter(F.entity == "ads"))
 async def paginate_ads(
     callback: CallbackQuery,
@@ -98,7 +91,6 @@ async def paginate_ads(
     await callback.answer()
 
 
-# --- Детали товара ---
 @router.callback_query(AdCallback.filter())
 async def show_ad_detail(
     callback: CallbackQuery,
