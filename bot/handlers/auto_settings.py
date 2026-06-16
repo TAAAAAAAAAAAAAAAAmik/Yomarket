@@ -60,12 +60,6 @@ def _auto_text(s: dict) -> str:
     if aw_on:
         lines.append(f"   Мин. сумма: {aw.get('min_amount', 500)} ₽")
 
-    lines.append(f"\n🎮 <b>Правила по игре/категории</b> ({len(rules)} шт.)")
-    for i, rule in enumerate(rules[:5], 1):
-        lines.append(f"   {i}. [{rule.get('keyword','')}] → {rule.get('message','')[:30]}")
-    if len(rules) > 5:
-        lines.append(f"   … и ещё {len(rules)-5}")
-
     return "\n".join(lines)
 
 
@@ -99,10 +93,6 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     builder.button(text=f"{'🔴 Выкл' if aw_on else '🟢 Вкл'} автовывод", callback_data="auto:toggle:withdraw")
     if aw_on:
         builder.button(text="✏️ Мин. сумма вывода", callback_data="auto:set:withdraw_amount")
-
-    builder.button(text="➕ Добавить правило (игра/категория)", callback_data="auto:rule:add")
-    if s.get("auto_rules"):
-        builder.button(text="🗑 Удалить последнее правило", callback_data="auto:rule:del")
 
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
     builder.adjust(1)
