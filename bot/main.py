@@ -16,7 +16,7 @@ from aiogram.types import TelegramObject
 from config import BOT_TOKEN
 from api.yoomarket import YooMarketAPI
 from storage import get_token
-from handlers import ads, auto_settings, balance, chats, orders, plugins, responders, start
+from handlers import ads, auto_settings, balance, chats, orders, plugins, responders, start, stats
 from tasks import TaskManager
 
 logging.basicConfig(
@@ -79,6 +79,7 @@ async def main() -> None:
     dp.include_router(auto_settings.router)
     dp.include_router(responders.router)
     dp.include_router(plugins.router)
+    dp.include_router(stats.router)
 
     logger.info("Bot starting…")
     try:
