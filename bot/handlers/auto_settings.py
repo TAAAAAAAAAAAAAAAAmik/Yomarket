@@ -27,38 +27,24 @@ def _st(on: bool) -> str:
 def _auto_text(s: dict) -> str:
     ar = s.get("auto_reply", {})
     ae = s.get("auto_events", {})
-    rules = s.get("auto_rules", [])
 
     lines = ["⚙️ <b>Авто-функции</b>\n"]
-    lines.append('📩 Нажми "Автоответчики" для настройки ответов по играм\n')
 
     on = ar.get("enabled", False)
-    lines.append(f"📩 <b>Новый заказ</b> — {_st(on)}")
+    lines.append(f"📩 <b>Автоответчик (новый заказ)</b> — {_st(on)}")
     if on:
         lines.append(f'   <i>"{ar.get("message","")[:50]}"</i>')
 
-    ev_conf = ae.get("on_confirmed", {})
-    on2 = ev_conf.get("enabled", False)
-    lines.append(f"\n✅ <b>Подтверждение заказа</b> — {_st(on2)}")
-    if on2:
-        lines.append(f'   <i>"{ev_conf.get("message","")[:50]}"</i>')
-
     ev_ref = ae.get("on_refunded", {})
     on3 = ev_ref.get("enabled", False)
-    lines.append(f"\n↩️ <b>Возврат</b> — {_st(on3)}")
+    lines.append(f"\n↩️ <b>Автоответ при возврате</b> — {_st(on3)}")
     if on3:
         lines.append(f'   <i>"{ev_ref.get("message","")[:50]}"</i>')
 
     rst_on = s.get("auto_restore", {}).get("enabled", False)
-    lines.append(f"\n🔄 <b>Авторестор</b> — {_st(rst_on)}")
+    lines.append(f"\n🔄 <b>Авто-восстановление товаров</b> — {_st(rst_on)}")
     bump_on = s.get("auto_bump", {}).get("enabled", False)
     lines.append(f"⬆️ <b>Автоподнятие</b> — {_st(bump_on)}")
-
-    aw = s.get("auto_withdraw", {})
-    aw_on = aw.get("enabled", False)
-    lines.append(f"💸 <b>Автовывод</b> — {_st(aw_on)}")
-    if aw_on:
-        lines.append(f"   Мин. сумма: {aw.get('min_amount', 500)} ₽")
 
     return "\n".join(lines)
 
@@ -66,7 +52,6 @@ def _auto_text(s: dict) -> str:
 def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     ar = s.get("auto_reply", {})
     ae = s.get("auto_events", {})
-    aw = s.get("auto_withdraw", {})
     builder = InlineKeyboardBuilder()
 
     builder.button(text="📩 Автоответчики", callback_data="resp:cats")
@@ -76,23 +61,13 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     if ar_on:
         builder.button(text="✏️ Текст нового заказа", callback_data="auto:set:reply_msg")
 
-    conf_on = ae.get("on_confirmed", {}).get("enabled", False)
-    builder.button(text=f"{'🔴 Выкл' if conf_on else '🟢 Вкл'} подтверждение", callback_data="auto:toggle:confirmed")
-    if conf_on:
-        builder.button(text="✏️ Текст подтверждения", callback_data="auto:set:confirmed_msg")
-
     ref_on = ae.get("on_refunded", {}).get("enabled", False)
-    builder.button(text=f"{'🔴 Выкл' if ref_on else '🟢 Вкл'} возврат", callback_data="auto:toggle:refunded")
+    builder.button(text=f"{'🔴 Выкл' if ref_on else '🟢 Вкл'} автовозврат", callback_data="auto:toggle:refunded")
     if ref_on:
         builder.button(text="✏️ Текст возврата", callback_data="auto:set:refunded_msg")
 
-    builder.button(text="🔄 Авторестор", callback_data="auto:toggle:restore")
+    builder.button(text="🔄 Авто-восстановление товаров", callback_data="auto:toggle:restore")
     builder.button(text="⬆️ Автоподнятие", callback_data="auto:toggle:bump")
-
-    aw_on = aw.get("enabled", False)
-    builder.button(text=f"{'🔴 Выкл' if aw_on else '🟢 Вкл'} автовывод", callback_data="auto:toggle:withdraw")
-    if aw_on:
-        builder.button(text="✏️ Мин. сумма вывода", callback_data="auto:set:withdraw_amount")
 
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
     builder.adjust(1)
