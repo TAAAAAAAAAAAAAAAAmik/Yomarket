@@ -42,18 +42,9 @@ def _fmt_list(ads: list[dict], total: int | None) -> str:
     return "\n".join(lines)
 
 
-@router.callback_query(F.data == "menu:ads")
-async def ads_menu(callback: CallbackQuery) -> None:
-    await callback.message.edit_text(
-        "📦 <b>Товары</b>\n\nНажми кнопку чтобы загрузить все объявления с YooMarket:",
-        reply_markup=ads_menu_keyboard(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "ads_load")
-async def load_ads(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    await callback.message.edit_text("⏳ Загружаю товары...")
+@router.callback_query(F.data.in_({"menu:ads", "ads_load"}))
+async def ads_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    await callback.message.edit_text("⏳ Загружаю объявления...")
     try:
         data = await api.get_ads()
         ads: list[dict] = data.get("data") or data.get("items") or []
