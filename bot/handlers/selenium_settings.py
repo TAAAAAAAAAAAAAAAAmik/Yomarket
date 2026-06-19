@@ -21,8 +21,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class SeleniumState(StatesGroup):
-    waiting_login = State()
-    waiting_password = State()
+    waiting_cookies = State()
     waiting_bump_interval = State()
     waiting_withdraw_amount = State()
 
@@ -77,55 +76,83 @@ def _no_creds_kb() -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data == "selenium:setup:start")
 async def setup_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(SeleniumState.waiting_login)
+    await state.set_state(SeleniumState.waiting_cookies)
     await callback.message.edit_text(
-        "🔑 <b>Настройка входа в панель YooMarket</b>\n\n"
-        "Введите ваш e-mail (логин) от <b>panel.yoomarket.net</b>:",
+        "🍪 <b>Настройка входа в панель YooMarket</b>\n\n"
+        "Панель использует SMS-вход, поэтому нужно скопировать куки из браузера.\n\n"
+        "<b>Как получить куки:</b>\n"
+        "1. Открой <b>panel.yoomarket.net</b> в Chrome/Firefox\n"
+        "2. Войди через SMS как обычно\n"
+        "3. Нажми <b>F12</b> → вкладка <b>Console</b>\n"
+        "4. Введи команду и нажми Enter:\n"
+        "<code>copy(document.cookie)</code>\n"
+        "5. Куки скопированы в буфер — вставь сюда:\n\n"
+        "<i>⚠️ Куки хранятся только локально и нужны только для автоматизации</i>",
         reply_markup=_cancel_kb("auto:menu"),
     )
     await callback.answer()
 
 
-@router.message(SeleniumState.waiting_login)
-async def setup_password(message: Message, state: FSMContext) -> None:
-    """Save login from state data, then ask for password."""
-    login = (message.text or "").strip()
-    if not login:
-        await message.answer("❌ Введите корректный e-mail")
+@router.message(SeleniumState.waiting_cookies)
+async def setup_save_cookies(message: Message, state: FSMContext) -> None:
+    cookie_string = (message.text or "").strip()
+    if not cookie_string or "=" not in cookie_string:
+        await message.answer(
+            "❌ Некорректный формат. Куки должны выглядеть так:\n"
+            "<code>key1=value1; key2=value2</code>\n\n"
+            "Попробуй снова — выполни <code>copy(document.cookie)</code> в консоли браузера:"
+        )
         return
-    await state.update_data(panel_login=login)
-    await state.set_state(SeleniumState.waiting_password)
-    await message.answer(
-        f"🔑 Логин: <code>{login}</code>\n\n"
-        "Теперь введите <b>пароль</b> от панели:\n"
-        "<i>(сообщение будет удалено после сохранения)</i>",
-        reply_markup=_cancel_kb("auto:menu"),
-    )
-
-
-@router.message(SeleniumState.waiting_password)
-async def setup_save(message: Message, state: FSMContext) -> None:
-    """Save credentials and confirm."""
-    password = (message.text or "").strip()
-    if not password:
-        await message.answer("❌ Введите корректный пароль")
-        return
-    data = await state.get_data()
-    login = data.get("panel_login", "")
-    save_panel_creds(message.from_user.id, {"login": login, "password": password})
+    save_panel_creds(message.from_user.id, {"cookie_string": cookie_string})
     await state.clear()
-    # Try to delete the password message for security
     try:
         await message.delete()
     except Exception:
         pass
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Проверить сессию", callback_data="selenium:check_session")
+    b.button(text="⬅️ Назад", callback_data="auto:menu")
+    b.adjust(1)
     await message.answer(
-        f"✅ <b>Данные входа сохранены</b>\n\n"
-        f"Логин: <code>{login}</code>\n"
-        f"Пароль: <code>{'*' * len(password)}</code>\n\n"
-        "Теперь можно включить авто-функции через браузер.",
-        reply_markup=_no_creds_kb(),
+        "✅ <b>Куки сохранены!</b>\n\n"
+        "Нажми «Проверить сессию» чтобы убедиться что всё работает.",
+        reply_markup=b.as_markup(),
     )
+
+
+@router.callback_query(F.data == "selenium:check_session")
+async def check_session(callback: CallbackQuery) -> None:
+    await callback.message.edit_text("⏳ Проверяю сессию...")
+    creds = get_panel_creds(callback.from_user.id)
+    if not creds:
+        await callback.message.edit_text("❌ Куки не настроены.", reply_markup=_no_creds_kb())
+        await callback.answer()
+        return
+    try:
+        from automation.panel import YooMarketPanel
+        panel = YooMarketPanel(creds.get("cookie_string", ""))
+        await panel.start()
+        ok = await panel.check_session()
+        await panel.close()
+    except Exception as e:
+        ok = False
+        logger.error("Session check error: %s", e)
+    b = InlineKeyboardBuilder()
+    b.button(text="🔑 Обновить куки", callback_data="selenium:setup:start")
+    b.button(text="⬅️ Назад", callback_data="auto:menu")
+    b.adjust(1)
+    if ok:
+        await callback.message.edit_text(
+            "✅ <b>Сессия активна!</b>\n\nАвто-функции через браузер готовы к работе.",
+            reply_markup=b.as_markup(),
+        )
+    else:
+        await callback.message.edit_text(
+            "❌ <b>Сессия истекла</b>\n\n"
+            "Нужно обновить куки — войди на panel.yoomarket.net заново и повтори процедуру.",
+            reply_markup=b.as_markup(),
+        )
+    await callback.answer()
 
 
 # ---------------------------------------------------------------------------

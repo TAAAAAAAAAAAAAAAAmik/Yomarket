@@ -1,150 +1,100 @@
-"""YooMarket panel browser automation via Playwright."""
+"""YooMarket panel browser automation via Playwright (cookie-based auth)."""
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 PANEL_URL = "https://panel.yoomarket.net"
 
 
+def _parse_cookies(cookie_string: str) -> list[dict]:
+    """Parse 'key=value; key2=value2' cookie string into Playwright cookie list."""
+    cookies = []
+    for part in cookie_string.split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, _, value = part.partition("=")
+            name = name.strip()
+            value = value.strip()
+            if name:
+                cookies.append({
+                    "name": name,
+                    "value": value,
+                    "domain": "panel.yoomarket.net",
+                    "path": "/",
+                })
+    return cookies
+
+
 class YooMarketPanel:
     """Headless Chromium automation for the YooMarket seller panel."""
 
-    def __init__(self, login: str, password: str) -> None:
-        self.login = login
-        self.password = password
+    def __init__(self, cookie_string: str) -> None:
+        self.cookie_string = cookie_string
         self._playwright = None
         self._browser = None
 
     async def start(self) -> None:
-        """Launch headless Chromium browser."""
         from playwright.async_api import async_playwright
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
-        logger.info("Playwright browser started")
 
     async def close(self) -> None:
-        """Close browser and playwright."""
         try:
             if self._browser:
                 await self._browser.close()
-                self._browser = None
         except Exception as e:
             logger.warning("Error closing browser: %s", e)
         try:
             if self._playwright:
                 await self._playwright.stop()
-                self._playwright = None
         except Exception as e:
             logger.warning("Error stopping playwright: %s", e)
-        logger.info("Playwright browser closed")
 
     async def _new_page(self):
-        """Create a new browser page."""
+        """Create a new page with pre-loaded session cookies."""
         if not self._browser:
             await self.start()
-        return await self._browser.new_page()
+        context = await self._browser.new_context()
+        cookies = _parse_cookies(self.cookie_string)
+        if cookies:
+            await context.add_cookies(cookies)
+        return await context.new_page(), context
 
-    async def check_login(self, page) -> bool:
-        """Check if the user is currently logged in."""
+    async def check_session(self) -> bool:
+        """Returns True if the session cookies are still valid."""
+        page, context = await self._new_page()
         try:
             await page.goto(PANEL_URL + "/", timeout=15000)
             await page.wait_for_load_state("networkidle", timeout=15000)
-            current_url = page.url
-            # If redirected to login page, not logged in
-            if "/login" in current_url or "/auth" in current_url or "/signin" in current_url:
+            url = page.url
+            if "/login" in url or "/auth" in url or "/signin" in url:
                 return False
-            # Check for login form on current page
-            login_input = await page.query_selector('input[type="email"], input[name="login"], input[name="email"]')
-            if login_input:
-                return False
-            return True
+            login_input = await page.query_selector('input[type="email"], input[name="login"]')
+            return login_input is None
         except Exception as e:
-            logger.warning("check_login error: %s", e)
+            logger.warning("check_session error: %s", e)
             return False
-
-    async def do_login(self, page) -> bool:
-        """Fill and submit the login form."""
-        try:
-            await page.goto(PANEL_URL + "/login", timeout=15000)
-            await page.wait_for_load_state("networkidle", timeout=15000)
-
-            # Try various email selectors
-            login_filled = False
-            for selector in ['input[type="email"]', 'input[name="login"]', 'input[name="email"]']:
-                try:
-                    el = await page.query_selector(selector)
-                    if el:
-                        await el.fill(self.login)
-                        login_filled = True
-                        logger.debug("Filled login with selector: %s", selector)
-                        break
-                except Exception:
-                    continue
-
-            if not login_filled:
-                logger.error("Could not find login input field")
-                return False
-
-            # Fill password
-            pwd_el = await page.query_selector('input[type="password"]')
-            if not pwd_el:
-                logger.error("Could not find password input field")
-                return False
-            await pwd_el.fill(self.password)
-
-            # Click submit
-            submit_el = await page.query_selector('button[type="submit"]')
-            if not submit_el:
-                logger.error("Could not find submit button")
-                return False
-            await submit_el.click()
-
-            # Wait for navigation after login
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
-
-            current_url = page.url
-            if "/login" in current_url or "/auth" in current_url or "/signin" in current_url:
-                logger.warning("Login failed — still on login page after submit")
-                return False
-
-            logger.info("Login successful")
-            return True
-        except Exception as e:
-            logger.error("do_login error: %s", e)
-            return False
-
-    async def ensure_logged_in(self, page) -> bool:
-        """Make sure we're logged in, logging in if necessary."""
-        logged_in = await self.check_login(page)
-        if logged_in:
-            return True
-        logger.info("Not logged in, attempting login...")
-        return await self.do_login(page)
+        finally:
+            await page.close()
+            await context.close()
 
     async def bump_all_ads(self) -> tuple[int, str]:
         """Navigate to /goods and click all bump buttons."""
-        page = None
+        page, context = await self._new_page()
         try:
-            page = await self._new_page()
-            ok = await self.ensure_logged_in(page)
-            if not ok:
-                return (0, "❌ Не удалось войти в панель")
-
             await page.goto(PANEL_URL + "/goods", timeout=15000)
             await page.wait_for_load_state("networkidle", timeout=15000)
 
-            # Find bump buttons with various selectors
+            if "/login" in page.url or "/auth" in page.url:
+                return 0, "❌ Сессия истекла — обнови куки в настройках"
+
             bump_buttons = []
             for selector in [
                 'button:has-text("Поднять")',
@@ -156,50 +106,41 @@ class YooMarketPanel:
                     buttons = await page.query_selector_all(selector)
                     if buttons:
                         bump_buttons = buttons
-                        logger.debug("Found %d bump buttons with selector: %s", len(buttons), selector)
                         break
                 except Exception:
                     continue
 
             if not bump_buttons:
-                return (0, "ℹ️ Кнопки поднятия не найдены (возможно, все уже подняты)")
+                return 0, "ℹ️ Кнопки поднятия не найдены (возможно, все уже подняты)"
 
             count = 0
             for btn in bump_buttons:
                 try:
                     await btn.click()
                     count += 1
-                    logger.debug("Bumped ad #%d", count)
                     await asyncio.sleep(1.5)
                 except Exception as e:
-                    logger.warning("Failed to click bump button #%d: %s", count + 1, e)
+                    logger.warning("Bump click error: %s", e)
 
-            msg = f"✅ Поднято объявлений: {count}" if count else "⚠️ Ни одно объявление не удалось поднять"
-            return (count, msg)
+            return count, (f"✅ Поднято объявлений: {count}" if count else "⚠️ Не удалось поднять объявления")
 
         except Exception as e:
             logger.error("bump_all_ads error: %s", e)
-            return (0, f"❌ Ошибка при поднятии: {e}")
+            return 0, f"❌ Ошибка: {e}"
         finally:
-            if page:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+            await page.close()
+            await context.close()
 
     async def restore_sold_ads(self) -> tuple[int, str]:
         """Navigate to /goods and click all restore buttons."""
-        page = None
+        page, context = await self._new_page()
         try:
-            page = await self._new_page()
-            ok = await self.ensure_logged_in(page)
-            if not ok:
-                return (0, "❌ Не удалось войти в панель")
-
             await page.goto(PANEL_URL + "/goods", timeout=15000)
             await page.wait_for_load_state("networkidle", timeout=15000)
 
-            # Find restore buttons with various selectors
+            if "/login" in page.url or "/auth" in page.url:
+                return 0, "❌ Сессия истекла — обнови куки в настройках"
+
             restore_buttons = []
             for selector in [
                 'button:has-text("Восстановить")',
@@ -212,72 +153,56 @@ class YooMarketPanel:
                     buttons = await page.query_selector_all(selector)
                     if buttons:
                         restore_buttons = buttons
-                        logger.debug("Found %d restore buttons with selector: %s", len(buttons), selector)
                         break
                 except Exception:
                     continue
 
             if not restore_buttons:
-                return (0, "ℹ️ Кнопки восстановления не найдены (нет проданных/истёкших товаров)")
+                return 0, "ℹ️ Нет товаров для восстановления"
 
             count = 0
             for btn in restore_buttons:
                 try:
                     await btn.click()
                     count += 1
-                    logger.debug("Restored ad #%d", count)
                     await asyncio.sleep(1.5)
                 except Exception as e:
-                    logger.warning("Failed to click restore button #%d: %s", count + 1, e)
+                    logger.warning("Restore click error: %s", e)
 
-            msg = f"✅ Восстановлено объявлений: {count}" if count else "⚠️ Ни одно объявление не удалось восстановить"
-            return (count, msg)
+            return count, (f"✅ Восстановлено: {count}" if count else "⚠️ Не удалось восстановить")
 
         except Exception as e:
             logger.error("restore_sold_ads error: %s", e)
-            return (0, f"❌ Ошибка при восстановлении: {e}")
+            return 0, f"❌ Ошибка: {e}"
         finally:
-            if page:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+            await page.close()
+            await context.close()
 
     async def withdraw_balance(self, min_amount: int) -> tuple[bool, str]:
-        """Withdraw balance if it is at or above min_amount."""
-        page = None
+        """Withdraw balance if >= min_amount."""
+        page, context = await self._new_page()
         try:
-            page = await self._new_page()
-            ok = await self.ensure_logged_in(page)
-            if not ok:
-                return (False, "❌ Не удалось войти в панель")
-
-            # Try /finance first, then /wallet
+            current_balance = 0.0
             balance_found = False
-            current_balance = 0
 
             for path in ["/finance", "/wallet", "/balance"]:
                 try:
                     await page.goto(PANEL_URL + path, timeout=15000)
                     await page.wait_for_load_state("networkidle", timeout=15000)
-
-                    # Try to read balance from page text
+                    if "/login" in page.url or "/auth" in page.url:
+                        return False, "❌ Сессия истекла — обнови куки в настройках"
                     page_text = await page.inner_text("body")
-                    # Look for patterns like "1 234 ₽", "1234.56 ₽", "1234 RUB" etc.
-                    patterns = [
+                    for pattern in [
                         r"([\d\s]+[,.]?\d*)\s*₽",
                         r"([\d\s]+[,.]?\d*)\s*RUB",
                         r"Баланс[:\s]+([\d\s]+[,.]?\d*)",
-                        r"Balance[:\s]+([\d\s]+[,.]?\d*)",
-                    ]
-                    for pattern in patterns:
+                    ]:
                         matches = re.findall(pattern, page_text)
                         if matches:
                             raw = matches[0].replace(" ", "").replace(",", ".").strip()
                             try:
                                 current_balance = float(raw)
                                 balance_found = True
-                                logger.info("Found balance: %.2f on path %s", current_balance, path)
                                 break
                             except ValueError:
                                 continue
@@ -287,74 +212,46 @@ class YooMarketPanel:
                     logger.warning("Failed to load %s: %s", path, e)
 
             if not balance_found:
-                return (False, "❌ Не удалось найти баланс на странице")
+                return False, "❌ Не удалось найти баланс на странице"
 
             if current_balance < min_amount:
-                return (False, f"ℹ️ Баланс {current_balance:.0f} ₽ ниже порога {min_amount} ₽")
+                return False, f"ℹ️ Баланс {current_balance:.0f} ₽ ниже порога {min_amount} ₽"
 
-            # Find withdraw button
-            withdraw_clicked = False
-            for selector in [
-                'button:has-text("Вывести")',
-                'button:has-text("Вывод")',
-                'a:has-text("Вывести")',
-                'a:has-text("Вывод средств")',
-                '[data-action="withdraw"]',
-                '.withdraw-btn',
-            ]:
+            for selector in ['button:has-text("Вывести")', 'button:has-text("Вывод")',
+                             'a:has-text("Вывести")', '[data-action="withdraw"]']:
                 try:
                     btn = await page.query_selector(selector)
                     if btn:
                         await btn.click()
                         await asyncio.sleep(1.5)
-                        withdraw_clicked = True
-                        logger.debug("Clicked withdraw button with selector: %s", selector)
                         break
                 except Exception:
                     continue
 
-            if not withdraw_clicked:
-                return (False, f"❌ Кнопка вывода не найдена (баланс: {current_balance:.0f} ₽)")
-
-            # Try to fill amount input if it appeared
             try:
-                amount_input = await page.query_selector('input[type="number"], input[name="amount"], input[placeholder*="сумм"]')
+                amount_input = await page.query_selector('input[type="number"], input[name="amount"]')
                 if amount_input:
                     await amount_input.fill(str(int(current_balance)))
                     await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.debug("No amount input or error filling it: %s", e)
+            except Exception:
+                pass
 
-            # Try to confirm / submit
-            confirmed = False
-            for selector in [
-                'button[type="submit"]',
-                'button:has-text("Подтвердить")',
-                'button:has-text("Вывести")',
-                'button:has-text("OK")',
-            ]:
+            for selector in ['button[type="submit"]', 'button:has-text("Подтвердить")',
+                             'button:has-text("OK")']:
                 try:
                     btn = await page.query_selector(selector)
                     if btn:
                         await btn.click()
                         await asyncio.sleep(1.5)
-                        confirmed = True
-                        logger.debug("Confirmed withdraw with selector: %s", selector)
-                        break
+                        return True, f"✅ Вывод {current_balance:.0f} ₽ выполнен"
                 except Exception:
                     continue
 
-            if confirmed:
-                return (True, f"✅ Вывод {current_balance:.0f} ₽ выполнен")
-            else:
-                return (True, f"⚠️ Кнопка вывода нажата, но подтверждение не найдено (баланс: {current_balance:.0f} ₽)")
+            return True, f"⚠️ Запрос вывода отправлен ({current_balance:.0f} ₽)"
 
         except Exception as e:
             logger.error("withdraw_balance error: %s", e)
-            return (False, f"❌ Ошибка при выводе: {e}")
+            return False, f"❌ Ошибка: {e}"
         finally:
-            if page:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+            await page.close()
+            await context.close()

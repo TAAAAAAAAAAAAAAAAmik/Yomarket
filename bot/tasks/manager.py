@@ -290,7 +290,7 @@ class TaskManager:
 
         try:
             from automation.panel import YooMarketPanel
-            panel = YooMarketPanel(creds["login"], creds["password"])
+            panel = YooMarketPanel(creds.get("cookie_string", ""))
             await panel.start()
 
             try:
