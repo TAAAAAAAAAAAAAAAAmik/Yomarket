@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 
 from aiogram import Bot
@@ -9,9 +10,12 @@ from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
-from storage import get_token, get_settings, save_settings
+from storage import get_token, get_settings, save_settings, get_panel_creds
 
 logger = logging.getLogger(__name__)
+
+# Selenium loop interval in seconds (check every 30 minutes)
+_SELENIUM_LOOP_INTERVAL = 30 * 60
 
 
 def _fmt_time(raw) -> str:
@@ -62,16 +66,24 @@ class TaskManager:
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
         self._tasks: dict[int, asyncio.Task] = {}
+        self._selenium_tasks: dict[int, asyncio.Task] = {}
 
     def start_for_user(self, user_id: int) -> None:
         if user_id in self._tasks and not self._tasks[user_id].done():
             self._tasks[user_id].cancel()
         self._tasks[user_id] = asyncio.create_task(self._user_loop(user_id))
+        # Also start the selenium automation loop
+        if user_id in self._selenium_tasks and not self._selenium_tasks[user_id].done():
+            self._selenium_tasks[user_id].cancel()
+        self._selenium_tasks[user_id] = asyncio.create_task(self._selenium_loop(user_id))
 
     def stop_for_user(self, user_id: int) -> None:
         if user_id in self._tasks:
             self._tasks[user_id].cancel()
             del self._tasks[user_id]
+        if user_id in self._selenium_tasks:
+            self._selenium_tasks[user_id].cancel()
+            del self._selenium_tasks[user_id]
 
     async def start_all(self) -> None:
         from storage import get_all_users
@@ -248,3 +260,78 @@ class TaskManager:
             await self.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=reply_markup)
         except Exception as e:
             logger.warning("Notify failed (user %s): %s", user_id, e)
+
+    # ------------------------------------------------------------------
+    # Selenium / Playwright automation loop (separate from orders loop)
+    # ------------------------------------------------------------------
+
+    async def _selenium_loop(self, user_id: int) -> None:
+        """Background loop that runs browser automation tasks every 30 minutes."""
+        # Initial delay so it doesn't run immediately on startup
+        await asyncio.sleep(60)
+        while True:
+            try:
+                await self._tick_selenium(user_id)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Selenium task error for user %s: %s", user_id, e)
+            await asyncio.sleep(_SELENIUM_LOOP_INTERVAL)
+
+    async def _tick_selenium(self, user_id: int) -> None:
+        """Check which selenium automation tasks need to run and execute them."""
+        creds = get_panel_creds(user_id)
+        if not creds:
+            return  # No panel credentials configured, skip
+
+        settings = get_settings(user_id)
+        now = time.time()
+        messages = []
+
+        try:
+            from automation.panel import YooMarketPanel
+            panel = YooMarketPanel(creds["login"], creds["password"])
+            await panel.start()
+
+            try:
+                # --- Auto-bump ---
+                ab = settings.get("auto_bump", {})
+                if ab.get("enabled"):
+                    interval_hours = ab.get("interval_hours", 24)
+                    last_run = ab.get("last_bump_run", 0)
+                    elapsed_hours = (now - last_run) / 3600
+                    if elapsed_hours >= interval_hours:
+                        logger.info("Running auto-bump for user %s", user_id)
+                        count, msg = await panel.bump_all_ads()
+                        settings["auto_bump"]["last_bump_run"] = now
+                        messages.append(f"⬆️ Авто-поднятие: {msg}")
+
+                # --- Auto-restore ---
+                ar = settings.get("auto_restore", {})
+                if ar.get("enabled"):
+                    logger.info("Running auto-restore for user %s", user_id)
+                    count, msg = await panel.restore_sold_ads()
+                    settings["auto_restore"]["last_restore_run"] = now
+                    messages.append(f"🔄 Авто-восстановление: {msg}")
+
+                # --- Auto-withdraw ---
+                aw = settings.get("auto_withdraw", {})
+                if aw.get("enabled"):
+                    min_amount = aw.get("min_amount", 500)
+                    logger.info("Running auto-withdraw for user %s (min: %d)", user_id, min_amount)
+                    success, msg = await panel.withdraw_balance(min_amount)
+                    messages.append(f"💸 Авто-вывод: {msg}")
+
+            finally:
+                await panel.close()
+
+        except Exception as e:
+            logger.error("Selenium panel error for user %s: %s", user_id, e)
+            messages.append(f"❌ Ошибка браузерной автоматизации: {e}")
+
+        if messages:
+            save_settings(user_id, settings)
+            await self._notify(
+                user_id,
+                "🤖 <b>Авто-задачи браузера</b>\n\n" + "\n".join(messages),
+            )

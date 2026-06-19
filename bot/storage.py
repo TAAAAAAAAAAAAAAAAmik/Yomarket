@@ -3,6 +3,7 @@ import os
 
 _FILE = os.path.join(os.path.dirname(__file__), "data", "tokens.json")
 _SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "data", "settings.json")
+_PANEL_FILE = os.path.join(os.path.dirname(__file__), "data", "panel_creds.json")
 
 _DEFAULT_SETTINGS = {
     "shop_name": "",
@@ -111,3 +112,37 @@ def save_shop_name(user_id: int, name: str) -> None:
     s = get_settings(user_id)
     s["shop_name"] = name
     save_settings(user_id, s)
+
+
+# ---------------------------------------------------------------------------
+# Panel credentials (YooMarket seller panel login/password)
+# ---------------------------------------------------------------------------
+
+def _load_panel_creds() -> dict:
+    if os.path.exists(_PANEL_FILE):
+        with open(_PANEL_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def get_panel_creds(user_id: int) -> dict | None:
+    """Return {"login": "...", "password": "..."} for the user, or None."""
+    return _load_panel_creds().get(str(user_id))
+
+
+def save_panel_creds(user_id: int, creds: dict) -> None:
+    """Save panel credentials for the user."""
+    os.makedirs(os.path.dirname(_PANEL_FILE), exist_ok=True)
+    data = _load_panel_creds()
+    data[str(user_id)] = creds
+    with open(_PANEL_FILE, "w") as f:
+        json.dump(data, f)
+
+
+def delete_panel_creds(user_id: int) -> None:
+    """Remove panel credentials for the user."""
+    data = _load_panel_creds()
+    data.pop(str(user_id), None)
+    os.makedirs(os.path.dirname(_PANEL_FILE), exist_ok=True)
+    with open(_PANEL_FILE, "w") as f:
+        json.dump(data, f)

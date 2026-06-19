@@ -66,8 +66,9 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     if ref_on:
         builder.button(text="✏️ Текст возврата", callback_data="auto:set:refunded_msg")
 
-    builder.button(text="🔄 Авто-восстановление товаров", callback_data="auto:toggle:restore")
-    builder.button(text="⬆️ Автоподнятие", callback_data="auto:toggle:bump")
+    builder.button(text="🔄 Авто-восстановление товаров", callback_data="selenium:restore:menu")
+    builder.button(text="⬆️ Автоподнятие", callback_data="selenium:bump:menu")
+    builder.button(text="💸 Авто-вывод", callback_data="selenium:withdraw:menu")
 
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
     builder.adjust(1)
@@ -111,12 +112,26 @@ async def toggle_refunded(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "auto:toggle:restore")
 async def toggle_restore(callback: CallbackQuery) -> None:
-    await callback.answer("⚠️ Авторестор появится после обновления API YooMarket", show_alert=True)
+    # Redirect to the Playwright-based selenium restore menu
+    from handlers.selenium_settings import _restore_text, _restore_kb
+    from storage import get_panel_creds
+    uid = callback.from_user.id
+    creds = get_panel_creds(uid)
+    s = get_settings(uid)
+    await callback.message.edit_text(_restore_text(s, creds), reply_markup=_restore_kb(s, creds))
+    await callback.answer()
 
 
 @router.callback_query(F.data == "auto:toggle:bump")
 async def toggle_bump(callback: CallbackQuery) -> None:
-    await callback.answer("⚠️ Автоподнятие появится после обновления API YooMarket", show_alert=True)
+    # Redirect to the Playwright-based selenium bump menu
+    from handlers.selenium_settings import _bump_text, _bump_kb
+    from storage import get_panel_creds
+    uid = callback.from_user.id
+    creds = get_panel_creds(uid)
+    s = get_settings(uid)
+    await callback.message.edit_text(_bump_text(s, creds), reply_markup=_bump_kb(s, creds))
+    await callback.answer()
 
 
 @router.callback_query(F.data == "auto:toggle:withdraw")
