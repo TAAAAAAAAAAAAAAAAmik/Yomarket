@@ -101,12 +101,47 @@ async def setup_phone(message: Message, state: FSMContext) -> None:
     wait_msg = await message.answer("⏳ Открываю браузер и захожу на страницу входа...")
 
     try:
-        from automation.panel import YooMarketPanel
-        panel = YooMarketPanel()
-        await panel.start()
-        page, context = await panel.open_login_page()
+        try:
+            from automation.panel import YooMarketPanel
+        except ImportError:
+            await wait_msg.edit_text(
+                "❌ <b>Playwright не установлен</b>\n\n"
+                "Браузерная автоматизация недоступна в текущем окружении.\n"
+                "Дождись следующего деплоя Railway с обновлённым Dockerfile.",
+                reply_markup=_cancel_kb("auto:menu"),
+            )
+            await state.clear()
+            return
 
-        ok, err = await panel.submit_phone(page, phone)
+        async def _do_login():
+            panel = YooMarketPanel()
+            await panel.start()
+            page, context = await panel.open_login_page()
+            return panel, page, context
+
+        import asyncio
+        try:
+            panel, page, context = await asyncio.wait_for(_do_login(), timeout=25)
+        except asyncio.TimeoutError:
+            await wait_msg.edit_text(
+                "⏱ <b>Браузер не запустился за 25 сек</b>\n\n"
+                "Возможно, Playwright/Chromium ещё не установлен на сервере.\n"
+                "Подожди несколько минут и попробуй снова.",
+                reply_markup=_cancel_kb("auto:menu"),
+            )
+            await state.clear()
+            return
+
+        try:
+            ok, err = await asyncio.wait_for(panel.submit_phone(page, phone), timeout=20)
+        except asyncio.TimeoutError:
+            await panel.close()
+            await wait_msg.edit_text(
+                "⏱ Страница входа не ответила за 20 сек. Попробуй ещё раз:",
+                reply_markup=_cancel_kb("auto:menu"),
+            )
+            await state.clear()
+            return
 
         if not ok:
             await panel.close()
@@ -139,7 +174,11 @@ async def setup_phone(message: Message, state: FSMContext) -> None:
 
     except Exception as e:
         logger.error("setup_phone error: %s", e)
-        await wait_msg.edit_text(f"❌ Ошибка браузера: {e}\n\nПопробуй ещё раз:")
+        await state.clear()
+        await wait_msg.edit_text(
+            f"❌ Ошибка: <code>{e}</code>\n\nПопробуй ещё раз:",
+            reply_markup=_cancel_kb("auto:menu"),
+        )
 
 
 @router.callback_query(F.data == "selenium:cancel_login")
