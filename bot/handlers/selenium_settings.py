@@ -24,9 +24,11 @@ _login_sessions: dict[int, tuple] = {}
 # ---------------------------------------------------------------------------
 
 class SeleniumState(StatesGroup):
-    waiting_cookie_string = State()
-    waiting_sms_phone = State()
-    waiting_sms_code = State()
+    waiting_http_phone = State()    # HTTP SMS flow — phone step
+    waiting_http_code = State()     # HTTP SMS flow — code step
+    waiting_cookie_string = State() # Cookie paste flow
+    waiting_sms_phone = State()     # Browser SMS flow (advanced)
+    waiting_sms_code = State()      # Browser SMS flow — code step
     waiting_bump_interval = State()
     waiting_withdraw_amount = State()
 
@@ -82,26 +84,151 @@ def _no_creds_kb() -> InlineKeyboardMarkup:
 async def setup_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     creds = get_panel_creds(callback.from_user.id)
-    status = "✅ Cookies сохранены" if creds else "❌ Не настроено"
+    status = "✅ Сессия настроена" if creds else "❌ Не настроено"
     b = InlineKeyboardBuilder()
-    b.button(text="📋 Вставить cookies (рекомендуется)", callback_data="selenium:setup:cookie")
-    b.button(text="📱 Войти через SMS (бот + браузер)", callback_data="selenium:setup:sms")
+    b.button(text="📱 Войти через SMS (с телефона)", callback_data="selenium:setup:http")
+    b.button(text="📋 Вставить cookies (с компьютера)", callback_data="selenium:setup:cookie")
+    b.button(text="🖥 Войти через браузер (сервер)", callback_data="selenium:setup:sms")
     if creds:
         b.button(text="🔍 Проверить сессию", callback_data="selenium:check_session")
-        b.button(text="🗑 Удалить cookies", callback_data="selenium:setup:delete")
+        b.button(text="🗑 Удалить сессию", callback_data="selenium:setup:delete")
     b.button(text="⬅️ Назад", callback_data="auto:menu")
     b.adjust(1)
     await callback.message.edit_text(
         f"🔑 <b>Вход в панель YooMarket</b>\n\n"
-        f"Текущий статус: {status}\n\n"
-        "Выбери способ входа:",
+        f"Статус: {status}\n\n"
+        "📱 <b>С телефона</b> — «Войти через SMS»\n"
+        "💻 <b>С компьютера</b> — «Вставить cookies»",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
 
 
 # ---------------------------------------------------------------------------
-# Method 1: Cookie paste (recommended — no browser needed)
+# Method 1: HTTP SMS login (mobile-friendly, no browser)
+# ---------------------------------------------------------------------------
+
+# Stores HTTP panel sessions between phone and code steps
+_http_sessions: dict[int, object] = {}
+
+
+@router.callback_query(F.data == "selenium:setup:http")
+async def setup_http_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(SeleniumState.waiting_http_phone)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="selenium:setup:start")
+    await callback.message.edit_text(
+        "📱 <b>Вход по SMS</b>\n\n"
+        "Введи номер телефона или e-mail от аккаунта <b>panel.yoomarket.net</b>:\n\n"
+        "<i>Бот запросит SMS-код без запуска браузера</i>",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.message(SeleniumState.waiting_http_phone)
+async def setup_http_phone(message: Message, state: FSMContext) -> None:
+    phone = (message.text or "").strip()
+    if not phone:
+        await message.answer("❌ Введи номер телефона или e-mail:")
+        return
+
+    uid = message.from_user.id
+    wait_msg = await message.answer("⏳ Запрашиваю SMS-код...")
+
+    from automation.panel import YooMarketPanelHTTP
+    panel = YooMarketPanelHTTP()
+    await panel.start()
+
+    try:
+        ok, err = await panel.send_sms(phone)
+    except Exception as e:
+        ok, err = False, str(e)
+
+    if not ok:
+        await panel.close()
+        await state.clear()
+        b = InlineKeyboardBuilder()
+        b.button(text="🔄 Попробовать снова", callback_data="selenium:setup:http")
+        b.button(text="📋 Вставить cookies", callback_data="selenium:setup:cookie")
+        b.button(text="⬅️ Назад", callback_data="selenium:setup:start")
+        b.adjust(1)
+        await wait_msg.edit_text(err, reply_markup=b.as_markup())
+        return
+
+    _http_sessions[uid] = panel
+    await state.set_state(SeleniumState.waiting_http_code)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="selenium:http:cancel")
+    await wait_msg.edit_text(
+        f"📨 <b>SMS отправлено</b> на <code>{phone}</code>\n\nВведи код из SMS:",
+        reply_markup=b.as_markup(),
+    )
+
+
+@router.callback_query(F.data == "selenium:http:cancel")
+async def http_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    uid = callback.from_user.id
+    panel = _http_sessions.pop(uid, None)
+    if panel:
+        try:
+            await panel.close()
+        except Exception:
+            pass
+    await state.clear()
+    await callback.message.edit_text("❌ Вход отменён.", reply_markup=_no_creds_kb())
+    await callback.answer()
+
+
+@router.message(SeleniumState.waiting_http_code)
+async def setup_http_code(message: Message, state: FSMContext) -> None:
+    code = (message.text or "").strip()
+    uid = message.from_user.id
+
+    panel = _http_sessions.pop(uid, None)
+    if panel is None:
+        await message.answer("❌ Сессия истекла. Начни заново.", reply_markup=_no_creds_kb())
+        await state.clear()
+        return
+
+    wait_msg = await message.answer("⏳ Проверяю код...")
+
+    try:
+        ok, result = await panel.verify_code(code)
+    except Exception as e:
+        ok, result = False, str(e)
+    finally:
+        try:
+            await panel.close()
+        except Exception:
+            pass
+
+    await state.clear()
+
+    if ok:
+        save_panel_creds(uid, {"cookie_string": result})
+        b = InlineKeyboardBuilder()
+        b.button(text="🔍 Проверить сессию", callback_data="selenium:check_session")
+        b.button(text="⬅️ К авто-функциям", callback_data="auto:menu")
+        b.adjust(1)
+        await wait_msg.edit_text(
+            "✅ <b>Вход выполнен!</b>\n\nСессия сохранена. Авто-функции готовы к работе.",
+            reply_markup=b.as_markup(),
+        )
+    else:
+        b = InlineKeyboardBuilder()
+        b.button(text="🔄 Попробовать снова", callback_data="selenium:setup:http")
+        b.button(text="📋 Вставить cookies", callback_data="selenium:setup:cookie")
+        b.button(text="⬅️ Назад", callback_data="selenium:setup:start")
+        b.adjust(1)
+        await wait_msg.edit_text(
+            f"❌ <b>Ошибка входа</b>\n\n{result}",
+            reply_markup=b.as_markup(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Method 2: Cookie paste (desktop — F12 → document.cookie)
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "selenium:setup:cookie")
@@ -147,16 +274,16 @@ async def setup_cookie_save(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Method 2: SMS via browser (advanced — requires Playwright)
+# Method 3: SMS via browser (advanced — requires Playwright on server)
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "selenium:setup:sms")
 async def setup_sms_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SeleniumState.waiting_sms_phone)
     await callback.message.edit_text(
-        "📱 <b>Вход через SMS</b>\n\n"
-        "Введи номер телефона или e-mail от аккаунта на <b>panel.yoomarket.net</b>:\n\n"
-        "<i>⚠️ Требует установленного браузера на сервере</i>",
+        "🖥 <b>Вход через браузер на сервере</b>\n\n"
+        "Введи номер телефона или e-mail от аккаунта <b>panel.yoomarket.net</b>:\n\n"
+        "<i>⚠️ Требует Playwright/Chromium на сервере. Может не работать на Railway free tier.</i>",
         reply_markup=_cancel_kb("selenium:setup:start"),
     )
     await callback.answer()
