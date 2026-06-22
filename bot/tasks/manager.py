@@ -347,59 +347,54 @@ class TaskManager:
             await asyncio.sleep(_SELENIUM_LOOP_INTERVAL)
 
     async def _tick_selenium(self, user_id: int) -> None:
-        """Check which selenium automation tasks need to run and execute them."""
-        creds = get_panel_creds(user_id)
-        if not creds:
-            return  # No panel credentials configured, skip
+        """Run auto-bump / auto-restore / auto-withdraw via the Integration API."""
+        token = get_token(user_id)
+        if not token:
+            return
 
         settings = get_settings(user_id)
         now = time.time()
         messages = []
 
+        api = YooMarketAPI(token)
+        await api.start()
         try:
-            from automation.panel import YooMarketPanel
-            panel = YooMarketPanel(creds.get("cookie_string", ""))
-            await panel.start()
+            # --- Auto-bump ---
+            ab = settings.get("auto_bump", {})
+            if ab.get("enabled"):
+                interval_hours = ab.get("interval_hours", 24)
+                last_run = ab.get("last_bump_run", 0)
+                if (now - last_run) / 3600 >= interval_hours:
+                    logger.info("Auto-bump for user %s via API", user_id)
+                    count, msg = await api.bump_all_ads()
+                    settings["auto_bump"]["last_bump_run"] = now
+                    messages.append(f"⬆️ Авто-поднятие: {msg}")
 
-            try:
-                # --- Auto-bump ---
-                ab = settings.get("auto_bump", {})
-                if ab.get("enabled"):
-                    interval_hours = ab.get("interval_hours", 24)
-                    last_run = ab.get("last_bump_run", 0)
-                    elapsed_hours = (now - last_run) / 3600
-                    if elapsed_hours >= interval_hours:
-                        logger.info("Running auto-bump for user %s", user_id)
-                        count, msg = await panel.bump_all_ads()
-                        settings["auto_bump"]["last_bump_run"] = now
-                        messages.append(f"⬆️ Авто-поднятие: {msg}")
+            # --- Auto-restore ---
+            ar = settings.get("auto_restore", {})
+            if ar.get("enabled"):
+                logger.info("Auto-restore for user %s via API", user_id)
+                count, msg = await api.restore_all_ads()
+                settings["auto_restore"]["last_restore_run"] = now
+                messages.append(f"🔄 Авто-восстановление: {msg}")
 
-                # --- Auto-restore ---
-                ar = settings.get("auto_restore", {})
-                if ar.get("enabled"):
-                    logger.info("Running auto-restore for user %s", user_id)
-                    count, msg = await panel.restore_sold_ads()
-                    settings["auto_restore"]["last_restore_run"] = now
-                    messages.append(f"🔄 Авто-восстановление: {msg}")
-
-                # --- Auto-withdraw ---
-                aw = settings.get("auto_withdraw", {})
-                if aw.get("enabled"):
-                    min_amount = aw.get("min_amount", 500)
-                    logger.info("Running auto-withdraw for user %s (min: %d)", user_id, min_amount)
-                    success, msg = await panel.withdraw_balance(min_amount)
-                    messages.append(f"💸 Авто-вывод: {msg}")
-
-            finally:
-                await panel.close()
+            # --- Auto-withdraw ---
+            aw = settings.get("auto_withdraw", {})
+            if aw.get("enabled"):
+                min_amount = aw.get("min_amount", 500)
+                logger.info("Auto-withdraw for user %s via API", user_id)
+                success, msg = await api.withdraw_balance(min_amount)
+                messages.append(f"💸 Авто-вывод: {msg}")
 
         except Exception as e:
-            logger.error("Selenium panel error for user %s: %s", user_id, e)
-            messages.append(f"❌ Ошибка браузерной автоматизации: {e}")
+            logger.error("Auto-tasks error for user %s: %s", user_id, e)
+            messages.append(f"❌ Ошибка авто-задач: {e}")
+        finally:
+            await api.close()
 
         if messages:
             save_settings(user_id, settings)
             await self._notify(
                 user_id,
-                "🤖 <b>Авто-задачи браузера</b>\n\n" + "\n".join(messages),
+                "🤖 <b>Авто-задачи</b>\n\n" + "\n".join(messages),
             )

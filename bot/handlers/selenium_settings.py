@@ -10,6 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from api.yoomarket import YooMarketAPI
 from storage import get_panel_creds, save_panel_creds, delete_panel_creds, get_settings, save_settings
 
 router = Router()
@@ -337,25 +338,22 @@ async def _http_check_session(cookie_string: str) -> bool:
 # Auto-bump menu
 # ---------------------------------------------------------------------------
 
-def _bump_text(s: dict, creds) -> str:
+def _bump_text(s: dict, creds=None) -> str:
     ab = s.get("auto_bump", {})
     on = ab.get("enabled", False)
     interval = ab.get("interval_hours", 24)
     last_run = _fmt_ts(ab.get("last_bump_run"))
-    lines = [
+    return "\n".join([
         "⬆️ <b>Авто-поднятие</b>\n",
         f"Статус: {_st(on)}",
         f"Интервал: каждые {interval} ч",
         f"Последний запуск: {last_run}",
         "",
-        "Ставит все объявления на верх каждые N часов через браузер.",
-    ]
-    if not creds:
-        lines.append("\n⚠️ <b>Нужно настроить вход в панель</b>")
-    return "\n".join(lines)
+        "Поднимает все объявления через API — браузер не нужен.",
+    ])
 
 
-def _bump_kb(s: dict, creds) -> InlineKeyboardMarkup:
+def _bump_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
     ab = s.get("auto_bump", {})
     on = ab.get("enabled", False)
     interval = ab.get("interval_hours", 24)
@@ -363,32 +361,25 @@ def _bump_kb(s: dict, creds) -> InlineKeyboardMarkup:
     b.button(text="▶️ Запустить сейчас", callback_data="selenium:run:bump")
     b.button(text=f"{'🔴 Выкл' if on else '🟢 Вкл'}", callback_data="selenium:bump:toggle")
     b.button(text=f"⏱ Интервал: {interval} ч", callback_data="selenium:bump:set_interval")
-    b.button(text="🔑 Сменить cookies", callback_data="selenium:setup:start")
     b.button(text="⬅️ Назад", callback_data="auto:menu")
-    b.adjust(1, 2, 2)
+    b.adjust(1, 2, 1)
     return b.as_markup()
 
 
 @router.callback_query(F.data == "selenium:bump:menu")
 async def bump_menu(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id
-    creds = get_panel_creds(uid)
-    s = get_settings(uid)
-    await callback.message.edit_text(_bump_text(s, creds), reply_markup=_bump_kb(s, creds))
+    s = get_settings(callback.from_user.id)
+    await callback.message.edit_text(_bump_text(s), reply_markup=_bump_kb(s))
     await callback.answer()
 
 
 @router.callback_query(F.data == "selenium:bump:toggle")
 async def bump_toggle(callback: CallbackQuery) -> None:
     uid = callback.from_user.id
-    creds = get_panel_creds(uid)
-    if not creds:
-        await callback.answer("⚠️ Сначала настройте вход в панель", show_alert=True)
-        return
     s = get_settings(uid)
     s["auto_bump"]["enabled"] = not s["auto_bump"].get("enabled", False)
     save_settings(uid, s)
-    await callback.message.edit_text(_bump_text(s, creds), reply_markup=_bump_kb(s, creds))
+    await callback.message.edit_text(_bump_text(s), reply_markup=_bump_kb(s))
     await callback.answer()
 
 
@@ -414,154 +405,114 @@ async def bump_save_interval(message: Message, state: FSMContext) -> None:
         save_settings(message.from_user.id, s)
         await state.clear()
         await message.answer(f"✅ Интервал поднятия: <b>{hours} ч</b>")
-        creds = get_panel_creds(message.from_user.id)
-        await message.answer(_bump_text(s, creds), reply_markup=_bump_kb(s, creds))
+        await message.answer(_bump_text(s), reply_markup=_bump_kb(s))
     except ValueError:
         await message.answer("❌ Введите целое число часов, например: 24")
 
 
 @router.callback_query(F.data == "selenium:run:bump")
-async def run_bump(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id
-    creds = get_panel_creds(uid)
-    if not creds:
-        await callback.answer("⚠️ Сначала настройте вход в панель", show_alert=True)
+async def run_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    if not api:
+        await callback.answer("⚠️ API токен не настроен", show_alert=True)
         return
-    await callback.answer("⏳ Запускаю поднятие...", show_alert=False)
-    await callback.message.edit_text("⏳ Поднимаю объявления через браузер...")
+    await callback.answer("⏳ Поднимаю объявления...", show_alert=False)
+    await callback.message.edit_text("⏳ Поднимаю все объявления через API...")
     try:
-        from automation.panel import YooMarketPanel
-        panel = YooMarketPanel(creds.get("cookie_string", ""))
-        await panel.start()
-        try:
-            count, msg = await panel.bump_all_ads()
-        finally:
-            await panel.close()
-        import time
-        s = get_settings(uid)
-        s["auto_bump"]["last_bump_run"] = time.time()
-        save_settings(uid, s)
-        result_text = f"⬆️ <b>Авто-поднятие завершено</b>\n\n{msg}"
+        count, msg = await api.bump_all_ads()
+        import time as _time
+        s = get_settings(callback.from_user.id)
+        s["auto_bump"]["last_bump_run"] = _time.time()
+        save_settings(callback.from_user.id, s)
+        result_text = f"⬆️ <b>Поднятие завершено</b>\n\n{msg}"
     except Exception as e:
-        logger.error("Manual bump error for user %s: %s", uid, e)
-        result_text = f"❌ Ошибка при поднятии: {e}"
-    s = get_settings(uid)
-    creds = get_panel_creds(uid)
-    await callback.message.edit_text(
-        result_text + "\n\n" + _bump_text(s, creds),
-        reply_markup=_bump_kb(s, creds),
-    )
+        logger.error("Manual bump error: %s", e)
+        result_text = f"❌ Ошибка: {e}"
+        s = get_settings(callback.from_user.id)
+    await callback.message.edit_text(result_text + "\n\n" + _bump_text(s), reply_markup=_bump_kb(s))
 
 
 # ---------------------------------------------------------------------------
 # Auto-restore menu
 # ---------------------------------------------------------------------------
 
-def _restore_text(s: dict, creds) -> str:
+def _restore_text(s: dict, creds=None) -> str:
     ar = s.get("auto_restore", {})
     on = ar.get("enabled", False)
     last_run = _fmt_ts(ar.get("last_restore_run"))
-    lines = [
+    return "\n".join([
         "🔄 <b>Авто-восстановление</b>\n",
         f"Статус: {_st(on)}",
         f"Последний запуск: {last_run}",
         "",
-        "Переактивирует проданные или истёкшие объявления через браузер.",
-    ]
-    if not creds:
-        lines.append("\n⚠️ <b>Нужно настроить вход в панель</b>")
-    return "\n".join(lines)
+        "Переактивирует проданные или истёкшие объявления через API.",
+    ])
 
 
-def _restore_kb(s: dict, creds) -> InlineKeyboardMarkup:
-    ar = s.get("auto_restore", {})
-    on = ar.get("enabled", False)
+def _restore_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
+    on = s.get("auto_restore", {}).get("enabled", False)
     b = InlineKeyboardBuilder()
     b.button(text="▶️ Запустить сейчас", callback_data="selenium:run:restore")
     b.button(text=f"{'🔴 Выкл' if on else '🟢 Вкл'}", callback_data="selenium:restore:toggle")
-    b.button(text="🔑 Сменить cookies", callback_data="selenium:setup:start")
     b.button(text="⬅️ Назад", callback_data="auto:menu")
-    b.adjust(1, 1, 2)
+    b.adjust(1)
     return b.as_markup()
 
 
 @router.callback_query(F.data == "selenium:restore:menu")
 async def restore_menu(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id
-    creds = get_panel_creds(uid)
-    s = get_settings(uid)
-    await callback.message.edit_text(_restore_text(s, creds), reply_markup=_restore_kb(s, creds))
+    s = get_settings(callback.from_user.id)
+    await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
     await callback.answer()
 
 
 @router.callback_query(F.data == "selenium:restore:toggle")
 async def restore_toggle(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id
-    creds = get_panel_creds(uid)
-    if not creds:
-        await callback.answer("⚠️ Сначала настройте вход в панель", show_alert=True)
-        return
-    s = get_settings(uid)
+    s = get_settings(callback.from_user.id)
     s["auto_restore"]["enabled"] = not s["auto_restore"].get("enabled", False)
-    save_settings(uid, s)
-    await callback.message.edit_text(_restore_text(s, creds), reply_markup=_restore_kb(s, creds))
+    save_settings(callback.from_user.id, s)
+    await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
     await callback.answer()
 
 
 @router.callback_query(F.data == "selenium:run:restore")
-async def run_restore(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id
-    creds = get_panel_creds(uid)
-    if not creds:
-        await callback.answer("⚠️ Сначала настройте вход в панель", show_alert=True)
+async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    if not api:
+        await callback.answer("⚠️ API токен не настроен", show_alert=True)
         return
-    await callback.answer("⏳ Запускаю восстановление...", show_alert=False)
-    await callback.message.edit_text("⏳ Восстанавливаю объявления через браузер...")
+    await callback.answer("⏳ Восстанавливаю объявления...", show_alert=False)
+    await callback.message.edit_text("⏳ Восстанавливаю объявления через API...")
     try:
-        from automation.panel import YooMarketPanel
-        panel = YooMarketPanel(creds.get("cookie_string", ""))
-        await panel.start()
-        try:
-            count, msg = await panel.restore_sold_ads()
-        finally:
-            await panel.close()
-        import time
-        s = get_settings(uid)
-        s["auto_restore"]["last_restore_run"] = time.time()
-        save_settings(uid, s)
-        result_text = f"🔄 <b>Авто-восстановление завершено</b>\n\n{msg}"
+        count, msg = await api.restore_all_ads()
+        import time as _time
+        s = get_settings(callback.from_user.id)
+        s["auto_restore"]["last_restore_run"] = _time.time()
+        save_settings(callback.from_user.id, s)
+        result_text = f"🔄 <b>Восстановление завершено</b>\n\n{msg}"
     except Exception as e:
-        logger.error("Manual restore error for user %s: %s", uid, e)
-        result_text = f"❌ Ошибка при восстановлении: {e}"
-    s = get_settings(uid)
-    creds = get_panel_creds(uid)
-    await callback.message.edit_text(
-        result_text + "\n\n" + _restore_text(s, creds),
-        reply_markup=_restore_kb(s, creds),
-    )
+        logger.error("Manual restore error: %s", e)
+        result_text = f"❌ Ошибка: {e}"
+        s = get_settings(callback.from_user.id)
+    await callback.message.edit_text(result_text + "\n\n" + _restore_text(s), reply_markup=_restore_kb(s))
 
 
 # ---------------------------------------------------------------------------
 # Auto-withdraw menu
 # ---------------------------------------------------------------------------
 
-def _withdraw_text(s: dict, creds) -> str:
+def _withdraw_text(s: dict, creds=None) -> str:
     aw = s.get("auto_withdraw", {})
     on = aw.get("enabled", False)
     min_amount = aw.get("min_amount", 500)
-    lines = [
+    return "\n".join([
         "💸 <b>Авто-вывод баланса</b>\n",
         f"Статус: {_st(on)}",
         f"Мин. сумма: {min_amount} ₽",
         "",
-        "Переводит баланс, когда он превышает указанный порог.",
-    ]
-    if not creds:
-        lines.append("\n⚠️ <b>Нужно настроить вход в панель</b>")
-    return "\n".join(lines)
+        "Выводит баланс через API, когда он превышает порог.",
+    ])
 
 
-def _withdraw_kb(s: dict, creds) -> InlineKeyboardMarkup:
+def _withdraw_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
     aw = s.get("auto_withdraw", {})
     on = aw.get("enabled", False)
     min_amount = aw.get("min_amount", 500)
@@ -569,32 +520,24 @@ def _withdraw_kb(s: dict, creds) -> InlineKeyboardMarkup:
     b.button(text="▶️ Запустить сейчас", callback_data="selenium:run:withdraw")
     b.button(text=f"{'🔴 Выкл' if on else '🟢 Вкл'}", callback_data="selenium:withdraw:toggle")
     b.button(text=f"💰 Порог: {min_amount} ₽", callback_data="selenium:withdraw:set_amount")
-    b.button(text="🔑 Сменить cookies", callback_data="selenium:setup:start")
     b.button(text="⬅️ Назад", callback_data="auto:menu")
-    b.adjust(1, 2, 2)
+    b.adjust(1, 2, 1)
     return b.as_markup()
 
 
 @router.callback_query(F.data == "selenium:withdraw:menu")
 async def withdraw_menu(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id
-    creds = get_panel_creds(uid)
-    s = get_settings(uid)
-    await callback.message.edit_text(_withdraw_text(s, creds), reply_markup=_withdraw_kb(s, creds))
+    s = get_settings(callback.from_user.id)
+    await callback.message.edit_text(_withdraw_text(s), reply_markup=_withdraw_kb(s))
     await callback.answer()
 
 
 @router.callback_query(F.data == "selenium:withdraw:toggle")
 async def withdraw_toggle(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id
-    creds = get_panel_creds(uid)
-    if not creds:
-        await callback.answer("⚠️ Сначала настройте вход в панель", show_alert=True)
-        return
-    s = get_settings(uid)
+    s = get_settings(callback.from_user.id)
     s["auto_withdraw"]["enabled"] = not s["auto_withdraw"].get("enabled", False)
-    save_settings(uid, s)
-    await callback.message.edit_text(_withdraw_text(s, creds), reply_markup=_withdraw_kb(s, creds))
+    save_settings(callback.from_user.id, s)
+    await callback.message.edit_text(_withdraw_text(s), reply_markup=_withdraw_kb(s))
     await callback.answer()
 
 
@@ -620,38 +563,25 @@ async def withdraw_save_amount(message: Message, state: FSMContext) -> None:
         save_settings(message.from_user.id, s)
         await state.clear()
         await message.answer(f"✅ Мин. сумма вывода: <b>{amount} ₽</b>")
-        creds = get_panel_creds(message.from_user.id)
-        await message.answer(_withdraw_text(s, creds), reply_markup=_withdraw_kb(s, creds))
+        await message.answer(_withdraw_text(s), reply_markup=_withdraw_kb(s))
     except ValueError:
         await message.answer("❌ Введите целое число, например: 500")
 
 
 @router.callback_query(F.data == "selenium:run:withdraw")
-async def run_withdraw(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id
-    creds = get_panel_creds(uid)
-    if not creds:
-        await callback.answer("⚠️ Сначала настройте вход в панель", show_alert=True)
+async def run_withdraw(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    if not api:
+        await callback.answer("⚠️ API токен не настроен", show_alert=True)
         return
-    s = get_settings(uid)
+    s = get_settings(callback.from_user.id)
     min_amount = s.get("auto_withdraw", {}).get("min_amount", 500)
     await callback.answer("⏳ Запускаю вывод...", show_alert=False)
-    await callback.message.edit_text("⏳ Проверяю баланс и выполняю вывод через браузер...")
+    await callback.message.edit_text("⏳ Проверяю баланс и выполняю вывод через API...")
     try:
-        from automation.panel import YooMarketPanel
-        panel = YooMarketPanel(creds.get("cookie_string", ""))
-        await panel.start()
-        try:
-            success, msg = await panel.withdraw_balance(min_amount)
-        finally:
-            await panel.close()
+        success, msg = await api.withdraw_balance(min_amount)
         result_text = f"💸 <b>Авто-вывод</b>\n\n{msg}"
     except Exception as e:
-        logger.error("Manual withdraw error for user %s: %s", uid, e)
-        result_text = f"❌ Ошибка при выводе: {e}"
-    s = get_settings(uid)
-    creds = get_panel_creds(uid)
-    await callback.message.edit_text(
-        result_text + "\n\n" + _withdraw_text(s, creds),
-        reply_markup=_withdraw_kb(s, creds),
-    )
+        logger.error("Manual withdraw error: %s", e)
+        result_text = f"❌ Ошибка: {e}"
+    s = get_settings(callback.from_user.id)
+    await callback.message.edit_text(result_text + "\n\n" + _withdraw_text(s), reply_markup=_withdraw_kb(s))
