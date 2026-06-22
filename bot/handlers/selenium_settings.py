@@ -1,4 +1,4 @@
-"""Handlers for panel automation: cookie login, auto-bump, auto-restore, auto-withdraw."""
+"""Handlers for panel automation: SMS/cookie login, auto-bump, auto-restore, auto-withdraw."""
 from __future__ import annotations
 
 import logging
@@ -15,8 +15,8 @@ from storage import get_panel_creds, save_panel_creds, delete_panel_creds, get_s
 router = Router()
 logger = logging.getLogger(__name__)
 
-# Stores active SMS login sessions: user_id -> (panel, page, context)
-_login_sessions: dict[int, tuple] = {}
+# HTTP SMS sessions: user_id -> YooMarketPanelHTTP instance
+_http_sessions: dict[int, object] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -24,11 +24,9 @@ _login_sessions: dict[int, tuple] = {}
 # ---------------------------------------------------------------------------
 
 class SeleniumState(StatesGroup):
-    waiting_http_phone = State()    # HTTP SMS flow — phone step
-    waiting_http_code = State()     # HTTP SMS flow — code step
-    waiting_cookie_string = State() # Cookie paste flow
-    waiting_sms_phone = State()     # Browser SMS flow (advanced)
-    waiting_sms_code = State()      # Browser SMS flow — code step
+    waiting_http_phone = State()
+    waiting_http_code = State()
+    waiting_cookie_string = State()
     waiting_bump_interval = State()
     waiting_withdraw_amount = State()
 
@@ -86,9 +84,8 @@ async def setup_start(callback: CallbackQuery, state: FSMContext) -> None:
     creds = get_panel_creds(callback.from_user.id)
     status = "✅ Сессия настроена" if creds else "❌ Не настроено"
     b = InlineKeyboardBuilder()
-    b.button(text="📱 Войти через SMS (с телефона)", callback_data="selenium:setup:http")
-    b.button(text="📋 Вставить cookies (с компьютера)", callback_data="selenium:setup:cookie")
-    b.button(text="🖥 Войти через браузер (сервер)", callback_data="selenium:setup:sms")
+    b.button(text="📱 Войти через SMS", callback_data="selenium:setup:http")
+    b.button(text="📋 Вставить cookies (с ПК)", callback_data="selenium:setup:cookie")
     if creds:
         b.button(text="🔍 Проверить сессию", callback_data="selenium:check_session")
         b.button(text="🗑 Удалить сессию", callback_data="selenium:setup:delete")
@@ -96,9 +93,7 @@ async def setup_start(callback: CallbackQuery, state: FSMContext) -> None:
     b.adjust(1)
     await callback.message.edit_text(
         f"🔑 <b>Вход в панель YooMarket</b>\n\n"
-        f"Статус: {status}\n\n"
-        "📱 <b>С телефона</b> — «Войти через SMS»\n"
-        "💻 <b>С компьютера</b> — «Вставить cookies»",
+        f"Статус: {status}",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -271,177 +266,6 @@ async def setup_cookie_save(message: Message, state: FSMContext) -> None:
         "Теперь авто-поднятие, авто-восстановление и авто-вывод доступны.",
         reply_markup=b.as_markup(),
     )
-
-
-# ---------------------------------------------------------------------------
-# Method 3: SMS via browser (advanced — requires Playwright on server)
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data == "selenium:setup:sms")
-async def setup_sms_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(SeleniumState.waiting_sms_phone)
-    await callback.message.edit_text(
-        "🖥 <b>Вход через браузер на сервере</b>\n\n"
-        "Введи номер телефона или e-mail от аккаунта <b>panel.yoomarket.net</b>:\n\n"
-        "<i>⚠️ Требует Playwright/Chromium на сервере. Может не работать на Railway free tier.</i>",
-        reply_markup=_cancel_kb("selenium:setup:start"),
-    )
-    await callback.answer()
-
-
-@router.message(SeleniumState.waiting_sms_phone)
-async def setup_sms_phone(message: Message, state: FSMContext) -> None:
-    phone = (message.text or "").strip()
-    if not phone:
-        await message.answer("❌ Введи номер телефона или e-mail:")
-        return
-
-    uid = message.from_user.id
-    wait_msg = await message.answer("⏳ Открываю браузер...")
-
-    try:
-        try:
-            from automation.panel import YooMarketPanel
-        except ImportError:
-            await wait_msg.edit_text(
-                "❌ <b>Playwright не установлен</b>\n\n"
-                "Используй метод «Вставить cookies» — он работает без браузера.",
-                reply_markup=_cancel_kb("selenium:setup:start"),
-            )
-            await state.clear()
-            return
-
-        import asyncio
-
-        async def _do_login():
-            panel = YooMarketPanel()
-            await panel.start()
-            page, context = await panel.open_login_page()
-            return panel, page, context
-
-        try:
-            panel, page, context = await asyncio.wait_for(_do_login(), timeout=20)
-        except asyncio.TimeoutError:
-            await wait_msg.edit_text(
-                "⏱ <b>Браузер не запустился</b>\n\n"
-                "На сервере не хватает ресурсов для запуска браузера.\n"
-                "Используй метод «Вставить cookies».",
-                reply_markup=_cancel_kb("selenium:setup:start"),
-            )
-            await state.clear()
-            return
-
-        try:
-            ok, err = await asyncio.wait_for(panel.submit_phone(page, phone), timeout=15)
-        except asyncio.TimeoutError:
-            await panel.close()
-            await wait_msg.edit_text(
-                "⏱ Страница входа не ответила. Используй метод «Вставить cookies».",
-                reply_markup=_cancel_kb("selenium:setup:start"),
-            )
-            await state.clear()
-            return
-
-        if not ok:
-            await panel.close()
-            await wait_msg.edit_text(
-                f"❌ {err}\n\nПопробуй метод «Вставить cookies».",
-                reply_markup=_cancel_kb("selenium:setup:start"),
-            )
-            await state.clear()
-            return
-
-        if err == "__already_logged_in__":
-            cookies = await context.cookies()
-            cookie_string = "; ".join(
-                f"{c['name']}={c['value']}" for c in cookies
-                if c.get("domain", "").endswith("yoomarket.net")
-            ) or "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-            save_panel_creds(uid, {"cookie_string": cookie_string})
-            await panel.close()
-            await state.clear()
-            await wait_msg.edit_text(
-                "✅ <b>Вошли без SMS!</b>\n\nАвто-функции готовы.",
-                reply_markup=_no_creds_kb(),
-            )
-            return
-
-        _login_sessions[uid] = (panel, page, context)
-        await state.set_state(SeleniumState.waiting_sms_code)
-        await wait_msg.edit_text(
-            f"📨 <b>SMS отправлено</b> на <code>{phone}</code>\n\nВведи код из SMS:",
-            reply_markup=_cancel_kb("selenium:cancel_login"),
-        )
-
-    except Exception as e:
-        logger.error("setup_sms_phone error: %s", e)
-        await state.clear()
-        await wait_msg.edit_text(
-            f"❌ Ошибка: <code>{str(e)[:200]}</code>\n\n"
-            "Используй метод «Вставить cookies».",
-            reply_markup=_cancel_kb("selenium:setup:start"),
-        )
-
-
-@router.callback_query(F.data == "selenium:cancel_login")
-async def cancel_login(callback: CallbackQuery, state: FSMContext) -> None:
-    uid = callback.from_user.id
-    if uid in _login_sessions:
-        panel, page, context = _login_sessions.pop(uid)
-        try:
-            await page.close()
-            await context.close()
-            await panel.close()
-        except Exception:
-            pass
-    await state.clear()
-    await callback.message.edit_text("❌ Вход отменён.", reply_markup=_no_creds_kb())
-    await callback.answer()
-
-
-@router.message(SeleniumState.waiting_sms_code)
-async def setup_sms_code(message: Message, state: FSMContext) -> None:
-    code = (message.text or "").strip()
-    uid = message.from_user.id
-
-    if uid not in _login_sessions:
-        await message.answer("❌ Сессия истекла. Начни заново.", reply_markup=_no_creds_kb())
-        await state.clear()
-        return
-
-    wait_msg = await message.answer("⏳ Проверяю код...")
-    panel, page, context = _login_sessions.pop(uid)
-
-    try:
-        ok, result = await panel.submit_code(page, context, code)
-    except Exception as e:
-        ok, result = False, str(e)
-
-    try:
-        await page.close()
-        await context.close()
-        await panel.close()
-    except Exception:
-        pass
-
-    await state.clear()
-
-    if ok:
-        save_panel_creds(uid, {"cookie_string": result})
-        b = InlineKeyboardBuilder()
-        b.button(text="🔍 Проверить сессию", callback_data="selenium:check_session")
-        b.button(text="⬅️ Назад", callback_data="auto:menu")
-        b.adjust(1)
-        await wait_msg.edit_text(
-            "✅ <b>Вход выполнен!</b>\n\nСессия сохранена. Авто-функции готовы.",
-            reply_markup=b.as_markup(),
-        )
-    else:
-        b = InlineKeyboardBuilder()
-        b.button(text="🔄 Попробовать снова", callback_data="selenium:setup:start")
-        b.button(text="⬅️ Назад", callback_data="auto:menu")
-        b.adjust(1)
-        await wait_msg.edit_text(f"❌ <b>Ошибка входа</b>\n\n{result}", reply_markup=b.as_markup())
 
 
 # ---------------------------------------------------------------------------
