@@ -5,6 +5,8 @@ import logging
 import time
 from datetime import datetime
 
+_ACTIVE_STATUSES = {"active", "new", "work", "processing", "pending"}
+
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -106,6 +108,7 @@ class TaskManager:
             return
         settings = get_settings(user_id)
         await self._process_orders(user_id, token, settings)
+        await self._check_reminders(user_id, settings)
 
     async def _process_orders(self, user_id: int, token: str, settings: dict) -> None:
         api = YooMarketAPI(token)
@@ -121,6 +124,9 @@ class TaskManager:
             responders_map = settings.get("responders", {})
             order_details: dict = settings.setdefault("known_order_details", {})
 
+            blacklist: list = settings.get("blacklist", [])
+            reminded: list = settings.setdefault("reminded_orders", [])
+
             for order in orders:
                 oid = str(order.get("id", ""))
                 if not oid:
@@ -134,19 +140,34 @@ class TaskManager:
                 time_raw = order.get("created_at") or order.get("date") or order.get("created")
                 chat_id = str(order.get("chat_id") or oid)
 
-                order_details[oid] = {"title": title, "buyer": buyer, "price": price, "chat_id": chat_id}
+                order_details[oid] = {
+                    "title": title,
+                    "buyer": buyer,
+                    "price": price,
+                    "chat_id": chat_id,
+                    # Preserve seen_at from previous tick; set on first appearance
+                    "seen_at": order_details.get(oid, {}).get("seen_at") or time.time(),
+                }
+
+                # If order moved to a terminal/changed status, clear its reminder record
+                if prev_status is not None and prev_status != status:
+                    if oid in reminded:
+                        reminded.remove(oid)
+
+                is_blacklisted = buyer in blacklist
 
                 if prev_status is None:
-                    time_str = _fmt_time(time_raw)
-                    time_part = f"  •  🕐 {time_str}" if time_str else ""
-                    await self._notify(
-                        user_id,
-                        f"🛒 <b>Новая покупка!</b>\n\n"
-                        f"👤 Покупатель: <b>{buyer}</b>\n"
-                        f"💰 Сумма: <b>{price} ₽</b>{time_part}\n"
-                        f"📦 Товар: <b>{title}</b>",
-                        reply_markup=_order_notify_kb(oid, chat_id),
-                    )
+                    if not is_blacklisted:
+                        time_str = _fmt_time(time_raw)
+                        time_part = f"  •  🕐 {time_str}" if time_str else ""
+                        await self._notify(
+                            user_id,
+                            f"🛒 <b>Новая покупка!</b>\n\n"
+                            f"👤 Покупатель: <b>{buyer}</b>\n"
+                            f"💰 Сумма: <b>{price} ₽</b>{time_part}\n"
+                            f"📦 Товар: <b>{title}</b>",
+                            reply_markup=_order_notify_kb(oid, chat_id),
+                        )
                     if ar.get("enabled"):
                         msg = self._pick_message(title, ar.get("message", "Спасибо за заказ!"), rules, responders_map)
                         await self._send_chat(api, chat_id, msg)
@@ -166,6 +187,8 @@ class TaskManager:
                     await self._notify(user_id, f"↩️ Заказ #{oid} — возврат\n📦 {title}")
 
                 known[oid] = status
+
+            settings["reminded_orders"] = reminded
 
             settings["known_orders"] = known
             settings["known_order_ids"] = list(known.keys())
@@ -236,6 +259,51 @@ class TaskManager:
                 logger.warning("Message check for order %s: %s", order_id, e)
 
         settings["known_messages"] = known_messages
+
+    async def _check_reminders(self, user_id: int, settings: dict) -> None:
+        rem = settings.get("reminders", {})
+        if not rem.get("enabled"):
+            return
+
+        threshold_secs = rem.get("hours", 24) * 3600
+        now = time.time()
+        known_orders: dict = settings.get("known_orders", {})
+        order_details: dict = settings.get("known_order_details", {})
+        reminded: list = settings.setdefault("reminded_orders", [])
+        reminded_set = set(reminded)
+
+        changed = False
+        for oid, status in known_orders.items():
+            if status in ("confirmed", "completed", "done", "refunded", "cancelled", "returned"):
+                continue
+            if oid in reminded_set:
+                continue
+            det = order_details.get(oid, {})
+            seen_at = det.get("seen_at", now)
+            if (now - seen_at) < threshold_secs:
+                continue
+
+            hours_waiting = int((now - seen_at) / 3600)
+            title = det.get("title", f"Заказ #{oid}")
+            buyer = det.get("buyer", "—")
+            price = det.get("price", "—")
+            chat_id = det.get("chat_id", oid)
+
+            await self._notify(
+                user_id,
+                f"⏰ <b>Напоминание о заказе</b>\n\n"
+                f"📦 {title}\n"
+                f"👤 {buyer}  •  💰 {price} ₽\n\n"
+                f"⏳ Ждёт подтверждения уже <b>{hours_waiting} ч</b>",
+                reply_markup=_order_notify_kb(oid, chat_id),
+            )
+            reminded_set.add(oid)
+            changed = True
+
+        if changed:
+            settings["reminded_orders"] = list(reminded_set)
+            from storage import save_settings
+            save_settings(user_id, settings)
 
     def _pick_message(self, title: str, default: str, rules: list[dict], responders: dict | None = None) -> str:
         title_lower = title.lower()

@@ -43,6 +43,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="📊 Статистика", callback_data="menu:stats")
     builder.button(text="⚙️ Авто-функции", callback_data="auto:menu")
     builder.button(text="🧩 Плагины", callback_data="plugins:menu")
+    builder.button(text="🛠 Инструменты", callback_data="tools:menu")
     builder.adjust(2)
     return builder.as_markup()
 

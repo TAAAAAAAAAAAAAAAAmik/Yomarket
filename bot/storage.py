@@ -19,8 +19,11 @@ _DEFAULT_SETTINGS = {
     "responders": {},  # {"GameName": "message text"} - keyed by ad title/name
     "known_orders": {},  # {order_id: status}
     "known_order_ids": [],
-    "known_order_details": {},  # {order_id: {title, buyer, price, chat_id}}
+    "known_order_details": {},  # {order_id: {title, buyer, price, chat_id, seen_at}}
     "known_messages": {},  # {order_id: last_msg_id}
+    "blacklist": [],  # list of buyer names to suppress notifications for
+    "reminders": {"enabled": False, "hours": 24},
+    "reminded_orders": [],  # order IDs already reminded (reset on status change)
     "plugins": {
         "auto_stars": {"enabled": False, "amount": 50, "note": ""},
         "auto_roblox": {"enabled": False, "robux": 0, "note": ""},

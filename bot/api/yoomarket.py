@@ -99,3 +99,13 @@ class YooMarketAPI:
 
     async def send_message(self, chat_id: int | str, text: str) -> dict:
         return await self._post(f"/chats/{chat_id}/sendMessage", json={"text": text})
+
+    async def get_reviews(self) -> dict:
+        for path in ("/reviews", "/feedback", "/ratings"):
+            try:
+                return await self._get(path)
+            except RuntimeError as e:
+                if "404" in str(e) or "not found" in str(e).lower() or "405" in str(e):
+                    continue
+                raise
+        return {"data": []}
