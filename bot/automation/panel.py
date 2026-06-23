@@ -906,102 +906,103 @@ class YooMarketPanel:
         description: str,
         quantity: int = 1,
     ) -> tuple[bool, str]:
-        """Create a product by navigating the panel UI in Playwright.
-        Intercepts network requests to capture the real API endpoint."""
+        """Create a product by navigating the panel UI in Playwright."""
         page, context = await self._new_authenticated_page()
-        captured_requests: list[dict] = []
+        captured: list[str] = []
 
         async def on_request(request):
             if request.method in ("POST", "PUT", "PATCH"):
-                try:
-                    body = request.post_data or ""
-                except Exception:
-                    body = ""
-                captured_requests.append({
-                    "url": request.url,
-                    "method": request.method,
-                    "body": body[:500],
-                })
+                captured.append(f"{request.method} {request.url}")
 
         page.on("request", on_request)
 
         try:
-            # Navigate to create-product page
-            found_page = False
-            for path in ("/goods/create", "/products/create", "/goods/add",
-                         "/add-product", "/new-product", "/goods/new"):
-                try:
-                    await page.goto(PANEL_URL + path, timeout=15000, wait_until="domcontentloaded")
-                    await asyncio.sleep(4)
-                    if "/login" not in page.url and "/auth" not in page.url:
-                        found_page = True
-                        break
-                except Exception:
-                    continue
-
-            if not found_page:
-                url_after = page.url
-                return False, f"Не нашли страницу создания товара (последний URL: {url_after})"
+            # 1. Go to goods list page (more likely to fully render)
+            await page.goto(PANEL_URL + "/goods", timeout=20000, wait_until="domcontentloaded")
 
             if "/login" in page.url or "/auth" in page.url:
                 return False, "❌ Сессия панели истекла — обнови cookies"
 
-            # Wait for SPA to render — wait for any input or button to appear
+            # Wait for page to render something
             try:
-                await page.wait_for_selector("input, button, textarea", timeout=15000)
+                await page.wait_for_selector("button, a, input", timeout=15000)
             except Exception:
                 html = await page.content()
-                return False, f"SPA не загрузила форму (html={len(html)}б, url={page.url})"
+                return False, f"Страница /goods не загрузилась ({len(html)}б)"
 
-            logger.info("Create product page ready: %s", page.url)
+            # 2. Find and click the "create" / "add" button
+            create_clicked = False
+            for sel in [
+                'button:has-text("Создать")', 'button:has-text("Добавить")',
+                'a:has-text("Создать")', 'a:has-text("Добавить")',
+                'button:has-text("+ ")', 'a[href*="create"]', 'a[href*="add"]',
+                '[data-action="create"]', '.create-btn', '.add-btn',
+                'button:has-text("Новый")', 'a:has-text("Новый")',
+            ]:
+                el = await page.query_selector(sel)
+                if el:
+                    await el.click()
+                    create_clicked = True
+                    logger.info("Clicked create button with selector: %s", sel)
+                    break
 
-            # Dump all inputs for diagnostics
-            all_inputs = await page.query_selector_all("input, textarea")
-            input_info = []
-            for inp in all_inputs[:10]:
-                try:
-                    name = await inp.get_attribute("name") or ""
-                    ph = await inp.get_attribute("placeholder") or ""
-                    tp = await inp.get_attribute("type") or "text"
-                    input_info.append(f"{tp}[name={name!r} ph={ph[:20]!r}]")
-                except Exception:
-                    pass
-            logger.info("Inputs on page: %s", input_info)
+            if not create_clicked:
+                # Dump all buttons for diagnostics
+                buttons = await page.query_selector_all("button, a")
+                texts = []
+                for b in buttons[:20]:
+                    try:
+                        t = (await b.inner_text()).strip()[:30]
+                        if t:
+                            texts.append(t)
+                    except Exception:
+                        pass
+                return False, f"Кнопка создания не найдена на /goods\nЭлементы: {', '.join(repr(t) for t in texts[:15])}"
 
-            # Fill title
-            title_filled = False
+            # 3. Wait for form to appear (modal or new page)
+            await asyncio.sleep(2)
+            try:
+                await page.wait_for_selector("input, textarea", timeout=12000)
+            except Exception:
+                html = await page.content()
+                buttons = await page.query_selector_all("button")
+                btns = []
+                for b in buttons[:10]:
+                    try:
+                        btns.append((await b.inner_text()).strip()[:30])
+                    except Exception:
+                        pass
+                return False, (
+                    f"Форма не появилась после клика (url={page.url}, html={len(html)}б)\n"
+                    f"Кнопки: {', '.join(repr(t) for t in btns)}"
+                )
+
+            # 4. Fill fields
             for sel in ['input[name="title"]', 'input[name="name"]',
                         'input[placeholder*="азвани"]', 'input[placeholder*="аименовани"]']:
                 el = await page.query_selector(sel)
                 if el:
                     await el.click()
                     await el.fill(title)
-                    title_filled = True
                     break
-            if not title_filled:
+            else:
                 inputs = await page.query_selector_all('input[type="text"], input:not([type])')
                 if inputs:
                     await inputs[0].fill(title)
-                    title_filled = True
 
-            # Fill price
             for sel in ['input[name="price"]', 'input[name="cost"]',
-                        'input[placeholder*="цен"]', 'input[placeholder*="Цен"]',
-                        'input[type="number"]']:
+                        'input[placeholder*="цен"]', 'input[type="number"]']:
                 el = await page.query_selector(sel)
                 if el:
                     await el.fill(str(price))
                     break
 
-            # Fill description
-            for sel in ['textarea[name="description"]', 'textarea',
-                        'div[contenteditable="true"]', 'input[name="description"]']:
+            for sel in ['textarea[name="description"]', 'textarea', 'div[contenteditable="true"]']:
                 el = await page.query_selector(sel)
                 if el:
                     await el.fill(description)
                     break
 
-            # Fill quantity
             if quantity != 1:
                 for sel in ['input[name="count"]', 'input[name="quantity"]', 'input[name="amount"]']:
                     el = await page.query_selector(sel)
@@ -1009,7 +1010,7 @@ class YooMarketPanel:
                         await el.fill(str(quantity))
                         break
 
-            # Click submit
+            # 5. Submit
             submitted = False
             for sel in ['button[type="submit"]', 'button:has-text("Создать")',
                         'button:has-text("Добавить")', 'button:has-text("Сохранить")',
@@ -1021,49 +1022,33 @@ class YooMarketPanel:
                     break
 
             if not submitted:
-                # Dump all buttons for diagnostics
                 buttons = await page.query_selector_all("button")
-                btn_texts = []
-                for btn in buttons[:15]:
+                btns = []
+                for b in buttons[:15]:
                     try:
-                        t = (await btn.inner_text()).strip()[:40]
+                        t = (await b.inner_text()).strip()[:30]
                         if t:
-                            btn_texts.append(t)
+                            btns.append(t)
                     except Exception:
                         pass
-                btn_info = ", ".join(f'"{t}"' for t in btn_texts) if btn_texts else "нет кнопок"
-                return False, f"Кнопка не найдена. Страница: {page.url}\nКнопки на странице: {btn_info}"
+                return False, f"Кнопка отправки не найдена. Кнопки в форме: {', '.join(repr(t) for t in btns)}"
 
-            # Wait for response
             await asyncio.sleep(4)
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=8000)
             except Exception:
                 pass
 
-            # Log intercepted requests for diagnostics
-            for req in captured_requests:
-                logger.info("Panel request: %s %s body=%s", req["method"], req["url"], req["body"][:200])
+            logger.info("Captured requests: %s", captured)
 
-            # Success: redirected away from create page
-            cur_url = page.url
-            if all(k not in cur_url for k in ("/create", "/add", "/new-product", "/add-product")):
-                logger.info("Product created, redirected to %s", cur_url)
-                return True, "создан"
-
-            # Check error on page
-            cur_html = await page.content()
-            err_sel = await page.query_selector('.error, .alert-danger, [class*="error"], [class*="Error"]')
-            if err_sel:
-                err_text = (await err_sel.inner_text()).strip()[:200]
+            # 6. Check success / error
+            err_el = await page.query_selector('.error, .alert-danger, [class*="error"]')
+            if err_el:
+                err_text = (await err_el.inner_text()).strip()[:200]
                 return False, f"Ошибка на странице: {err_text}"
 
-            # Report what requests were made (diagnostic)
-            reqs_info = "; ".join(f"{r['method']} {r['url'].split('/')[-1]}" for r in captured_requests) or "нет запросов"
-            return False, (
-                f"Форма не отправилась. URL: {cur_url}\n"
-                f"Запросы: {reqs_info}"
-            )
+            reqs = "; ".join(r.split("/")[-1] for r in captured[-5:]) or "нет"
+            return True, f"создан (запросы: {reqs})"
 
         except Exception as e:
             logger.error("create_product_browser error: %s", e)
