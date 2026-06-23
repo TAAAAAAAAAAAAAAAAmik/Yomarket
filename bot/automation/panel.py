@@ -271,6 +271,18 @@ class YooMarketPanelHTTP:
         discovered = await self._discover_api_paths()
 
         fallback_paths = [
+            # web.php routes (no /api/ prefix) — most likely for Laravel SPA
+            "/auth/send-code",
+            "/auth/email",
+            "/auth/login",
+            "/auth/code",
+            "/send-code",
+            "/login/send-code",
+            "/login/code",
+            "/login/email",
+            "/sign-in",
+            "/auth/sign-in",
+            # api.php routes
             "/api/auth/send-code",
             "/api/auth/email",
             "/api/send-code",
@@ -325,18 +337,18 @@ class YooMarketPanelHTTP:
                 try:
                     async with self._session.get(url, timeout=timeout) as resp:
                         js = await resp.text()
-                    # Search for API path patterns
+                    # Search for API path patterns (with and without /api/)
                     patterns = [
-                        r'["\'](/api/[a-z0-9/_-]{3,50})["\']',
-                        r'axios\.[a-z]+\(["\']([^"\']+)["\']',
-                        r'fetch\(["\']([^"\']+)["\']',
-                        r'url:\s*["\']([^"\']+)["\']',
+                        r'["\']((?:/api)?/[a-z0-9/_-]{3,60})["\']',
+                        r'post\(["\`](/?[a-z0-9/_-]{3,60})["\`]',
+                        r'axios\.[a-z]+\(["\`](/?[^"\'`\s]{3,60})["\`]',
+                        r'fetch\(["\`](/?[^"\'`\s?]{3,60})["\`]',
                     ]
+                    kws = ("auth", "login", "code", "send", "verify", "confirm", "email")
                     for pat in patterns:
-                        for match in re.findall(pat, js):
-                            if any(kw in match for kw in
-                                   ("auth", "login", "code", "send", "verify", "confirm")):
-                                if match not in discovered:
+                        for match in re.findall(pat, js, re.I):
+                            if any(kw in match.lower() for kw in kws):
+                                if not match.startswith("http") and match not in discovered:
                                     discovered.append(match)
                     if discovered:
                         logger.info("Discovered API paths from JS: %s", discovered)
