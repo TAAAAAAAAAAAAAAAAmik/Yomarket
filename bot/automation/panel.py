@@ -575,7 +575,7 @@ class YooMarketPanel:
         return await context.new_page(), context
 
     # ------------------------------------------------------------------
-    # SMS login flow (interactive — called step by step from handlers)
+    # Email OTP login flow (interactive — called step by step from handlers)
     # ------------------------------------------------------------------
 
     async def open_login_page(self) -> tuple[object, object]:
@@ -584,54 +584,65 @@ class YooMarketPanel:
             await self.start()
         context = await self._browser.new_context()
         page = await context.new_page()
-        await page.goto(PANEL_URL + "/login", timeout=20000)
+        await page.goto(PANEL_URL + "/login", timeout=25000)
         await page.wait_for_load_state("networkidle", timeout=20000)
         return page, context
 
-    async def submit_phone(self, page, phone_or_email: str) -> tuple[bool, str]:
+    async def submit_email(self, page, email: str) -> tuple[bool, str]:
         """
-        Fill the phone/email field and click submit.
-        Returns (True, '') if SMS code field appeared, (False, error) otherwise.
+        Fill the email field and click "Получить код".
+        Returns (True, '') when code input appears, (False, error) otherwise.
         """
         try:
-            filled = await _fill_first(page, _PHONE_SELECTORS, phone_or_email)
+            # Fill email input
+            filled = await _fill_first(page, _EMAIL_SELECTORS, email)
             if not filled:
-                return False, "Поле ввода телефона/email не найдено на странице входа"
+                html = await page.content()
+                logger.error("Email input not found. Page HTML: %s", html[:1000])
+                return False, "Поле email не найдено на странице входа"
 
-            await _click_first(page, _SUBMIT_SELECTORS)
-            # Wait for either a code input or navigation
-            await asyncio.sleep(3)
+            # Click "Получить код"
+            clicked = await _click_first(page, _SEND_CODE_SELECTORS)
+            if not clicked:
+                return False, "Кнопка «Получить код» не найдена"
+
+            # Wait for code input to appear (page re-renders with new field)
+            await asyncio.sleep(2)
             try:
-                await page.wait_for_load_state("networkidle", timeout=8000)
+                await page.wait_for_selector(
+                    'input[placeholder*="Код"], input[placeholder*="код"], input[name="code"]',
+                    timeout=10000,
+                )
             except Exception:
                 pass
 
-            # Check if SMS code input appeared
+            # Verify code input appeared
             for sel in _CODE_SELECTORS:
                 el = await page.query_selector(sel)
                 if el:
+                    logger.info("Code input appeared after submitting email")
                     return True, ""
 
-            # Maybe already logged in (no 2FA)
-            if "/login" not in page.url and "/auth" not in page.url:
+            # Check for already logged in
+            if "/login" not in page.url:
                 return True, "__already_logged_in__"
 
-            return False, "Поле для кода не появилось — возможно, неверный номер или страница изменилась"
+            return False, "Поле для кода не появилось — проверьте email"
         except Exception as e:
-            logger.error("submit_phone error: %s", e)
+            logger.error("submit_email error: %s", e)
             return False, str(e)
 
     async def submit_code(self, page, context, code: str) -> tuple[bool, str]:
         """
-        Enter SMS code and submit. If login succeeds, return (True, cookie_string).
-        Otherwise (False, error_message).
+        Enter code from email and click "Подтвердить".
+        Returns (True, cookie_string) on success, (False, error) otherwise.
         """
         try:
             filled = await _fill_first(page, _CODE_SELECTORS, code)
             if not filled:
                 return False, "Поле для кода не найдено"
 
-            await _click_first(page, _SUBMIT_SELECTORS)
+            await _click_first(page, _CONFIRM_SELECTORS)
             await asyncio.sleep(3)
             try:
                 await page.wait_for_load_state("networkidle", timeout=10000)

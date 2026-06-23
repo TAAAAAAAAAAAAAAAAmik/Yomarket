@@ -9,14 +9,14 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from automation.panel import YooMarketPanelHTTP, PanelSession, try_token_login
+from automation.panel import YooMarketPanel, PanelSession, try_token_login
 from storage import get_panel_creds, save_panel_creds, delete_panel_creds, get_token
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-# Хранит активные HTTP-сессии для входа: {user_id: YooMarketPanelHTTP}
-_login_sessions: dict[int, YooMarketPanelHTTP] = {}
+# Хранит активные Playwright-сессии для входа: {user_id: {"panel", "page", "context"}}
+_login_sessions: dict[int, dict] = {}
 
 
 class PanelState(StatesGroup):
@@ -185,25 +185,44 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         return
 
     uid = message.from_user.id
-    if uid in _login_sessions:
+
+    # Закрываем старую сессию
+    old = _login_sessions.pop(uid, None)
+    if old:
         try:
-            await _login_sessions[uid].close()
+            await old["panel"].close()
         except Exception:
             pass
 
-    http = YooMarketPanelHTTP()
-    await http.start()
-    _login_sessions[uid] = http
+    status_msg = await message.answer("⏳ Открываю страницу входа...")
 
-    status_msg = await message.answer("⏳ Отправляю код на почту...")
+    panel = YooMarketPanel()
+    try:
+        await panel.start()
+        page, context = await panel.open_login_page()
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ Не удалось запустить браузер: {e}\n\n"
+            "Используйте вход через cookies."
+        )
+        b = InlineKeyboardBuilder()
+        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
+        b.button(text="↩️ Назад", callback_data="panel:menu")
+        b.adjust(1)
+        await message.answer("Выберите действие:", reply_markup=b.as_markup())
+        await state.clear()
+        return
 
-    ok, err = await http.send_code(email)
+    await status_msg.edit_text("⏳ Отправляю код на почту...")
+    ok, err = await panel.submit_email(page, email)
 
     if not ok:
-        await http.close()
-        _login_sessions.pop(uid, None)
+        await panel.close()
         await state.clear()
-        await status_msg.edit_text(err)
+        await status_msg.edit_text(
+            f"❌ {err}\n\n"
+            "Используйте вход через cookies вручную."
+        )
         b = InlineKeyboardBuilder()
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
@@ -211,6 +230,7 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите действие:", reply_markup=b.as_markup())
         return
 
+    _login_sessions[uid] = {"panel": panel, "page": page, "context": context}
     await state.update_data(email=email)
     await state.set_state(PanelState.waiting_sms_code)
     await status_msg.edit_text(
@@ -232,8 +252,8 @@ async def panel_email_code(message: Message, state: FSMContext) -> None:
         return
 
     uid = message.from_user.id
-    http = _login_sessions.get(uid)
-    if not http:
+    sess = _login_sessions.get(uid)
+    if not sess:
         await state.clear()
         await message.answer(
             "❌ Сессия входа истекла. Начните заново.",
@@ -242,14 +262,14 @@ async def panel_email_code(message: Message, state: FSMContext) -> None:
         return
 
     status_msg = await message.answer("⏳ Проверяю код...")
-    ok, result = await http.verify_code(code)
+    ok, result = await sess["panel"].submit_code(sess["page"], sess["context"], code)
 
-    await http.close()
+    await sess["panel"].close()
     _login_sessions.pop(uid, None)
 
     if not ok:
         await state.clear()
-        await status_msg.edit_text(result)
+        await status_msg.edit_text(f"❌ {result}")
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
