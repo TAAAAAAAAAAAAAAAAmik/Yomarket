@@ -503,21 +503,54 @@ class PanelSession:
         if category:
             payload["category"] = category
 
+        # First, try GET /api/products to understand data structure
+        try:
+            async with self._session.get(PANEL_URL + "/api/products", timeout=timeout) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    logger.info("GET /api/products: %s", text[:500])
+                    # Try to POST to same URL with X-HTTP-Method-Override just in case
+        except Exception as e:
+            logger.debug("GET /api/products: %s", e)
+
         endpoints = [
-            "/api/goods",
-            "/api/goods/store",
-            "/api/goods/create",
-            "/api/products",
-            "/api/products/store",
-            "/api/v1/goods",
-            "/api/v1/products",
-            "/api/listings",
-            "/api/ads",
-            "/goods",
-            "/products",
+            # Standard Laravel resource store routes
+            "/api/products",           # might accept POST with right headers
+            "/api/product",            # singular
+            "/api/product/store",
+            # seller-scoped
+            "/api/seller/products",
+            "/api/seller/product",
+            "/api/seller/goods",
+            "/api/my/products",
+            "/api/my/goods",
+            "/api/shop/products",
+            "/api/shop/goods",
+            # other naming conventions
+            "/api/offers",
+            "/api/offer",
+            "/api/items",
+            "/api/item",
+            "/api/lots",
+            "/api/lot",
+            "/api/announcements",
         ]
 
+        # GET /api/products to learn structure
+        get_info = ""
+        try:
+            async with self._session.get(PANEL_URL + "/api/products", timeout=timeout) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    get_info = f"\nGET /api/products → {text[:300]}"
+                    logger.info("GET /api/products: %s", text[:500])
+        except Exception:
+            pass
+
         diag_lines: list[str] = []
+        if get_info:
+            diag_lines.append(f"<code>GET /api/products</code>:{get_info[:200]}")
+
         for path in endpoints:
             url = PANEL_URL + path
             try:
@@ -550,7 +583,7 @@ class PanelSession:
             except aiohttp.ClientError as e:
                 diag_lines.append(f"<code>{path}</code> → err: {str(e)[:60]}")
 
-        return False, "🔍 Все эндпоинты:\n" + "\n".join(diag_lines)
+        return False, "🔍 Эндпоинты:\n" + "\n".join(diag_lines[:15])
 
     async def check_session(self) -> bool:
         """Verify cookies are still valid."""
