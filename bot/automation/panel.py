@@ -508,39 +508,56 @@ class PanelSession:
 
         debug: list[str] = []
 
-        # 1. Find Nova resource uriKeys from the dashboard HTML (/resources/{name})
+        # 1. Enumerate Nova resources via the navigation endpoint
         resources: list[str] = []
-        try:
-            async with self._session.get(PANEL_URL + "/", timeout=timeout) as resp:
-                html = await resp.text()
-            found = re.findall(r'/resources/([a-z0-9\-_]+)', html, re.I)
-            seen = set()
-            for r in found:
-                rl = r.lower()
-                if rl not in seen:
-                    seen.add(rl)
-                    resources.append(rl)
-            debug.append(f"Nova-ресурсы: {resources[:12]}")
-        except Exception as e:
-            debug.append(f"HTML err: {str(e)[:50]}")
+        for nav_path in ("/nova-api/navigation", "/nova-api/resources"):
+            try:
+                async with self._session.get(PANEL_URL + nav_path, headers=headers, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        text = await resp.text()
+                        found = re.findall(r'"uriKey"\s*:\s*"([^"]+)"', text)
+                        resources.extend(r for r in found if r not in resources)
+            except Exception:
+                pass
 
-        # Prioritise product-like resource names
-        kws = ("product", "goods", "tovar", "offer", "item", "lot", "advert", "ad")
-        resources.sort(key=lambda r: (not any(k in r for k in kws), r))
-        # Always also try common defaults
-        for d in ("products", "goods"):
+        # 2. Also scan the HTML for /nova-api/ and /resources/ refs
+        try:
+            async with self._session.get(PANEL_URL + "/", headers=headers, timeout=timeout) as resp:
+                html = await resp.text()
+            # Nova stores config as window.Nova or embedded JSON
+            nova_cfg = re.findall(r'"uriKey"\s*:\s*"([^"]+)"', html)
+            for r in nova_cfg:
+                if r not in resources:
+                    resources.append(r)
+            # Also look for /nova/resources/{name} links
+            for r in re.findall(r'/resources/([a-z0-9_\-]+)', html, re.I):
+                if r not in resources:
+                    resources.append(r)
+        except Exception as e:
+            debug.append(f"HTML: {str(e)[:40]}")
+
+        debug.append(f"Nova-ресурсы: {resources[:15]}")
+
+        # 3. Always include likely candidates, including the known-good API resource
+        kws = ("product", "goods", "tovar", "offer", "item", "lot", "advert")
+        for d in ("products", "goods", "offers", "items", "lots", "adverts", "advertisements"):
             if d not in resources:
                 resources.append(d)
+        resources.sort(key=lambda r: (not any(k in r for k in kws), r))
 
-        # 2. For each candidate, fetch creation-fields to confirm + learn attributes
-        for res in resources[:10]:
+        # 4. For each candidate: confirm via creation-fields, then POST
+        for res in resources[:15]:
             cf_url = f"{PANEL_URL}/nova-api/{res}/creation-fields"
             try:
                 async with self._session.get(cf_url, headers=headers, timeout=timeout) as resp:
-                    if resp.status != 200:
-                        continue
+                    cf_status = resp.status
                     cf_text = await resp.text()
-            except Exception:
+            except Exception as e:
+                debug.append(f"{res}/creation-fields → err")
+                continue
+
+            if cf_status != 200:
+                debug.append(f"{res}/creation-fields → {cf_status}")
                 continue
 
             try:
@@ -550,14 +567,14 @@ class PanelSession:
 
             fields = cf.get("fields") or []
             if not fields:
+                debug.append(f"{res} → fields empty")
                 continue
 
-            # Build payload by matching Nova field attributes to our values
-            payload = self._map_nova_fields(fields, values)
             attrs = [f.get("attribute") for f in fields if f.get("attribute")]
-            debug.append(f"<b>{res}</b> поля: {attrs[:12]}")
+            debug.append(f"<b>{res}</b> поля: {attrs}")
 
-            # 3. POST to create the resource
+            payload = self._map_nova_fields(fields, values)
+
             store_url = f"{PANEL_URL}/nova-api/{res}?editing=true&editMode=create"
             try:
                 async with self._session.post(
@@ -575,19 +592,20 @@ class PanelSession:
                         return True, str(rid) if rid else "создан"
                     elif resp.status == 422:
                         try:
-                            errs = _json.loads(text).get("errors") or text[:300]
+                            errs = _json.loads(text).get("errors") or text[:400]
                         except Exception:
-                            errs = text[:300]
+                            errs = text[:400]
                         return False, (
-                            f"✅ Ресурс <b>{res}</b> найден, нужны поля:\n<code>{errs}</code>\n\n"
-                            f"Доступные поля: {attrs[:15]}"
+                            f"✅ Ресурс <b>{res}</b> найден\n"
+                            f"Нужны поля: {attrs}\n\n"
+                            f"Ошибка: <code>{errs}</code>"
                         )
                     else:
-                        debug.append(f"POST {res} → {resp.status}: {text[:80]}")
+                        debug.append(f"POST {res} → {resp.status}: {text[:60]}")
             except Exception as e:
                 debug.append(f"POST {res} err: {str(e)[:50]}")
 
-        return False, "🔍 Nova:\n" + "\n".join(debug[:15])
+        return False, "🔍 Nova:\n" + "\n".join(debug[:20])
 
     @staticmethod
     def _map_nova_fields(fields: list[dict], values: dict) -> dict:
