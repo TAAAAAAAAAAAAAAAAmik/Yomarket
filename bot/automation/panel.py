@@ -932,7 +932,7 @@ class YooMarketPanel:
                          "/add-product", "/new-product", "/goods/new"):
                 try:
                     await page.goto(PANEL_URL + path, timeout=15000, wait_until="domcontentloaded")
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(4)
                     if "/login" not in page.url and "/auth" not in page.url:
                         found_page = True
                         break
@@ -1002,7 +1002,18 @@ class YooMarketPanel:
                     break
 
             if not submitted:
-                return False, f"Не нашли кнопку отправки формы. Страница: {page.url}"
+                # Dump all buttons for diagnostics
+                buttons = await page.query_selector_all("button")
+                btn_texts = []
+                for btn in buttons[:15]:
+                    try:
+                        t = (await btn.inner_text()).strip()[:40]
+                        if t:
+                            btn_texts.append(t)
+                    except Exception:
+                        pass
+                btn_info = ", ".join(f'"{t}"' for t in btn_texts) if btn_texts else "нет кнопок"
+                return False, f"Кнопка не найдена. Страница: {page.url}\nКнопки на странице: {btn_info}"
 
             # Wait for response
             await asyncio.sleep(4)
