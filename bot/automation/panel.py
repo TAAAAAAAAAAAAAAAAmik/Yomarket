@@ -455,6 +455,14 @@ class PanelSession:
                 pass
             self._session = None
 
+    def _xsrf(self) -> str:
+        import urllib.parse
+        jar = self._session.cookie_jar.filter_cookies(PANEL_URL)
+        for name, cookie in jar.items():
+            if name.upper() in ("XSRF-TOKEN", "CSRF-TOKEN"):
+                return urllib.parse.unquote(cookie.value)
+        return ""
+
     async def create_product(
         self,
         title: str,
@@ -470,6 +478,19 @@ class PanelSession:
         if not self._session:
             return False, "Сессия не запущена"
 
+        # Grab CSRF token first
+        timeout = aiohttp.ClientTimeout(total=12)
+        for csrf_path in ("/sanctum/csrf-cookie", "/csrf-cookie"):
+            try:
+                async with self._session.get(PANEL_URL + csrf_path, timeout=timeout) as r:
+                    if r.status < 400:
+                        break
+            except Exception:
+                pass
+
+        xsrf = self._xsrf()
+        extra = {"X-XSRF-TOKEN": xsrf, "X-Requested-With": "XMLHttpRequest"} if xsrf else {"X-Requested-With": "XMLHttpRequest"}
+
         payload: dict = {
             "title": title,
             "name": title,
@@ -482,31 +503,28 @@ class PanelSession:
         if category:
             payload["category"] = category
 
-        timeout = aiohttp.ClientTimeout(total=15)
-
-        # Try common internal API endpoints
         endpoints = [
             "/api/goods",
-            "/api/goods/create",
+            "/api/goods/store",
             "/api/products",
-            "/api/products/create",
+            "/api/products/store",
             "/api/v1/goods",
             "/api/v1/products",
             "/api/listings",
             "/api/ads",
         ]
 
+        last_diag = ""
         for path in endpoints:
             url = PANEL_URL + path
             try:
-                async with self._session.post(url, json=payload, timeout=timeout) as resp:
+                async with self._session.post(url, json=payload, headers=extra, timeout=timeout) as resp:
                     text = await resp.text()
                     if resp.status in (200, 201):
                         try:
                             data = _json.loads(text)
                         except Exception:
                             data = {}
-                        # Extract created product ID
                         pid = (
                             data.get("id")
                             or (data.get("data") or {}).get("id")
@@ -519,21 +537,19 @@ class PanelSession:
                     elif resp.status == 401:
                         return False, "❌ Сессия панели истекла — обнови cookies"
                     elif resp.status == 422:
-                        # Validation error means endpoint exists but form is wrong
                         try:
                             data = _json.loads(text)
                             errs = data.get("errors") or data.get("message") or text[:200]
-                            return False, f"❌ Ошибка валидации: {errs}"
+                            return False, f"❌ Ошибка валидации ({path}): {errs}"
                         except Exception:
                             return False, f"❌ Ошибка валидации (422): {text[:200]}"
+                    else:
+                        last_diag = f"{path} → {resp.status}"
             except aiohttp.ClientError as e:
-                logger.debug("Panel endpoint %s error: %s", path, e)
+                last_diag = f"{path} → {e}"
                 continue
 
-        return False, (
-            "❌ Не удалось найти эндпоинт создания товара в панели.\n\n"
-            "Попробуй создать товар вручную на <b>panel.yoomarket.net</b>"
-        )
+        return False, f"❌ Не нашли эндпоинт создания товара в панели ({last_diag})"
 
     async def check_session(self) -> bool:
         """Verify cookies are still valid."""
@@ -883,3 +899,89 @@ class YooMarketPanel:
             await page.close()
             await context.close()
 
+    async def create_product_browser(
+        self,
+        title: str,
+        price: int,
+        description: str,
+        quantity: int = 1,
+    ) -> tuple[bool, str]:
+        """Create a product by navigating the panel UI in Playwright."""
+        page, context = await self._new_authenticated_page()
+        try:
+            # Try common create-product page paths
+            for path in ("/goods/create", "/products/create", "/goods/add", "/add-product", "/new-product"):
+                try:
+                    await page.goto(PANEL_URL + path, timeout=15000, wait_until="domcontentloaded")
+                    await asyncio.sleep(2)
+                    if "/login" not in page.url and "/auth" not in page.url:
+                        break
+                except Exception:
+                    continue
+            else:
+                return False, "Не нашли страницу создания товара в панели"
+
+            if "/login" in page.url or "/auth" in page.url:
+                return False, "❌ Сессия панели истекла — обнови cookies"
+
+            # Fill title
+            for sel in ['input[name="title"]', 'input[name="name"]', 'input[placeholder*="название"]',
+                        'input[placeholder*="Название"]', 'input[placeholder*="наименование"]']:
+                el = await page.query_selector(sel)
+                if el:
+                    await el.fill(title)
+                    break
+
+            # Fill price
+            for sel in ['input[name="price"]', 'input[placeholder*="цена"]', 'input[placeholder*="Цена"]',
+                        'input[type="number"]']:
+                el = await page.query_selector(sel)
+                if el:
+                    await el.fill(str(price))
+                    break
+
+            # Fill description
+            for sel in ['textarea[name="description"]', 'textarea', 'div[contenteditable="true"]',
+                        'input[name="description"]']:
+                el = await page.query_selector(sel)
+                if el:
+                    await el.fill(description)
+                    break
+
+            # Fill quantity if > 1
+            if quantity > 1:
+                for sel in ['input[name="count"]', 'input[name="quantity"]', 'input[name="amount"]']:
+                    el = await page.query_selector(sel)
+                    if el:
+                        await el.fill(str(quantity))
+                        break
+
+            # Submit
+            for sel in ['button[type="submit"]', 'button:has-text("Создать")', 'button:has-text("Добавить")',
+                        'button:has-text("Сохранить")', 'button:has-text("Опубликовать")']:
+                el = await page.query_selector(sel)
+                if el:
+                    await el.click()
+                    await asyncio.sleep(3)
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=8000)
+                    except Exception:
+                        pass
+                    break
+
+            # Check result: if redirected away from /create page — success
+            if "/create" not in page.url and "/add" not in page.url and "/new" not in page.url:
+                return True, "создан"
+
+            # Check for error on page
+            html = await page.content()
+            err_match = re.search(r'class="[^"]*error[^"]*"[^>]*>([^<]{5,100})', html, re.I)
+            err_text = err_match.group(1).strip() if err_match else "неизвестная ошибка"
+            return False, f"Форма не отправилась: {err_text}"
+
+        except Exception as e:
+            logger.error("create_product_browser error: %s", e)
+            return False, str(e)
+        finally:
+            await page.close()
+            await context.close()

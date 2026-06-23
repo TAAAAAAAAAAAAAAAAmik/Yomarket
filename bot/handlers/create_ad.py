@@ -1,6 +1,7 @@
 """Handler for creating new product listings via the API."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from aiogram import F, Router
@@ -231,13 +232,19 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
     await state.clear()
     await callback.message.edit_text("⏳ Создаю товар...")
 
+    uid = callback.from_user.id
+    title = data["title"]
+    price = data["price"]
+    description = data["description"]
+    quantity = data.get("quantity", 1)
+    category = data.get("category", "")
+
+    # Step 1: try Integration API
+    api_error = None
     try:
         result = await api.create_ad(
-            title=data["title"],
-            price=data["price"],
-            description=data["description"],
-            quantity=data.get("quantity", 1),
-            category=data.get("category", ""),
+            title=title, price=price, description=description,
+            quantity=quantity, category=category,
         )
         ad_id = result.get("id") or result.get("data", {}).get("id") or "—"
         b = InlineKeyboardBuilder()
@@ -246,22 +253,98 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
         b.adjust(1)
         await callback.message.edit_text(
             f"✅ <b>Товар создан!</b>\n\n"
-            f"📝 {data['title']}\n"
-            f"💰 {data['price']} ₽\n"
-            f"🆔 ID: {ad_id}",
+            f"📝 {title}\n💰 {price} ₽\n🆔 ID: {ad_id}",
             reply_markup=b.as_markup(),
         )
+        await callback.answer()
+        return
     except Exception as e:
-        logger.error("create_ad error: %s", e)
+        api_error = e
+
+    # Step 2: fallback — create via panel cookies (PanelSession)
+    from storage import get_panel_creds
+    from automation.panel import PanelSession
+
+    creds = get_panel_creds(uid)
+    if creds and creds.get("cookies"):
+        await callback.message.edit_text("⏳ API не поддерживает создание. Пробую через панель...")
+        ps = PanelSession(creds["cookies"])
+        await ps.start()
+        try:
+            ok, result_msg = await ps.create_product(
+                title=title, price=price, description=description,
+                quantity=quantity, category=category,
+            )
+        finally:
+            await ps.close()
+
+        if ok:
+            b = InlineKeyboardBuilder()
+            b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
+            b.button(text="📦 Мои товары", callback_data="menu:ads")
+            b.adjust(1)
+            await callback.message.edit_text(
+                f"✅ <b>Товар создан через панель!</b>\n\n"
+                f"📝 {title}\n💰 {price} ₽",
+                reply_markup=b.as_markup(),
+            )
+            await callback.answer()
+            return
+
+        # Step 3: Playwright browser fallback
+        from automation.panel import YooMarketPanel
+        await callback.message.edit_text("⏳ Пробую через браузер панели...")
+        panel = YooMarketPanel(cookie_string=creds["cookies"])
+        try:
+            await asyncio.wait_for(panel.start(), timeout=15)
+            ok2, res2 = await asyncio.wait_for(
+                panel.create_product_browser(title=title, price=price, description=description, quantity=quantity),
+                timeout=40,
+            )
+        except asyncio.TimeoutError:
+            ok2, res2 = False, "Превышено время ожидания"
+        except Exception as ex:
+            ok2, res2 = False, str(ex)
+        finally:
+            try:
+                await panel.close()
+            except Exception:
+                pass
+
+        if ok2:
+            b = InlineKeyboardBuilder()
+            b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
+            b.button(text="📦 Мои товары", callback_data="menu:ads")
+            b.adjust(1)
+            await callback.message.edit_text(
+                f"✅ <b>Товар создан через браузер!</b>\n\n📝 {title}\n💰 {price} ₽",
+                reply_markup=b.as_markup(),
+            )
+            await callback.answer()
+            return
+
         b = InlineKeyboardBuilder()
         b.button(text="🌐 Открыть панель", url="https://panel.yoomarket.net")
         b.button(text="⬅️ Назад", callback_data="menu:ads")
         b.adjust(1)
         await callback.message.edit_text(
-            f"❌ <b>Ошибка создания товара</b>\n\n{e}",
+            f"❌ <b>Не удалось создать товар</b>\n\n{res2}",
             reply_markup=b.as_markup(),
         )
+        await callback.answer()
+        return
 
+    # No panel creds
+    b = InlineKeyboardBuilder()
+    b.button(text="🌐 Войти в панель", callback_data="panel:menu")
+    b.button(text="⬅️ Назад", callback_data="menu:ads")
+    b.adjust(1)
+    await callback.message.edit_text(
+        f"❌ <b>Ошибка создания товара</b>\n\n"
+        f"Integration API не поддерживает создание.\n\n"
+        f"💡 Войдите в <b>Панель продавца</b> — бот попробует создать через неё.",
+        reply_markup=b.as_markup(),
+    )
     await callback.answer()
 
 
