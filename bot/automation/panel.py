@@ -472,14 +472,15 @@ class PanelSession:
         category: str = "",
     ) -> tuple[bool, str]:
         """
-        Try to create a product via the panel's internal API.
-        Returns (True, product_id_or_url) or (False, error_message).
+        Create a product via the Laravel Nova API (panel is built on Nova).
+        Returns (True, product_id) or (False, error/diagnostic).
         """
         if not self._session:
             return False, "Сессия не запущена"
 
-        # Grab CSRF token first
-        timeout = aiohttp.ClientTimeout(total=12)
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        # CSRF handshake (Nova uses Laravel XSRF-TOKEN cookie + header)
         for csrf_path in ("/sanctum/csrf-cookie", "/csrf-cookie"):
             try:
                 async with self._session.get(PANEL_URL + csrf_path, timeout=timeout) as r:
@@ -488,85 +489,137 @@ class PanelSession:
             except Exception:
                 pass
 
-        xsrf = self._xsrf()
-        extra = {"X-XSRF-TOKEN": xsrf, "X-Requested-With": "XMLHttpRequest"} if xsrf else {"X-Requested-With": "XMLHttpRequest"}
-
-        payload: dict = {
+        values = {
             "title": title,
-            "name": title,
             "price": price,
             "description": description,
-            "count": quantity,
             "quantity": quantity,
-            "amount": quantity,
+            "category": category,
         }
-        if category:
-            payload["category"] = category
+        return await self._nova_create_product(values)
 
-        # First, try GET /api/products to understand data structure
+    async def _nova_create_product(self, values: dict) -> tuple[bool, str]:
+        """Discover the Nova product resource and create it via /nova-api."""
+        timeout = aiohttp.ClientTimeout(total=15)
+        xsrf = self._xsrf()
+        headers = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
+        if xsrf:
+            headers["X-XSRF-TOKEN"] = xsrf
+
+        debug: list[str] = []
+
+        # 1. Find Nova resource uriKeys from the dashboard HTML (/resources/{name})
+        resources: list[str] = []
         try:
-            async with self._session.get(PANEL_URL + "/api/products", timeout=timeout) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    logger.info("GET /api/products: %s", text[:500])
-                    # Try to POST to same URL with X-HTTP-Method-Override just in case
+            async with self._session.get(PANEL_URL + "/", timeout=timeout) as resp:
+                html = await resp.text()
+            found = re.findall(r'/resources/([a-z0-9\-_]+)', html, re.I)
+            seen = set()
+            for r in found:
+                rl = r.lower()
+                if rl not in seen:
+                    seen.add(rl)
+                    resources.append(rl)
+            debug.append(f"Nova-ресурсы: {resources[:12]}")
         except Exception as e:
-            logger.debug("GET /api/products: %s", e)
+            debug.append(f"HTML err: {str(e)[:50]}")
 
-        # Step A: discover product-related API paths from the SPA JS bundle.
-        discovered, disc_debug = await self._discover_product_paths()
+        # Prioritise product-like resource names
+        kws = ("product", "goods", "tovar", "offer", "item", "lot", "advert", "ad")
+        resources.sort(key=lambda r: (not any(k in r for k in kws), r))
+        # Always also try common defaults
+        for d in ("products", "goods"):
+            if d not in resources:
+                resources.append(d)
 
-        # Step B: build the candidate list — discovered paths first, then fallbacks.
-        # NOTE: /api/products/<anything> matches the read-only show route → 405.
-        # Only try genuinely distinct base paths as fallbacks.
-        fallback = [
-            "/api/product/store",
-            "/api/seller/products",
-            "/api/cabinet/products",
-            "/api/account/products",
-            "/api/v2/products",
-            "/api/products-create",
-            "/api/create-product",
-        ]
-        candidates = list(dict.fromkeys(discovered + fallback))
-
-        diag_lines: list[str] = []
-        if disc_debug:
-            diag_lines.append(disc_debug)
-
-        for path in candidates:
-            url = PANEL_URL + path
+        # 2. For each candidate, fetch creation-fields to confirm + learn attributes
+        for res in resources[:10]:
+            cf_url = f"{PANEL_URL}/nova-api/{res}/creation-fields"
             try:
-                async with self._session.post(url, json=payload, headers=extra, timeout=timeout) as resp:
+                async with self._session.get(cf_url, headers=headers, timeout=timeout) as resp:
+                    if resp.status != 200:
+                        continue
+                    cf_text = await resp.text()
+            except Exception:
+                continue
+
+            try:
+                cf = _json.loads(cf_text)
+            except Exception:
+                continue
+
+            fields = cf.get("fields") or []
+            if not fields:
+                continue
+
+            # Build payload by matching Nova field attributes to our values
+            payload = self._map_nova_fields(fields, values)
+            attrs = [f.get("attribute") for f in fields if f.get("attribute")]
+            debug.append(f"<b>{res}</b> поля: {attrs[:12]}")
+
+            # 3. POST to create the resource
+            store_url = f"{PANEL_URL}/nova-api/{res}?editing=true&editMode=create"
+            try:
+                async with self._session.post(
+                    store_url, data=payload, headers=headers, timeout=timeout,
+                ) as resp:
                     text = await resp.text()
-                    short = text[:100].replace("\n", " ")
-                    diag_lines.append(f"<code>{path}</code> → {resp.status}: {short}")
                     if resp.status in (200, 201):
                         try:
                             data = _json.loads(text)
                         except Exception:
                             data = {}
-                        pid = (
-                            data.get("id")
-                            or (data.get("data") or {}).get("id")
-                            or (data.get("product") or {}).get("id")
-                            or ""
-                        )
-                        return True, str(pid) if pid else "создан"
-                    elif resp.status == 401:
-                        return False, "❌ Сессия панели истекла — обнови cookies"
+                        rid = (data.get("resource") or {}).get("id") or data.get("id") or ""
+                        if isinstance(rid, dict):
+                            rid = rid.get("value", "")
+                        return True, str(rid) if rid else "создан"
                     elif resp.status == 422:
-                        # Route exists, validation failed — show what fields it wants
                         try:
-                            data = _json.loads(text)
-                            errs = data.get("errors") or data.get("message") or text[:300]
-                            return False, f"✅ Найден эндпоинт <code>{path}</code>, но нужны поля:\n<code>{errs}</code>"
+                            errs = _json.loads(text).get("errors") or text[:300]
                         except Exception:
-                            return False, f"422 на <code>{path}</code>: {text[:300]}"
-            except aiohttp.ClientError as e:
-                diag_lines.append(f"<code>{path}</code> → err: {str(e)[:50]}")
+                            errs = text[:300]
+                        return False, (
+                            f"✅ Ресурс <b>{res}</b> найден, нужны поля:\n<code>{errs}</code>\n\n"
+                            f"Доступные поля: {attrs[:15]}"
+                        )
+                    else:
+                        debug.append(f"POST {res} → {resp.status}: {text[:80]}")
+            except Exception as e:
+                debug.append(f"POST {res} err: {str(e)[:50]}")
 
-        return False, "🔍 Эндпоинты:\n" + "\n".join(diag_lines[:15])
+        return False, "🔍 Nova:\n" + "\n".join(debug[:15])
+
+    @staticmethod
+    def _map_nova_fields(fields: list[dict], values: dict) -> dict:
+        """Map our title/price/description/quantity onto Nova field attributes."""
+        payload: dict = {}
+        for f in fields:
+            attr = f.get("attribute") or ""
+            if not attr:
+                continue
+            al = attr.lower()
+            val = None
+            if any(k in al for k in ("title", "name", "header", "naimenov")):
+                val = values.get("title")
+            elif "price" in al or "cost" in al or "cena" in al:
+                val = values.get("price")
+            elif "desc" in al or "opis" in al or "text" in al or "content" in al:
+                val = values.get("description")
+            elif any(k in al for k in ("count", "quantity", "amount", "stock", "kolich", "qty")):
+                val = values.get("quantity")
+            elif "categ" in al or "kategor" in al:
+                val = values.get("category") or None
+            else:
+                # Pre-fill any existing default value Nova provides
+                dv = f.get("value")
+                if dv not in (None, ""):
+                    val = dv
+            if val is not None and val != "":
+                payload[attr] = val
+        # Ensure core fields present even if Nova naming differs
+        payload.setdefault("title", values.get("title"))
+        payload.setdefault("price", values.get("price"))
+        return payload
 
     async def _discover_product_paths(self) -> tuple[list[str], str]:
         """Download the SPA JS bundles and extract product-creation API paths."""
