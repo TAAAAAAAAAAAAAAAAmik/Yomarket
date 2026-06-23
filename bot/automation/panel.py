@@ -295,6 +295,138 @@ def _extract_cookies(session: aiohttp.ClientSession, url: str) -> str:
     return "; ".join(parts)
 
 
+class PanelSession:
+    """
+    HTTP client authenticated with panel.yoomarket.net session cookies.
+    Uses the panel's internal (non-public) API — no browser needed.
+    """
+
+    def __init__(self, cookie_string: str) -> None:
+        self.cookie_string = cookie_string
+        self._session: aiohttp.ClientSession | None = None
+
+    async def start(self) -> None:
+        cookies: dict[str, str] = {}
+        for part in self.cookie_string.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, _, v = part.partition("=")
+                cookies[k.strip()] = v.strip()
+
+        connector = aiohttp.TCPConnector(ssl=False)
+        self._session = aiohttp.ClientSession(
+            cookies=cookies,
+            connector=connector,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "ru-RU,ru;q=0.9",
+                "Referer": PANEL_URL + "/",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+
+    async def close(self) -> None:
+        if self._session:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+            self._session = None
+
+    async def create_product(
+        self,
+        title: str,
+        price: int,
+        description: str,
+        quantity: int = 1,
+        category: str = "",
+    ) -> tuple[bool, str]:
+        """
+        Try to create a product via the panel's internal API.
+        Returns (True, product_id_or_url) or (False, error_message).
+        """
+        if not self._session:
+            return False, "Сессия не запущена"
+
+        payload: dict = {
+            "title": title,
+            "name": title,
+            "price": price,
+            "description": description,
+            "count": quantity,
+            "quantity": quantity,
+            "amount": quantity,
+        }
+        if category:
+            payload["category"] = category
+
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        # Try common internal API endpoints
+        endpoints = [
+            "/api/goods",
+            "/api/goods/create",
+            "/api/products",
+            "/api/products/create",
+            "/api/v1/goods",
+            "/api/v1/products",
+            "/api/listings",
+            "/api/ads",
+        ]
+
+        for path in endpoints:
+            url = PANEL_URL + path
+            try:
+                async with self._session.post(url, json=payload, timeout=timeout) as resp:
+                    text = await resp.text()
+                    if resp.status in (200, 201):
+                        try:
+                            data = _json.loads(text)
+                        except Exception:
+                            data = {}
+                        # Extract created product ID
+                        pid = (
+                            data.get("id")
+                            or (data.get("data") or {}).get("id")
+                            or (data.get("product") or {}).get("id")
+                            or (data.get("good") or {}).get("id")
+                            or ""
+                        )
+                        logger.info("Product created via %s, id=%s", path, pid)
+                        return True, str(pid) if pid else "создан"
+                    elif resp.status == 401:
+                        return False, "❌ Сессия панели истекла — обнови cookies"
+                    elif resp.status == 422:
+                        # Validation error means endpoint exists but form is wrong
+                        try:
+                            data = _json.loads(text)
+                            errs = data.get("errors") or data.get("message") or text[:200]
+                            return False, f"❌ Ошибка валидации: {errs}"
+                        except Exception:
+                            return False, f"❌ Ошибка валидации (422): {text[:200]}"
+            except aiohttp.ClientError as e:
+                logger.debug("Panel endpoint %s error: %s", path, e)
+                continue
+
+        return False, (
+            "❌ Не удалось найти эндпоинт создания товара в панели.\n\n"
+            "Попробуй создать товар вручную на <b>panel.yoomarket.net</b>"
+        )
+
+    async def check_session(self) -> bool:
+        """Verify cookies are still valid."""
+        if not self._session:
+            return False
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with self._session.get(PANEL_URL + "/", timeout=timeout) as resp:
+                final_url = str(resp.url)
+                return "/login" not in final_url and "/auth" not in final_url
+        except Exception:
+            return False
+
+
 class YooMarketPanel:
     """Headless Chromium automation for the YooMarket seller panel."""
 
