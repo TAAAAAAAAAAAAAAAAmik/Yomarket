@@ -595,32 +595,60 @@ class PanelSession:
             js_files = list(dict.fromkeys(js_files))
             debug.append(f"JS: {len(js_files)} {[s.split('/')[-1][:20] for s in js_files[:3]]}")
 
-            # Capture ALL /api/... paths so we see the full surface
-            path_re = re.compile(r'["\'`](/api/[a-zA-Z0-9/_{}.\-]{2,70})["\'`]')
-            kws = ("product", "goods", "offer", "item", "lot", "create", "store", "save", "publish", "add")
-            all_api: set[str] = set()
+            kws = ("product", "goods", "offer", "item", "lot")
+            # Capture arguments to .post()/.put()/.patch() AND any product-ish string literal
+            post_re = re.compile(r'\.(?:post|put|patch)\(\s*["\'`]([^"\'`]{2,80})["\'`]')
+            lit_re = re.compile(r'["\'`]([a-zA-Z0-9/_{}$.\-]*(?:product|goods|offer|item|lot)[a-zA-Z0-9/_{}$.\-]*)["\'`]', re.I)
+            base_re = re.compile(r'baseURL\s*[:=]\s*["\'`]([^"\'`]+)["\'`]')
+
+            post_paths: set[str] = set()
+            lit_paths: set[str] = set()
+            base_url = ""
+            total_js_bytes = 0
 
             for src in js_files[:8]:
                 url = src if src.startswith("http") else PANEL_URL + src
                 try:
                     async with self._session.get(url, timeout=timeout) as r:
                         js = await r.text()
+                    total_js_bytes += len(js)
                 except Exception:
                     continue
-                for m in path_re.findall(js):
-                    all_api.add(m)
+                if not base_url:
+                    bm = base_re.search(js)
+                    if bm:
+                        base_url = bm.group(1)
+                for m in post_re.findall(js):
+                    post_paths.add(m)
+                for m in lit_re.findall(js):
+                    if "/" in m or any(k in m.lower() for k in kws):
+                        lit_paths.add(m)
 
-            # Keep product-related, prefer ones without {id} templates
-            for p in all_api:
-                if any(k in p.lower() for k in kws):
-                    discovered.append(p)
-            discovered.sort(key=lambda p: ("{" in p or "}" in p, p.count("/")))
-            debug.append(f"API всего: {len(all_api)}")
-            debug.append(f"Товарные: {discovered[:10]}")
+            debug.append(f"JS {total_js_bytes}б base={base_url or '?'}")
+            # POST targets that mention a product keyword are the strongest candidates
+            prod_posts = [p for p in post_paths if any(k in p.lower() for k in kws)]
+            debug.append(f"POST-вызовы: {sorted(post_paths)[:8]}")
+            debug.append(f"Товарные литералы: {sorted(lit_paths)[:10]}")
+
+            # Build absolute /api candidate paths
+            def _norm(p: str) -> str:
+                p = p.strip()
+                if p.startswith("http"):
+                    return ""
+                if p.startswith("/api"):
+                    return p
+                if p.startswith("/"):
+                    return "/api" + p
+                return "/api/" + p
+
+            for p in prod_posts + [x for x in lit_paths if "{" not in x and "$" not in x]:
+                np = _norm(p)
+                if np and np not in discovered:
+                    discovered.append(np)
         except Exception as e:
             debug.append(f"Ошибка: {str(e)[:80]}")
 
-        return discovered[:12], " | ".join(debug)
+        return discovered[:15], " | ".join(debug)
 
     async def check_session(self) -> bool:
         """Verify cookies are still valid."""
