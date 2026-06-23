@@ -506,20 +506,25 @@ class PanelSession:
         endpoints = [
             "/api/goods",
             "/api/goods/store",
+            "/api/goods/create",
             "/api/products",
             "/api/products/store",
             "/api/v1/goods",
             "/api/v1/products",
             "/api/listings",
             "/api/ads",
+            "/goods",
+            "/products",
         ]
 
-        last_diag = ""
+        diag_lines: list[str] = []
         for path in endpoints:
             url = PANEL_URL + path
             try:
                 async with self._session.post(url, json=payload, headers=extra, timeout=timeout) as resp:
                     text = await resp.text()
+                    short = text[:120].replace("\n", " ")
+                    diag_lines.append(f"<code>{path}</code> → {resp.status}: {short}")
                     if resp.status in (200, 201):
                         try:
                             data = _json.loads(text)
@@ -532,24 +537,20 @@ class PanelSession:
                             or (data.get("good") or {}).get("id")
                             or ""
                         )
-                        logger.info("Product created via %s, id=%s", path, pid)
                         return True, str(pid) if pid else "создан"
                     elif resp.status == 401:
                         return False, "❌ Сессия панели истекла — обнови cookies"
                     elif resp.status == 422:
                         try:
                             data = _json.loads(text)
-                            errs = data.get("errors") or data.get("message") or text[:200]
-                            return False, f"❌ Ошибка валидации ({path}): {errs}"
+                            errs = data.get("errors") or data.get("message") or text[:300]
+                            return False, f"422 на <code>{path}</code>:\n<code>{errs}</code>"
                         except Exception:
-                            return False, f"❌ Ошибка валидации (422): {text[:200]}"
-                    else:
-                        last_diag = f"{path} → {resp.status}"
+                            return False, f"422: {text[:300]}"
             except aiohttp.ClientError as e:
-                last_diag = f"{path} → {e}"
-                continue
+                diag_lines.append(f"<code>{path}</code> → err: {str(e)[:60]}")
 
-        return False, f"❌ Не нашли эндпоинт создания товара в панели ({last_diag})"
+        return False, "🔍 Все эндпоинты:\n" + "\n".join(diag_lines)
 
     async def check_session(self) -> bool:
         """Verify cookies are still valid."""
