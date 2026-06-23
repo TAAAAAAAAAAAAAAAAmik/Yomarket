@@ -41,9 +41,8 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="💬 Чаты", callback_data="menu:chats")
     builder.button(text="💰 Баланс", callback_data="menu:balance")
     builder.button(text="📊 Статистика", callback_data="menu:stats")
-    builder.button(text="⚙️ Авто-функции", callback_data="auto:menu")
     builder.button(text="🧩 Плагины", callback_data="plugins:menu")
-    builder.button(text="🛠 Инструменты", callback_data="tools:menu")
+    builder.button(text="⚙️ Настройки", callback_data="settings:menu")
     builder.adjust(2)
     return builder.as_markup()
 

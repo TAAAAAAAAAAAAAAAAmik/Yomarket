@@ -19,8 +19,6 @@ class AutoState(StatesGroup):
     waiting_rule_keyword = State()
     waiting_rule_message = State()
     waiting_confirm_hours = State()
-    waiting_balance_threshold = State()
-    waiting_report_hour = State()
 
 
 def _st(on: bool) -> str:
@@ -56,20 +54,6 @@ def _auto_text(s: dict) -> str:
     if ac_on:
         lines.append(f"   Через <b>{ac_h} ч</b> после взятия в работу")
 
-    bn = s.get("balance_notify", {})
-    bn_on = bn.get("enabled", False)
-    bn_thr = bn.get("threshold", 1000)
-    lines.append(f"\n🔔 <b>Уведомление о балансе</b> — {_st(bn_on)}")
-    if bn_on:
-        lines.append(f"   Порог: <b>{bn_thr} ₽</b>")
-
-    drep = s.get("daily_report", {})
-    dr_on = drep.get("enabled", False)
-    dr_h = drep.get("hour", 20)
-    lines.append(f"\n📊 <b>Ежедневный отчёт</b> — {_st(dr_on)}")
-    if dr_on:
-        lines.append(f"   В <b>{dr_h}:00</b>")
-
     return "\n".join(lines)
 
 
@@ -104,27 +88,7 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     if ac_on:
         builder.button(text="⏱ Время подтверждения", callback_data="auto:set:confirm_hours")
 
-    bn = s.get("balance_notify", {})
-    bn_on = bn.get("enabled", False)
-    bn_thr = bn.get("threshold", 1000)
-    builder.button(
-        text=f"{'🔴 Выкл' if bn_on else '🟢 Вкл'} уведомление о балансе",
-        callback_data="auto:toggle:balance_notify",
-    )
-    if bn_on:
-        builder.button(text=f"💰 Порог: {bn_thr} ₽", callback_data="auto:set:balance_threshold")
-
-    drep = s.get("daily_report", {})
-    dr_on = drep.get("enabled", False)
-    dr_h = drep.get("hour", 20)
-    builder.button(
-        text=f"{'🔴 Выкл' if dr_on else '🟢 Вкл'} ежедневный отчёт",
-        callback_data="auto:toggle:daily_report",
-    )
-    if dr_on:
-        builder.button(text=f"🕐 Время отчёта: {dr_h}:00", callback_data="auto:set:report_hour")
-
-    builder.button(text="⬅️ Главное меню", callback_data="menu:main")
+    builder.button(text="⬅️ Настройки", callback_data="settings:menu")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -382,84 +346,3 @@ async def save_confirm_hours(message: Message, state: FSMContext) -> None:
     await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
 
 
-# ---------------------------------------------------------------------------
-# Balance notify
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data == "auto:toggle:balance_notify")
-async def toggle_balance_notify(callback: CallbackQuery) -> None:
-    s = get_settings(callback.from_user.id)
-    bn = s.setdefault("balance_notify", {"enabled": False, "threshold": 1000, "last_notified_balance": 0.0})
-    bn["enabled"] = not bn.get("enabled", False)
-    save_settings(callback.from_user.id, s)
-    await _refresh(callback)
-
-
-@router.callback_query(F.data == "auto:set:balance_threshold")
-async def set_balance_threshold(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AutoState.waiting_balance_threshold)
-    cur = get_settings(callback.from_user.id).get("balance_notify", {}).get("threshold", 1000)
-    await callback.message.edit_text(
-        f"💰 Порог уведомления о балансе (сейчас: <b>{cur} ₽</b>)\n\nВведите сумму:",
-        reply_markup=_cancel_kb(),
-    )
-    await callback.answer()
-
-
-@router.message(AutoState.waiting_balance_threshold)
-async def save_balance_threshold(message: Message, state: FSMContext) -> None:
-    try:
-        amount = int((message.text or "").strip())
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите положительное число")
-        return
-    await state.clear()
-    s = get_settings(message.from_user.id)
-    s.setdefault("balance_notify", {})["threshold"] = amount
-    save_settings(message.from_user.id, s)
-    await message.answer(f"✅ Порог: <b>{amount} ₽</b>")
-    await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
-
-
-# ---------------------------------------------------------------------------
-# Daily report
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data == "auto:toggle:daily_report")
-async def toggle_daily_report(callback: CallbackQuery) -> None:
-    s = get_settings(callback.from_user.id)
-    dr = s.setdefault("daily_report", {"enabled": False, "hour": 20, "last_report_day": ""})
-    dr["enabled"] = not dr.get("enabled", False)
-    save_settings(callback.from_user.id, s)
-    await _refresh(callback)
-
-
-@router.callback_query(F.data == "auto:set:report_hour")
-async def set_report_hour(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AutoState.waiting_report_hour)
-    cur = get_settings(callback.from_user.id).get("daily_report", {}).get("hour", 20)
-    await callback.message.edit_text(
-        f"🕐 В какой час отправлять отчёт? (сейчас: <b>{cur}:00</b>)\n\nВведите час (0–23):",
-        reply_markup=_cancel_kb(),
-    )
-    await callback.answer()
-
-
-@router.message(AutoState.waiting_report_hour)
-async def save_report_hour(message: Message, state: FSMContext) -> None:
-    try:
-        hour = int((message.text or "").strip())
-        if not 0 <= hour <= 23:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите число от 0 до 23")
-        return
-    await state.clear()
-    s = get_settings(message.from_user.id)
-    s.setdefault("daily_report", {})["hour"] = hour
-    s.setdefault("daily_report", {})["last_report_day"] = ""
-    save_settings(message.from_user.id, s)
-    await message.answer(f"✅ Отчёт в <b>{hour}:00</b>")
-    await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))

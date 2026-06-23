@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
+
 from aiogram import F, Router
-from aiogram.types import CallbackQuery
+from aiogram.types import BufferedInputFile, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
@@ -75,6 +76,8 @@ async def show_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
     builder.button(text="🔄 Обновить", callback_data="menu:stats")
     builder.button(text="📈 График (7 дней)", callback_data="stats:chart")
     builder.button(text="🏆 Топ товаров", callback_data="stats:top")
+    builder.button(text="📤 Экспорт заказов", callback_data="stats:export")
+    builder.button(text="⭐ Отзывы", callback_data="stats:reviews")
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
     builder.adjust(1)
 
@@ -172,3 +175,111 @@ async def show_top_products(callback: CallbackQuery) -> None:
         text = "🏆 <b>Топ товаров (по продажам)</b>\n\n" + "\n".join(lines)
 
     await callback.message.edit_text(text, reply_markup=_back_to_stats_keyboard())
+
+
+_STATUS_MAP = {
+    "confirmed": "✅ Выполнен", "completed": "✅ Выполнен", "done": "✅ Выполнен",
+    "refunded": "↩️ Возврат", "cancelled": "↩️ Отменён", "returned": "↩️ Возврат",
+    "active": "⏳ Активен", "new": "🆕 Новый", "work": "🔧 В работе",
+}
+
+
+@router.callback_query(F.data == "stats:export")
+async def export_orders(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    await callback.answer("⏳ Генерирую файл...", show_alert=False)
+
+    s = get_settings(callback.from_user.id)
+    known_orders: dict = s.get("known_orders", {})
+    order_details: dict = s.get("known_order_details", {})
+
+    all_orders: list[dict] = []
+    if api:
+        try:
+            data = await api.get_orders()
+            all_orders = data.get("data") or data.get("items") or []
+        except Exception as e:
+            logger.warning("Export: API error: %s", e)
+
+    lines = [
+        "YooMarket — Экспорт заказов",
+        f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        f"Всего заказов: {len(known_orders)}",
+        "=" * 40,
+        "",
+    ]
+
+    if all_orders:
+        for order in all_orders:
+            oid = str(order.get("id", ""))
+            title = order.get("title") or order.get("ad_title") or order.get("product_name") or "—"
+            buyer = order.get("buyer_name") or (order.get("buyer") or {}).get("name") or "—"
+            price = order.get("price") or order.get("total") or "—"
+            status = _STATUS_MAP.get(str(order.get("status", "")), str(order.get("status", "")))
+            created = order.get("created_at") or order.get("date") or ""
+            lines += [
+                f"ID: {oid}", f"Товар: {title}", f"Покупатель: {buyer}",
+                f"Сумма: {price} ₽", f"Статус: {status}",
+                f"Создан: {str(created)[:19] if created else '—'}", "-" * 30, "",
+            ]
+    else:
+        for oid, status_raw in known_orders.items():
+            det = order_details.get(oid, {})
+            status = _STATUS_MAP.get(status_raw, status_raw)
+            lines += [
+                f"ID: {oid}", f"Товар: {det.get('title', '—')}",
+                f"Покупатель: {det.get('buyer', '—')}",
+                f"Сумма: {det.get('price', '—')} ₽", f"Статус: {status}",
+                "-" * 30, "",
+            ]
+
+    content = "\n".join(lines).encode("utf-8")
+    file = BufferedInputFile(content, filename="orders_export.txt")
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Статистика", callback_data="menu:stats")
+    await callback.message.answer_document(
+        file,
+        caption=f"📤 <b>Экспорт заказов</b>\nВсего: <b>{len(known_orders)}</b>",
+        reply_markup=b.as_markup(),
+    )
+
+
+@router.callback_query(F.data == "stats:reviews")
+async def reviews_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    await callback.message.edit_text("⏳ Загружаю отзывы...")
+
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Обновить", callback_data="stats:reviews")
+    b.button(text="⬅️ Статистика", callback_data="menu:stats")
+    b.adjust(1)
+
+    if not api:
+        await callback.message.edit_text(
+            "⭐ <b>Отзывы</b>\n\n❌ API токен не настроен",
+            reply_markup=b.as_markup(),
+        )
+        await callback.answer()
+        return
+
+    try:
+        data = await api.get_reviews()
+        reviews: list[dict] = data.get("data") or data.get("items") or []
+        if not reviews:
+            text = "⭐ <b>Отзывы</b>\n\nОтзывов пока нет."
+        else:
+            lines = [f"⭐ <b>Отзывы</b> (последние {min(len(reviews), 10)})\n"]
+            for r in reviews[:10]:
+                rating = r.get("rating") or r.get("score") or 0
+                author = r.get("author") or r.get("buyer_name") or "Покупатель"
+                comment = (r.get("text") or r.get("comment") or "—")[:120]
+                try:
+                    stars = "⭐" * int(rating)
+                except (TypeError, ValueError):
+                    stars = str(rating)
+                lines.append(f"{stars or '—'} <b>{author}</b>")
+                lines.append(f"   <i>{comment}</i>\n")
+            text = "\n".join(lines)
+    except Exception as e:
+        text = f"⭐ <b>Отзывы</b>\n\n❌ Ошибка: {e}"
+
+    await callback.message.edit_text(text, reply_markup=b.as_markup())
+    await callback.answer()
