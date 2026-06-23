@@ -946,13 +946,32 @@ class YooMarketPanel:
             if "/login" in page.url or "/auth" in page.url:
                 return False, "❌ Сессия панели истекла — обнови cookies"
 
-            html = await page.content()
-            logger.info("Create product page: %s, html len=%d", page.url, len(html))
+            # Wait for SPA to render — wait for any input or button to appear
+            try:
+                await page.wait_for_selector("input, button, textarea", timeout=15000)
+            except Exception:
+                html = await page.content()
+                return False, f"SPA не загрузила форму (html={len(html)}б, url={page.url})"
+
+            logger.info("Create product page ready: %s", page.url)
+
+            # Dump all inputs for diagnostics
+            all_inputs = await page.query_selector_all("input, textarea")
+            input_info = []
+            for inp in all_inputs[:10]:
+                try:
+                    name = await inp.get_attribute("name") or ""
+                    ph = await inp.get_attribute("placeholder") or ""
+                    tp = await inp.get_attribute("type") or "text"
+                    input_info.append(f"{tp}[name={name!r} ph={ph[:20]!r}]")
+                except Exception:
+                    pass
+            logger.info("Inputs on page: %s", input_info)
 
             # Fill title
             title_filled = False
             for sel in ['input[name="title"]', 'input[name="name"]',
-                        'input[placeholder*="азвани"]', 'input[placeholder*="NAME"]']:
+                        'input[placeholder*="азвани"]', 'input[placeholder*="аименовани"]']:
                 el = await page.query_selector(sel)
                 if el:
                     await el.click()
@@ -960,7 +979,6 @@ class YooMarketPanel:
                     title_filled = True
                     break
             if not title_filled:
-                # Try all visible text inputs
                 inputs = await page.query_selector_all('input[type="text"], input:not([type])')
                 if inputs:
                     await inputs[0].fill(title)
@@ -968,7 +986,8 @@ class YooMarketPanel:
 
             # Fill price
             for sel in ['input[name="price"]', 'input[name="cost"]',
-                        'input[placeholder*="цен"]', 'input[placeholder*="Цен"]']:
+                        'input[placeholder*="цен"]', 'input[placeholder*="Цен"]',
+                        'input[type="number"]']:
                 el = await page.query_selector(sel)
                 if el:
                     await el.fill(str(price))
