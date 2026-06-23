@@ -926,18 +926,31 @@ class YooMarketPanel:
         page.on("request", on_request)
 
         try:
-            # 1. Go to goods list page (more likely to fully render)
+            # 1. Go to goods list page
             await page.goto(PANEL_URL + "/goods", timeout=20000, wait_until="domcontentloaded")
 
-            if "/login" in page.url or "/auth" in page.url:
-                return False, "❌ Сессия панели истекла — обнови cookies"
-
-            # Wait for page to render something
+            # Let JS execute and make auth API calls
             try:
-                await page.wait_for_selector("button, a, input", timeout=15000)
+                await page.wait_for_load_state("networkidle", timeout=12000)
             except Exception:
-                html = await page.content()
-                return False, f"Страница /goods не загрузилась ({len(html)}б)"
+                pass
+
+            await asyncio.sleep(1)
+            cur_url = page.url
+
+            if "/login" in cur_url or "/auth" in cur_url:
+                return False, "❌ Сессия панели истекла — обнови cookies в разделе «Панель продавца»"
+
+            # Check if something rendered
+            html = await page.content()
+            try:
+                await page.wait_for_selector("button, a[href], input, [role='button']", timeout=8000)
+            except Exception:
+                return False, (
+                    f"Страница /goods не отрисовала элементы\n"
+                    f"URL: {cur_url} | html: {len(html)}б\n"
+                    f"Скорее всего cookies истекли — войдите заново в «Панель продавца»"
+                )
 
             # 2. Find and click the "create" / "add" button
             create_clicked = False
