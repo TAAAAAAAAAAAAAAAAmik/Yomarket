@@ -906,78 +906,134 @@ class YooMarketPanel:
         description: str,
         quantity: int = 1,
     ) -> tuple[bool, str]:
-        """Create a product by navigating the panel UI in Playwright."""
+        """Create a product by navigating the panel UI in Playwright.
+        Intercepts network requests to capture the real API endpoint."""
         page, context = await self._new_authenticated_page()
+        captured_requests: list[dict] = []
+
+        async def on_request(request):
+            if request.method in ("POST", "PUT", "PATCH"):
+                try:
+                    body = request.post_data or ""
+                except Exception:
+                    body = ""
+                captured_requests.append({
+                    "url": request.url,
+                    "method": request.method,
+                    "body": body[:500],
+                })
+
+        page.on("request", on_request)
+
         try:
-            # Try common create-product page paths
-            for path in ("/goods/create", "/products/create", "/goods/add", "/add-product", "/new-product"):
+            # Navigate to create-product page
+            found_page = False
+            for path in ("/goods/create", "/products/create", "/goods/add",
+                         "/add-product", "/new-product", "/goods/new"):
                 try:
                     await page.goto(PANEL_URL + path, timeout=15000, wait_until="domcontentloaded")
                     await asyncio.sleep(2)
                     if "/login" not in page.url and "/auth" not in page.url:
+                        found_page = True
                         break
                 except Exception:
                     continue
-            else:
-                return False, "Не нашли страницу создания товара в панели"
+
+            if not found_page:
+                url_after = page.url
+                return False, f"Не нашли страницу создания товара (последний URL: {url_after})"
 
             if "/login" in page.url or "/auth" in page.url:
                 return False, "❌ Сессия панели истекла — обнови cookies"
 
+            html = await page.content()
+            logger.info("Create product page: %s, html len=%d", page.url, len(html))
+
             # Fill title
-            for sel in ['input[name="title"]', 'input[name="name"]', 'input[placeholder*="название"]',
-                        'input[placeholder*="Название"]', 'input[placeholder*="наименование"]']:
+            title_filled = False
+            for sel in ['input[name="title"]', 'input[name="name"]',
+                        'input[placeholder*="азвани"]', 'input[placeholder*="NAME"]']:
                 el = await page.query_selector(sel)
                 if el:
+                    await el.click()
                     await el.fill(title)
+                    title_filled = True
                     break
+            if not title_filled:
+                # Try all visible text inputs
+                inputs = await page.query_selector_all('input[type="text"], input:not([type])')
+                if inputs:
+                    await inputs[0].fill(title)
+                    title_filled = True
 
             # Fill price
-            for sel in ['input[name="price"]', 'input[placeholder*="цена"]', 'input[placeholder*="Цена"]',
-                        'input[type="number"]']:
+            for sel in ['input[name="price"]', 'input[name="cost"]',
+                        'input[placeholder*="цен"]', 'input[placeholder*="Цен"]']:
                 el = await page.query_selector(sel)
                 if el:
                     await el.fill(str(price))
                     break
 
             # Fill description
-            for sel in ['textarea[name="description"]', 'textarea', 'div[contenteditable="true"]',
-                        'input[name="description"]']:
+            for sel in ['textarea[name="description"]', 'textarea',
+                        'div[contenteditable="true"]', 'input[name="description"]']:
                 el = await page.query_selector(sel)
                 if el:
                     await el.fill(description)
                     break
 
-            # Fill quantity if > 1
-            if quantity > 1:
+            # Fill quantity
+            if quantity != 1:
                 for sel in ['input[name="count"]', 'input[name="quantity"]', 'input[name="amount"]']:
                     el = await page.query_selector(sel)
                     if el:
                         await el.fill(str(quantity))
                         break
 
-            # Submit
-            for sel in ['button[type="submit"]', 'button:has-text("Создать")', 'button:has-text("Добавить")',
-                        'button:has-text("Сохранить")', 'button:has-text("Опубликовать")']:
+            # Click submit
+            submitted = False
+            for sel in ['button[type="submit"]', 'button:has-text("Создать")',
+                        'button:has-text("Добавить")', 'button:has-text("Сохранить")',
+                        'button:has-text("Опубликовать")', 'input[type="submit"]']:
                 el = await page.query_selector(sel)
                 if el:
                     await el.click()
-                    await asyncio.sleep(3)
-                    try:
-                        await page.wait_for_load_state("domcontentloaded", timeout=8000)
-                    except Exception:
-                        pass
+                    submitted = True
                     break
 
-            # Check result: if redirected away from /create page — success
-            if "/create" not in page.url and "/add" not in page.url and "/new" not in page.url:
+            if not submitted:
+                return False, f"Не нашли кнопку отправки формы. Страница: {page.url}"
+
+            # Wait for response
+            await asyncio.sleep(4)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+
+            # Log intercepted requests for diagnostics
+            for req in captured_requests:
+                logger.info("Panel request: %s %s body=%s", req["method"], req["url"], req["body"][:200])
+
+            # Success: redirected away from create page
+            cur_url = page.url
+            if all(k not in cur_url for k in ("/create", "/add", "/new-product", "/add-product")):
+                logger.info("Product created, redirected to %s", cur_url)
                 return True, "создан"
 
-            # Check for error on page
-            html = await page.content()
-            err_match = re.search(r'class="[^"]*error[^"]*"[^>]*>([^<]{5,100})', html, re.I)
-            err_text = err_match.group(1).strip() if err_match else "неизвестная ошибка"
-            return False, f"Форма не отправилась: {err_text}"
+            # Check error on page
+            cur_html = await page.content()
+            err_sel = await page.query_selector('.error, .alert-danger, [class*="error"], [class*="Error"]')
+            if err_sel:
+                err_text = (await err_sel.inner_text()).strip()[:200]
+                return False, f"Ошибка на странице: {err_text}"
+
+            # Report what requests were made (diagnostic)
+            reqs_info = "; ".join(f"{r['method']} {r['url'].split('/')[-1]}" for r in captured_requests) or "нет запросов"
+            return False, (
+                f"Форма не отправилась. URL: {cur_url}\n"
+                f"Запросы: {reqs_info}"
+            )
 
         except Exception as e:
             logger.error("create_product_browser error: %s", e)
