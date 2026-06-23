@@ -12,7 +12,7 @@ from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
-from storage import get_token, get_settings, save_settings, get_panel_creds
+from storage import get_token, get_settings, save_settings
 
 logger = logging.getLogger(__name__)
 
