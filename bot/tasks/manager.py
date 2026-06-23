@@ -140,13 +140,17 @@ class TaskManager:
                 time_raw = order.get("created_at") or order.get("date") or order.get("created")
                 chat_id = str(order.get("chat_id") or oid)
 
+                prev_det = order_details.get(oid, {})
+                work_at = prev_det.get("work_at")
+                if status in ("work", "working", "processing") and prev_status not in ("work", "working", "processing"):
+                    work_at = time.time()
                 order_details[oid] = {
                     "title": title,
                     "buyer": buyer,
                     "price": price,
                     "chat_id": chat_id,
-                    # Preserve seen_at from previous tick; set on first appearance
-                    "seen_at": order_details.get(oid, {}).get("seen_at") or time.time(),
+                    "seen_at": prev_det.get("seen_at") or time.time(),
+                    "work_at": work_at,
                 }
 
                 # If order moved to a terminal/changed status, clear its reminder record
@@ -195,6 +199,7 @@ class TaskManager:
             settings["known_order_details"] = order_details
 
             await self._check_messages(user_id, api, settings)
+            await self._auto_confirm(user_id, api, settings)
 
             save_settings(user_id, settings)
         finally:
@@ -305,6 +310,30 @@ class TaskManager:
             from storage import save_settings
             save_settings(user_id, settings)
 
+    async def _auto_confirm(self, user_id: int, api: YooMarketAPI, settings: dict) -> None:
+        ac = settings.get("auto_confirm", {})
+        if not ac.get("enabled"):
+            return
+        threshold_secs = ac.get("hours", 24) * 3600
+        now = time.time()
+        known_orders: dict = settings.get("known_orders", {})
+        order_details: dict = settings.get("known_order_details", {})
+        for oid, status in list(known_orders.items()):
+            if status not in ("work", "working", "processing"):
+                continue
+            det = order_details.get(oid, {})
+            work_at = det.get("work_at")
+            if not work_at or (now - work_at) < threshold_secs:
+                continue
+            try:
+                await api.confirm_order(oid)
+                known_orders[oid] = "confirmed"
+                title = det.get("title", f"Заказ #{oid}")
+                await self._notify(user_id, f"✅ <b>Авто-подтверждение</b>\n\n📦 {title} #{oid}")
+            except Exception as e:
+                logger.warning("Auto-confirm order %s: %s", oid, e)
+        settings["known_orders"] = known_orders
+
     def _pick_message(self, title: str, default: str, rules: list[dict], responders: dict | None = None) -> str:
         title_lower = title.lower()
         if responders:
@@ -385,6 +414,49 @@ class TaskManager:
                 logger.info("Auto-withdraw for user %s via API", user_id)
                 success, msg = await api.withdraw_balance(min_amount)
                 messages.append(f"💸 Авто-вывод: {msg}")
+
+            # --- Balance notify ---
+            bn = settings.get("balance_notify", {})
+            if bn.get("enabled"):
+                threshold = bn.get("threshold", 1000)
+                last_bal = bn.get("last_notified_balance", 0.0)
+                try:
+                    balance, balance_str = await api.get_balance()
+                    settings["balance_notify"]["last_notified_balance"] = balance
+                    if balance >= threshold > last_bal:
+                        await self._notify(
+                            user_id,
+                            f"🔔 <b>Уведомление о балансе</b>\n\n"
+                            f"Баланс достиг порога: <b>{balance_str}</b> ≥ {threshold:.0f} ₽",
+                        )
+                except Exception as e:
+                    logger.warning("Balance notify error for user %s: %s", user_id, e)
+
+            # --- Daily report ---
+            dr = settings.get("daily_report", {})
+            if dr.get("enabled"):
+                report_hour = dr.get("hour", 20)
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                last_day = dr.get("last_report_day", "")
+                if last_day != today_str and datetime.now().hour >= report_hour:
+                    settings["daily_report"]["last_report_day"] = today_str
+                    try:
+                        known_orders = get_settings(user_id).get("known_orders", {})
+                        completed_today = sum(
+                            1 for s in known_orders.values()
+                            if s in ("confirmed", "completed", "done")
+                        )
+                        total = len(known_orders)
+                        balance, balance_str = await api.get_balance()
+                        await self._notify(
+                            user_id,
+                            f"📊 <b>Ежедневный отчёт</b>\n\n"
+                            f"📦 Всего заказов: <b>{total}</b>\n"
+                            f"✅ Выполнено: <b>{completed_today}</b>\n"
+                            f"💰 Баланс: <b>{balance_str}</b>",
+                        )
+                    except Exception as e:
+                        logger.warning("Daily report error for user %s: %s", user_id, e)
 
         except Exception as e:
             logger.error("Auto-tasks error for user %s: %s", user_id, e)

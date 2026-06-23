@@ -240,6 +240,38 @@ class YooMarketAPI:
                     continue
                 raise
         return []
+
+    async def update_ad(self, ad_id: int | str, **fields) -> dict:
+        """Update ad fields via PATCH /ads/{id}."""
+        return await self._patch(f"/ads/{ad_id}", json=fields)
+
+    async def bulk_change_prices(self, percent: float) -> tuple[int, str]:
+        """Change all ad prices by percent (+/-). Returns (count, message)."""
+        data = await self.get_ads()
+        ads = data.get("data") or data.get("items") or []
+        if not ads:
+            return 0, "ℹ️ Нет объявлений"
+        count = 0
+        last_err = ""
+        for ad in ads:
+            ad_id = ad.get("id")
+            try:
+                current_price = int(float(str(ad.get("price", 0))))
+            except (TypeError, ValueError):
+                continue
+            if not ad_id or current_price <= 0:
+                continue
+            new_price = max(1, round(current_price * (1 + percent / 100)))
+            try:
+                await self.update_ad(ad_id, price=new_price)
+                count += 1
+            except RuntimeError as e:
+                last_err = str(e)
+        sign = "+" if percent >= 0 else ""
+        if count:
+            return count, f"✅ Обновлено {count} товаров ({sign}{percent:.0f}%)"
+        return 0, f"⚠️ Не удалось обновить цены ({last_err})"
+
         for path in ("/reviews", "/feedback", "/ratings"):
             try:
                 return await self._get(path)

@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from aiogram import F, Router
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
 from keyboards.main import OrderCallback, PaginationCallback, back_keyboard, order_actions_keyboard
+from storage import get_settings
 
 router = Router()
+
+
+class OrderSearchState(StatesGroup):
+    waiting_query = State()
 
 STATUS_EMOJI = {
     "new": "🔄 Новый",
@@ -51,6 +58,7 @@ def _build_orders_keyboard(orders: list[dict], next_cursor: str | None) -> Inlin
             text="Следующая →",
             callback_data=PaginationCallback(entity="orders", cursor=next_cursor).pack(),
         )
+    builder.button(text="🔍 Поиск", callback_data="orders:search")
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
     return builder.as_markup()
 
@@ -148,3 +156,63 @@ async def handle_order_action(
     builder.adjust(1)
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
+
+
+@router.callback_query(F.data == "orders:search")
+async def orders_search_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(OrderSearchState.waiting_query)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="menu:orders")
+    await callback.message.edit_text(
+        "🔍 <b>Поиск по заказам</b>\n\nВведите имя покупателя, название товара или сумму:",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.message(OrderSearchState.waiting_query)
+async def orders_search_exec(message: Message, state: FSMContext) -> None:
+    query = (message.text or "").strip().lower()
+    await state.clear()
+
+    s = get_settings(message.from_user.id)
+    order_details: dict = s.get("known_order_details", {})
+    known_orders: dict = s.get("known_orders", {})
+
+    results = []
+    for oid, det in order_details.items():
+        buyer = (det.get("buyer") or "").lower()
+        price = str(det.get("price") or "").lower()
+        title = (det.get("title") or "").lower()
+        if query in buyer or query in price or query in title:
+            results.append((oid, det))
+
+    b = InlineKeyboardBuilder()
+    if not results:
+        b.button(text="⬅️ Заказы", callback_data="menu:orders")
+        await message.answer(
+            f"🔍 По запросу «{message.text}» ничего не найдено.",
+            reply_markup=b.as_markup(),
+        )
+        return
+
+    lines = [f"🔍 <b>Найдено: {len(results)}</b>\n"]
+    for oid, det in results[:15]:
+        buyer = det.get("buyer", "—")
+        price = det.get("price", "—")
+        title = (det.get("title") or "")[:28]
+        status_raw = known_orders.get(str(oid), known_orders.get(oid, ""))
+        STATUS = {"confirmed": "✅", "completed": "✅", "done": "✅",
+                  "refunded": "↩️", "cancelled": "↩️", "work": "🔧", "new": "🆕"}
+        emoji = STATUS.get(status_raw, "⚪")
+        lines.append(f"{emoji} #{oid} — <b>{title}</b>\n   👤 {buyer}  💰 {price} ₽")
+
+    for oid, det in results[:10]:
+        title = (det.get("title") or f"Заказ {oid}")[:30]
+        b.button(
+            text=f"#{oid} {title}",
+            callback_data=OrderCallback(order_id=str(oid), action="view").pack(),
+        )
+    b.adjust(1)
+    b.button(text="⬅️ Заказы", callback_data="menu:orders")
+    await message.answer("\n".join(lines), reply_markup=b.as_markup())

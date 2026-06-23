@@ -8,6 +8,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
 from keyboards.main import ChatCallback, PaginationCallback, back_keyboard
+from storage import get_settings
 
 router = Router()
 
@@ -101,8 +102,12 @@ async def show_chat_messages(
         messages: list[dict] = data.get("data") or data.get("items") or []
         messages = messages[-10:] if len(messages) > 10 else messages
         text = f"💬 <b>Чат по заказу #{chat_id}</b>\n\n" + _format_messages(messages)
+        settings = get_settings(callback.from_user.id)
+        quick_replies: list = settings.get("quick_replies", [])
         builder = InlineKeyboardBuilder()
         builder.button(text="✉️ Ответить", callback_data=f"reply_init:{chat_id}")
+        for i, qr in enumerate(quick_replies[:3]):
+            builder.button(text=f"💬 {qr[:28]}", callback_data=f"qr:{chat_id}:{i}")
         builder.button(text="🔄 Обновить", callback_data=ChatCallback(chat_id=chat_id).pack())
         builder.button(text="⬅️ Чаты", callback_data="menu:chats")
         builder.adjust(1)
@@ -171,3 +176,28 @@ async def send_reply(message: Message, state: FSMContext, api: YooMarketAPI) -> 
     builder.button(text="⬅️ Чаты", callback_data="menu:chats")
     builder.adjust(1)
     await message.answer(text, reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("qr:"))
+async def send_quick_reply(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    parts = callback.data.split(":", 2)
+    if len(parts) != 3:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    _, chat_id, idx_str = parts
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    settings = get_settings(callback.from_user.id)
+    quick_replies: list = settings.get("quick_replies", [])
+    if idx >= len(quick_replies):
+        await callback.answer("❌ Шаблон не найден", show_alert=True)
+        return
+    text = quick_replies[idx]
+    try:
+        await api.send_message(chat_id, text)
+        await callback.answer("✅ Отправлено!", show_alert=True)
+    except Exception as e:
+        await callback.answer(f"❌ {e}", show_alert=True)

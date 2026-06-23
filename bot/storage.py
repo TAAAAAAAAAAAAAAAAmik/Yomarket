@@ -24,6 +24,11 @@ _DEFAULT_SETTINGS = {
     "blacklist": [],  # list of buyer names to suppress notifications for
     "reminders": {"enabled": False, "hours": 24},
     "reminded_orders": [],  # order IDs already reminded (reset on status change)
+    "auto_confirm": {"enabled": False, "hours": 24},
+    "balance_notify": {"enabled": False, "threshold": 1000, "last_notified_balance": 0.0},
+    "daily_report": {"enabled": False, "hour": 20, "last_report_day": ""},
+    "quick_replies": ["Спасибо за заказ!", "Отправлю в течение часа.", "Уточните, пожалуйста."],
+    "buyer_notes": {},
     "plugins": {
         "auto_stars": {"enabled": False, "amount": 50, "note": ""},
         "auto_roblox": {"enabled": False, "robux": 0, "note": ""},
