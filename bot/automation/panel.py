@@ -278,6 +278,7 @@ class YooMarketPanelHTTP:
             "/api/v1/auth/email",
             "/api/user/send-code",
         ]
+        diag_lines = []
         for path in json_paths:
             try:
                 async with self._session.post(
@@ -288,16 +289,17 @@ class YooMarketPanelHTTP:
                     allow_redirects=False,
                 ) as resp:
                     text = await resp.text()
+                    diag_lines.append(f"<code>{path}</code> → <b>{resp.status}</b>: {text[:80]}")
                     logger.info("POST %s → %s: %s", path, resp.status, text[:200])
                     if resp.status in (200, 201):
                         return True, ""
                     if resp.status == 422:
-                        # Endpoint exists but validation error
-                        return False, f"Сервер вернул ошибку валидации:\n<code>{text[:300]}</code>"
+                        return False, f"422 на {path}:\n<code>{text[:300]}</code>"
             except Exception as e:
-                logger.debug("POST %s: %s", path, e)
+                diag_lines.append(f"<code>{path}</code> → ошибка: {str(e)[:60]}")
 
-        return False, ""
+        diag = "\n".join(diag_lines)
+        return False, f"🔍 <b>Диагностика эндпоинтов:</b>\n\n{diag}"
 
     async def verify_code(self, code: str) -> tuple[bool, str]:
         """

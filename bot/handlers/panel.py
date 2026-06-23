@@ -208,15 +208,7 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         await http.close()
         await state.clear()
         # Если err пустой — эндпоинт не найден, нужна диагностика
-        if not err:
-            await status_msg.edit_text(
-                "⚠️ Не нашли API-эндпоинт панели.\n\n"
-                "Для диагностики нужны логи — проверь вывод бота в Railway.\n"
-                "Там будет видно что отвечает сервер на каждый запрос.\n\n"
-                "Пока используй вход через cookies 👇"
-            )
-        else:
-            await status_msg.edit_text(err)
+        await status_msg.edit_text(err or "⚠️ Неизвестная ошибка")
         b = InlineKeyboardBuilder()
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
