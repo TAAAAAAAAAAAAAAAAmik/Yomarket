@@ -458,6 +458,68 @@ class TaskManager:
                     except Exception as e:
                         logger.warning("Daily report error for user %s: %s", user_id, e)
 
+            # --- Reviews monitor ---
+            rm = settings.get("reviews_monitor", {})
+            if rm.get("enabled"):
+                try:
+                    data = await api.get_reviews()
+                    reviews = data.get("data") or data.get("items") or []
+                    known_ids: list = rm.get("known_review_ids", [])
+                    known_set = set(str(r) for r in known_ids)
+                    new_reviews = []
+                    for rev in reviews:
+                        rid = str(rev.get("id", ""))
+                        if rid and rid not in known_set:
+                            new_reviews.append(rev)
+                            known_set.add(rid)
+                    if new_reviews:
+                        settings["reviews_monitor"]["known_review_ids"] = list(known_set)
+                        for rev in new_reviews:
+                            author = rev.get("author") or rev.get("buyer_name") or "Покупатель"
+                            rating = rev.get("rating") or rev.get("stars") or "?"
+                            text = (rev.get("text") or rev.get("comment") or "—")[:300]
+                            stars = "⭐" * int(rating) if str(rating).isdigit() else f"★{rating}"
+                            await self._notify(
+                                user_id,
+                                f"⭐ <b>Новый отзыв</b>\n\n"
+                                f"👤 {author}  {stars}\n\n"
+                                f"<i>«{text}»</i>",
+                            )
+                    elif not known_ids:
+                        settings["reviews_monitor"]["known_review_ids"] = [
+                            str(r.get("id", "")) for r in reviews if r.get("id")
+                        ]
+                except Exception as e:
+                    logger.warning("Reviews monitor error for user %s: %s", user_id, e)
+
+            # --- Bump scheduler ---
+            bs = settings.get("bump_schedule", {})
+            if bs.get("enabled") and bs.get("times"):
+                now_dt = datetime.now()
+                current_slot = now_dt.strftime("%H:%M")
+                current_mins = now_dt.hour * 60 + now_dt.minute
+                last_runs: dict = bs.get("last_runs", {})
+                today_str = now_dt.strftime("%Y-%m-%d")
+                for slot in bs["times"]:
+                    try:
+                        sh, sm = map(int, slot.split(":"))
+                    except (ValueError, AttributeError):
+                        continue
+                    slot_mins = sh * 60 + sm
+                    # Within 35-minute window of the slot
+                    if not (0 <= current_mins - slot_mins < 35):
+                        continue
+                    last_run_key = f"{today_str}_{slot}"
+                    if last_runs.get(last_run_key):
+                        continue
+                    try:
+                        count, msg = await api.bump_all_ads()
+                        last_runs[last_run_key] = now_dt.isoformat()
+                        settings["bump_schedule"]["last_runs"] = last_runs
+                        messages.append(f"⬆️ Поднятие ({slot}): {msg}")
+                    except Exception as e:
+                        logger.warning("Bump scheduler error for user %s slot %s: %s", user_id, slot, e)
+
         except Exception as e:
             logger.error("Auto-tasks error for user %s: %s", user_id, e)
             messages.append(f"❌ Ошибка авто-задач: {e}")

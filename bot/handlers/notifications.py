@@ -45,6 +45,9 @@ def _notif_text(s: dict) -> str:
     if dr_on:
         lines.append(f"   В <b>{dr_h}:00</b>")
     lines.append(f"\n⛔ <b>Чёрный список</b>: {len(bl)} покупателей")
+    rm = s.get("reviews_monitor", {})
+    rm_on = rm.get("enabled", False)
+    lines.append(f"\n⭐ <b>Мониторинг отзывов</b> — {_st(rm_on)}")
     return "\n".join(lines)
 
 
@@ -76,6 +79,12 @@ def _notif_kb(s: dict):
     if dr_on:
         b.button(text="🕐 Время отчёта", callback_data="notif:set:report_hour")
     b.button(text="⛔ Чёрный список", callback_data="notif:blacklist")
+    rm = s.get("reviews_monitor", {})
+    rm_on = rm.get("enabled", False)
+    b.button(
+        text=f"{'🔴 Выкл' if rm_on else '🟢 Вкл'} мониторинг отзывов",
+        callback_data="notif:toggle:reviews",
+    )
     b.button(text="⬅️ Настройки", callback_data="settings:menu")
     b.adjust(1)
     return b.as_markup()
@@ -248,6 +257,15 @@ def _bl_kb(s: dict):
     b.button(text="⬅️ Уведомления", callback_data="notif:menu")
     b.adjust(1)
     return b.as_markup()
+
+
+@router.callback_query(F.data == "notif:toggle:reviews")
+async def toggle_reviews_monitor(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    rm = s.setdefault("reviews_monitor", {"enabled": False, "known_review_ids": []})
+    rm["enabled"] = not rm.get("enabled", False)
+    save_settings(callback.from_user.id, s)
+    await _refresh(callback)
 
 
 @router.callback_query(F.data == "notif:blacklist")

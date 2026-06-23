@@ -29,6 +29,9 @@ _DEFAULT_SETTINGS = {
     "daily_report": {"enabled": False, "hour": 20, "last_report_day": ""},
     "quick_replies": ["Спасибо за заказ!", "Отправлю в течение часа.", "Уточните, пожалуйста."],
     "buyer_notes": {},
+    "bump_schedule": {"enabled": False, "times": [], "last_runs": {}},
+    "reviews_monitor": {"enabled": False, "known_review_ids": []},
+    "ad_templates": [],
     "plugins": {
         "auto_stars": {"enabled": False, "amount": 50, "note": ""},
         "auto_roblox": {"enabled": False, "robux": 0, "note": ""},

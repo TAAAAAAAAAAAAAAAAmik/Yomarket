@@ -11,6 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
 from keyboards.main import back_keyboard
+from storage import get_settings, save_settings
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ def _preview(data: dict) -> str:
 def _confirm_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="✅ Создать товар", callback_data="create_ad:submit")
+    b.button(text="💾 Сохранить как шаблон", callback_data="create_ad:save_template")
     b.button(text="✏️ Изменить название", callback_data="create_ad:edit:title")
     b.button(text="✏️ Изменить цену", callback_data="create_ad:edit:price")
     b.button(text="✏️ Изменить описание", callback_data="create_ad:edit:description")
@@ -68,10 +70,17 @@ def _confirm_kb() -> InlineKeyboardMarkup:
 async def create_ad_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(CreateAdState.title)
+    s = get_settings(callback.from_user.id)
+    templates = s.get("ad_templates", [])
+    b = InlineKeyboardBuilder()
+    if templates:
+        b.button(text=f"📋 Использовать шаблон ({len(templates)})", callback_data="create_ad:templates_list")
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    b.adjust(1)
     await callback.message.edit_text(
         "➕ <b>Добавить товар</b>\n\n"
         "<b>Шаг 1/4</b> — Введи название товара:",
-        reply_markup=_cancel_kb(),
+        reply_markup=b.as_markup(),
     )
     await callback.answer()
 
@@ -253,4 +262,67 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
             reply_markup=b.as_markup(),
         )
 
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "create_ad:save_template")
+async def save_template(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if not data.get("title"):
+        await callback.answer("❌ Нет данных для сохранения", show_alert=True)
+        return
+    s = get_settings(callback.from_user.id)
+    templates = s.setdefault("ad_templates", [])
+    template = {
+        "title": data.get("title", ""),
+        "price": data.get("price", 0),
+        "description": data.get("description", ""),
+        "quantity": data.get("quantity", 1),
+    }
+    templates.append(template)
+    save_settings(callback.from_user.id, s)
+    await callback.answer(f"✅ Шаблон «{template['title'][:30]}» сохранён", show_alert=True)
+
+
+@router.callback_query(F.data == "create_ad:templates_list")
+async def templates_list(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    templates = s.get("ad_templates", [])
+    if not templates:
+        await callback.answer("Шаблонов нет", show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    for i, t in enumerate(templates[:8]):
+        b.button(text=f"📋 {t.get('title','')[:30]} — {t.get('price',0)} ₽", callback_data=f"create_ad:use_template:{i}")
+    b.button(text="➕ Новый товар", callback_data="create_ad:start")
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    b.adjust(1)
+    await callback.message.edit_text(
+        "📋 <b>Шаблоны товаров</b>\n\nВыберите шаблон:",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("create_ad:use_template:"))
+async def use_template(callback: CallbackQuery, state: FSMContext) -> None:
+    idx = int(callback.data.split(":")[-1])
+    s = get_settings(callback.from_user.id)
+    templates = s.get("ad_templates", [])
+    if idx >= len(templates):
+        await callback.answer("Шаблон не найден", show_alert=True)
+        return
+    t = templates[idx]
+    await state.clear()
+    await state.update_data(
+        title=t.get("title", ""),
+        price=t.get("price", 0),
+        description=t.get("description", ""),
+        quantity=t.get("quantity", 1),
+    )
+    await _show_preview(callback.message, state, edit=True)
     await callback.answer()

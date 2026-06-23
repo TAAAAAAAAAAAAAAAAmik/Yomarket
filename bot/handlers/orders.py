@@ -59,6 +59,9 @@ def _build_orders_keyboard(orders: list[dict], next_cursor: str | None) -> Inlin
             callback_data=PaginationCallback(entity="orders", cursor=next_cursor).pack(),
         )
     builder.button(text="🔍 Поиск", callback_data="orders:search")
+    builder.button(text="✅ Выполненные", callback_data="orders:filter:done")
+    builder.button(text="⏳ Активные", callback_data="orders:filter:active")
+    builder.button(text="↩️ Возвраты", callback_data="orders:filter:refunds")
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
     return builder.as_markup()
 
@@ -216,3 +219,138 @@ async def orders_search_exec(message: Message, state: FSMContext) -> None:
     b.adjust(1)
     b.button(text="⬅️ Заказы", callback_data="menu:orders")
     await message.answer("\n".join(lines), reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "orders:filter:done")
+async def filter_orders_done(callback: CallbackQuery) -> None:
+    await callback.answer()
+    done_statuses = ("confirmed", "completed", "done")
+    s = get_settings(callback.from_user.id)
+    known_orders: dict = s.get("known_orders", {})
+    order_details: dict = s.get("known_order_details", {})
+
+    matched = [
+        (oid, order_details.get(str(oid), order_details.get(oid, {})))
+        for oid, status in known_orders.items()
+        if status in done_statuses
+    ]
+
+    b = InlineKeyboardBuilder()
+    if not matched:
+        b.button(text="⬅️ Заказы", callback_data="menu:orders")
+        await callback.message.edit_text(
+            "✅ <b>Выполненные заказы</b>\n\nНет выполненных заказов.",
+            reply_markup=b.as_markup(),
+        )
+        return
+
+    lines = [f"✅ <b>Выполненные заказы</b> ({len(matched)})\n"]
+    STATUS_LABEL = {"confirmed": "✔️ Подтверждён", "completed": "✅ Выполнен", "done": "✅ Готов"}
+    for oid, det in matched[:15]:
+        title = (det.get("title") or "—")[:28]
+        buyer = det.get("buyer", "—")
+        price = det.get("price", "—")
+        status_raw = known_orders.get(str(oid), known_orders.get(oid, ""))
+        status_label = STATUS_LABEL.get(status_raw, status_raw)
+        lines.append(f"#{oid} — <b>{title}</b>\n   👤 {buyer}  💰 {price} ₽  {status_label}")
+
+    for oid, det in matched[:15]:
+        title = (det.get("title") or f"Заказ {oid}")[:30]
+        b.button(
+            text=f"#{oid} {title}",
+            callback_data=OrderCallback(order_id=str(oid), action="view").pack(),
+        )
+    b.adjust(1)
+    b.button(text="⬅️ Заказы", callback_data="menu:orders")
+    await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "orders:filter:active")
+async def filter_orders_active(callback: CallbackQuery) -> None:
+    await callback.answer()
+    active_statuses = ("new", "work", "working", "processing", "active", "pending")
+    s = get_settings(callback.from_user.id)
+    known_orders: dict = s.get("known_orders", {})
+    order_details: dict = s.get("known_order_details", {})
+
+    matched = [
+        (oid, order_details.get(str(oid), order_details.get(oid, {})))
+        for oid, status in known_orders.items()
+        if status in active_statuses
+    ]
+
+    b = InlineKeyboardBuilder()
+    if not matched:
+        b.button(text="⬅️ Заказы", callback_data="menu:orders")
+        await callback.message.edit_text(
+            "⏳ <b>Активные заказы</b>\n\nНет активных заказов.",
+            reply_markup=b.as_markup(),
+        )
+        return
+
+    lines = [f"⏳ <b>Активные заказы</b> ({len(matched)})\n"]
+    STATUS_LABEL = {
+        "new": "🆕 Новый", "work": "🔧 В работе", "working": "🔧 В работе",
+        "processing": "⚙️ Обработка", "active": "⏳ Активен", "pending": "🕐 Ожидает",
+    }
+    for oid, det in matched[:15]:
+        title = (det.get("title") or "—")[:28]
+        buyer = det.get("buyer", "—")
+        price = det.get("price", "—")
+        status_raw = known_orders.get(str(oid), known_orders.get(oid, ""))
+        status_label = STATUS_LABEL.get(status_raw, status_raw)
+        lines.append(f"#{oid} — <b>{title}</b>\n   👤 {buyer}  💰 {price} ₽  {status_label}")
+
+    for oid, det in matched[:15]:
+        title = (det.get("title") or f"Заказ {oid}")[:30]
+        b.button(
+            text=f"#{oid} {title}",
+            callback_data=OrderCallback(order_id=str(oid), action="view").pack(),
+        )
+    b.adjust(1)
+    b.button(text="⬅️ Заказы", callback_data="menu:orders")
+    await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "orders:filter:refunds")
+async def filter_orders_refunds(callback: CallbackQuery) -> None:
+    await callback.answer()
+    refund_statuses = ("refunded", "cancelled", "returned")
+    s = get_settings(callback.from_user.id)
+    known_orders: dict = s.get("known_orders", {})
+    order_details: dict = s.get("known_order_details", {})
+
+    matched = [
+        (oid, order_details.get(str(oid), order_details.get(oid, {})))
+        for oid, status in known_orders.items()
+        if status in refund_statuses
+    ]
+
+    b = InlineKeyboardBuilder()
+    if not matched:
+        b.button(text="⬅️ Заказы", callback_data="menu:orders")
+        await callback.message.edit_text(
+            "↩️ <b>Возвраты и отмены</b>\n\nНет возвратов или отменённых заказов.",
+            reply_markup=b.as_markup(),
+        )
+        return
+
+    lines = [f"↩️ <b>Возвраты и отмены</b> ({len(matched)})\n"]
+    STATUS_LABEL = {"refunded": "↩️ Возврат", "cancelled": "❌ Отменён", "returned": "↩️ Возврат"}
+    for oid, det in matched[:15]:
+        title = (det.get("title") or "—")[:28]
+        buyer = det.get("buyer", "—")
+        price = det.get("price", "—")
+        status_raw = known_orders.get(str(oid), known_orders.get(oid, ""))
+        status_label = STATUS_LABEL.get(status_raw, status_raw)
+        lines.append(f"#{oid} — <b>{title}</b>\n   👤 {buyer}  💰 {price} ₽  {status_label}")
+
+    for oid, det in matched[:15]:
+        title = (det.get("title") or f"Заказ {oid}")[:30]
+        b.button(
+            text=f"#{oid} {title}",
+            callback_data=OrderCallback(order_id=str(oid), action="view").pack(),
+        )
+    b.adjust(1)
+    b.button(text="⬅️ Заказы", callback_data="menu:orders")
+    await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import logging
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
@@ -78,6 +80,9 @@ async def show_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
     builder.button(text="🏆 Топ товаров", callback_data="stats:top")
     builder.button(text="📤 Экспорт заказов", callback_data="stats:export")
     builder.button(text="⭐ Отзывы", callback_data="stats:reviews")
+    builder.button(text="📊 По часам", callback_data="stats:hours")
+    builder.button(text="👥 Повторные покупатели", callback_data="stats:buyers")
+    builder.button(text="📊 Экспорт CSV", callback_data="stats:export_csv")
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
     builder.adjust(1)
 
@@ -283,3 +288,143 @@ async def reviews_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
 
     await callback.message.edit_text(text, reply_markup=b.as_markup())
     await callback.answer()
+
+
+@router.callback_query(F.data == "stats:hours")
+async def show_hours_chart(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+    settings = get_settings(callback.from_user.id)
+    known_orders: dict = settings.get("known_orders", {})
+    known_order_details: dict = settings.get("known_order_details", {})
+
+    hour_counts: dict[int, int] = defaultdict(int)
+
+    for order_id, status in known_orders.items():
+        if status not in COMPLETED_STATUSES:
+            continue
+        details = known_order_details.get(str(order_id)) or known_order_details.get(order_id)
+        if not details:
+            continue
+        seen_at = details.get("seen_at")
+        if not seen_at:
+            continue
+        try:
+            order_dt = datetime.fromtimestamp(int(seen_at), tz=timezone.utc)
+        except (ValueError, OSError):
+            continue
+        hour_counts[order_dt.hour] += 1
+
+    total_count = sum(hour_counts.values())
+
+    if not total_count:
+        text = "📊 <b>Статистика по часам</b>\n\nНет данных о выполненных заказах."
+        await callback.message.edit_text(text, reply_markup=_back_to_stats_keyboard())
+        return
+
+    bar_length = 8
+    max_count = max(hour_counts.values(), default=1) or 1
+    lines = []
+    for block in range(12):
+        h_start = block * 2
+        h_end = h_start + 1
+        count = hour_counts.get(h_start, 0) + hour_counts.get(h_end, 0)
+        filled = round((count / max_count) * bar_length)
+        bar = "█" * filled + "░" * (bar_length - filled)
+        label = f"{h_start:02d}-{h_end:02d}"
+        lines.append(f"{label} {bar} {count}")
+
+    peak_hour = max(hour_counts, key=hour_counts.get)
+    chart_text = "\n".join(lines)
+    text = (
+        f"📊 <b>Статистика по часам</b>\n\n"
+        f"<code>{chart_text}</code>\n\n"
+        f"📦 Всего выполнено: <b>{total_count}</b>\n"
+        f"🔝 Пиковый час: <b>{peak_hour:02d}:00–{peak_hour:02d}:59</b> ({hour_counts[peak_hour]} заказов)"
+    )
+
+    await callback.message.edit_text(text, reply_markup=_back_to_stats_keyboard())
+
+
+@router.callback_query(F.data == "stats:buyers")
+async def show_repeat_buyers(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+    settings = get_settings(callback.from_user.id)
+    known_orders: dict = settings.get("known_orders", {})
+    known_order_details: dict = settings.get("known_order_details", {})
+
+    buyer_counts: Counter = Counter()
+    buyer_revenue: dict[str, int] = defaultdict(int)
+
+    for order_id, status in known_orders.items():
+        if status not in COMPLETED_STATUSES:
+            continue
+        details = known_order_details.get(str(order_id)) or known_order_details.get(order_id)
+        if not details:
+            continue
+        buyer = details.get("buyer")
+        if not buyer:
+            continue
+        buyer = str(buyer)
+        buyer_counts[buyer] += 1
+        try:
+            price = int(float(str(details.get("price", 0))))
+        except (ValueError, TypeError):
+            price = 0
+        buyer_revenue[buyer] += price
+
+    if not buyer_counts:
+        text = "👥 <b>Повторные покупатели</b>\n\nНет данных о выполненных заказах."
+        await callback.message.edit_text(text, reply_markup=_back_to_stats_keyboard())
+        return
+
+    top = buyer_counts.most_common(10)
+    lines = [f"👥 <b>Топ покупателей</b> (по кол-ву заказов)\n"]
+    for rank, (buyer, count) in enumerate(top, start=1):
+        revenue = buyer_revenue[buyer]
+        plural = "заказов" if count % 10 in (0, 5, 6, 7, 8, 9) or 11 <= count % 100 <= 19 else ("заказ" if count % 10 == 1 else "заказа")
+        lines.append(f"{rank}. {buyer} — <b>{count} {plural}</b>, {revenue} ₽")
+
+    text = "\n".join(lines)
+    await callback.message.edit_text(text, reply_markup=_back_to_stats_keyboard())
+
+
+@router.callback_query(F.data == "stats:export_csv")
+async def export_orders_csv(callback: CallbackQuery) -> None:
+    await callback.answer("⏳ Генерирую CSV...", show_alert=False)
+
+    s = get_settings(callback.from_user.id)
+    known_orders: dict = s.get("known_orders", {})
+    order_details: dict = s.get("known_order_details", {})
+
+    output = io.StringIO()
+    output.write("﻿")
+    writer = csv.writer(output)
+    writer.writerow(["ID", "Товар", "Покупатель", "Сумма", "Статус", "Дата"])
+
+    for oid, status_raw in known_orders.items():
+        det = order_details.get(str(oid), order_details.get(oid, {}))
+        title = det.get("title", "—")
+        buyer = det.get("buyer", "—")
+        price = det.get("price", "—")
+        status = _STATUS_MAP.get(status_raw, status_raw)
+        seen_at = det.get("seen_at")
+        if seen_at:
+            try:
+                date_str = datetime.fromtimestamp(int(seen_at), tz=timezone.utc).strftime("%d.%m.%Y %H:%M")
+            except (ValueError, OSError):
+                date_str = "—"
+        else:
+            date_str = "—"
+        writer.writerow([oid, title, buyer, price, status, date_str])
+
+    content = output.getvalue().encode("utf-8-sig")
+    file = BufferedInputFile(content, filename="orders_export.csv")
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Статистика", callback_data="menu:stats")
+    await callback.message.answer_document(
+        file,
+        caption=f"📊 <b>Экспорт CSV</b>\nВсего: <b>{len(known_orders)}</b>",
+        reply_markup=b.as_markup(),
+    )

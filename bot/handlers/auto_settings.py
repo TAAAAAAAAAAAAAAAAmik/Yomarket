@@ -19,6 +19,7 @@ class AutoState(StatesGroup):
     waiting_rule_keyword = State()
     waiting_rule_message = State()
     waiting_confirm_hours = State()
+    waiting_bump_times = State()
 
 
 def _st(on: bool) -> str:
@@ -54,6 +55,15 @@ def _auto_text(s: dict) -> str:
     if ac_on:
         lines.append(f"   Через <b>{ac_h} ч</b> после взятия в работу")
 
+    bs = s.get("bump_schedule", {})
+    bs_on = bs.get("enabled", False)
+    bs_times = bs.get("times", [])
+    lines.append(f"\n⏰ <b>Планировщик поднятия</b> — {_st(bs_on)}")
+    if bs_on and bs_times:
+        lines.append(f"   Время: <b>{', '.join(bs_times)}</b>")
+    elif bs_on:
+        lines.append("   Время не задано")
+
     return "\n".join(lines)
 
 
@@ -87,6 +97,17 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     )
     if ac_on:
         builder.button(text="⏱ Время подтверждения", callback_data="auto:set:confirm_hours")
+
+    bs = s.get("bump_schedule", {})
+    bs_on = bs.get("enabled", False)
+    bs_times = bs.get("times", [])
+    times_str = ", ".join(bs_times) if bs_times else "не задано"
+    builder.button(
+        text=f"{'🔴 Выкл' if bs_on else '🟢 Вкл'} планировщик поднятия",
+        callback_data="auto:toggle:bump_schedule",
+    )
+    if bs_on:
+        builder.button(text=f"⏰ Время: {times_str}", callback_data="auto:set:bump_times")
 
     builder.button(text="⬅️ Настройки", callback_data="settings:menu")
     builder.adjust(1)
@@ -343,6 +364,56 @@ async def save_confirm_hours(message: Message, state: FSMContext) -> None:
     s.setdefault("auto_confirm", {})["hours"] = hours
     save_settings(message.from_user.id, s)
     await message.answer(f"✅ Подтверждение через <b>{hours} ч</b>")
+    await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
+
+
+# ---------------------------------------------------------------------------
+# Bump schedule
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "auto:toggle:bump_schedule")
+async def toggle_bump_schedule(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    bs = s.setdefault("bump_schedule", {"enabled": False, "times": [], "last_runs": {}})
+    bs["enabled"] = not bs.get("enabled", False)
+    save_settings(callback.from_user.id, s)
+    await _refresh(callback)
+
+
+@router.callback_query(F.data == "auto:set:bump_times")
+async def set_bump_times(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AutoState.waiting_bump_times)
+    s = get_settings(callback.from_user.id)
+    cur = ", ".join(s.get("bump_schedule", {}).get("times", []))
+    await callback.message.edit_text(
+        f"⏰ <b>Время автоподнятия</b>\n\nТекущее: <b>{cur or 'не задано'}</b>\n\n"
+        "Введите время через запятую (формат ЧЧ:ММ):\n"
+        "Пример: <code>09:00, 15:00, 21:00</code>",
+        reply_markup=_cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AutoState.waiting_bump_times)
+async def save_bump_times(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    import re
+    times = [t.strip() for t in raw.replace(";", ",").split(",")]
+    valid = []
+    for t in times:
+        if re.match(r"^\d{1,2}:\d{2}$", t):
+            h, m = map(int, t.split(":"))
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                valid.append(f"{h:02d}:{m:02d}")
+    if not valid:
+        await message.answer("❌ Введите время в формате ЧЧ:ММ, например: <code>09:00, 21:00</code>")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    s.setdefault("bump_schedule", {})["times"] = valid
+    s["bump_schedule"]["last_runs"] = {}
+    save_settings(message.from_user.id, s)
+    await message.answer(f"✅ Время поднятия: <b>{', '.join(valid)}</b>")
     await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
 
 

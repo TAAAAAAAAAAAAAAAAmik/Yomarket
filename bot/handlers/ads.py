@@ -22,6 +22,7 @@ STATUS_EMOJI = {
 class AdEditState(StatesGroup):
     waiting_new_price = State()
     waiting_bulk_percent = State()
+    waiting_bulk_description = State()
 
 
 def _status(raw: str) -> str:
@@ -56,6 +57,7 @@ def _ads_keyboard(ads: list[dict], next_cursor: str | None):
         b.button(text="Ещё товары ▶️", callback_data=PaginationCallback(entity="ads", cursor=next_cursor).pack())
     b.button(text="➕ Добавить товар", callback_data="create_ad:start")
     b.button(text="💰 Изменить все цены", callback_data="ads:bulk_price")
+    b.button(text="📝 Изменить описание всех", callback_data="ads:bulk_desc")
     b.button(text="🔄 Обновить", callback_data="ads_load")
     b.button(text="⬅️ Меню", callback_data="menu:main")
     b.adjust(1)
@@ -269,6 +271,49 @@ async def bulk_price_start(callback: CallbackQuery, state: FSMContext) -> None:
         reply_markup=b.as_markup(),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "ads:bulk_desc")
+async def bulk_desc_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdEditState.waiting_bulk_description)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="ads_load")
+    await callback.message.edit_text(
+        "📝 <b>Изменить описание всех товаров</b>\n\n"
+        "Введите новый текст описания (будет применён ко всем активным товарам):",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.message(AdEditState.waiting_bulk_description)
+async def bulk_desc_save(message: Message, state: FSMContext, api: YooMarketAPI) -> None:
+    desc = (message.text or "").strip()
+    if not desc:
+        await message.answer("❌ Введите текст описания")
+        return
+    await state.clear()
+    await message.answer("⏳ Обновляю описания...")
+    try:
+        data = await api.get_ads()
+        ads = data.get("data") or data.get("items") or []
+        count = 0
+        for ad in ads:
+            ad_id = ad.get("id")
+            if not ad_id:
+                continue
+            try:
+                await api.update_ad(ad_id, description=desc)
+                count += 1
+            except Exception:
+                pass
+        b = InlineKeyboardBuilder()
+        b.button(text="📦 Мои товары", callback_data="ads_load")
+        b.adjust(1)
+        await message.answer(f"✅ Описание обновлено у <b>{count}</b> товаров", reply_markup=b.as_markup())
+    except Exception as e:
+        from keyboards.main import back_keyboard
+        await message.answer(f"❌ Ошибка: {e}", reply_markup=back_keyboard())
 
 
 @router.message(AdEditState.waiting_bulk_percent)

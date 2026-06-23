@@ -272,6 +272,8 @@ class YooMarketAPI:
             return count, f"✅ Обновлено {count} товаров ({sign}{percent:.0f}%)"
         return 0, f"⚠️ Не удалось обновить цены ({last_err})"
 
+    async def get_reviews(self) -> dict:
+        """Fetch reviews/feedback. Tries common endpoint names."""
         for path in ("/reviews", "/feedback", "/ratings"):
             try:
                 return await self._get(path)

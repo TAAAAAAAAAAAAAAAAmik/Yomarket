@@ -24,6 +24,7 @@ def _tools_kb():
     b = InlineKeyboardBuilder()
     b.button(text="📝 Заметки о покупателях", callback_data="tools:crm")
     b.button(text="💬 Быстрые ответы", callback_data="tools:quick_replies")
+    b.button(text="💾 Бэкап настроек", callback_data="tools:backup")
     b.button(text="⬅️ Настройки", callback_data="settings:menu")
     b.adjust(1)
     return b.as_markup()
@@ -222,3 +223,26 @@ async def qr_clear(callback: CallbackQuery) -> None:
     save_settings(callback.from_user.id, s)
     await callback.answer("✅ Шаблоны очищены", show_alert=True)
     await callback.message.edit_text(_qr_text(s), reply_markup=_qr_kb(s))
+
+
+# ---------------------------------------------------------------------------
+# Backup
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "tools:backup")
+async def backup_settings(callback: CallbackQuery) -> None:
+    import json
+    from datetime import datetime
+    s = get_settings(callback.from_user.id)
+    backup = {k: v for k, v in s.items() if k not in ("known_orders", "known_order_ids", "known_order_details", "known_messages", "reminded_orders")}
+    content = json.dumps(backup, ensure_ascii=False, indent=2).encode("utf-8")
+    from aiogram.types import BufferedInputFile
+    file = BufferedInputFile(content, filename=f"yoomarket_backup_{datetime.now().strftime('%d%m%Y')}.json")
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Инструменты", callback_data="tools:menu")
+    await callback.answer()
+    await callback.message.answer_document(
+        file,
+        caption="💾 <b>Бэкап настроек</b>\n\nВосстановление: перешли файл боту (будет добавлено позже).",
+        reply_markup=b.as_markup(),
+    )
