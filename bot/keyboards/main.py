@@ -83,6 +83,7 @@ def ads_list_keyboard(
             text="Ещё товары ▶️",
             callback_data=PaginationCallback(entity="ads", cursor=next_cursor).pack(),
         )
+    builder.button(text="➕ Добавить товар", callback_data="create_ad:start")
     builder.button(text="🔄 Обновить", callback_data="ads_load")
     builder.button(text="⬅️ Меню", callback_data="menu:main")
     builder.adjust(1)

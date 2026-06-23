@@ -210,7 +210,32 @@ class YooMarketAPI:
     async def send_message(self, chat_id: int | str, text: str) -> dict:
         return await self._post(f"/chats/{chat_id}/sendMessage", json={"text": text})
 
-    async def get_reviews(self) -> dict:
+    async def create_ad(self, title: str, price: int, description: str,
+                        quantity: int = 1, category: str = "") -> dict:
+        """Create a new product listing."""
+        payload: dict = {"title": title, "price": price, "description": description, "quantity": quantity}
+        if category:
+            payload["category"] = category
+        for path in ("/ads", "/products", "/listings"):
+            try:
+                return await self._post(path, json=payload)
+            except RuntimeError as e:
+                if "404" in str(e) or "not found" in str(e).lower():
+                    continue
+                raise
+        raise RuntimeError("Создание товаров не поддерживается текущей версией API")
+
+    async def get_categories(self) -> list[dict]:
+        """Fetch available categories."""
+        for path in ("/categories", "/ads/categories", "/catalog/categories"):
+            try:
+                data = await self._get(path)
+                return data.get("data") or data.get("items") or []
+            except RuntimeError as e:
+                if "404" in str(e) or "not found" in str(e).lower():
+                    continue
+                raise
+        return []
         for path in ("/reviews", "/feedback", "/ratings"):
             try:
                 return await self._get(path)

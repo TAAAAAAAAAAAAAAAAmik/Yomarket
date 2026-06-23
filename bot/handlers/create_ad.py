@@ -1,0 +1,256 @@
+"""Handler for creating new product listings via the API."""
+from __future__ import annotations
+
+import logging
+
+from aiogram import F, Router
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from api.yoomarket import YooMarketAPI
+from keyboards.main import back_keyboard
+
+router = Router()
+logger = logging.getLogger(__name__)
+
+
+class CreateAdState(StatesGroup):
+    title = State()
+    price = State()
+    description = State()
+    quantity = State()
+    category = State()
+    confirm = State()
+
+
+def _cancel_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    return b.as_markup()
+
+
+def _preview(data: dict) -> str:
+    title = data.get("title", "—")
+    price = data.get("price", "—")
+    description = data.get("description", "—")
+    quantity = data.get("quantity", 1)
+    category = data.get("category", "")
+    lines = [
+        "📦 <b>Новый товар — предпросмотр</b>\n",
+        f"📝 Название: <b>{title}</b>",
+        f"💰 Цена: <b>{price} ₽</b>",
+        f"🔢 Количество: <b>{quantity}</b>",
+    ]
+    if category:
+        lines.append(f"🏷 Категория: <b>{category}</b>")
+    lines.append(f"\n📄 Описание:\n{description}")
+    return "\n".join(lines)
+
+
+def _confirm_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Создать товар", callback_data="create_ad:submit")
+    b.button(text="✏️ Изменить название", callback_data="create_ad:edit:title")
+    b.button(text="✏️ Изменить цену", callback_data="create_ad:edit:price")
+    b.button(text="✏️ Изменить описание", callback_data="create_ad:edit:description")
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    b.adjust(1)
+    return b.as_markup()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "create_ad:start")
+async def create_ad_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(CreateAdState.title)
+    await callback.message.edit_text(
+        "➕ <b>Добавить товар</b>\n\n"
+        "<b>Шаг 1/4</b> — Введи название товара:",
+        reply_markup=_cancel_kb(),
+    )
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Title
+# ---------------------------------------------------------------------------
+
+@router.message(CreateAdState.title)
+async def ad_title(message: Message, state: FSMContext) -> None:
+    title = (message.text or "").strip()
+    if not title:
+        await message.answer("❌ Название не может быть пустым:")
+        return
+    if len(title) > 100:
+        await message.answer("❌ Название слишком длинное (макс. 100 символов):")
+        return
+    await state.update_data(title=title)
+    await state.set_state(CreateAdState.price)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    await message.answer(
+        f"✅ Название: <b>{title}</b>\n\n<b>Шаг 2/4</b> — Введи цену (₽):",
+        reply_markup=b.as_markup(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Price
+# ---------------------------------------------------------------------------
+
+@router.message(CreateAdState.price)
+async def ad_price(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        price = int(float(raw))
+        if price <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введи цену числом, например: <b>500</b>")
+        return
+    await state.update_data(price=price)
+    await state.set_state(CreateAdState.description)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    await message.answer(
+        f"✅ Цена: <b>{price} ₽</b>\n\n<b>Шаг 3/4</b> — Введи описание товара:",
+        reply_markup=b.as_markup(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Description
+# ---------------------------------------------------------------------------
+
+@router.message(CreateAdState.description)
+async def ad_description(message: Message, state: FSMContext) -> None:
+    desc = (message.text or "").strip()
+    if not desc:
+        await message.answer("❌ Описание не может быть пустым:")
+        return
+    await state.update_data(description=desc)
+    await state.set_state(CreateAdState.quantity)
+    b = InlineKeyboardBuilder()
+    b.button(text="1️⃣ Пропустить (кол-во = 1)", callback_data="create_ad:qty:1")
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    b.adjust(1)
+    await message.answer(
+        "<b>Шаг 4/4</b> — Введи количество товаров или пропусти:",
+        reply_markup=b.as_markup(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Quantity
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "create_ad:qty:1")
+async def ad_qty_skip(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(quantity=1)
+    await _show_preview(callback.message, state, edit=True)
+    await callback.answer()
+
+
+@router.message(CreateAdState.quantity)
+async def ad_quantity(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    try:
+        qty = int(raw)
+        if qty <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введи целое число, например: <b>10</b>")
+        return
+    await state.update_data(quantity=qty)
+    await _show_preview(message, state, edit=False)
+
+
+async def _show_preview(msg, state: FSMContext, edit: bool) -> None:
+    data = await state.get_data()
+    await state.set_state(CreateAdState.confirm)
+    text = _preview(data)
+    kb = _confirm_kb()
+    if edit:
+        await msg.edit_text(text, reply_markup=kb)
+    else:
+        await msg.answer(text, reply_markup=kb)
+
+
+# ---------------------------------------------------------------------------
+# Edit fields from preview
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("create_ad:edit:"))
+async def edit_field(callback: CallbackQuery, state: FSMContext) -> None:
+    field = callback.data.split(":")[-1]
+    prompts = {
+        "title": "Введи новое название:",
+        "price": "Введи новую цену (₽):",
+        "description": "Введи новое описание:",
+    }
+    states = {
+        "title": CreateAdState.title,
+        "price": CreateAdState.price,
+        "description": CreateAdState.description,
+    }
+    if field not in prompts:
+        await callback.answer()
+        return
+    await state.set_state(states[field])
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    await callback.message.edit_text(prompts[field], reply_markup=b.as_markup())
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Submit
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "create_ad:submit")
+async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAPI) -> None:
+    if not api:
+        await callback.answer("⚠️ API токен не настроен", show_alert=True)
+        return
+
+    data = await state.get_data()
+    await state.clear()
+    await callback.message.edit_text("⏳ Создаю товар...")
+
+    try:
+        result = await api.create_ad(
+            title=data["title"],
+            price=data["price"],
+            description=data["description"],
+            quantity=data.get("quantity", 1),
+            category=data.get("category", ""),
+        )
+        ad_id = result.get("id") or result.get("data", {}).get("id") or "—"
+        b = InlineKeyboardBuilder()
+        b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
+        b.button(text="📦 Мои товары", callback_data="menu:ads")
+        b.adjust(1)
+        await callback.message.edit_text(
+            f"✅ <b>Товар создан!</b>\n\n"
+            f"📝 {data['title']}\n"
+            f"💰 {data['price']} ₽\n"
+            f"🆔 ID: {ad_id}",
+            reply_markup=b.as_markup(),
+        )
+    except Exception as e:
+        logger.error("create_ad error: %s", e)
+        b = InlineKeyboardBuilder()
+        b.button(text="🔄 Попробовать снова", callback_data="create_ad:start")
+        b.button(text="⬅️ Назад", callback_data="menu:ads")
+        b.adjust(1)
+        await callback.message.edit_text(
+            f"❌ <b>Ошибка создания товара</b>\n\n{e}",
+            reply_markup=b.as_markup(),
+        )
+
+    await callback.answer()

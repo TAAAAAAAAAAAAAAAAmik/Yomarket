@@ -16,7 +16,7 @@ from aiogram.types import TelegramObject
 from config import BOT_TOKEN
 from api.yoomarket import YooMarketAPI
 from storage import get_token
-from handlers import ads, auto_settings, balance, chats, orders, plugins, responders, selenium_settings, start, stats, tools
+from handlers import ads, auto_settings, balance, chats, create_ad, orders, plugins, responders, selenium_settings, start, stats, tools
 from tasks import TaskManager
 
 logging.basicConfig(
@@ -74,6 +74,7 @@ async def main() -> None:
     dp.include_router(start.router)
     dp.include_router(balance.router)
     dp.include_router(ads.router)
+    dp.include_router(create_ad.router)
     dp.include_router(orders.router)
     dp.include_router(chats.router)
     dp.include_router(auto_settings.router)
