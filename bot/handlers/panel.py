@@ -9,14 +9,14 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from automation.panel import YooMarketPanel, PanelSession, try_token_login
+from automation.panel import YooMarketPanelHTTP, PanelSession, try_token_login
 from storage import get_panel_creds, save_panel_creds, delete_panel_creds, get_token
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-# Хранит активные Playwright-сессии для входа: {user_id: {"panel", "page", "context"}}
-_login_sessions: dict[int, dict] = {}
+# Хранит активные HTTP-сессии для входа: {user_id: YooMarketPanelHTTP}
+_login_sessions: dict[int, YooMarketPanelHTTP] = {}
 
 
 class PanelState(StatesGroup):
@@ -190,55 +190,33 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
     old = _login_sessions.pop(uid, None)
     if old:
         try:
-            await old["panel"].close()
+            await old.close()
         except Exception:
             pass
 
-    status_msg = await message.answer("⏳ Открываю страницу входа...")
+    status_msg = await message.answer("⏳ Отправляю запрос на почту...")
 
-    panel = YooMarketPanel()
-    try:
-        await asyncio.wait_for(panel.start(), timeout=15)
-        page, context = await asyncio.wait_for(panel.open_login_page(), timeout=30)
-    except asyncio.TimeoutError:
-        try:
-            await panel.close()
-        except Exception:
-            pass
-        await status_msg.edit_text(
-            "⏳ Браузер не успел запуститься.\n\n"
-            "На сервере нужно выполнить: <code>playwright install chromium</code>\n\n"
-            "Пока используйте вход через cookies 👇"
-        )
-        b = InlineKeyboardBuilder()
-        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
-        b.button(text="↩️ Назад", callback_data="panel:menu")
-        b.adjust(1)
-        await message.answer("Выберите действие:", reply_markup=b.as_markup())
-        await state.clear()
-        return
-    except Exception as e:
-        await status_msg.edit_text(
-            f"❌ Ошибка браузера: {e}\n\nИспользуйте вход через cookies 👇"
-        )
-        b = InlineKeyboardBuilder()
-        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
-        b.button(text="↩️ Назад", callback_data="panel:menu")
-        b.adjust(1)
-        await message.answer("Выберите действие:", reply_markup=b.as_markup())
-        await state.clear()
-        return
+    http = YooMarketPanelHTTP()
+    await http.start()
 
-    await status_msg.edit_text("⏳ Отправляю код на почту...")
     try:
-        ok, err = await asyncio.wait_for(panel.submit_email(page, email), timeout=20)
+        ok, err = await asyncio.wait_for(http.send_code(email), timeout=20)
     except asyncio.TimeoutError:
-        ok, err = False, "Страница не ответила вовремя"
+        ok, err = False, "Сервер не ответил"
 
     if not ok:
-        await panel.close()
+        await http.close()
         await state.clear()
-        await status_msg.edit_text(f"❌ {err}\n\nИспользуйте вход через cookies 👇")
+        # Если err пустой — эндпоинт не найден, нужна диагностика
+        if not err:
+            await status_msg.edit_text(
+                "⚠️ Не нашли API-эндпоинт панели.\n\n"
+                "Для диагностики нужны логи — проверь вывод бота в Railway.\n"
+                "Там будет видно что отвечает сервер на каждый запрос.\n\n"
+                "Пока используй вход через cookies 👇"
+            )
+        else:
+            await status_msg.edit_text(err)
         b = InlineKeyboardBuilder()
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
@@ -246,7 +224,7 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите действие:", reply_markup=b.as_markup())
         return
 
-    _login_sessions[uid] = {"panel": panel, "page": page, "context": context}
+    _login_sessions[uid] = http
     await state.update_data(email=email)
     await state.set_state(PanelState.waiting_sms_code)
     await status_msg.edit_text(
@@ -268,8 +246,8 @@ async def panel_email_code(message: Message, state: FSMContext) -> None:
         return
 
     uid = message.from_user.id
-    sess = _login_sessions.get(uid)
-    if not sess:
+    http = _login_sessions.get(uid)
+    if not http:
         await state.clear()
         await message.answer(
             "❌ Сессия входа истекла. Начните заново.",
@@ -278,9 +256,12 @@ async def panel_email_code(message: Message, state: FSMContext) -> None:
         return
 
     status_msg = await message.answer("⏳ Проверяю код...")
-    ok, result = await sess["panel"].submit_code(sess["page"], sess["context"], code)
+    try:
+        ok, result = await asyncio.wait_for(http.verify_code(code), timeout=15)
+    except asyncio.TimeoutError:
+        ok, result = False, "Сервер не ответил вовремя"
 
-    await sess["panel"].close()
+    await http.close()
     _login_sessions.pop(uid, None)
 
     if not ok:
