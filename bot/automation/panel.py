@@ -513,50 +513,33 @@ class PanelSession:
         except Exception as e:
             logger.debug("GET /api/products: %s", e)
 
-        endpoints = [
-            # Standard Laravel resource store routes
-            "/api/products",           # might accept POST with right headers
-            "/api/product",            # singular
-            "/api/product/store",
-            # seller-scoped
-            "/api/seller/products",
-            "/api/seller/product",
-            "/api/seller/goods",
-            "/api/my/products",
-            "/api/my/goods",
-            "/api/shop/products",
-            "/api/shop/goods",
-            # other naming conventions
-            "/api/offers",
-            "/api/offer",
-            "/api/items",
-            "/api/item",
-            "/api/lots",
-            "/api/lot",
-            "/api/announcements",
-        ]
+        # Step A: discover product-related API paths from the SPA JS bundle.
+        discovered, disc_debug = await self._discover_product_paths()
 
-        # GET /api/products to learn structure
-        get_info = ""
-        try:
-            async with self._session.get(PANEL_URL + "/api/products", timeout=timeout) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    get_info = f"\nGET /api/products → {text[:300]}"
-                    logger.info("GET /api/products: %s", text[:500])
-        except Exception:
-            pass
+        # Step B: build the candidate list — discovered paths first, then fallbacks.
+        fallback = [
+            "/api/products/store",
+            "/api/product/store",
+            "/api/seller/products",
+            "/api/cabinet/products",
+            "/api/account/products",
+            "/api/products/save",
+            "/api/products/add",
+            "/api/products/publish",
+            "/api/products/draft",
+        ]
+        candidates = list(dict.fromkeys(discovered + fallback))
 
         diag_lines: list[str] = []
-        if get_info:
-            diag_lines.append(f"<code>GET /api/products</code>:{get_info[:200]}")
+        if disc_debug:
+            diag_lines.append(disc_debug)
 
-        for path in endpoints:
+        for path in candidates:
             url = PANEL_URL + path
             try:
                 async with self._session.post(url, json=payload, headers=extra, timeout=timeout) as resp:
                     text = await resp.text()
-                    short = text[:120].replace("\n", " ")
+                    short = text[:100].replace("\n", " ")
                     diag_lines.append(f"<code>{path}</code> → {resp.status}: {short}")
                     if resp.status in (200, 201):
                         try:
@@ -567,23 +550,62 @@ class PanelSession:
                             data.get("id")
                             or (data.get("data") or {}).get("id")
                             or (data.get("product") or {}).get("id")
-                            or (data.get("good") or {}).get("id")
                             or ""
                         )
                         return True, str(pid) if pid else "создан"
                     elif resp.status == 401:
                         return False, "❌ Сессия панели истекла — обнови cookies"
                     elif resp.status == 422:
+                        # Route exists, validation failed — show what fields it wants
                         try:
                             data = _json.loads(text)
                             errs = data.get("errors") or data.get("message") or text[:300]
-                            return False, f"422 на <code>{path}</code>:\n<code>{errs}</code>"
+                            return False, f"✅ Найден эндпоинт <code>{path}</code>, но нужны поля:\n<code>{errs}</code>"
                         except Exception:
-                            return False, f"422: {text[:300]}"
+                            return False, f"422 на <code>{path}</code>: {text[:300]}"
             except aiohttp.ClientError as e:
-                diag_lines.append(f"<code>{path}</code> → err: {str(e)[:60]}")
+                diag_lines.append(f"<code>{path}</code> → err: {str(e)[:50]}")
 
         return False, "🔍 Эндпоинты:\n" + "\n".join(diag_lines[:15])
+
+    async def _discover_product_paths(self) -> tuple[list[str], str]:
+        """Download the SPA JS bundles and extract product-creation API paths."""
+        timeout = aiohttp.ClientTimeout(total=15)
+        discovered: list[str] = []
+        debug: list[str] = []
+        try:
+            async with self._session.get(PANEL_URL + "/goods", timeout=timeout) as resp:
+                html = await resp.text()
+            srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html)
+            js_files = [s for s in srcs if ".js" in s]
+            debug.append(f"JS-файлов: {len(js_files)}")
+
+            # Patterns that capture API paths in axios/fetch calls
+            path_re = re.compile(r'["\'`](/?api/[a-z0-9/_{}.\-]{3,70})["\'`]', re.I)
+            kws = ("product", "goods", "offer", "item", "lot", "create", "store", "save", "publish")
+
+            for src in js_files[:6]:
+                url = src if src.startswith("http") else PANEL_URL + src
+                try:
+                    async with self._session.get(url, timeout=timeout) as r:
+                        js = await r.text()
+                except Exception:
+                    continue
+                for m in path_re.findall(js):
+                    low = m.lower()
+                    if any(k in low for k in kws):
+                        p = m if m.startswith("/") else "/" + m
+                        # skip pure GET list/detail templates with {id}
+                        if p not in discovered:
+                            discovered.append(p)
+
+            # Prioritise paths that look like creation (no trailing {id})
+            discovered.sort(key=lambda p: ("{" in p, "product" not in p.lower()))
+            debug.append(f"Найдено: {discovered[:8]}")
+        except Exception as e:
+            debug.append(f"Ошибка discovery: {str(e)[:80]}")
+
+        return discovered[:12], " | ".join(debug)
 
     async def check_session(self) -> bool:
         """Verify cookies are still valid."""
