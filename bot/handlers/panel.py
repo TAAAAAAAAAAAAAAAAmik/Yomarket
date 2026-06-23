@@ -198,12 +198,28 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
 
     panel = YooMarketPanel()
     try:
-        await panel.start()
-        page, context = await panel.open_login_page()
+        await asyncio.wait_for(panel.start(), timeout=15)
+        page, context = await asyncio.wait_for(panel.open_login_page(), timeout=30)
+    except asyncio.TimeoutError:
+        try:
+            await panel.close()
+        except Exception:
+            pass
+        await status_msg.edit_text(
+            "⏳ Браузер не успел запуститься.\n\n"
+            "На сервере нужно выполнить: <code>playwright install chromium</code>\n\n"
+            "Пока используйте вход через cookies 👇"
+        )
+        b = InlineKeyboardBuilder()
+        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
+        b.button(text="↩️ Назад", callback_data="panel:menu")
+        b.adjust(1)
+        await message.answer("Выберите действие:", reply_markup=b.as_markup())
+        await state.clear()
+        return
     except Exception as e:
         await status_msg.edit_text(
-            f"❌ Не удалось запустить браузер: {e}\n\n"
-            "Используйте вход через cookies."
+            f"❌ Ошибка браузера: {e}\n\nИспользуйте вход через cookies 👇"
         )
         b = InlineKeyboardBuilder()
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
@@ -214,15 +230,15 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         return
 
     await status_msg.edit_text("⏳ Отправляю код на почту...")
-    ok, err = await panel.submit_email(page, email)
+    try:
+        ok, err = await asyncio.wait_for(panel.submit_email(page, email), timeout=20)
+    except asyncio.TimeoutError:
+        ok, err = False, "Страница не ответила вовремя"
 
     if not ok:
         await panel.close()
         await state.clear()
-        await status_msg.edit_text(
-            f"❌ {err}\n\n"
-            "Используйте вход через cookies вручную."
-        )
+        await status_msg.edit_text(f"❌ {err}\n\nИспользуйте вход через cookies 👇")
         b = InlineKeyboardBuilder()
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
@@ -300,13 +316,18 @@ async def panel_cookies_start(callback: CallbackQuery, state: FSMContext) -> Non
     await state.set_state(PanelState.waiting_cookies)
     await callback.message.edit_text(
         "🍪 <b>Вставить cookies вручную</b>\n\n"
-        "Как получить cookies:\n"
-        "1. Зайдите на <b>panel.yoomarket.net</b> с компьютера\n"
-        "2. Войдите в аккаунт\n"
-        "3. Нажмите F12 → вкладка <b>Console</b>\n"
-        "4. Введите <code>document.cookie</code> и нажмите Enter\n"
-        "5. Скопируйте весь результат и отправьте сюда\n\n"
-        "<i>Строка будет выглядеть примерно так: session=abc123; token=xyz789</i>",
+        "<b>С компьютера (проще):</b>\n"
+        "1. Зайдите на <b>panel.yoomarket.net</b> и войдите\n"
+        "2. Нажмите F12 → вкладка <b>Console</b>\n"
+        "3. Введите <code>document.cookie</code> → Enter\n"
+        "4. Скопируйте результат и отправьте сюда\n\n"
+        "<b>С телефона (Chrome):</b>\n"
+        "1. Войдите на <b>panel.yoomarket.net</b>\n"
+        "2. В адресной строке введите:\n"
+        "<code>javascript:copy(document.cookie)</code>\n"
+        "3. Нажмите Enter — cookies скопируются в буфер\n"
+        "4. Вставьте сюда\n\n"
+        "<i>Или просто введите строку вида: key=value; key2=value2</i>",
         reply_markup=_cancel_kb(),
     )
     await callback.answer()
