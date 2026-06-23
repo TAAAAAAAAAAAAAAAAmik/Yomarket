@@ -151,6 +151,25 @@ class YooMarketAPI:
 
     async def get_balance(self) -> tuple[float, str]:
         """Get current balance. Returns (amount_float, formatted_string)."""
+        # Primary: /check (same endpoint used by balance handler)
+        try:
+            data = await self._get("/check")
+            shop = data.get("data") or data.get("shop") or data.get("seller") or data
+            if isinstance(shop, dict):
+                raw = (
+                    shop.get("balance") or shop.get("wallet") or shop.get("money") or
+                    shop.get("balance_rub") or shop.get("amount") or
+                    data.get("balance") or data.get("wallet") or data.get("money") or 0
+                )
+                try:
+                    amount = float(str(raw).replace(" ", "").replace(",", ".") or 0)
+                    return amount, f"{amount:.0f} ₽"
+                except (ValueError, TypeError):
+                    pass
+        except RuntimeError:
+            pass
+
+        # Fallback: dedicated balance endpoints
         for path in ("/balance", "/wallet", "/finance", "/account/balance", "/account"):
             try:
                 data = await self._get(path)
