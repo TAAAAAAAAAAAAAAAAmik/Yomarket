@@ -1,4 +1,4 @@
-"""YooMarket panel automation: HTTP-based SMS login + Playwright fallback."""
+"""YooMarket panel automation: email OTP login."""
 from __future__ import annotations
 
 import asyncio
@@ -12,37 +12,38 @@ logger = logging.getLogger(__name__)
 
 PANEL_URL = "https://panel.yoomarket.net"
 
-# Phone/email input selectors to try in order
-_PHONE_SELECTORS = [
-    'input[type="tel"]',
-    'input[name="phone"]',
-    'input[name="login"]',
-    'input[name="email"]',
+# Email input selectors (страница входа: "Введите электронную почту")
+_EMAIL_SELECTORS = [
     'input[type="email"]',
-    'input[placeholder*="телефон"]',
-    'input[placeholder*="phone"]',
+    'input[name="email"]',
+    'input[placeholder*="почту"]',
+    'input[placeholder*="электронную"]',
     'input[placeholder*="mail"]',
 ]
 
-# SMS code input selectors
+# Code input selectors (после отправки: "Код из письма")
 _CODE_SELECTORS = [
-    'input[name="code"]',
-    'input[name="sms"]',
-    'input[name="otp"]',
-    'input[type="number"][maxlength]',
+    'input[placeholder*="Код из"]',
     'input[placeholder*="код"]',
-    'input[placeholder*="code"]',
+    'input[name="code"]',
+    'input[name="otp"]',
+    'input[type="number"]',
     'input[inputmode="numeric"]',
 ]
 
-# Submit button selectors
-_SUBMIT_SELECTORS = [
+# "Получить код" button
+_SEND_CODE_SELECTORS = [
+    'button:has-text("Получить код")',
+    'button[type="submit"]',
+    'button:has-text("Отправить")',
+    'button:has-text("Получить")',
+]
+
+# "Подтвердить" button
+_CONFIRM_SELECTORS = [
+    'button:has-text("Подтвердить")',
     'button[type="submit"]',
     'button:has-text("Войти")',
-    'button:has-text("Получить")',
-    'button:has-text("Далее")',
-    'button:has-text("Отправить")',
-    'button:has-text("Подтвердить")',
     'button:has-text("Продолжить")',
 ]
 
@@ -178,17 +179,17 @@ async def try_token_login(api_token: str) -> tuple[bool, str]:
 
 class YooMarketPanelHTTP:
     """
-    SMS login via plain HTTP — no browser, works on mobile.
+    Email OTP login for panel.yoomarket.net.
 
-    Flow:
-      1. send_sms(phone)  → bot receives SMS code
-      2. verify_code(code) → returns (True, cookie_string) or (False, error)
+    Flow (exactly as seen on the login page):
+      1. send_code(email)   → "Код для авторизации отправлен на почту"
+      2. verify_code(code)  → returns (True, cookie_string) or (False, error)
     """
 
     def __init__(self) -> None:
         self._session: aiohttp.ClientSession | None = None
+        self._email: str = ""
         self._csrf: str = ""
-        self._phone: str = ""
 
     async def start(self) -> None:
         connector = aiohttp.TCPConnector(ssl=False)
@@ -201,8 +202,9 @@ class YooMarketPanelHTTP:
                     "Chrome/120.0.0.0 Mobile Safari/537.36"
                 ),
                 "Accept": "application/json, text/html, */*",
-                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-                "X-Requested-With": "XMLHttpRequest",
+                "Accept-Language": "ru-RU,ru;q=0.9",
+                "Origin": PANEL_URL,
+                "Referer": PANEL_URL + "/login",
             },
         )
 
@@ -214,162 +216,184 @@ class YooMarketPanelHTTP:
                 pass
             self._session = None
 
-    async def send_sms(self, phone_or_email: str) -> tuple[bool, str]:
-        """POST phone/email to trigger SMS. Returns (True, '') or (False, error)."""
+    async def send_code(self, email: str) -> tuple[bool, str]:
+        """
+        POST email to trigger OTP code sent to inbox.
+        Returns (True, '') on success, (False, error) on failure.
+        """
         if not self._session:
             return False, "Сессия не запущена"
 
-        self._phone = phone_or_email
+        self._email = email.strip()
 
-        # Step 1: Load login page → grab CSRF token + detect site type
+        # Grab CSRF token from login page (Laravel Sanctum / Vue SPA pattern)
+        try:
+            timeout = aiohttp.ClientTimeout(total=12)
+            # Laravel SPA: fetch CSRF cookie first
+            async with self._session.get(
+                PANEL_URL + "/sanctum/csrf-cookie", timeout=timeout
+            ) as resp:
+                pass
+        except Exception:
+            pass
+
         try:
             timeout = aiohttp.ClientTimeout(total=12)
             async with self._session.get(PANEL_URL + "/login", timeout=timeout) as resp:
                 html = await resp.text()
                 for pattern in [
                     r'"csrfToken"\s*:\s*"([^"]+)"',
-                    r'name=["\']_token["\']\s+(?:content|value)=["\']([^"\']+)["\']',
-                    r'content=["\']([^"\']+)["\']\s+name=["\']csrf-token["\']',
+                    r'<meta[^>]+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']',
+                    r'<meta[^>]+content=["\']([^"\']+)["\']\s+name=["\']csrf-token["\']',
                     r'"_token"\s*:\s*"([^"]+)"',
+                    r'name=["\']_token["\']\s+value=["\']([^"\']+)["\']',
                 ]:
                     m = re.search(pattern, html)
                     if m:
                         self._csrf = m.group(1)
                         break
         except Exception as e:
-            return False, f"Не удалось загрузить страницу входа: {e}"
+            logger.warning("Could not load login page: %s", e)
 
-        # Step 2: Try multiple endpoint patterns
-        attempts: list[tuple[str, str, dict]] = []
+        timeout = aiohttp.ClientTimeout(total=12)
 
-        # JSON REST API (common for Vue/React SPAs)
-        for path in ("/api/auth/phone", "/api/auth/send-code", "/api/login",
-                     "/api/auth/login", "/api/v1/auth/phone", "/api/user/login"):
-            attempts.append((PANEL_URL + path, "json", {
-                "phone": phone_or_email,
-                "email": phone_or_email,
-                "login": phone_or_email,
-            }))
-
-        # Form POST (Laravel/PHP style)
-        if self._csrf:
-            attempts.append((PANEL_URL + "/login", "form", {
-                "_token": self._csrf,
-                "login": phone_or_email,
-                "phone": phone_or_email,
-                "email": phone_or_email,
-            }))
-
-        timeout = aiohttp.ClientTimeout(total=10)
-        for url, kind, payload in attempts:
+        # Primary: JSON API endpoints (SPA pattern)
+        json_paths = [
+            "/api/auth/send-code",
+            "/api/auth/email",
+            "/api/auth/login",
+            "/api/login",
+            "/api/v1/auth/send-code",
+            "/api/v1/auth/email",
+        ]
+        for path in json_paths:
             try:
-                if kind == "json":
-                    ctx = self._session.post(url, json=payload, timeout=timeout, allow_redirects=False)
-                else:
-                    ctx = self._session.post(url, data=payload, timeout=timeout, allow_redirects=False)
-
-                async with ctx as resp:
+                async with self._session.post(
+                    PANEL_URL + path,
+                    json={"email": self._email},
+                    timeout=timeout,
+                    allow_redirects=False,
+                ) as resp:
                     text = await resp.text()
-                    status = resp.status
-
-                    if status in (200, 201):
-                        # Look for success signals in response body
-                        ok_patterns = [
+                    if resp.status in (200, 201):
+                        ok_signals = [
                             r'"success"\s*:\s*true',
-                            r'"status"\s*:\s*"ok"',
                             r'"sent"\s*:\s*true',
-                            r'"code"', r'"sms"', r'otp',
-                            r'код', r'отправ', r'смс',
+                            r'"status"\s*:\s*"ok"',
+                            r'отправ',
+                            r'"code"',
+                            r'"message"',
                         ]
-                        if any(re.search(p, text, re.I) for p in ok_patterns):
-                            logger.info("SMS sent via %s", url)
+                        if any(re.search(p, text, re.I) for p in ok_signals):
+                            logger.info("Code sent via %s", path)
                             return True, ""
-
-                    elif status == 302:
-                        loc = resp.headers.get("Location", "")
-                        if any(kw in loc for kw in ("code", "sms", "verify", "otp")):
-                            logger.info("SMS sent (redirect) via %s → %s", url, loc)
-                            return True, ""
-
+                    elif resp.status == 422:
+                        # Endpoint found but validation error — endpoint is real
+                        logger.info("Endpoint found (422) at %s: %s", path, text[:200])
+                        return False, f"❌ Ошибка валидации: {text[:300]}"
             except Exception as e:
-                logger.debug("Attempt %s failed: %s", url, e)
-                continue
+                logger.debug("send_code attempt %s: %s", path, e)
+
+        # Fallback: form POST (traditional server-side)
+        form_payload: dict = {"email": self._email}
+        if self._csrf:
+            form_payload["_token"] = self._csrf
+        try:
+            async with self._session.post(
+                PANEL_URL + "/login",
+                data=form_payload,
+                timeout=timeout,
+                allow_redirects=True,
+            ) as resp:
+                text = await resp.text()
+                final_url = str(resp.url)
+                # If we're redirected away from /login → code was accepted
+                if "/login" not in final_url:
+                    return True, ""
+                # Check for success message in page
+                if re.search(r'отправ|код|code sent|check your', text, re.I):
+                    return True, ""
+        except Exception as e:
+            logger.debug("Form POST fallback: %s", e)
 
         return False, (
-            "❌ Не удалось автоматически запросить SMS.\n\n"
-            "Попробуй войти через метод <b>«Вставить cookies»</b>:\n"
-            "1. С компьютера зайди на <b>panel.yoomarket.net</b>\n"
-            "2. Войди через SMS вручную\n"
-            "3. F12 → Console → введи <code>document.cookie</code>\n"
-            "4. Скопируй и отправь боту"
+            "❌ Не удалось отправить код.\n\n"
+            "Попробуйте войти через <b>«Вставить cookies»</b>:\n"
+            "1. Зайдите на <b>panel.yoomarket.net</b> в браузере\n"
+            "2. Войдите через почту вручную\n"
+            "3. F12 → Console → введите <code>document.cookie</code>\n"
+            "4. Скопируйте результат и отправьте боту"
         )
 
     async def verify_code(self, code: str) -> tuple[bool, str]:
-        """Submit SMS code. Returns (True, cookie_string) or (False, error)."""
+        """
+        Submit the code from email. Returns (True, cookie_string) or (False, error).
+        """
         if not self._session:
             return False, "Сессия не запущена"
 
-        attempts: list[tuple[str, str, dict]] = []
-
-        # JSON REST API
-        for path in ("/api/auth/verify", "/api/auth/confirm", "/api/login/verify",
-                     "/api/v1/auth/verify", "/api/auth/check-code"):
-            attempts.append((PANEL_URL + path, "json", {
-                "phone": self._phone,
-                "email": self._phone,
-                "code": code,
-                "sms_code": code,
-                "otp": code,
-            }))
-
-        # Form POST
-        if self._csrf:
-            attempts.append((PANEL_URL + "/login", "form", {
-                "_token": self._csrf,
-                "code": code,
-                "sms_code": code,
-                "phone": self._phone,
-            }))
-
         timeout = aiohttp.ClientTimeout(total=12)
-        for url, kind, payload in attempts:
-            try:
-                if kind == "json":
-                    ctx = self._session.post(url, json=payload, timeout=timeout, allow_redirects=True)
-                else:
-                    ctx = self._session.post(url, data=payload, timeout=timeout, allow_redirects=True)
 
-                async with ctx as resp:
+        # JSON API endpoints
+        json_paths = [
+            "/api/auth/verify",
+            "/api/auth/confirm",
+            "/api/auth/check-code",
+            "/api/login/verify",
+            "/api/v1/auth/verify",
+            "/api/v1/auth/confirm",
+        ]
+        for path in json_paths:
+            try:
+                async with self._session.post(
+                    PANEL_URL + path,
+                    json={"email": self._email, "code": code},
+                    timeout=timeout,
+                    allow_redirects=True,
+                ) as resp:
                     final_url = str(resp.url)
                     text = await resp.text()
-
-                    # Success: we left the login/auth page
                     not_on_login = all(
-                        kw not in final_url
-                        for kw in ("/login", "/auth", "/signin", "/sign-in")
+                        kw not in final_url for kw in ("/login", "/auth", "/signin")
                     )
                     if resp.status in (200, 201) and not_on_login:
-                        cookie_string = _extract_cookies(self._session, PANEL_URL)
-                        if cookie_string:
-                            logger.info("Login verified via %s", url)
-                            return True, cookie_string
-
-                    # Check JSON for token
+                        cookies = _extract_cookies(self._session, PANEL_URL)
+                        if cookies:
+                            logger.info("Verified via %s", path)
+                            return True, cookies
+                    # Token in JSON response
                     if resp.status in (200, 201) and "{" in text:
                         try:
                             data = _json.loads(text)
-                            for key in ("token", "access_token", "api_token", "session"):
+                            for key in ("token", "access_token", "api_token"):
                                 if data.get(key):
-                                    cookie_string = _extract_cookies(self._session, PANEL_URL)
-                                    return True, cookie_string or f"{key}={data[key]}"
+                                    cookies = _extract_cookies(self._session, PANEL_URL)
+                                    return True, cookies or f"{key}={data[key]}"
                         except Exception:
                             pass
-
             except Exception as e:
-                logger.debug("Verify attempt %s failed: %s", url, e)
-                continue
+                logger.debug("verify_code attempt %s: %s", path, e)
 
-        return False, "Неверный код или код истёк. Попробуй запросить SMS снова."
+        # Fallback: form POST
+        form_payload: dict = {"email": self._email, "code": code}
+        if self._csrf:
+            form_payload["_token"] = self._csrf
+        try:
+            async with self._session.post(
+                PANEL_URL + "/login",
+                data=form_payload,
+                timeout=timeout,
+                allow_redirects=True,
+            ) as resp:
+                final_url = str(resp.url)
+                if "/login" not in final_url and "/auth" not in final_url:
+                    cookies = _extract_cookies(self._session, PANEL_URL)
+                    if cookies:
+                        return True, cookies
+        except Exception as e:
+            logger.debug("verify_code form fallback: %s", e)
+
+        return False, "❌ Неверный код или срок действия истёк. Запросите код снова."
 
 
 def _extract_cookies(session: aiohttp.ClientSession, url: str) -> str:

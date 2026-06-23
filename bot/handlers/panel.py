@@ -48,13 +48,13 @@ def _menu_kb(creds: dict | None, has_token: bool = False):
         b.button(text="🔄 Проверить сессию", callback_data="panel:check")
         if has_token:
             b.button(text="🔑 Обновить через токен", callback_data="panel:token_login")
-        b.button(text="📲 Обновить вход (SMS)", callback_data="panel:sms_start")
+        b.button(text="📧 Обновить вход (email)", callback_data="panel:sms_start")
         b.button(text="🍪 Обновить cookies вручную", callback_data="panel:cookies_start")
         b.button(text="🚪 Выйти из панели", callback_data="panel:logout")
     else:
         if has_token:
             b.button(text="🔑 Войти автоматически (через токен)", callback_data="panel:token_login")
-        b.button(text="📲 Войти через SMS", callback_data="panel:sms_start")
+        b.button(text="📧 Войти через email", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies вручную", callback_data="panel:cookies_start")
     b.button(text="⬅️ Настройки", callback_data="settings:menu")
     b.adjust(1)
@@ -124,7 +124,7 @@ async def panel_check(callback: CallbackQuery) -> None:
         await callback.message.answer("✅ Сессия <b>активна</b> — всё работает!")
     else:
         await callback.message.answer(
-            "⚠️ Сессия <b>истекла</b>.\n\nВойдите заново через SMS или вставьте новые cookies."
+            "⚠️ Сессия <b>истекла</b>.\n\nВойдите заново через email или вставьте новые cookies."
         )
     await _refresh_menu(callback)
 
@@ -153,7 +153,7 @@ async def panel_token_login(callback: CallbackQuery) -> None:
         await status_msg.edit_text(
             "⚠️ <b>Автоматический вход не сработал.</b>\n\n"
             "Панель использует отдельную авторизацию.\n"
-            "Попробуйте войти через SMS или вставить cookies вручную."
+            "Попробуйте войти через email или вставить cookies вручную."
         )
 
     creds = get_panel_creds(uid)
@@ -162,30 +162,29 @@ async def panel_token_login(callback: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SMS login: step 1 — ask for phone
+# Email login: step 1 — ask for email
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "panel:sms_start")
-async def panel_sms_start(callback: CallbackQuery, state: FSMContext) -> None:
+async def panel_email_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PanelState.waiting_phone)
     await callback.message.edit_text(
-        "📲 <b>Вход через SMS</b>\n\n"
-        "Введите номер телефона или email, привязанный к аккаунту YooMarket:\n\n"
-        "<i>Пример: +79001234567 или mail@example.com</i>",
+        "📧 <b>Вход через email</b>\n\n"
+        "Введите электронную почту, привязанную к аккаунту YooMarket:\n\n"
+        "<i>Пример: mail@example.com</i>",
         reply_markup=_cancel_kb(),
     )
     await callback.answer()
 
 
 @router.message(PanelState.waiting_phone)
-async def panel_sms_phone(message: Message, state: FSMContext) -> None:
-    phone = (message.text or "").strip()
-    if not phone:
-        await message.answer("❌ Введите номер телефона или email")
+async def panel_email_input(message: Message, state: FSMContext) -> None:
+    email = (message.text or "").strip()
+    if not email or "@" not in email:
+        await message.answer("❌ Введите корректный email адрес")
         return
 
     uid = message.from_user.id
-    # Закрываем старую сессию если была
     if uid in _login_sessions:
         try:
             await _login_sessions[uid].close()
@@ -196,18 +195,15 @@ async def panel_sms_phone(message: Message, state: FSMContext) -> None:
     await http.start()
     _login_sessions[uid] = http
 
-    status_msg = await message.answer("⏳ Отправляю SMS...")
+    status_msg = await message.answer("⏳ Отправляю код на почту...")
 
-    ok, err = await http.send_sms(phone)
+    ok, err = await http.send_code(email)
 
     if not ok:
         await http.close()
         _login_sessions.pop(uid, None)
         await state.clear()
-        await status_msg.edit_text(
-            f"{err}\n\n"
-            "Нажмите <b>«Вставить cookies вручную»</b> как альтернативный способ.",
-        )
+        await status_msg.edit_text(err)
         b = InlineKeyboardBuilder()
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
@@ -215,24 +211,24 @@ async def panel_sms_phone(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите действие:", reply_markup=b.as_markup())
         return
 
-    await state.update_data(phone=phone)
+    await state.update_data(email=email)
     await state.set_state(PanelState.waiting_sms_code)
     await status_msg.edit_text(
-        "✅ SMS отправлена!\n\n"
-        "Введите <b>код из SMS</b>:",
+        "✅ <b>Код отправлен на почту!</b>\n\n"
+        "Введите <b>код из письма</b>:",
         reply_markup=_cancel_kb(),
     )
 
 
 # ---------------------------------------------------------------------------
-# SMS login: step 2 — verify code
+# Email login: step 2 — verify code
 # ---------------------------------------------------------------------------
 
 @router.message(PanelState.waiting_sms_code)
-async def panel_sms_code(message: Message, state: FSMContext) -> None:
+async def panel_email_code(message: Message, state: FSMContext) -> None:
     code = (message.text or "").strip()
     if not code:
-        await message.answer("❌ Введите код из SMS")
+        await message.answer("❌ Введите код из письма")
         return
 
     uid = message.from_user.id
@@ -250,10 +246,10 @@ async def panel_sms_code(message: Message, state: FSMContext) -> None:
 
     await http.close()
     _login_sessions.pop(uid, None)
-    await state.clear()
 
     if not ok:
-        await status_msg.edit_text(f"❌ {result}")
+        await state.clear()
+        await status_msg.edit_text(result)
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
@@ -263,14 +259,16 @@ async def panel_sms_code(message: Message, state: FSMContext) -> None:
         return
 
     data = await state.get_data()
-    phone = data.get("phone", "")
-    save_panel_creds(uid, {"login": phone, "cookies": result})
+    email = data.get("email", "")
+    await state.clear()
+    save_panel_creds(uid, {"login": email, "cookies": result})
     await status_msg.edit_text(
         "✅ <b>Успешно вошли в панель!</b>\n\n"
         "Теперь доступны функции авто-поднятия и авто-восстановления товаров."
     )
     creds = get_panel_creds(uid)
-    await message.answer(_status_text(creds), reply_markup=_menu_kb(creds))
+    has_token = bool(get_token(uid))
+    await message.answer(_status_text(creds, has_token), reply_markup=_menu_kb(creds, has_token))
 
 
 # ---------------------------------------------------------------------------
