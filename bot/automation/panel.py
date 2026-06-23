@@ -595,10 +595,20 @@ class YooMarketPanel:
         """Open a fresh browser context at the login page. Returns (page, context)."""
         if not self._browser:
             await self.start()
-        context = await self._browser.new_context()
+        context = await self._browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Mobile Safari/537.36"
+            ),
+        )
         page = await context.new_page()
-        await page.goto(PANEL_URL + "/login", timeout=25000)
-        await page.wait_for_load_state("networkidle", timeout=20000)
+        try:
+            await page.goto(PANEL_URL + "/login", timeout=20000, wait_until="domcontentloaded")
+        except Exception:
+            pass
+        # Let the SPA render the form
+        await asyncio.sleep(3)
         return page, context
 
     async def submit_email(self, page, email: str) -> tuple[bool, str]:
@@ -611,19 +621,22 @@ class YooMarketPanel:
             filled = await _fill_first(page, _EMAIL_SELECTORS, email)
             if not filled:
                 html = await page.content()
-                logger.error("Email input not found. Page HTML: %s", html[:1000])
-                return False, "Поле email не найдено на странице входа"
+                logger.error("Email input not found. Page snippet: %s", html[:500])
+                # Show page content as diagnostic
+                return False, f"Поле email не найдено.\nHTML начало: <code>{html[:300]}</code>"
 
             # Click "Получить код"
             clicked = await _click_first(page, _SEND_CODE_SELECTORS)
             if not clicked:
-                return False, "Кнопка «Получить код» не найдена"
+                html = await page.content()
+                return False, f"Кнопка «Получить код» не найдена.\nHTML: <code>{html[:300]}</code>"
 
-            # Wait for code input to appear (page re-renders with new field)
+            # Wait for code input to appear (SPA re-renders)
             await asyncio.sleep(2)
             try:
                 await page.wait_for_selector(
-                    'input[placeholder*="Код"], input[placeholder*="код"], input[name="code"]',
+                    'input[placeholder*="Код"], input[placeholder*="код"], '
+                    'input[name="code"], input[name="otp"], input[inputmode="numeric"]',
                     timeout=10000,
                 )
             except Exception:
@@ -640,7 +653,9 @@ class YooMarketPanel:
             if "/login" not in page.url:
                 return True, "__already_logged_in__"
 
-            return False, "Поле для кода не появилось — проверьте email"
+            # Show current page content as diagnostic
+            html = await page.content()
+            return False, f"Поле для кода не появилось.\nHTML: <code>{html[:400]}</code>"
         except Exception as e:
             logger.error("submit_email error: %s", e)
             return False, str(e)
@@ -653,32 +668,35 @@ class YooMarketPanel:
         try:
             filled = await _fill_first(page, _CODE_SELECTORS, code)
             if not filled:
-                return False, "Поле для кода не найдено"
+                html = await page.content()
+                return False, f"Поле для кода не найдено.\nHTML: <code>{html[:300]}</code>"
 
             await _click_first(page, _CONFIRM_SELECTORS)
-            await asyncio.sleep(3)
+            # Wait for navigation/re-render
+            await asyncio.sleep(4)
             try:
-                await page.wait_for_load_state("networkidle", timeout=10000)
+                await page.wait_for_load_state("domcontentloaded", timeout=8000)
             except Exception:
                 pass
 
-            # Check if login succeeded
+            # Check if login succeeded (still on login page?)
             if "/login" in page.url or "/auth" in page.url or "/signin" in page.url:
-                # Check for error message on page
-                error_el = await page.query_selector('.error, .alert-danger, [class*="error"]')
+                error_el = await page.query_selector(
+                    '.error, .alert-danger, [class*="error"], [class*="Error"]'
+                )
                 if error_el:
                     error_text = await error_el.inner_text()
-                    return False, f"Ошибка: {error_text.strip()[:100]}"
-                return False, "Неверный код или истёк срок действия"
+                    return False, f"Ошибка: {error_text.strip()[:150]}"
+                html = await page.content()
+                return False, f"Неверный код или истёк срок действия.\nHTML: <code>{html[:300]}</code>"
 
-            # Extract cookies
+            # Extract cookies from context
             cookies = await context.cookies()
             cookie_string = "; ".join(
                 f"{c['name']}={c['value']}" for c in cookies
                 if c.get("domain", "").endswith("yoomarket.net")
             )
             if not cookie_string:
-                # Fallback: get all cookies
                 cookie_string = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
             logger.info("Login successful, extracted %d cookies", len(cookies))

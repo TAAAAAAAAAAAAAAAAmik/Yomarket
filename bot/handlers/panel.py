@@ -9,14 +9,14 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from automation.panel import YooMarketPanelHTTP, PanelSession, try_token_login
+from automation.panel import YooMarketPanel, PanelSession, try_token_login
 from storage import get_panel_creds, save_panel_creds, delete_panel_creds, get_token
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-# Хранит активные HTTP-сессии для входа: {user_id: YooMarketPanelHTTP}
-_login_sessions: dict[int, YooMarketPanelHTTP] = {}
+# {user_id: (YooMarketPanel, page, context)}
+_login_sessions: dict[int, tuple] = {}
 
 
 class PanelState(StatesGroup):
@@ -76,6 +76,17 @@ async def _refresh_menu(callback: CallbackQuery) -> None:
         reply_markup=_menu_kb(creds, has_token),
     )
     await callback.answer()
+
+
+async def _close_session(uid: int) -> None:
+    """Close and remove any active Playwright session for the user."""
+    entry = _login_sessions.pop(uid, None)
+    if entry:
+        panel, _, _ = entry
+        try:
+            await panel.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -185,30 +196,30 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         return
 
     uid = message.from_user.id
+    await _close_session(uid)
 
-    # Закрываем старую сессию
-    old = _login_sessions.pop(uid, None)
-    if old:
-        try:
-            await old.close()
-        except Exception:
-            pass
+    status_msg = await message.answer("⏳ Открываю браузер и страницу входа...")
 
-    status_msg = await message.answer("⏳ Отправляю запрос на почту...")
-
-    http = YooMarketPanelHTTP()
-    await http.start()
+    panel = YooMarketPanel()
+    page = None
+    context = None
 
     try:
-        ok, err = await asyncio.wait_for(http.send_code(email), timeout=20)
-    except asyncio.TimeoutError:
-        ok, err = False, "Сервер не ответил"
+        await asyncio.wait_for(panel.start(), timeout=20)
 
-    if not ok:
-        await http.close()
+        await status_msg.edit_text("⏳ Загружаю страницу входа panel.yoomarket.net...")
+        page, context = await asyncio.wait_for(panel.open_login_page(), timeout=30)
+
+        await status_msg.edit_text("⏳ Ввожу email и нажимаю «Получить код»...")
+        ok, err = await asyncio.wait_for(panel.submit_email(page, email), timeout=20)
+
+    except asyncio.TimeoutError:
+        await panel.close()
         await state.clear()
-        # Если err пустой — эндпоинт не найден, нужна диагностика
-        await status_msg.edit_text(err or "⚠️ Неизвестная ошибка")
+        await status_msg.edit_text(
+            "⏰ <b>Превышено время ожидания.</b>\n\n"
+            "Браузер не успел загрузить страницу. Попробуйте вставить cookies вручную."
+        )
         b = InlineKeyboardBuilder()
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
@@ -216,7 +227,30 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите действие:", reply_markup=b.as_markup())
         return
 
-    _login_sessions[uid] = http
+    except Exception as e:
+        await panel.close()
+        await state.clear()
+        await status_msg.edit_text(f"❌ Ошибка при открытии браузера:\n<code>{str(e)[:300]}</code>")
+        b = InlineKeyboardBuilder()
+        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
+        b.button(text="↩️ Назад", callback_data="panel:menu")
+        b.adjust(1)
+        await message.answer("Выберите действие:", reply_markup=b.as_markup())
+        return
+
+    if not ok:
+        await panel.close()
+        await state.clear()
+        await status_msg.edit_text(f"❌ {err or 'Не удалось отправить код'}")
+        b = InlineKeyboardBuilder()
+        b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
+        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
+        b.button(text="↩️ Назад", callback_data="panel:menu")
+        b.adjust(1)
+        await message.answer("Выберите действие:", reply_markup=b.as_markup())
+        return
+
+    _login_sessions[uid] = (panel, page, context)
     await state.update_data(email=email)
     await state.set_state(PanelState.waiting_sms_code)
     await status_msg.edit_text(
@@ -238,8 +272,8 @@ async def panel_email_code(message: Message, state: FSMContext) -> None:
         return
 
     uid = message.from_user.id
-    http = _login_sessions.get(uid)
-    if not http:
+    entry = _login_sessions.get(uid)
+    if not entry:
         await state.clear()
         await message.answer(
             "❌ Сессия входа истекла. Начните заново.",
@@ -247,14 +281,19 @@ async def panel_email_code(message: Message, state: FSMContext) -> None:
         )
         return
 
+    panel, page, context = entry
     status_msg = await message.answer("⏳ Проверяю код...")
-    try:
-        ok, result = await asyncio.wait_for(http.verify_code(code), timeout=15)
-    except asyncio.TimeoutError:
-        ok, result = False, "Сервер не ответил вовремя"
 
-    await http.close()
-    _login_sessions.pop(uid, None)
+    try:
+        ok, result = await asyncio.wait_for(panel.submit_code(page, context, code), timeout=20)
+    except asyncio.TimeoutError:
+        ok, result = False, "Превышено время ожидания. Попробуйте ещё раз."
+    finally:
+        try:
+            await panel.close()
+        except Exception:
+            pass
+        _login_sessions.pop(uid, None)
 
     if not ok:
         await state.clear()
@@ -316,7 +355,6 @@ async def panel_cookies_save(message: Message, state: FSMContext) -> None:
     await state.clear()
     uid = message.from_user.id
 
-    # Быстрая проверка что куки рабочие
     status_msg = await message.answer("⏳ Проверяю cookies...")
     ps = PanelSession(cookies)
     await ps.start()
@@ -329,7 +367,6 @@ async def panel_cookies_save(message: Message, state: FSMContext) -> None:
         save_panel_creds(uid, {"login": "", "cookies": cookies})
         await status_msg.edit_text("✅ <b>Cookies сохранены и проверены!</b>")
     else:
-        # Сохраняем в любом случае — может check_session даёт ложный результат
         save_panel_creds(uid, {"login": "", "cookies": cookies})
         await status_msg.edit_text(
             "⚠️ Cookies сохранены, но проверка дала неоднозначный результат.\n"
