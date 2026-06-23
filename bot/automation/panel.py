@@ -457,10 +457,21 @@ class PanelSession:
 
     def _xsrf(self) -> str:
         import urllib.parse
-        jar = self._session.cookie_jar.filter_cookies(PANEL_URL)
-        for name, cookie in jar.items():
-            if name.upper() in ("XSRF-TOKEN", "CSRF-TOKEN"):
-                return urllib.parse.unquote(cookie.value)
+        # From cookie jar (set by server responses, e.g. /sanctum/csrf-cookie)
+        try:
+            jar = self._session.cookie_jar.filter_cookies(PANEL_URL)
+            for name, cookie in jar.items():
+                if name.upper() in ("XSRF-TOKEN", "CSRF-TOKEN"):
+                    return urllib.parse.unquote(cookie.value)
+        except Exception:
+            pass
+        # Fallback: parse from original Playwright cookie string
+        for part in self.cookie_string.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, _, v = part.partition("=")
+                if k.strip().upper() in ("XSRF-TOKEN", "CSRF-TOKEN"):
+                    return urllib.parse.unquote(v.strip())
         return ""
 
     async def create_product(
@@ -480,7 +491,7 @@ class PanelSession:
 
         timeout = aiohttp.ClientTimeout(total=15)
 
-        # CSRF handshake (Nova uses Laravel XSRF-TOKEN cookie + header)
+        # CSRF handshake — GET /sanctum/csrf-cookie sets XSRF-TOKEN in cookie jar
         for csrf_path in ("/sanctum/csrf-cookie", "/csrf-cookie"):
             try:
                 async with self._session.get(PANEL_URL + csrf_path, timeout=timeout) as r:
@@ -488,6 +499,15 @@ class PanelSession:
                         break
             except Exception:
                 pass
+
+        # Warm up session: GET main page so Laravel session cookie is renewed
+        try:
+            async with self._session.get(
+                PANEL_URL + "/goods", timeout=timeout, allow_redirects=True,
+            ) as r:
+                pass
+        except Exception:
+            pass
 
         values = {
             "title": title,
@@ -500,85 +520,115 @@ class PanelSession:
 
     async def _nova_create_product(self, values: dict) -> tuple[bool, str]:
         """Discover the Nova product resource and create it via /nova-api."""
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=20)
         xsrf = self._xsrf()
-        headers = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
+        hdrs = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
         if xsrf:
-            headers["X-XSRF-TOKEN"] = xsrf
+            hdrs["X-XSRF-TOKEN"] = xsrf
 
         debug: list[str] = []
+        debug.append(f"XSRF: {'✓' if xsrf else '✗ (нет токена)'}")
 
-        # 1. Enumerate Nova resources via the navigation endpoint
+        # 1. Enumerate Nova resources via navigation endpoint
         resources: list[str] = []
         for nav_path in ("/nova-api/navigation", "/nova-api/resources"):
             try:
-                async with self._session.get(PANEL_URL + nav_path, headers=headers, timeout=timeout) as resp:
+                async with self._session.get(
+                    PANEL_URL + nav_path, headers=hdrs, timeout=timeout, allow_redirects=False,
+                ) as resp:
+                    txt = await resp.text()
+                    short = txt[:150].replace("\n", " ")
+                    if resp.status in (301, 302):
+                        loc = resp.headers.get("Location", "?")
+                        debug.append(f"{nav_path}: {resp.status} → {loc}")
+                    else:
+                        debug.append(f"{nav_path}: {resp.status} → {short}")
                     if resp.status == 200:
-                        text = await resp.text()
-                        found = re.findall(r'"uriKey"\s*:\s*"([^"]+)"', text)
+                        found = re.findall(r'"uriKey"\s*:\s*"([^"]+)"', txt)
                         resources.extend(r for r in found if r not in resources)
-            except Exception:
-                pass
+                    elif resp.status in (401, 403):
+                        return False, (
+                            "⚠️ <b>Сессия в панели истекла.</b>\n\n"
+                            "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
+                        )
+            except Exception as e:
+                debug.append(f"{nav_path}: ошибка {str(e)[:50]}")
 
-        # 2. Also scan the HTML for /nova-api/ and /resources/ refs
+        debug.append(f"Ресурсы из navigation: {resources or '(не найдено)'}")
+
+        # 2. Scan main page HTML for uriKey hints
         try:
-            async with self._session.get(PANEL_URL + "/", headers=headers, timeout=timeout) as resp:
+            async with self._session.get(PANEL_URL + "/", headers=hdrs, timeout=timeout) as resp:
                 html = await resp.text()
-            # Nova stores config as window.Nova or embedded JSON
-            nova_cfg = re.findall(r'"uriKey"\s*:\s*"([^"]+)"', html)
-            for r in nova_cfg:
+            for r in re.findall(r'"uriKey"\s*:\s*"([^"]+)"', html):
                 if r not in resources:
                     resources.append(r)
-            # Also look for /nova/resources/{name} links
             for r in re.findall(r'/resources/([a-z0-9_\-]+)', html, re.I):
                 if r not in resources:
                     resources.append(r)
         except Exception as e:
-            debug.append(f"HTML: {str(e)[:40]}")
+            debug.append(f"html scan: {str(e)[:40]}")
 
-        debug.append(f"Nova-ресурсы: {resources[:15]}")
-
-        # 3. Always include likely candidates, including the known-good API resource
-        kws = ("product", "goods", "tovar", "offer", "item", "lot", "advert")
-        for d in ("products", "goods", "offers", "items", "lots", "adverts", "advertisements"):
+        # 3. Hardcoded fallbacks — goods first (SPA route is /goods → uriKey='goods')
+        for d in ("goods", "products", "offers", "items", "lots", "adverts",
+                  "listings", "seller-goods", "seller-products", "advertisements"):
             if d not in resources:
                 resources.append(d)
-        resources.sort(key=lambda r: (not any(k in r for k in kws), r))
 
-        # 4. For each candidate: confirm via creation-fields, then POST
+        debug.append(f"Всего ресурсов для проверки: {len(resources)}")
+
+        # 4. For each candidate: check creation-fields, then POST with JSON
         for res in resources[:15]:
             cf_url = f"{PANEL_URL}/nova-api/{res}/creation-fields"
             try:
-                async with self._session.get(cf_url, headers=headers, timeout=timeout) as resp:
+                async with self._session.get(
+                    cf_url, headers=hdrs, timeout=timeout, allow_redirects=False,
+                ) as resp:
                     cf_status = resp.status
                     cf_text = await resp.text()
             except Exception as e:
-                debug.append(f"{res}/creation-fields → err")
+                debug.append(f"{res}: connection error")
                 continue
 
+            if cf_status == 401:
+                return False, (
+                    "⚠️ <b>Сессия в панели истекла.</b>\n\n"
+                    "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
+                )
+            if cf_status == 403:
+                debug.append(f"{res}: 403 нет доступа")
+                continue
+            if cf_status == 404:
+                debug.append(f"{res}: 404")
+                continue
             if cf_status != 200:
-                debug.append(f"{res}/creation-fields → {cf_status}")
+                debug.append(f"{res}: {cf_status} → {cf_text[:80]}")
                 continue
 
             try:
                 cf = _json.loads(cf_text)
             except Exception:
+                debug.append(f"{res}: невалидный JSON")
                 continue
 
             fields = cf.get("fields") or []
             if not fields:
-                debug.append(f"{res} → fields empty")
+                debug.append(f"{res}: пустые поля")
                 continue
 
             attrs = [f.get("attribute") for f in fields if f.get("attribute")]
-            debug.append(f"<b>{res}</b> поля: {attrs}")
+            required = [
+                f.get("attribute") for f in fields
+                if f.get("attribute") and "required" in str(f.get("rules", []))
+            ]
+            debug.append(f"✅ {res}: поля={attrs}")
 
             payload = self._map_nova_fields(fields, values)
 
             store_url = f"{PANEL_URL}/nova-api/{res}?editing=true&editMode=create"
             try:
                 async with self._session.post(
-                    store_url, data=payload, headers=headers, timeout=timeout,
+                    store_url, json=payload, headers=hdrs, timeout=timeout,
                 ) as resp:
                     text = await resp.text()
                     if resp.status in (200, 201):
@@ -592,20 +642,34 @@ class PanelSession:
                         return True, str(rid) if rid else "создан"
                     elif resp.status == 422:
                         try:
-                            errs = _json.loads(text).get("errors") or text[:400]
+                            err_body = _json.loads(text)
+                            err_fields = err_body.get("errors") or err_body.get("message") or text[:300]
                         except Exception:
-                            errs = text[:400]
+                            err_fields = text[:300]
+                        err_str = (
+                            _json.dumps(err_fields, ensure_ascii=False)[:500]
+                            if isinstance(err_fields, dict)
+                            else str(err_fields)[:500]
+                        )
                         return False, (
-                            f"✅ Ресурс <b>{res}</b> найден\n"
-                            f"Нужны поля: {attrs}\n\n"
-                            f"Ошибка: <code>{errs}</code>"
+                            f"✅ Ресурс <b>{res}</b> найден!\n"
+                            f"Поля Nova: <code>{attrs}</code>\n"
+                            f"Обязательные: <code>{required}</code>\n\n"
+                            f"Ошибка 422:\n<code>{err_str}</code>\n\n"
+                            f"Отправлено: <code>{_json.dumps(payload, ensure_ascii=False)[:200]}</code>"
+                        )
+                    elif resp.status == 401:
+                        return False, (
+                            "⚠️ <b>Сессия в панели истекла.</b>\n\n"
+                            "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова."
                         )
                     else:
-                        debug.append(f"POST {res} → {resp.status}: {text[:60]}")
+                        debug.append(f"POST {res}: {resp.status} → {text[:80]}")
             except Exception as e:
-                debug.append(f"POST {res} err: {str(e)[:50]}")
+                debug.append(f"POST {res}: {str(e)[:50]}")
 
-        return False, "🔍 Nova:\n" + "\n".join(debug[:20])
+        diag = "\n".join(debug[:20])
+        return False, f"🔍 <b>Диагностика Nova</b>:\n{diag}"
 
     @staticmethod
     def _map_nova_fields(fields: list[dict], values: dict) -> dict:
@@ -722,14 +786,39 @@ class PanelSession:
         return discovered[:15], " | ".join(debug)
 
     async def check_session(self) -> bool:
-        """Verify cookies are still valid."""
+        """Verify cookies are still valid via authenticated API calls."""
         if not self._session:
             return False
+        timeout = aiohttp.ClientTimeout(total=10)
+        xsrf = self._xsrf()
+        hdrs = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
+        if xsrf:
+            hdrs["X-XSRF-TOKEN"] = xsrf
         try:
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with self._session.get(PANEL_URL + "/", timeout=timeout) as resp:
+            # Nova navigation endpoint — 200 = authenticated
+            async with self._session.get(
+                PANEL_URL + "/nova-api/navigation",
+                headers=hdrs, timeout=timeout, allow_redirects=False,
+            ) as resp:
+                if resp.status == 200:
+                    return True
+                if resp.status in (401, 403):
+                    return False
+            # /api/user — standard Sanctum auth check
+            async with self._session.get(
+                PANEL_URL + "/api/user",
+                headers=hdrs, timeout=timeout, allow_redirects=False,
+            ) as resp:
+                if resp.status == 200:
+                    return True
+                if resp.status in (401, 403):
+                    return False
+            # Fallback: redirect check (SPA may give false positive)
+            async with self._session.get(
+                PANEL_URL + "/", timeout=timeout, allow_redirects=True,
+            ) as resp:
                 final_url = str(resp.url)
-                return "/login" not in final_url and "/auth" not in final_url
+                return not any(k in final_url for k in ("/login", "/auth", "/signin"))
         except Exception:
             return False
 

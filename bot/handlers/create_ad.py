@@ -224,94 +224,123 @@ async def edit_field(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "create_ad:submit")
 async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAPI) -> None:
-    if not api:
-        await callback.answer("⚠️ API токен не настроен", show_alert=True)
-        return
-
     data = await state.get_data()
     await state.clear()
-    await callback.message.edit_text("⏳ Создаю товар...")
-
     uid = callback.from_user.id
-    title = data["title"]
-    price = data["price"]
-    description = data["description"]
+
+    title = data.get("title", "")
+    price = data.get("price", 0)
+    description = data.get("description", "")
     quantity = data.get("quantity", 1)
     category = data.get("category", "")
 
-    # Step 1: try Integration API
-    api_error = None
-    try:
-        result = await api.create_ad(
-            title=title, price=price, description=description,
-            quantity=quantity, category=category,
-        )
-        ad_id = result.get("id") or result.get("data", {}).get("id") or "—"
-        b = InlineKeyboardBuilder()
-        b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
-        b.button(text="📦 Мои товары", callback_data="menu:ads")
-        b.adjust(1)
-        await callback.message.edit_text(
-            f"✅ <b>Товар создан!</b>\n\n"
-            f"📝 {title}\n💰 {price} ₽\n🆔 ID: {ad_id}",
-            reply_markup=b.as_markup(),
-        )
-        await callback.answer()
+    if not title or not price:
+        await callback.answer("❌ Не хватает данных", show_alert=True)
         return
-    except Exception as e:
-        api_error = e
 
-    # Step 2: fallback — create via panel cookies (PanelSession)
-    from storage import get_panel_creds
-    from automation.panel import PanelSession
+    await callback.message.edit_text("⏳ Создаю товар...")
 
-    creds = get_panel_creds(uid)
-    if creds and creds.get("cookies"):
-        await callback.message.edit_text("⏳ API не поддерживает создание. Пробую через панель...")
-        ps = PanelSession(creds["cookies"])
-        await ps.start()
+    # ── Шаг 1: Integration API ──────────────────────────────────────────────
+    if api:
         try:
-            ok, result_msg = await ps.create_product(
+            result = await api.create_ad(
                 title=title, price=price, description=description,
                 quantity=quantity, category=category,
             )
-        finally:
-            await ps.close()
-
-        if ok:
+            ad_id = result.get("id") or (result.get("data") or {}).get("id") or "—"
             b = InlineKeyboardBuilder()
             b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
             b.button(text="📦 Мои товары", callback_data="menu:ads")
             b.adjust(1)
             await callback.message.edit_text(
-                f"✅ <b>Товар создан через панель!</b>\n\n"
-                f"📝 {title}\n💰 {price} ₽",
+                f"✅ <b>Товар создан!</b>\n\n"
+                f"📝 {title}\n💰 {price} ₽\n🆔 ID: {ad_id}",
                 reply_markup=b.as_markup(),
             )
             await callback.answer()
             return
+        except Exception:
+            pass  # Fall through to panel
 
-        # Show HTTP diagnostic so we can find the right endpoint
+    # ── Шаг 2: Panel (Nova API) ─────────────────────────────────────────────
+    from storage import get_panel_creds
+    from automation.panel import PanelSession
+
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
         b = InlineKeyboardBuilder()
-        b.button(text="🌐 Открыть панель", url="https://panel.yoomarket.net")
+        b.button(text="🌐 Войти в панель", callback_data="panel:sms_start")
         b.button(text="⬅️ Назад", callback_data="menu:ads")
         b.adjust(1)
         await callback.message.edit_text(
-            f"❌ <b>Не удалось создать товар</b>\n\n{result_msg}",
+            "❌ <b>Не удалось создать товар</b>\n\n"
+            "Integration API не поддерживает создание товаров.\n\n"
+            "💡 Войдите в <b>Панель продавца</b> через email — бот будет создавать товары через неё.\n\n"
+            "<b>Настройки → Панель продавца → Войти через email</b>",
             reply_markup=b.as_markup(),
         )
         await callback.answer()
         return
 
-    # No panel creds
+    await callback.message.edit_text(
+        "⏳ API не поддерживает создание.\nПробую через панель YooMarket..."
+    )
+
+    ps = PanelSession(creds["cookies"])
+    await ps.start()
+    try:
+        ok, result_msg = await asyncio.wait_for(
+            ps.create_product(
+                title=title, price=price, description=description,
+                quantity=quantity, category=category,
+            ),
+            timeout=45,
+        )
+    except asyncio.TimeoutError:
+        ok, result_msg = False, "⏱ Превышено время ожидания (45с). Попробуйте позже."
+    except Exception as e:
+        ok, result_msg = False, f"Неожиданная ошибка: {str(e)[:150]}"
+    finally:
+        try:
+            await ps.close()
+        except Exception:
+            pass
+
+    if ok:
+        b = InlineKeyboardBuilder()
+        b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
+        b.button(text="📦 Мои товары", callback_data="menu:ads")
+        b.adjust(1)
+        await callback.message.edit_text(
+            f"✅ <b>Товар создан через панель!</b>\n\n"
+            f"📝 {title}\n💰 {price} ₽",
+            reply_markup=b.as_markup(),
+        )
+        await callback.answer()
+        return
+
+    # ── Ошибка — строим правильный набор кнопок ─────────────────────────────
+    is_expired = any(w in result_msg for w in ("истекла", "Сессия", "войдите снова", "Войдите"))
+    is_found = "✅ Ресурс" in result_msg  # creation-fields нашли, но POST не прошёл
+
     b = InlineKeyboardBuilder()
-    b.button(text="🌐 Войти в панель", callback_data="panel:menu")
+    if is_expired:
+        b.button(text="🔑 Войти в панель снова", callback_data="panel:sms_start")
+    else:
+        b.button(
+            text="🌐 Создать вручную в панели",
+            url="https://panel.yoomarket.net/goods/create",
+        )
+        b.button(text="🔄 Обновить вход в панель", callback_data="panel:sms_start")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
     b.adjust(1)
+
+    header = "❌ <b>Не удалось создать товар</b>"
+    if is_found:
+        header = "⚠️ <b>Ресурс найден, но есть ошибка валидации</b>"
+
     await callback.message.edit_text(
-        f"❌ <b>Ошибка создания товара</b>\n\n"
-        f"Integration API не поддерживает создание.\n\n"
-        f"💡 Войдите в <b>Панель продавца</b> — бот попробует создать через неё.",
+        f"{header}\n\n{result_msg}",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
