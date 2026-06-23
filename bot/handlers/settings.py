@@ -13,6 +13,7 @@ async def settings_menu(callback: CallbackQuery) -> None:
     b.button(text="🔔 Уведомления", callback_data="notif:menu")
     b.button(text="⚙️ Авто-функции", callback_data="auto:menu")
     b.button(text="🛠 Инструменты", callback_data="tools:menu")
+    b.button(text="🌐 Панель продавца", callback_data="panel:menu")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     b.adjust(1)
     await callback.message.edit_text(
