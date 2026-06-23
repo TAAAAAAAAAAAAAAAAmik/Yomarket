@@ -291,44 +291,13 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
             await callback.answer()
             return
 
-        # Step 3: Playwright browser fallback
-        from automation.panel import YooMarketPanel
-        await callback.message.edit_text("⏳ Пробую через браузер панели...")
-        panel = YooMarketPanel(cookie_string=creds["cookies"])
-        try:
-            await asyncio.wait_for(panel.start(), timeout=15)
-            ok2, res2 = await asyncio.wait_for(
-                panel.create_product_browser(title=title, price=price, description=description, quantity=quantity),
-                timeout=40,
-            )
-        except asyncio.TimeoutError:
-            ok2, res2 = False, "Превышено время ожидания"
-        except Exception as ex:
-            ok2, res2 = False, str(ex)
-        finally:
-            try:
-                await panel.close()
-            except Exception:
-                pass
-
-        if ok2:
-            b = InlineKeyboardBuilder()
-            b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
-            b.button(text="📦 Мои товары", callback_data="menu:ads")
-            b.adjust(1)
-            await callback.message.edit_text(
-                f"✅ <b>Товар создан через браузер!</b>\n\n📝 {title}\n💰 {price} ₽",
-                reply_markup=b.as_markup(),
-            )
-            await callback.answer()
-            return
-
+        # Show HTTP diagnostic so we can find the right endpoint
         b = InlineKeyboardBuilder()
         b.button(text="🌐 Открыть панель", url="https://panel.yoomarket.net")
         b.button(text="⬅️ Назад", callback_data="menu:ads")
         b.adjust(1)
         await callback.message.edit_text(
-            f"❌ <b>Не удалось создать товар</b>\n\n{res2}",
+            f"❌ <b>Не удалось создать товар</b>\n\n{result_msg}",
             reply_markup=b.as_markup(),
         )
         await callback.answer()
