@@ -267,8 +267,10 @@ class YooMarketPanelHTTP:
         xsrf = self._xsrf_token()
         extra_headers = {"X-XSRF-TOKEN": xsrf} if xsrf else {}
 
-        # Step 3: Try JSON API endpoints with XSRF header
-        json_paths = [
+        # Step 3: Discover real API paths from the JS bundle
+        discovered = await self._discover_api_paths()
+
+        fallback_paths = [
             "/api/auth/send-code",
             "/api/auth/email",
             "/api/send-code",
@@ -278,8 +280,10 @@ class YooMarketPanelHTTP:
             "/api/v1/auth/email",
             "/api/user/send-code",
         ]
+        all_paths = list(dict.fromkeys(discovered + fallback_paths))
+
         diag_lines = []
-        for path in json_paths:
+        for path in all_paths:
             try:
                 async with self._session.post(
                     PANEL_URL + path,
@@ -289,17 +293,60 @@ class YooMarketPanelHTTP:
                     allow_redirects=False,
                 ) as resp:
                     text = await resp.text()
-                    diag_lines.append(f"<code>{path}</code> → <b>{resp.status}</b>: {text[:80]}")
-                    logger.info("POST %s → %s: %s", path, resp.status, text[:200])
+                    short = text[:100].replace("\n", " ")
+                    diag_lines.append(f"<code>{path}</code> → <b>{resp.status}</b>: {short}")
+                    logger.info("POST %s → %s: %s", path, resp.status, text[:300])
                     if resp.status in (200, 201):
                         return True, ""
                     if resp.status == 422:
-                        return False, f"422 на {path}:\n<code>{text[:300]}</code>"
+                        return False, f"422 на <code>{path}</code>:\n<code>{text[:400]}</code>"
             except Exception as e:
-                diag_lines.append(f"<code>{path}</code> → ошибка: {str(e)[:60]}")
+                diag_lines.append(f"<code>{path}</code> → {str(e)[:60]}")
 
         diag = "\n".join(diag_lines)
-        return False, f"🔍 <b>Диагностика эндпоинтов:</b>\n\n{diag}"
+        return False, f"🔍 <b>Ответы сервера:</b>\n\n{diag}"
+
+    async def _discover_api_paths(self) -> list[str]:
+        """Fetch the JS bundle and extract API paths from it."""
+        discovered = []
+        timeout = aiohttp.ClientTimeout(total=15)
+        try:
+            async with self._session.get(PANEL_URL + "/login", timeout=timeout) as resp:
+                html = await resp.text()
+
+            # Find all <script src="..."> tags
+            script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html)
+            # Sort by likely size (longer names = more likely main bundle)
+            js_files = [s for s in script_srcs if s.endswith(".js")]
+            js_files.sort(key=len, reverse=True)
+
+            for src in js_files[:3]:
+                url = src if src.startswith("http") else PANEL_URL + src
+                try:
+                    async with self._session.get(url, timeout=timeout) as resp:
+                        js = await resp.text()
+                    # Search for API path patterns
+                    patterns = [
+                        r'["\'](/api/[a-z0-9/_-]{3,50})["\']',
+                        r'axios\.[a-z]+\(["\']([^"\']+)["\']',
+                        r'fetch\(["\']([^"\']+)["\']',
+                        r'url:\s*["\']([^"\']+)["\']',
+                    ]
+                    for pat in patterns:
+                        for match in re.findall(pat, js):
+                            if any(kw in match for kw in
+                                   ("auth", "login", "code", "send", "verify", "confirm")):
+                                if match not in discovered:
+                                    discovered.append(match)
+                    if discovered:
+                        logger.info("Discovered API paths from JS: %s", discovered)
+                        break
+                except Exception as e:
+                    logger.debug("JS fetch %s: %s", src, e)
+        except Exception as e:
+            logger.debug("_discover_api_paths: %s", e)
+
+        return discovered
 
     async def verify_code(self, code: str) -> tuple[bool, str]:
         """
