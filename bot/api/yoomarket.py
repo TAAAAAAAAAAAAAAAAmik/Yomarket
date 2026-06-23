@@ -220,10 +220,14 @@ class YooMarketAPI:
             try:
                 return await self._post(path, json=payload)
             except RuntimeError as e:
-                if "404" in str(e) or "not found" in str(e).lower():
+                err = str(e)
+                if "404" in err or "not found" in err.lower() or "405" in err or "method" in err.lower():
                     continue
                 raise
-        raise RuntimeError("Создание товаров не поддерживается текущей версией API")
+        raise RuntimeError(
+            "YooMarket Integration API не поддерживает создание товаров.\n"
+            "Создай товар вручную в панели <b>panel.yoomarket.net</b>"
+        )
 
     async def get_categories(self) -> list[dict]:
         """Fetch available categories."""

@@ -245,7 +245,7 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
     except Exception as e:
         logger.error("create_ad error: %s", e)
         b = InlineKeyboardBuilder()
-        b.button(text="🔄 Попробовать снова", callback_data="create_ad:start")
+        b.button(text="🌐 Открыть панель", url="https://panel.yoomarket.net")
         b.button(text="⬅️ Назад", callback_data="menu:ads")
         b.adjust(1)
         await callback.message.edit_text(
