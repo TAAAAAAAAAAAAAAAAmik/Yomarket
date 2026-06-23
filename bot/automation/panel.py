@@ -268,7 +268,7 @@ class YooMarketPanelHTTP:
         extra_headers = {"X-XSRF-TOKEN": xsrf} if xsrf else {}
 
         # Step 3: Discover real API paths from the JS bundle
-        discovered = await self._discover_api_paths()
+        discovered, disc_debug = await self._discover_api_paths()
 
         fallback_paths = [
             # web.php routes (no /api/ prefix) — most likely for Laravel SPA
@@ -316,28 +316,28 @@ class YooMarketPanelHTTP:
                 diag_lines.append(f"<code>{path}</code> → {str(e)[:60]}")
 
         diag = "\n".join(diag_lines)
-        return False, f"🔍 <b>Ответы сервера:</b>\n\n{diag}"
+        return False, f"🔍 <b>Диагностика JS:</b>\n{disc_debug}\n\n<b>Ответы сервера:</b>\n\n{diag}"
 
-    async def _discover_api_paths(self) -> list[str]:
-        """Fetch the JS bundle and extract API paths from it."""
+    async def _discover_api_paths(self) -> tuple[list[str], str]:
+        """Fetch the JS bundle and extract API paths. Returns (paths, debug_info)."""
         discovered = []
+        debug = []
         timeout = aiohttp.ClientTimeout(total=15)
         try:
             async with self._session.get(PANEL_URL + "/login", timeout=timeout) as resp:
                 html = await resp.text()
+                debug.append(f"HTML {len(html)}б")
 
-            # Find all <script src="..."> tags
             script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html)
-            # Sort by likely size (longer names = more likely main bundle)
-            js_files = [s for s in script_srcs if s.endswith(".js")]
-            js_files.sort(key=len, reverse=True)
+            js_files = [s for s in script_srcs if ".js" in s]
+            debug.append(f"Скриптов: {len(js_files)} → {[s[-40:] for s in js_files[:3]]}")
 
             for src in js_files[:3]:
                 url = src if src.startswith("http") else PANEL_URL + src
                 try:
                     async with self._session.get(url, timeout=timeout) as resp:
                         js = await resp.text()
-                    # Search for API path patterns (with and without /api/)
+                    debug.append(f"JS {url[-30:]}: {len(js)}б")
                     patterns = [
                         r'["\']((?:/api)?/[a-z0-9/_-]{3,60})["\']',
                         r'post\(["\`](/?[a-z0-9/_-]{3,60})["\`]',
@@ -351,14 +351,14 @@ class YooMarketPanelHTTP:
                                 if not match.startswith("http") and match not in discovered:
                                     discovered.append(match)
                     if discovered:
-                        logger.info("Discovered API paths from JS: %s", discovered)
                         break
                 except Exception as e:
-                    logger.debug("JS fetch %s: %s", src, e)
+                    debug.append(f"JS ошибка: {e}")
         except Exception as e:
-            logger.debug("_discover_api_paths: %s", e)
+            debug.append(f"Ошибка: {e}")
 
-        return discovered
+        debug.append(f"Найдено путей: {discovered[:5]}")
+        return discovered, " | ".join(debug)
 
     async def verify_code(self, code: str) -> tuple[bool, str]:
         """
