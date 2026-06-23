@@ -517,16 +517,16 @@ class PanelSession:
         discovered, disc_debug = await self._discover_product_paths()
 
         # Step B: build the candidate list — discovered paths first, then fallbacks.
+        # NOTE: /api/products/<anything> matches the read-only show route → 405.
+        # Only try genuinely distinct base paths as fallbacks.
         fallback = [
-            "/api/products/store",
             "/api/product/store",
             "/api/seller/products",
             "/api/cabinet/products",
             "/api/account/products",
-            "/api/products/save",
-            "/api/products/add",
-            "/api/products/publish",
-            "/api/products/draft",
+            "/api/v2/products",
+            "/api/products-create",
+            "/api/create-product",
         ]
         candidates = list(dict.fromkeys(discovered + fallback))
 
@@ -574,17 +574,33 @@ class PanelSession:
         discovered: list[str] = []
         debug: list[str] = []
         try:
-            async with self._session.get(PANEL_URL + "/goods", timeout=timeout) as resp:
-                html = await resp.text()
-            srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html)
-            js_files = [s for s in srcs if ".js" in s]
-            debug.append(f"JS-файлов: {len(js_files)}")
+            # Fetch the SPA shell from the root
+            html = ""
+            for page_path in ("/", "/goods", "/products"):
+                try:
+                    async with self._session.get(PANEL_URL + page_path, timeout=timeout) as resp:
+                        html = await resp.text()
+                    if len(html) > 500:
+                        break
+                except Exception:
+                    continue
+            debug.append(f"HTML {len(html)}б")
 
-            # Patterns that capture API paths in axios/fetch calls
-            path_re = re.compile(r'["\'`](/?api/[a-z0-9/_{}.\-]{3,70})["\'`]', re.I)
-            kws = ("product", "goods", "offer", "item", "lot", "create", "store", "save", "publish")
+            # Catch JS refs in <script src>, <link href=*.js>, modulepreload, and bare /assets/*.js
+            js_files: list[str] = []
+            js_files += re.findall(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', html, re.I)
+            js_files += re.findall(r'<link[^>]+href=["\']([^"\']+\.js[^"\']*)["\']', html, re.I)
+            js_files += re.findall(r'["\'](/assets/[^"\']+\.js)["\']', html, re.I)
+            js_files += re.findall(r'["\'](/build/[^"\']+\.js)["\']', html, re.I)
+            js_files = list(dict.fromkeys(js_files))
+            debug.append(f"JS: {len(js_files)} {[s.split('/')[-1][:20] for s in js_files[:3]]}")
 
-            for src in js_files[:6]:
+            # Capture ALL /api/... paths so we see the full surface
+            path_re = re.compile(r'["\'`](/api/[a-zA-Z0-9/_{}.\-]{2,70})["\'`]')
+            kws = ("product", "goods", "offer", "item", "lot", "create", "store", "save", "publish", "add")
+            all_api: set[str] = set()
+
+            for src in js_files[:8]:
                 url = src if src.startswith("http") else PANEL_URL + src
                 try:
                     async with self._session.get(url, timeout=timeout) as r:
@@ -592,18 +608,17 @@ class PanelSession:
                 except Exception:
                     continue
                 for m in path_re.findall(js):
-                    low = m.lower()
-                    if any(k in low for k in kws):
-                        p = m if m.startswith("/") else "/" + m
-                        # skip pure GET list/detail templates with {id}
-                        if p not in discovered:
-                            discovered.append(p)
+                    all_api.add(m)
 
-            # Prioritise paths that look like creation (no trailing {id})
-            discovered.sort(key=lambda p: ("{" in p, "product" not in p.lower()))
-            debug.append(f"Найдено: {discovered[:8]}")
+            # Keep product-related, prefer ones without {id} templates
+            for p in all_api:
+                if any(k in p.lower() for k in kws):
+                    discovered.append(p)
+            discovered.sort(key=lambda p: ("{" in p or "}" in p, p.count("/")))
+            debug.append(f"API всего: {len(all_api)}")
+            debug.append(f"Товарные: {discovered[:10]}")
         except Exception as e:
-            debug.append(f"Ошибка discovery: {str(e)[:80]}")
+            debug.append(f"Ошибка: {str(e)[:80]}")
 
         return discovered[:12], " | ".join(debug)
 
