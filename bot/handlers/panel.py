@@ -285,15 +285,15 @@ async def panel_email_code(message: Message, state: FSMContext) -> None:
     status_msg = await message.answer("⏳ Проверяю код...")
 
     try:
-        ok, result = await asyncio.wait_for(panel.submit_code(page, context, code), timeout=20)
+        ok, result = await asyncio.wait_for(panel.submit_code(page, context, code), timeout=18)
     except asyncio.TimeoutError:
         ok, result = False, "Превышено время ожидания. Попробуйте ещё раз."
     finally:
+        _login_sessions.pop(uid, None)
         try:
-            await panel.close()
+            await asyncio.wait_for(panel.close(), timeout=5)
         except Exception:
             pass
-        _login_sessions.pop(uid, None)
 
     if not ok:
         await state.clear()

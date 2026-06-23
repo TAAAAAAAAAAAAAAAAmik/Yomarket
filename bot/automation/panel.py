@@ -688,35 +688,44 @@ class YooMarketPanel:
                 return False, f"Поле для кода не найдено.\nHTML: <code>{html[:300]}</code>"
 
             await _click_first(page, _CONFIRM_SELECTORS)
-            # Wait for navigation/re-render
-            await asyncio.sleep(4)
+
+            # Wait for SPA to react: either navigate away from /login or show an error.
+            # Don't use wait_for_load_state — SPA doesn't reload, it redirects via JS router.
             try:
-                await page.wait_for_load_state("domcontentloaded", timeout=8000)
+                await page.wait_for_function(
+                    "() => !window.location.pathname.includes('/login')",
+                    timeout=12000,
+                )
             except Exception:
+                # Might still be on login page — check for error message
                 pass
 
-            # Check if login succeeded (still on login page?)
-            if "/login" in page.url or "/auth" in page.url or "/signin" in page.url:
-                error_el = await page.query_selector(
-                    '.error, .alert-danger, [class*="error"], [class*="Error"]'
+            await asyncio.sleep(1)
+            cur_url = page.url
+
+            if "/login" not in cur_url and "/auth" not in cur_url and "/signin" not in cur_url:
+                # Successfully left login page — extract cookies
+                cookies = await context.cookies()
+                cookie_string = "; ".join(
+                    f"{c['name']}={c['value']}" for c in cookies
+                    if c.get("domain", "").endswith("yoomarket.net")
                 )
-                if error_el:
-                    error_text = await error_el.inner_text()
-                    return False, f"Ошибка: {error_text.strip()[:150]}"
-                html = await page.content()
-                return False, f"Неверный код или истёк срок действия.\nHTML: <code>{html[:300]}</code>"
+                if not cookie_string:
+                    cookie_string = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                logger.info("Login successful, %d cookies, url=%s", len(cookies), cur_url)
+                return True, cookie_string
 
-            # Extract cookies from context
-            cookies = await context.cookies()
-            cookie_string = "; ".join(
-                f"{c['name']}={c['value']}" for c in cookies
-                if c.get("domain", "").endswith("yoomarket.net")
+            # Still on login page — check for error text
+            err_el = await page.query_selector(
+                '.error, .alert-danger, [class*="error"], [class*="Error"], '
+                '.v-alert, [role="alert"]'
             )
-            if not cookie_string:
-                cookie_string = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+            if err_el:
+                err_text = (await err_el.inner_text()).strip()[:200]
+                return False, f"Ошибка: {err_text}"
 
-            logger.info("Login successful, extracted %d cookies", len(cookies))
-            return True, cookie_string
+            html = await page.content()
+            return False, f"Код не принят, осталось на /login (html={len(html)}б)"
 
         except Exception as e:
             logger.error("submit_code error: %s", e)
