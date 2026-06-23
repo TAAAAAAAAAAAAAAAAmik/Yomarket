@@ -9,8 +9,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from automation.panel import YooMarketPanelHTTP, PanelSession
-from storage import get_panel_creds, save_panel_creds, delete_panel_creds
+from automation.panel import YooMarketPanelHTTP, PanelSession, try_token_login
+from storage import get_panel_creds, save_panel_creds, delete_panel_creds, get_token
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -29,26 +29,31 @@ class PanelState(StatesGroup):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _status_text(creds: dict | None) -> str:
+def _status_text(creds: dict | None, has_token: bool = False) -> str:
     if not creds:
-        return "🔒 <b>Панель YooMarket</b>\n\nВы <b>не авторизованы</b> в панели продавца."
+        hint = "\n\n💡 У вас есть API-токен — попробуйте <b>автоматический вход</b>." if has_token else ""
+        return f"🔒 <b>Панель YooMarket</b>\n\nВы <b>не авторизованы</b> в панели продавца.{hint}"
     login = creds.get("login", "")
     login_part = f"\n👤 Логин: <b>{login}</b>" if login else ""
     return (
         f"✅ <b>Панель YooMarket</b>\n"
         f"Вы <b>авторизованы</b> в панели продавца.{login_part}\n\n"
-        f"<i>Если автоматизация не работает — обновите куки.</i>"
+        f"<i>Если автоматизация не работает — обновите вход.</i>"
     )
 
 
-def _menu_kb(creds: dict | None):
+def _menu_kb(creds: dict | None, has_token: bool = False):
     b = InlineKeyboardBuilder()
     if creds:
         b.button(text="🔄 Проверить сессию", callback_data="panel:check")
+        if has_token:
+            b.button(text="🔑 Обновить через токен", callback_data="panel:token_login")
         b.button(text="📲 Обновить вход (SMS)", callback_data="panel:sms_start")
         b.button(text="🍪 Обновить cookies вручную", callback_data="panel:cookies_start")
         b.button(text="🚪 Выйти из панели", callback_data="panel:logout")
     else:
+        if has_token:
+            b.button(text="🔑 Войти автоматически (через токен)", callback_data="panel:token_login")
         b.button(text="📲 Войти через SMS", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies вручную", callback_data="panel:cookies_start")
     b.button(text="⬅️ Настройки", callback_data="settings:menu")
@@ -63,8 +68,13 @@ def _cancel_kb(back: str = "panel:menu"):
 
 
 async def _refresh_menu(callback: CallbackQuery) -> None:
-    creds = get_panel_creds(callback.from_user.id)
-    await callback.message.edit_text(_status_text(creds), reply_markup=_menu_kb(creds))
+    uid = callback.from_user.id
+    creds = get_panel_creds(uid)
+    has_token = bool(get_token(uid))
+    await callback.message.edit_text(
+        _status_text(creds, has_token),
+        reply_markup=_menu_kb(creds, has_token),
+    )
     await callback.answer()
 
 
@@ -117,6 +127,38 @@ async def panel_check(callback: CallbackQuery) -> None:
             "⚠️ Сессия <b>истекла</b>.\n\nВойдите заново через SMS или вставьте новые cookies."
         )
     await _refresh_menu(callback)
+
+
+# ---------------------------------------------------------------------------
+# Auto login via API token
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "panel:token_login")
+async def panel_token_login(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
+    token = get_token(uid)
+    if not token:
+        await callback.answer("❌ API-токен не найден", show_alert=True)
+        return
+
+    await callback.answer()
+    status_msg = await callback.message.answer("🔑 Пробую войти в панель через API-токен...")
+
+    ok, result = await try_token_login(token)
+
+    if ok and result:
+        save_panel_creds(uid, {"login": "", "cookies": result})
+        await status_msg.edit_text("✅ <b>Успешно!</b> Вошли в панель через API-токен.")
+    else:
+        await status_msg.edit_text(
+            "⚠️ <b>Автоматический вход не сработал.</b>\n\n"
+            "Панель использует отдельную авторизацию.\n"
+            "Попробуйте войти через SMS или вставить cookies вручную."
+        )
+
+    creds = get_panel_creds(uid)
+    has_token = True
+    await callback.message.answer(_status_text(creds, has_token), reply_markup=_menu_kb(creds, has_token))
 
 
 # ---------------------------------------------------------------------------

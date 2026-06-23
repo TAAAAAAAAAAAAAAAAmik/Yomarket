@@ -92,6 +92,90 @@ async def _click_first(page, selectors: list[str]) -> bool:
     return False
 
 
+async def try_token_login(api_token: str) -> tuple[bool, str]:
+    """
+    Try to log into the panel using the existing API token (token exchange / SSO).
+    Returns (True, cookie_string) on success, (False, error) on failure.
+    """
+    connector = aiohttp.TCPConnector(ssl=False)
+    timeout = aiohttp.ClientTimeout(total=12)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+        "Accept": "application/json, text/html, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+        # Attempt 1: POST token to common auth endpoints
+        token_payloads = [
+            (PANEL_URL + "/api/auth/token",       {"token": api_token}),
+            (PANEL_URL + "/api/auth/api-token",   {"api_token": api_token}),
+            (PANEL_URL + "/api/login/token",      {"token": api_token}),
+            (PANEL_URL + "/api/auth",             {"token": api_token, "type": "api"}),
+            (PANEL_URL + "/api/v1/auth/token",    {"token": api_token}),
+        ]
+        for url, payload in token_payloads:
+            try:
+                async with session.post(url, json=payload, timeout=timeout, allow_redirects=True) as resp:
+                    final_url = str(resp.url)
+                    if resp.status in (200, 201):
+                        not_login = all(k not in final_url for k in ("/login", "/auth", "/signin"))
+                        cookies = _extract_cookies(session, PANEL_URL)
+                        if cookies and not_login:
+                            logger.info("Token login succeeded via POST %s", url)
+                            return True, cookies
+                        # JSON token in response body
+                        try:
+                            import json as _json_mod
+                            data = _json_mod.loads(await resp.text())
+                            for key in ("token", "access_token", "session_token", "api_token"):
+                                if data.get(key):
+                                    return True, cookies or f"{key}={data[key]}"
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.debug("Token auth attempt %s: %s", url, e)
+
+        # Attempt 2: GET redirect (SSO-style)
+        sso_urls = [
+            PANEL_URL + f"/auth/token?token={api_token}",
+            PANEL_URL + f"/login?api_token={api_token}",
+            PANEL_URL + f"/sso?token={api_token}",
+        ]
+        for url in sso_urls:
+            try:
+                async with session.get(url, timeout=timeout, allow_redirects=True) as resp:
+                    final_url = str(resp.url)
+                    not_login = all(k not in final_url for k in ("/login", "/auth", "/signin"))
+                    if resp.status == 200 and not_login:
+                        cookies = _extract_cookies(session, PANEL_URL)
+                        if cookies:
+                            logger.info("Token login (SSO) succeeded via GET %s", url)
+                            return True, cookies
+            except Exception as e:
+                logger.debug("SSO attempt %s: %s", url, e)
+
+        # Attempt 3: Bearer header on panel root
+        try:
+            async with session.get(
+                PANEL_URL + "/",
+                headers={**headers, "Authorization": f"Bearer {api_token}"},
+                timeout=timeout,
+                allow_redirects=True,
+            ) as resp:
+                final_url = str(resp.url)
+                not_login = all(k not in final_url for k in ("/login", "/auth", "/signin"))
+                if resp.status == 200 and not_login:
+                    cookies = _extract_cookies(session, PANEL_URL)
+                    if cookies:
+                        return True, cookies
+        except Exception as e:
+            logger.debug("Bearer panel attempt: %s", e)
+
+    return False, ""
+
+
 class YooMarketPanelHTTP:
     """
     SMS login via plain HTTP — no browser, works on mobile.
