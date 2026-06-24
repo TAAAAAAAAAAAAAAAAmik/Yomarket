@@ -930,6 +930,9 @@ class YooMarketPanel:
                 html = await page.content()
                 return False, f"Поле email не найдено.\nHTML: <code>{html[:300]}</code>"
 
+            # Small pause so Vue can register the value before we click
+            await asyncio.sleep(0.4)
+
             # Click button or press Enter
             clicked = await _click_first(page, _SEND_CODE_SELECTORS)
             if not clicked:
@@ -943,15 +946,19 @@ class YooMarketPanel:
                 html = await page.content()
                 return False, f"Кнопка «Получить код» не найдена.\nHTML: <code>{html[:300]}</code>"
 
-            # Wait for SPA to re-render (code input or confirmation screen)
-            await asyncio.sleep(3)
+            # Wait for the browser to finish the form-submission network request,
+            # then give the SPA a moment to re-render the code input.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+            await asyncio.sleep(1)
 
             # If already navigated away from login — logged in without code
             if "/login" not in page.url:
                 return True, "__already_logged_in__"
 
-            # Return True regardless — code was probably sent, user enters it next
-            logger.info("Email submitted, proceeding to code entry (url=%s)", page.url)
+            logger.info("Email submitted OK, url=%s", page.url)
             return True, ""
 
         except Exception as e:
