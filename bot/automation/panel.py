@@ -625,7 +625,13 @@ class PanelSession:
                 debug.append(f"{res}: невалидный JSON")
                 continue
 
+            if not isinstance(cf, dict):
+                debug.append(f"{res}: ответ не объект ({type(cf).__name__}: {str(cf)[:60]})")
+                continue
+
             fields = cf.get("fields") or []
+            # Filter out non-dict entries (some Nova versions return field names as strings)
+            fields = [f for f in fields if isinstance(f, dict)]
             if not fields:
                 debug.append(f"{res}: пустые поля")
                 continue
@@ -702,6 +708,8 @@ class PanelSession:
         """Map our title/price/description/quantity onto Nova field attributes."""
         payload: dict = {}
         for f in fields:
+            if not isinstance(f, dict):
+                continue
             attr = f.get("attribute") or ""
             if not attr:
                 continue
