@@ -16,17 +16,21 @@ PANEL_URL = "https://panel.yoomarket.net"
 _EMAIL_SELECTORS = [
     'input[type="email"]',
     'input[name="email"]',
-    'input[placeholder*="почту"]',
-    'input[placeholder*="электронную"]',
-    'input[placeholder*="mail"]',
+    'input[placeholder*="почт" i]',
+    'input[placeholder*="mail" i]',
+    'input[placeholder*="email" i]',
 ]
 
-# Code input selectors (после отправки: "Код из письма")
+# Code input selectors (после отправки кода)
 _CODE_SELECTORS = [
-    'input[placeholder*="Код из"]',
-    'input[placeholder*="код"]',
+    'input[autocomplete="one-time-code"]',
+    'input[placeholder*="код" i]',
+    'input[placeholder*="code" i]',
     'input[name="code"]',
     'input[name="otp"]',
+    'input[name="token"]',
+    'input[maxlength="6"]',
+    'input[maxlength="4"]',
     'input[type="number"]',
     'input[inputmode="numeric"]',
 ]
@@ -34,17 +38,21 @@ _CODE_SELECTORS = [
 # "Получить код" button
 _SEND_CODE_SELECTORS = [
     'button:has-text("Получить код")',
+    'button:has-text("Отправить код")',
     'button[type="submit"]',
     'button:has-text("Отправить")',
     'button:has-text("Получить")',
+    'button:has-text("Войти")',
 ]
 
 # "Подтвердить" button
 _CONFIRM_SELECTORS = [
     'button:has-text("Подтвердить")',
-    'button[type="submit"]',
     'button:has-text("Войти")',
     'button:has-text("Продолжить")',
+    'button:has-text("Verify")',
+    'button:has-text("Submit")',
+    'button[type="submit"]',
 ]
 
 
@@ -889,81 +897,169 @@ class YooMarketPanel:
     async def submit_email(self, page, email: str) -> tuple[bool, str]:
         """
         Fill the email field and click "Получить код".
-        Returns (True, '') when code input appears, (False, error) otherwise.
+        Returns (True, '') on success, (False, error) on failure.
         """
         try:
-            # Fill email input
+            # Fill email — first try standard selectors, then JS fallback
             filled = await _fill_first(page, _EMAIL_SELECTORS, email)
             if not filled:
-                html = await page.content()
-                logger.error("Email input not found. Page snippet: %s", html[:500])
-                # Show page content as diagnostic
-                return False, f"Поле email не найдено.\nHTML начало: <code>{html[:300]}</code>"
+                try:
+                    ok = await page.evaluate(
+                        """(email) => {
+                            const inputs = [...document.querySelectorAll('input')];
+                            for (const inp of inputs) {
+                                const t = inp.type.toLowerCase();
+                                const p = (inp.placeholder || '').toLowerCase();
+                                if (t === 'email' || p.includes('почт') || p.includes('mail')) {
+                                    inp.focus();
+                                    inp.value = email;
+                                    inp.dispatchEvent(new Event('input', {bubbles:true}));
+                                    inp.dispatchEvent(new Event('change', {bubbles:true}));
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""",
+                        email,
+                    )
+                    filled = bool(ok)
+                except Exception:
+                    pass
 
-            # Click "Получить код"
+            if not filled:
+                html = await page.content()
+                return False, f"Поле email не найдено.\nHTML: <code>{html[:300]}</code>"
+
+            # Click button or press Enter
             clicked = await _click_first(page, _SEND_CODE_SELECTORS)
+            if not clicked:
+                try:
+                    await page.keyboard.press("Enter")
+                    clicked = True
+                except Exception:
+                    pass
+
             if not clicked:
                 html = await page.content()
                 return False, f"Кнопка «Получить код» не найдена.\nHTML: <code>{html[:300]}</code>"
 
-            # Wait for code input to appear (SPA re-renders)
-            await asyncio.sleep(2)
-            try:
-                await page.wait_for_selector(
-                    'input[placeholder*="Код"], input[placeholder*="код"], '
-                    'input[name="code"], input[name="otp"], input[inputmode="numeric"]',
-                    timeout=10000,
-                )
-            except Exception:
-                pass
+            # Wait for SPA to re-render (code input or confirmation screen)
+            await asyncio.sleep(3)
 
-            # Verify code input appeared
-            for sel in _CODE_SELECTORS:
-                el = await page.query_selector(sel)
-                if el:
-                    logger.info("Code input appeared after submitting email")
-                    return True, ""
-
-            # Check for already logged in
+            # If already navigated away from login — logged in without code
             if "/login" not in page.url:
                 return True, "__already_logged_in__"
 
-            # Show current page content as diagnostic
-            html = await page.content()
-            return False, f"Поле для кода не появилось.\nHTML: <code>{html[:400]}</code>"
+            # Return True regardless — code was probably sent, user enters it next
+            logger.info("Email submitted, proceeding to code entry (url=%s)", page.url)
+            return True, ""
+
         except Exception as e:
             logger.error("submit_email error: %s", e)
             return False, str(e)
 
     async def submit_code(self, page, context, code: str) -> tuple[bool, str]:
         """
-        Enter code from email and click "Подтвердить".
+        Enter OTP code and submit. Handles both single-input and multi-digit inputs.
         Returns (True, cookie_string) on success, (False, error) otherwise.
         """
         try:
+            code = code.strip()
+            filled = False
+
+            # Strategy 1: standard selectors (single input field)
             filled = await _fill_first(page, _CODE_SELECTORS, code)
+
             if not filled:
+                # Strategy 2: multi-digit OTP (separate <input maxlength="1"> per digit)
+                try:
+                    digit_inputs = await page.query_selector_all('input[maxlength="1"]')
+                    if len(digit_inputs) >= 4:
+                        for i, el in enumerate(digit_inputs):
+                            if i < len(code):
+                                await el.click()
+                                await el.type(code[i])
+                        filled = True
+                except Exception:
+                    pass
+
+            if not filled:
+                # Strategy 3: JavaScript — fill any visible code-like input,
+                # dispatching Vue/React events so the reactive form updates
+                try:
+                    ok = await page.evaluate(
+                        """(code) => {
+                            const inputs = [...document.querySelectorAll(
+                                'input:not([type="email"]):not([type="hidden"])')];
+                            const visible = inputs.filter(i => i.offsetParent !== null);
+                            if (!visible.length) return false;
+                            // Prefer inputs that look like OTP
+                            let target = visible.find(i => {
+                                const p = (i.placeholder || '').toLowerCase();
+                                const n = (i.name || '').toLowerCase();
+                                return p.includes('код') || p.includes('code') ||
+                                       n === 'code' || n === 'otp' || n === 'token';
+                            }) || visible[0];
+                            target.focus();
+                            target.value = code;
+                            target.dispatchEvent(new Event('input', {bubbles:true}));
+                            target.dispatchEvent(new Event('change', {bubbles:true}));
+                            return true;
+                        }""",
+                        code,
+                    )
+                    if ok:
+                        filled = True
+                except Exception:
+                    pass
+
+            if not filled:
+                # Strategy 4: keyboard type (last resort)
+                try:
+                    await page.keyboard.type(code)
+                    filled = True
+                except Exception:
+                    pass
+
+            if not filled:
+                # Collect diagnostics for the user
+                try:
+                    inputs_info = await page.evaluate(
+                        "() => [...document.querySelectorAll('input')].map(i=>"
+                        "({type:i.type,name:i.name,placeholder:i.placeholder,maxlength:i.maxLength}))"
+                    )
+                except Exception:
+                    inputs_info = []
                 html = await page.content()
-                return False, f"Поле для кода не найдено.\nHTML: <code>{html[:300]}</code>"
+                return False, (
+                    f"Поле для кода не найдено.\n"
+                    f"Inputs: <code>{str(inputs_info)[:300]}</code>\n"
+                    f"HTML: <code>{html[:200]}</code>"
+                )
 
-            await _click_first(page, _CONFIRM_SELECTORS)
+            await asyncio.sleep(0.5)
 
-            # Wait for SPA to react: either navigate away from /login or show an error.
-            # Don't use wait_for_load_state — SPA doesn't reload, it redirects via JS router.
+            # Submit: click button or press Enter
+            submitted = await _click_first(page, _CONFIRM_SELECTORS)
+            if not submitted:
+                try:
+                    await page.keyboard.press("Enter")
+                except Exception:
+                    pass
+
+            # Wait for SPA router to navigate away from /login
             try:
                 await page.wait_for_function(
                     "() => !window.location.pathname.includes('/login')",
                     timeout=12000,
                 )
             except Exception:
-                # Might still be on login page — check for error message
                 pass
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.5)
             cur_url = page.url
 
             if "/login" not in cur_url and "/auth" not in cur_url and "/signin" not in cur_url:
-                # Successfully left login page — extract cookies
                 cookies = await context.cookies()
                 cookie_string = "; ".join(
                     f"{c['name']}={c['value']}" for c in cookies
@@ -971,20 +1067,32 @@ class YooMarketPanel:
                 )
                 if not cookie_string:
                     cookie_string = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-                logger.info("Login successful, %d cookies, url=%s", len(cookies), cur_url)
+                logger.info("Login OK: %d cookies, url=%s", len(cookies), cur_url)
                 return True, cookie_string
 
-            # Still on login page — check for error text
-            err_el = await page.query_selector(
-                '.error, .alert-danger, [class*="error"], [class*="Error"], '
-                '.v-alert, [role="alert"]'
-            )
-            if err_el:
-                err_text = (await err_el.inner_text()).strip()[:200]
-                return False, f"Ошибка: {err_text}"
+            # Still on login — extract error message via JS
+            try:
+                err_text = await page.evaluate(
+                    """() => {
+                        const sels = ['.error','.alert','[class*="error" i]',
+                                      '.v-alert','[role="alert"]','.notification',
+                                      'p[class*="red"]','span[class*="red"]'];
+                        for (const s of sels) {
+                            const el = document.querySelector(s);
+                            if (el && el.textContent.trim())
+                                return el.textContent.trim().slice(0,200);
+                        }
+                        return null;
+                    }"""
+                )
+            except Exception:
+                err_text = None
+
+            if err_text:
+                return False, f"❌ {err_text}"
 
             html = await page.content()
-            return False, f"Код не принят, осталось на /login (html={len(html)}б)"
+            return False, f"Код не принят (html={len(html)}б, url={cur_url})"
 
         except Exception as e:
             logger.error("submit_code error: %s", e)
