@@ -282,9 +282,9 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
         await callback.answer()
         return
 
-    await callback.message.edit_text(
-        "⏳ Создаю товар через панель YooMarket… [v2]\n"
-        "<i>(жёсткий лимит — не более 35 секунд)</i>"
+    status_msg = await callback.message.edit_text(
+        "⏳ Создаю товар через панель YooMarket… [v3]\n"
+        "<i>0 сек...</i>"
     )
 
     async def _do_panel() -> tuple[bool, str]:
@@ -297,24 +297,47 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
             )
         finally:
             try:
-                await asyncio.wait_for(ps.close(), timeout=3)
+                await asyncio.shield(ps.close())
             except Exception:
                 pass
 
-    # One hard deadline around the ENTIRE panel flow (start + requests + close)
-    # so nothing — not even ps.start() — can hang the handler forever.
-    try:
-        ok, result_msg = await asyncio.wait_for(_do_panel(), timeout=35)
-    except asyncio.TimeoutError:
+    # Use create_task + asyncio.wait so the message updates every 6s.
+    # asyncio.wait_for cannot cancel if the loop is blocked; this detects that:
+    # if the counter stops incrementing, the event loop is frozen.
+    DEADLINE = 42
+    CHECK_INTERVAL = 6
+    panel_task = asyncio.create_task(_do_panel())
+    ok, result_msg = False, ""
+    elapsed = 0
+
+    while elapsed < DEADLINE:
+        done, _ = await asyncio.wait({panel_task}, timeout=CHECK_INTERVAL)
+        elapsed += CHECK_INTERVAL
+        if panel_task in done:
+            try:
+                ok, result_msg = panel_task.result()
+            except Exception as e:
+                ok, result_msg = False, f"Неожиданная ошибка: {str(e)[:200]}"
+            break
+        try:
+            await status_msg.edit_text(
+                f"⏳ Создаю товар через панель YooMarket… [v3]\n"
+                f"<i>{elapsed} сек...</i>"
+            )
+        except Exception:
+            pass
+    else:
+        panel_task.cancel()
+        try:
+            await panel_task
+        except Exception:
+            pass
         ok, result_msg = False, (
-            "⏱ <b>Панель не ответила за 35 секунд.</b>\n\n"
-            "Возможные причины:\n"
-            "• Сессия истекла — войдите в панель снова\n"
-            "• Сервер YooMarket недоступен\n\n"
-            "Попробуйте создать товар вручную."
+            "⏱ <b>Панель не ответила за 42 секунд.</b>\n\n"
+            "Если счетчик не менялся — event loop заблокирован (DNS/SSL).\n"
+            "Сессия истекла или сервер YooMarket недоступен.\n\n"
+            "Войдите в панель снова или создайте товар вручную."
         )
-    except Exception as e:
-        ok, result_msg = False, f"Неожиданная ошибка: {str(e)[:150]}"
 
     if ok:
         b = InlineKeyboardBuilder()
