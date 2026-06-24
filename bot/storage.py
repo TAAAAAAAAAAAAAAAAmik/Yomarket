@@ -2,21 +2,52 @@ import json
 import os
 import shutil
 
-# Data directory: prefer DATA_DIR env var, otherwise ~/.yomarket/ (survives git updates/reclones).
-# Falls back to legacy bot/data/ so existing installations keep working until migrated.
-_DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(os.path.expanduser("~"), ".yomarket")
-_LEGACY_DIR = os.path.join(os.path.dirname(__file__), "data")
+
+def _resolve_data_dir() -> str:
+    """
+    Pick a data directory that survives container re-deploys.
+
+    Priority:
+      1. $DATA_DIR env var (explicit override — e.g. a Railway volume mount path)
+      2. /app/data — the volume mount point declared in docker-compose.yml
+         (`bot_data:/app/data`). Persistent across `docker compose up --build`.
+      3. ~/.yomarket — fallback for bare-metal / non-Docker runs.
+
+    The previous version defaulted to ~/.yomarket even inside Docker, which is
+    NOT covered by the docker-compose volume, so data was wiped on every redeploy.
+    """
+    env = os.environ.get("DATA_DIR")
+    if env:
+        return env
+    # In the Docker image WORKDIR is /app and the compose volume maps /app/data.
+    if os.path.isdir("/app"):
+        return "/app/data"
+    return os.path.join(os.path.expanduser("~"), ".yomarket")
+
+
+_DATA_DIR = _resolve_data_dir()
+# Where storage files might have been written by older versions of the bot.
+_LEGACY_DIRS = [
+    os.path.join(os.path.dirname(__file__), "data"),     # bot/data/
+    os.path.join(os.path.expanduser("~"), ".yomarket"),  # previous (broken) default
+]
+
 
 def _migrate_legacy() -> None:
-    """Move bot/data/*.json to ~/.yomarket/ once, silently."""
-    if not os.path.isdir(_LEGACY_DIR):
-        return
+    """Move *.json from any known legacy location into the active data dir, once."""
     os.makedirs(_DATA_DIR, exist_ok=True)
-    for fname in ("tokens.json", "settings.json", "panel_creds.json"):
-        src = os.path.join(_LEGACY_DIR, fname)
-        dst = os.path.join(_DATA_DIR, fname)
-        if os.path.exists(src) and not os.path.exists(dst):
-            shutil.move(src, dst)
+    for legacy in _LEGACY_DIRS:
+        if not os.path.isdir(legacy) or os.path.abspath(legacy) == os.path.abspath(_DATA_DIR):
+            continue
+        for fname in ("tokens.json", "settings.json", "panel_creds.json"):
+            src = os.path.join(legacy, fname)
+            dst = os.path.join(_DATA_DIR, fname)
+            if os.path.exists(src) and not os.path.exists(dst):
+                try:
+                    shutil.move(src, dst)
+                except Exception:
+                    pass
+
 
 _migrate_legacy()
 
