@@ -282,8 +282,9 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
         await callback.answer()
         return
 
-    await callback.message.edit_text(
-        "⏳ API не поддерживает создание.\nПробую через панель YooMarket..."
+    status_msg = await callback.message.edit_text(
+        "⏳ Подключаюсь к панели YooMarket...\n"
+        "<i>(обычно занимает 5–15 секунд)</i>"
     )
 
     ps = PanelSession(creds["cookies"])
@@ -294,15 +295,21 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
                 title=title, price=price, description=description,
                 quantity=quantity, category=category,
             ),
-            timeout=45,
+            timeout=30,
         )
     except asyncio.TimeoutError:
-        ok, result_msg = False, "⏱ Превышено время ожидания (45с). Попробуйте позже."
+        ok, result_msg = False, (
+            "⏱ <b>Панель не ответила за 30 секунд.</b>\n\n"
+            "Возможные причины:\n"
+            "• Сессия истекла — войдите в панель снова\n"
+            "• Сервер YooMarket недоступен\n\n"
+            "Попробуйте создать товар вручную."
+        )
     except Exception as e:
         ok, result_msg = False, f"Неожиданная ошибка: {str(e)[:150]}"
     finally:
         try:
-            await ps.close()
+            await asyncio.wait_for(ps.close(), timeout=3)
         except Exception:
             pass
 

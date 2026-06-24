@@ -497,7 +497,8 @@ class PanelSession:
         if not self._session:
             return False, "Сессия не запущена"
 
-        timeout = aiohttp.ClientTimeout(total=15)
+        # Short connect timeout so hung TCP connections fail fast
+        timeout = aiohttp.ClientTimeout(total=8, connect=4)
 
         # CSRF handshake — GET /sanctum/csrf-cookie sets XSRF-TOKEN in cookie jar
         for csrf_path in ("/sanctum/csrf-cookie", "/csrf-cookie"):
@@ -528,7 +529,7 @@ class PanelSession:
 
     async def _nova_create_product(self, values: dict) -> tuple[bool, str]:
         """Discover the Nova product resource and create it via /nova-api."""
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=8, connect=4)
         xsrf = self._xsrf()
         hdrs = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
         if xsrf:
@@ -592,7 +593,7 @@ class PanelSession:
         debug.append(f"Всего ресурсов для проверки: {len(resources)}")
 
         # 4. For each candidate: check creation-fields, then POST with JSON
-        for res in resources[:15]:
+        for res in resources[:8]:
             cf_url = f"{PANEL_URL}/nova-api/{res}/creation-fields"
             try:
                 async with self._session.get(
