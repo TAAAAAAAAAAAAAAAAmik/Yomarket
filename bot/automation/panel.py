@@ -482,6 +482,42 @@ class PanelSession:
                     return urllib.parse.unquote(v.strip())
         return ""
 
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict | None = None,
+        json: dict | None = None,
+        allow_redirects: bool = False,
+        deadline: float = 7.0,
+    ) -> tuple[int, str]:
+        """
+        Make an HTTP request with a hard asyncio deadline so TCP hangs can't block forever.
+        Returns (status_code, response_text) or (-1, error_str) on timeout/error.
+        """
+        async def _do() -> tuple[int, str]:
+            kw: dict = {
+                "headers": headers or {},
+                "allow_redirects": allow_redirects,
+                "ssl": False,
+            }
+            if json is not None:
+                kw["json"] = json
+            if method == "GET":
+                cm = self._session.get(url, **kw)
+            else:
+                cm = self._session.post(url, **kw)
+            async with cm as resp:
+                return resp.status, await resp.text()
+
+        try:
+            return await asyncio.wait_for(_do(), timeout=deadline)
+        except asyncio.TimeoutError:
+            return -1, f"timeout after {deadline}s"
+        except Exception as e:
+            return -1, str(e)[:80]
+
     async def create_product(
         self,
         title: str,
@@ -497,26 +533,8 @@ class PanelSession:
         if not self._session:
             return False, "Сессия не запущена"
 
-        # Short connect timeout so hung TCP connections fail fast
-        timeout = aiohttp.ClientTimeout(total=8, connect=4)
-
-        # CSRF handshake — GET /sanctum/csrf-cookie sets XSRF-TOKEN in cookie jar
-        for csrf_path in ("/sanctum/csrf-cookie", "/csrf-cookie"):
-            try:
-                async with self._session.get(PANEL_URL + csrf_path, timeout=timeout) as r:
-                    if r.status < 400:
-                        break
-            except Exception:
-                pass
-
-        # Warm up session: GET main page so Laravel session cookie is renewed
-        try:
-            async with self._session.get(
-                PANEL_URL + "/goods", timeout=timeout, allow_redirects=True,
-            ) as r:
-                pass
-        except Exception:
-            pass
+        # Quick CSRF cookie grab (non-fatal if it times out)
+        await self._request("GET", PANEL_URL + "/sanctum/csrf-cookie", deadline=5.0)
 
         values = {
             "title": title,
@@ -529,7 +547,6 @@ class PanelSession:
 
     async def _nova_create_product(self, values: dict) -> tuple[bool, str]:
         """Discover the Nova product resource and create it via /nova-api."""
-        timeout = aiohttp.ClientTimeout(total=8, connect=4)
         xsrf = self._xsrf()
         hdrs = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
         if xsrf:
@@ -541,44 +558,24 @@ class PanelSession:
         # 1. Enumerate Nova resources via navigation endpoint
         resources: list[str] = []
         for nav_path in ("/nova-api/navigation", "/nova-api/resources"):
-            try:
-                async with self._session.get(
-                    PANEL_URL + nav_path, headers=hdrs, timeout=timeout, allow_redirects=False,
-                ) as resp:
-                    txt = await resp.text()
-                    short = txt[:150].replace("\n", " ")
-                    if resp.status in (301, 302):
-                        loc = resp.headers.get("Location", "?")
-                        debug.append(f"{nav_path}: {resp.status} → {loc}")
-                    else:
-                        debug.append(f"{nav_path}: {resp.status} → {short}")
-                    if resp.status == 200:
-                        found = re.findall(r'"uriKey"\s*:\s*"([^"]+)"', txt)
-                        resources.extend(r for r in found if r not in resources)
-                    elif resp.status in (401, 403):
-                        return False, (
-                            "⚠️ <b>Сессия в панели истекла.</b>\n\n"
-                            "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
-                        )
-            except Exception as e:
-                debug.append(f"{nav_path}: ошибка {str(e)[:50]}")
+            status, txt = await self._request("GET", PANEL_URL + nav_path, headers=hdrs)
+            if status == -1:
+                debug.append(f"{nav_path}: {txt}")
+                continue
+            short = txt[:150].replace("\n", " ")
+            debug.append(f"{nav_path}: {status} → {short}")
+            if status == 200:
+                found = re.findall(r'"uriKey"\s*:\s*"([^"]+)"', txt)
+                resources.extend(r for r in found if r not in resources)
+            elif status in (401, 403):
+                return False, (
+                    "⚠️ <b>Сессия в панели истекла.</b>\n\n"
+                    "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
+                )
 
         debug.append(f"Ресурсы из navigation: {resources or '(не найдено)'}")
 
-        # 2. Scan main page HTML for uriKey hints
-        try:
-            async with self._session.get(PANEL_URL + "/", headers=hdrs, timeout=timeout) as resp:
-                html = await resp.text()
-            for r in re.findall(r'"uriKey"\s*:\s*"([^"]+)"', html):
-                if r not in resources:
-                    resources.append(r)
-            for r in re.findall(r'/resources/([a-z0-9_\-]+)', html, re.I):
-                if r not in resources:
-                    resources.append(r)
-        except Exception as e:
-            debug.append(f"html scan: {str(e)[:40]}")
-
-        # 3. Hardcoded fallbacks — goods first (SPA route is /goods → uriKey='goods')
+        # 2. Hardcoded fallbacks — goods first (SPA route is /goods → uriKey='goods')
         for d in ("goods", "products", "offers", "items", "lots", "adverts",
                   "listings", "seller-goods", "seller-products", "advertisements"):
             if d not in resources:
@@ -592,18 +589,10 @@ class PanelSession:
 
         debug.append(f"Всего ресурсов для проверки: {len(resources)}")
 
-        # 4. For each candidate: check creation-fields, then POST with JSON
-        for res in resources[:8]:
+        # 3. For each candidate: check creation-fields, then POST with JSON
+        for res in resources[:6]:
             cf_url = f"{PANEL_URL}/nova-api/{res}/creation-fields"
-            try:
-                async with self._session.get(
-                    cf_url, headers=hdrs, timeout=timeout, allow_redirects=False,
-                ) as resp:
-                    cf_status = resp.status
-                    cf_text = await resp.text()
-            except Exception as e:
-                debug.append(f"{res}: connection error")
-                continue
+            cf_status, cf_text = await self._request("GET", cf_url, headers=hdrs)
 
             if cf_status == 401:
                 return False, (
@@ -659,47 +648,45 @@ class PanelSession:
             payload = self._map_nova_fields(fields, values)
 
             store_url = f"{PANEL_URL}/nova-api/{res}?editing=true&editMode=create"
-            try:
-                async with self._session.post(
-                    store_url, json=payload, headers=hdrs, timeout=timeout,
-                ) as resp:
-                    text = await resp.text()
-                    if resp.status in (200, 201):
-                        try:
-                            data = _json.loads(text)
-                        except Exception:
-                            data = {}
-                        rid = (data.get("resource") or {}).get("id") or data.get("id") or ""
-                        if isinstance(rid, dict):
-                            rid = rid.get("value", "")
-                        return True, str(rid) if rid else "создан"
-                    elif resp.status == 422:
-                        try:
-                            err_body = _json.loads(text)
-                            err_fields = err_body.get("errors") or err_body.get("message") or text[:300]
-                        except Exception:
-                            err_fields = text[:300]
-                        err_str = (
-                            _json.dumps(err_fields, ensure_ascii=False)[:500]
-                            if isinstance(err_fields, dict)
-                            else str(err_fields)[:500]
-                        )
-                        return False, (
-                            f"✅ Ресурс <b>{res}</b> найден!\n"
-                            f"Поля Nova: <code>{attrs}</code>\n"
-                            f"Обязательные: <code>{required}</code>\n\n"
-                            f"Ошибка 422:\n<code>{err_str}</code>\n\n"
-                            f"Отправлено: <code>{_json.dumps(payload, ensure_ascii=False)[:200]}</code>"
-                        )
-                    elif resp.status == 401:
-                        return False, (
-                            "⚠️ <b>Сессия в панели истекла.</b>\n\n"
-                            "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова."
-                        )
-                    else:
-                        debug.append(f"POST {res}: {resp.status} → {text[:80]}")
-            except Exception as e:
-                debug.append(f"POST {res}: {str(e)[:50]}")
+            post_status, text = await self._request(
+                "POST", store_url, headers=hdrs, json=payload
+            )
+            if post_status == -1:
+                debug.append(f"POST {res}: {text}")
+            elif post_status in (200, 201):
+                try:
+                    data = _json.loads(text)
+                except Exception:
+                    data = {}
+                rid = (data.get("resource") or {}).get("id") or data.get("id") or ""
+                if isinstance(rid, dict):
+                    rid = rid.get("value", "")
+                return True, str(rid) if rid else "создан"
+            elif post_status == 422:
+                try:
+                    err_body = _json.loads(text)
+                    err_fields = err_body.get("errors") or err_body.get("message") or text[:300]
+                except Exception:
+                    err_fields = text[:300]
+                err_str = (
+                    _json.dumps(err_fields, ensure_ascii=False)[:500]
+                    if isinstance(err_fields, dict)
+                    else str(err_fields)[:500]
+                )
+                return False, (
+                    f"✅ Ресурс <b>{res}</b> найден!\n"
+                    f"Поля Nova: <code>{attrs}</code>\n"
+                    f"Обязательные: <code>{required}</code>\n\n"
+                    f"Ошибка 422:\n<code>{err_str}</code>\n\n"
+                    f"Отправлено: <code>{_json.dumps(payload, ensure_ascii=False)[:200]}</code>"
+                )
+            elif post_status in (401, 403):
+                return False, (
+                    "⚠️ <b>Сессия в панели истекла.</b>\n\n"
+                    "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова."
+                )
+            else:
+                debug.append(f"POST {res}: {post_status} → {text[:80]}")
 
         diag = "\n".join(debug[:20])
         return False, f"🔍 <b>Диагностика Nova</b>:\n{diag}"
