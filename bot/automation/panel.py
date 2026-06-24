@@ -705,10 +705,21 @@ class PanelSession:
                 if dv not in (None, ""):
                     val = dv
             if val is not None and val != "":
+                # Respect max:N validation rule from Nova field definition
+                if isinstance(val, str):
+                    for rule in (f.get("rules") or []):
+                        if isinstance(rule, str) and rule.startswith("max:"):
+                            try:
+                                val = val[:int(rule.split(":")[1])]
+                            except (ValueError, IndexError):
+                                pass
                 payload[attr] = val
-        # Ensure core fields present even if Nova naming differs
-        payload.setdefault("title", values.get("title"))
-        payload.setdefault("price", values.get("price"))
+        # Ensure core fields present even if Nova naming differs (no truncation needed here
+        # since these only fire when the field wasn't found by name — Nova will reject anyway)
+        if "title" not in payload and values.get("title"):
+            payload["title"] = values["title"]
+        if "price" not in payload and values.get("price") is not None:
+            payload["price"] = values["price"]
         return payload
 
     async def _discover_product_paths(self) -> tuple[list[str], str]:
