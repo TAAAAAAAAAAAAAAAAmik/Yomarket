@@ -282,24 +282,32 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
         await callback.answer()
         return
 
-    status_msg = await callback.message.edit_text(
-        "⏳ Подключаюсь к панели YooMarket...\n"
-        "<i>(обычно занимает 5–15 секунд)</i>"
+    await callback.message.edit_text(
+        "⏳ Создаю товар через панель YooMarket… [v2]\n"
+        "<i>(жёсткий лимит — не более 35 секунд)</i>"
     )
 
-    ps = PanelSession(creds["cookies"])
-    await ps.start()
-    try:
-        ok, result_msg = await asyncio.wait_for(
-            ps.create_product(
+    async def _do_panel() -> tuple[bool, str]:
+        ps = PanelSession(creds["cookies"])
+        await ps.start()
+        try:
+            return await ps.create_product(
                 title=title, price=price, description=description,
                 quantity=quantity, category=category,
-            ),
-            timeout=30,
-        )
+            )
+        finally:
+            try:
+                await asyncio.wait_for(ps.close(), timeout=3)
+            except Exception:
+                pass
+
+    # One hard deadline around the ENTIRE panel flow (start + requests + close)
+    # so nothing — not even ps.start() — can hang the handler forever.
+    try:
+        ok, result_msg = await asyncio.wait_for(_do_panel(), timeout=35)
     except asyncio.TimeoutError:
         ok, result_msg = False, (
-            "⏱ <b>Панель не ответила за 30 секунд.</b>\n\n"
+            "⏱ <b>Панель не ответила за 35 секунд.</b>\n\n"
             "Возможные причины:\n"
             "• Сессия истекла — войдите в панель снова\n"
             "• Сервер YooMarket недоступен\n\n"
@@ -307,11 +315,6 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
         )
     except Exception as e:
         ok, result_msg = False, f"Неожиданная ошибка: {str(e)[:150]}"
-    finally:
-        try:
-            await asyncio.wait_for(ps.close(), timeout=3)
-        except Exception:
-            pass
 
     if ok:
         b = InlineKeyboardBuilder()
