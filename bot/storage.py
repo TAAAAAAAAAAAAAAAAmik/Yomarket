@@ -1,9 +1,28 @@
 import json
 import os
+import shutil
 
-_FILE = os.path.join(os.path.dirname(__file__), "data", "tokens.json")
-_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "data", "settings.json")
-_PANEL_FILE = os.path.join(os.path.dirname(__file__), "data", "panel_creds.json")
+# Data directory: prefer DATA_DIR env var, otherwise ~/.yomarket/ (survives git updates/reclones).
+# Falls back to legacy bot/data/ so existing installations keep working until migrated.
+_DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(os.path.expanduser("~"), ".yomarket")
+_LEGACY_DIR = os.path.join(os.path.dirname(__file__), "data")
+
+def _migrate_legacy() -> None:
+    """Move bot/data/*.json to ~/.yomarket/ once, silently."""
+    if not os.path.isdir(_LEGACY_DIR):
+        return
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    for fname in ("tokens.json", "settings.json", "panel_creds.json"):
+        src = os.path.join(_LEGACY_DIR, fname)
+        dst = os.path.join(_DATA_DIR, fname)
+        if os.path.exists(src) and not os.path.exists(dst):
+            shutil.move(src, dst)
+
+_migrate_legacy()
+
+_FILE = os.path.join(_DATA_DIR, "tokens.json")
+_SETTINGS_FILE = os.path.join(_DATA_DIR, "settings.json")
+_PANEL_FILE = os.path.join(_DATA_DIR, "panel_creds.json")
 
 _DEFAULT_SETTINGS = {
     "shop_name": "",
