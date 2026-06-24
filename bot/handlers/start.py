@@ -6,9 +6,12 @@ from aiogram.types import CallbackQuery, Message
 
 from api.yoomarket import YooMarketAPI
 from keyboards.main import main_menu_keyboard
-from storage import delete_token, get_token, save_token, get_settings, save_settings, get_shop_name, save_shop_name
+from storage import delete_token, get_token, save_token, get_settings, save_settings, get_shop_name, save_shop_name, _DATA_DIR
 
 router = Router()
+
+# Bumped on every meaningful code change — lets us confirm which version is running.
+BOT_VERSION = "2026-06-24-v3"
 
 
 class AuthState(StatesGroup):
@@ -60,6 +63,24 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "👋 Добро пожаловать в <b>YooMarket бот</b>!\n\n"
         "Отправьте ваш <b>API токен</b> из панели YooMarket:\n"
         "<i>Мой магазин → Интеграции → API токен</i>"
+    )
+
+
+@router.message(Command("version"))
+async def cmd_version(message: Message) -> None:
+    """Show running bot version and data directory — for debugging deploys."""
+    import os
+    data_files = []
+    try:
+        for f in ("tokens.json", "settings.json", "panel_creds.json"):
+            p = os.path.join(_DATA_DIR, f)
+            data_files.append(f"{'✅' if os.path.exists(p) else '❌'} {f}")
+    except Exception:
+        pass
+    await message.answer(
+        f"🤖 <b>Версия бота:</b> <code>{BOT_VERSION}</code>\n"
+        f"📁 <b>Данные:</b> <code>{_DATA_DIR}</code>\n\n"
+        + "\n".join(data_files)
     )
 
 
