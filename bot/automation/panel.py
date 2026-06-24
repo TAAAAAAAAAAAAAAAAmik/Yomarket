@@ -583,6 +583,12 @@ class PanelSession:
             if d not in resources:
                 resources.append(d)
 
+        # Remove resources that are definitely not product forms
+        _NON_PRODUCT = {"ad-groups", "ad-group", "categories", "tags", "users",
+                        "roles", "permissions", "settings", "logs", "reviews",
+                        "orders", "chats", "messages", "notifications"}
+        resources = [r for r in resources if r not in _NON_PRODUCT]
+
         debug.append(f"Всего ресурсов для проверки: {len(resources)}")
 
         # 4. For each candidate: check creation-fields, then POST with JSON
@@ -629,6 +635,18 @@ class PanelSession:
                 f.get("attribute") for f in fields
                 if f.get("attribute") and "required" in str(f.get("rules", []))
             ]
+
+            # Skip non-product resources: a product form MUST have a price-like field.
+            # Resources like ad-groups (title/public_title only) are not product forms.
+            _PRICE_KEYWORDS = ("price", "cost", "cena", "amount", "sum", "стоим")
+            has_price_field = any(
+                any(kw in (a or "").lower() for kw in _PRICE_KEYWORDS)
+                for a in attrs
+            )
+            if not has_price_field:
+                debug.append(f"⏭ {res}: нет поля цены, пропуск ({attrs})")
+                continue
+
             debug.append(f"✅ {res}: поля={attrs}")
 
             payload = self._map_nova_fields(fields, values)
