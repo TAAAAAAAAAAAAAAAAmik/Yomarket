@@ -424,6 +424,250 @@ def _extract_cookies(session: aiohttp.ClientSession, url: str) -> str:
     return "; ".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Synchronous panel product creation (runs in a thread via run_in_executor)
+# Uses `requests` with real socket timeouts so it never blocks the event loop.
+# ---------------------------------------------------------------------------
+
+def panel_create_product_sync(
+    cookie_string: str,
+    title: str,
+    price: int,
+    description: str,
+    quantity: int = 1,
+    category: str = "",
+) -> tuple[bool, str]:
+    """
+    Blocking function — call via loop.run_in_executor().
+    Creates a product via the Laravel Nova API using `requests` with socket timeouts.
+    """
+    import urllib.parse
+    import requests
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    CONNECT_TIMEOUT = 6   # seconds to establish TCP connection
+    READ_TIMEOUT = 10     # seconds to wait for server response
+
+    session = requests.Session()
+    session.verify = False
+
+    # Load cookies from the stored cookie string
+    for part in cookie_string.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            k, v = k.strip(), v.strip()
+            if k:
+                session.cookies.set(k, v, domain="panel.yoomarket.net")
+
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": PANEL_URL + "/",
+    })
+
+    # CSRF handshake
+    try:
+        session.get(PANEL_URL + "/sanctum/csrf-cookie",
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), allow_redirects=False)
+    except Exception:
+        pass
+
+    xsrf = ""
+    raw_xsrf = session.cookies.get("XSRF-TOKEN", "")
+    if raw_xsrf:
+        xsrf = urllib.parse.unquote(raw_xsrf)
+    if not xsrf:
+        # fallback: parse from original cookie string
+        for part in cookie_string.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, _, v = part.partition("=")
+                if k.strip().upper() in ("XSRF-TOKEN", "CSRF-TOKEN"):
+                    xsrf = urllib.parse.unquote(v.strip())
+                    break
+
+    hdrs = {}
+    if xsrf:
+        hdrs["X-XSRF-TOKEN"] = xsrf
+
+    debug: list[str] = [f"XSRF: {'✓' if xsrf else '✗'}"]
+
+    # Discover Nova resources
+    resources: list[str] = []
+    for nav_path in ("/nova-api/navigation", "/nova-api/resources"):
+        try:
+            resp = session.get(PANEL_URL + nav_path, headers=hdrs,
+                               timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                               allow_redirects=False)
+            debug.append(f"{nav_path}: {resp.status_code}")
+            if resp.status_code == 200:
+                found = re.findall(r'"uriKey"\s*:\s*"([^"]+)"', resp.text)
+                resources.extend(r for r in found if r not in resources)
+            elif resp.status_code in (401, 403):
+                return False, (
+                    "⚠️ <b>Сессия в панели истекла.</b>\n\n"
+                    "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
+                )
+        except Exception as e:
+            debug.append(f"{nav_path}: {str(e)[:50]}")
+
+    # Hardcoded fallbacks
+    for d in ("goods", "products", "offers", "items", "lots", "adverts",
+              "listings", "seller-goods", "seller-products"):
+        if d not in resources:
+            resources.append(d)
+
+    # Remove non-product resources
+    _NON_PRODUCT = {"ad-groups", "ad-group", "categories", "tags", "users",
+                    "roles", "permissions", "settings", "logs", "reviews",
+                    "orders", "chats", "messages", "notifications"}
+    resources = [r for r in resources if r not in _NON_PRODUCT]
+    debug.append(f"Ресурсы: {resources[:6]}")
+
+    values = {
+        "title": title, "price": price,
+        "description": description, "quantity": quantity, "category": category,
+    }
+    _PRICE_KWS = ("price", "cost", "cena", "amount", "sum", "стоим")
+
+    for res in resources[:6]:
+        try:
+            cf_resp = session.get(
+                f"{PANEL_URL}/nova-api/{res}/creation-fields",
+                headers=hdrs, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                allow_redirects=False,
+            )
+        except Exception as e:
+            debug.append(f"{res}: connect error {str(e)[:40]}")
+            continue
+
+        if cf_resp.status_code in (401, 403):
+            return False, (
+                "⚠️ <b>Сессия в панели истекла.</b>\n\n"
+                "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
+            )
+        if cf_resp.status_code == 404:
+            debug.append(f"{res}: 404")
+            continue
+        if cf_resp.status_code != 200:
+            debug.append(f"{res}: {cf_resp.status_code}")
+            continue
+
+        try:
+            cf = cf_resp.json()
+        except Exception:
+            debug.append(f"{res}: bad JSON")
+            continue
+
+        if not isinstance(cf, dict):
+            debug.append(f"{res}: not a dict ({type(cf).__name__})")
+            continue
+
+        fields = [f for f in (cf.get("fields") or []) if isinstance(f, dict)]
+        if not fields:
+            debug.append(f"{res}: no fields")
+            continue
+
+        attrs = [f.get("attribute") for f in fields if f.get("attribute")]
+
+        # Skip resources without a price field — not a product form
+        if not any(any(kw in (a or "").lower() for kw in _PRICE_KWS) for a in attrs):
+            debug.append(f"⏭ {res}: no price field ({attrs})")
+            continue
+
+        debug.append(f"✅ {res}: {attrs}")
+
+        # Build payload respecting max:N rules
+        payload: dict = {}
+        for f in fields:
+            attr = f.get("attribute", "")
+            al = attr.lower()
+            val = None
+            if any(k in al for k in ("title", "name", "header", "naimenov")):
+                val = values["title"]
+            elif any(k in al for k in ("price", "cost", "cena")):
+                val = values["price"]
+            elif any(k in al for k in ("desc", "opis", "text", "content")):
+                val = values["description"]
+            elif any(k in al for k in ("count", "quantity", "qty", "stock", "amount")):
+                val = values["quantity"]
+            elif any(k in al for k in ("categ", "kategor")):
+                val = values["category"] or None
+            else:
+                dv = f.get("value")
+                if dv not in (None, ""):
+                    val = dv
+            if val is not None and val != "":
+                if isinstance(val, str):
+                    for rule in (f.get("rules") or []):
+                        if isinstance(rule, str) and rule.startswith("max:"):
+                            try:
+                                val = val[:int(rule.split(":")[1])]
+                            except (ValueError, IndexError):
+                                pass
+                payload[attr] = val
+        payload.setdefault("title", values["title"])
+        payload.setdefault("price", values["price"])
+
+        try:
+            post_resp = session.post(
+                f"{PANEL_URL}/nova-api/{res}?editing=true&editMode=create",
+                json=payload, headers=hdrs,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+            )
+        except Exception as e:
+            debug.append(f"POST {res}: {str(e)[:50]}")
+            continue
+
+        if post_resp.status_code in (200, 201):
+            try:
+                data = post_resp.json()
+            except Exception:
+                data = {}
+            rid = (data.get("resource") or {}).get("id") or data.get("id") or ""
+            if isinstance(rid, dict):
+                rid = rid.get("value", "")
+            return True, str(rid) if rid else "создан"
+
+        if post_resp.status_code == 422:
+            try:
+                err_body = post_resp.json()
+                err_fields = err_body.get("errors") or err_body.get("message") or post_resp.text[:300]
+            except Exception:
+                err_fields = post_resp.text[:300]
+            err_str = (
+                _json.dumps(err_fields, ensure_ascii=False)[:400]
+                if isinstance(err_fields, dict)
+                else str(err_fields)[:400]
+            )
+            required = [
+                f.get("attribute") for f in fields
+                if f.get("attribute") and "required" in str(f.get("rules", []))
+            ]
+            return False, (
+                f"✅ Ресурс <b>{res}</b> найден!\n"
+                f"Поля: <code>{attrs}</code>\n"
+                f"Обязательные: <code>{required}</code>\n\n"
+                f"Ошибка 422:\n<code>{err_str}</code>\n\n"
+                f"Отправлено: <code>{_json.dumps(payload, ensure_ascii=False)[:200]}</code>"
+            )
+
+        if post_resp.status_code in (401, 403):
+            return False, (
+                "⚠️ <b>Сессия в панели истекла.</b>\n\n"
+                "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова."
+            )
+
+        debug.append(f"POST {res}: {post_resp.status_code} → {post_resp.text[:60]}")
+
+    diag = "\n".join(debug[:20])
+    return False, f"🔍 <b>Диагностика</b>:\n{diag}"
+
+
 class PanelSession:
     """
     HTTP client authenticated with panel.yoomarket.net session cookies.

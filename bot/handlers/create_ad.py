@@ -262,9 +262,9 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
         except Exception:
             pass  # Fall through to panel
 
-    # ── Шаг 2: Panel (Nova API) ─────────────────────────────────────────────
+    # ── Шаг 2: Panel (Nova API) via synchronous requests in a thread ──────────
     from storage import get_panel_creds
-    from automation.panel import PanelSession
+    from automation.panel import panel_create_product_sync
 
     creds = get_panel_creds(uid)
     if not creds or not creds.get("cookies"):
@@ -283,62 +283,48 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
         return
 
     status_msg = await callback.message.edit_text(
-        "⏳ Создаю товар через панель YooMarket… [v3]\n"
+        "⏳ Создаю товар через панель YooMarket… [v4]\n"
         "<i>0 сек...</i>"
     )
 
-    async def _do_panel() -> tuple[bool, str]:
-        ps = PanelSession(creds["cookies"])
-        await ps.start()
-        try:
-            return await ps.create_product(
-                title=title, price=price, description=description,
-                quantity=quantity, category=category,
-            )
-        finally:
-            try:
-                await asyncio.shield(ps.close())
-            except Exception:
-                pass
+    # Run blocking requests in a thread — never blocks the event loop.
+    # asyncio.wait polls every 6s so the message updates to show progress.
+    loop = asyncio.get_event_loop()
+    panel_task = loop.run_in_executor(
+        None,
+        panel_create_product_sync,
+        creds["cookies"], title, price, description, quantity, category,
+    )
+    panel_future = asyncio.ensure_future(panel_task)
 
-    # Use create_task + asyncio.wait so the message updates every 6s.
-    # asyncio.wait_for cannot cancel if the loop is blocked; this detects that:
-    # if the counter stops incrementing, the event loop is frozen.
     DEADLINE = 42
     CHECK_INTERVAL = 6
-    panel_task = asyncio.create_task(_do_panel())
     ok, result_msg = False, ""
     elapsed = 0
 
     while elapsed < DEADLINE:
-        done, _ = await asyncio.wait({panel_task}, timeout=CHECK_INTERVAL)
+        done, _ = await asyncio.wait({panel_future}, timeout=CHECK_INTERVAL)
         elapsed += CHECK_INTERVAL
-        if panel_task in done:
+        if panel_future in done:
             try:
-                ok, result_msg = panel_task.result()
+                ok, result_msg = panel_future.result()
             except Exception as e:
                 ok, result_msg = False, f"Неожиданная ошибка: {str(e)[:200]}"
             break
         try:
             await status_msg.edit_text(
-                f"⏳ Создаю товар через панель YooMarket… [v3]\n"
+                f"⏳ Создаю товар через панель YooMarket… [v4]\n"
                 f"<i>{elapsed} сек...</i>"
             )
         except Exception:
             pass
     else:
-        panel_task.cancel()
-        try:
-            await panel_task
-        except Exception:
-            pass
+        panel_future.cancel()
         ok, result_msg = False, (
             "⏱ <b>Панель не ответила за 42 секунд.</b>\n\n"
-            "Если счетчик не менялся — event loop заблокирован (DNS/SSL).\n"
             "Сессия истекла или сервер YooMarket недоступен.\n\n"
             "Войдите в панель снова или создайте товар вручную."
         )
-
     if ok:
         b = InlineKeyboardBuilder()
         b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
