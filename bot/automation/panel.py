@@ -557,19 +557,29 @@ def panel_create_product_sync(
         except Exception as e:
             debug.append(f"HTML scan: {str(e)[:40]}")
 
-    # Hardcoded fallbacks — items first: on this panel it's the only
-    # /nova-api resource that returns 200 for creation-fields
-    for d in ("items", "goods", "products", "offers", "lots", "adverts",
-              "listings", "seller-goods", "seller-products"):
+    # Candidates to try FIRST: on this panel ad-items belongsTo "ad", so the
+    # product entity is almost certainly the "ads" resource
+    priority = ["ads", "ad", "items", "goods", "products"]
+    for d in reversed(priority):
+        if d in resources:
+            resources.remove(d)
+        resources.insert(0, d)
+    for d in ("offers", "lots", "adverts", "listings"):
         if d not in resources:
             resources.append(d)
 
-    # Remove non-product resources
-    _NON_PRODUCT = {"ad-groups", "ad-group", "categories", "tags", "users",
-                    "roles", "permissions", "settings", "logs", "reviews",
-                    "orders", "chats", "messages", "notifications"}
-    resources = [r for r in resources if r not in _NON_PRODUCT]
-    debug.append(f"Ресурсы: {resources[:8]}")
+    # Remove resources that can't be the product form:
+    # groups/values/admin panels/events etc.
+    def _is_junk(name: str) -> bool:
+        n = name.lower()
+        if n in ("ad-groups", "ad-group", "categories", "tags", "users",
+                 "roles", "permissions", "settings", "logs", "reviews",
+                 "orders", "chats", "messages", "notifications"):
+            return True
+        return any(w in n for w in ("admin", "action-event", "balance", "cabinet"))
+
+    resources = [r for r in resources if not _is_junk(r)]
+    debug.append(f"Ресурсы: {resources[:12]}")
 
     values = {
         "title": title, "price": price,
@@ -577,7 +587,7 @@ def panel_create_product_sync(
     }
     _PRICE_KWS = ("price", "cost", "cena", "amount", "sum", "стоим")
 
-    for res in resources[:6]:
+    for res in resources[:12]:
         try:
             cf_resp = session.get(
                 f"{PANEL_URL}/nova-api/{res}/creation-fields"
@@ -616,12 +626,22 @@ def panel_create_product_sync(
             debug.append(f"{res}: not a dict ({type(cf).__name__})")
             continue
 
-        # Nova can return fields at top level or nested inside panels
-        raw_fields = cf.get("fields") or []
+        # Nova can return fields as a list, as a numeric-keyed dict
+        # ({"fields":{"2":{...}}} — seen on this panel), or nested inside panels
+        raw = cf.get("fields")
+        if isinstance(raw, dict):
+            raw_fields = list(raw.values())
+        elif isinstance(raw, list):
+            raw_fields = list(raw)
+        else:
+            raw_fields = []
         if not raw_fields and isinstance(cf.get("panels"), list):
             for p in cf["panels"]:
-                if isinstance(p, dict) and isinstance(p.get("fields"), list):
-                    raw_fields.extend(p["fields"])
+                pf = p.get("fields") if isinstance(p, dict) else None
+                if isinstance(pf, dict):
+                    raw_fields.extend(pf.values())
+                elif isinstance(pf, list):
+                    raw_fields.extend(pf)
         fields = [f for f in raw_fields if isinstance(f, dict)]
         if not fields:
             # Show raw body so we can see the actual response shape
