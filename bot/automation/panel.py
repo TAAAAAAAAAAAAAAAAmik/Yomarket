@@ -429,6 +429,147 @@ def _extract_cookies(session: aiohttp.ClientSession, url: str) -> str:
 # Uses `requests` with real socket timeouts so it never blocks the event loop.
 # ---------------------------------------------------------------------------
 
+def _make_panel_requests_session(cookie_string: str):
+    """Build a `requests` session pre-loaded with panel cookies and headers."""
+    import requests
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    session = requests.Session()
+    session.verify = False
+    for part in cookie_string.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            if k.strip():
+                session.cookies.set(k.strip(), v.strip(), domain="panel.yoomarket.net")
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": PANEL_URL + "/",
+    })
+    return session
+
+
+def _parse_nova_fields_payload(cf: dict) -> list[dict]:
+    """Extract the field list from a Nova creation-fields response.
+    Handles list, numeric-keyed dict, and panel-nested shapes."""
+    raw = cf.get("fields")
+    if isinstance(raw, dict):
+        raw_fields = list(raw.values())
+    elif isinstance(raw, list):
+        raw_fields = list(raw)
+    else:
+        raw_fields = []
+    if not raw_fields and isinstance(cf.get("panels"), list):
+        for p in cf["panels"]:
+            pf = p.get("fields") if isinstance(p, dict) else None
+            if isinstance(pf, dict):
+                raw_fields.extend(pf.values())
+            elif isinstance(pf, list):
+                raw_fields.extend(pf)
+    return [f for f in raw_fields if isinstance(f, dict)]
+
+
+def _normalize_options(field: dict) -> list[dict]:
+    """Return [{'label': str, 'value': any}, ...] from a Nova select field."""
+    options = field.get("options")
+    if not options:
+        options = (field.get("meta") or {}).get("options")
+    if not options:
+        return []
+    result = []
+    if isinstance(options, dict):
+        options = [{"label": str(v), "value": k} for k, v in options.items()]
+    if isinstance(options, list):
+        for o in options:
+            if isinstance(o, dict):
+                val = o.get("value", o.get("id"))
+                label = o.get("label") or o.get("display") or o.get("name") or str(val)
+                result.append({"label": str(label), "value": val})
+            else:
+                result.append({"label": str(o), "value": o})
+    return result
+
+
+def panel_get_item_form_sync(cookie_string: str) -> tuple[bool, object]:
+    """
+    Blocking: fetch the product creation form (fields + select options).
+    Returns (True, {"resource": str, "fields": [{attribute,label,options,required,dependsOn}]})
+    or (False, error_message).
+    """
+    session = _make_panel_requests_session(cookie_string)
+    last_err = "форма не найдена"
+    for res in ("items", "ads", "goods", "products"):
+        try:
+            r = session.get(
+                f"{PANEL_URL}/nova-api/{res}/creation-fields?editing=true&editMode=create",
+                timeout=(6, 10), allow_redirects=False,
+            )
+        except Exception as e:
+            last_err = str(e)[:60]
+            continue
+        if r.status_code == 401:
+            return False, "401: сессия панели истекла — войдите снова"
+        if r.status_code != 200:
+            continue
+        try:
+            cf = r.json()
+        except Exception:
+            continue
+        if not isinstance(cf, dict):
+            continue
+        fields = _parse_nova_fields_payload(cf)
+        if not fields:
+            continue
+        form_fields = []
+        for f in fields:
+            attr = f.get("attribute")
+            if not attr:
+                continue
+            form_fields.append({
+                "attribute": attr,
+                "label": f.get("name") or f.get("indexName") or attr,
+                "options": _normalize_options(f),
+                "required": "required" in str(f.get("rules", [])),
+                "dependsOn": f.get("dependsOn"),
+            })
+        return True, {"resource": res, "fields": form_fields}
+    return False, last_err
+
+
+def panel_sync_field_options_sync(
+    cookie_string: str, resource: str, field_attr: str, form_values: dict,
+) -> list[dict]:
+    """
+    Blocking: re-fetch options for a dependent select (Nova dependsOn), passing
+    already-chosen form values as query params. Returns [] if unsupported.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    params = {"editing": "true", "editMode": "create", "field": field_attr}
+    for k, v in form_values.items():
+        params[k] = str(v)
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/{resource}/creation-fields",
+            params=params, timeout=(6, 10), allow_redirects=False,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        if not isinstance(data, dict):
+            return []
+        candidates = _parse_nova_fields_payload(data) or ([data] if data.get("attribute") else [])
+        for f in candidates:
+            if f.get("attribute") == field_attr:
+                return _normalize_options(f)
+    except Exception:
+        pass
+    return []
+
+
 def _save_refreshed_cookies(uid: int | None, cookie_string: str, session) -> None:
     """Merge rotated Laravel session cookies back into storage so the panel
     session keeps extending instead of aging out from the original login."""
@@ -461,11 +602,14 @@ def panel_create_product_sync(
     quantity: int = 1,
     category: str = "",
     uid: int | None = None,
+    extra: dict | None = None,
 ) -> tuple[bool, str]:
     """
     Blocking function — call via loop.run_in_executor().
     Creates a product via the Laravel Nova API using `requests` with socket timeouts.
     If uid is given, refreshed session cookies are saved back to storage.
+    `extra` — exact Nova attribute values (e.g. category/subcategory/type ids
+    chosen by the user) merged into the payload last, overriding the mapping.
     """
     import urllib.parse
     import requests
@@ -688,6 +832,11 @@ def panel_create_product_sync(
                 payload[attr] = val
         payload.setdefault("title", values["title"])
         payload.setdefault("price", values["price"])
+        # User-chosen select values (category/subcategory/type ids) win over guesses
+        if extra:
+            for k, v in extra.items():
+                if v is not None:
+                    payload[k] = v
 
         try:
             post_resp = session.post(
