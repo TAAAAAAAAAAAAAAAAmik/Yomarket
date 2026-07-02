@@ -348,24 +348,42 @@ async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
     attr = queue[0]
     f = fields.get(attr) or {"attribute": attr, "label": attr, "options": []}
     options = f.get("options") or []
+    trace = ""
 
     if not options:
-        # Зависимый селект (суб-категория) — тянем варианты с учётом выбранного
+        # BelongsTo/зависимый селект — тянем варианты отдельным запросом
         creds = get_panel_creds(uid)
         loop = asyncio.get_event_loop()
         try:
-            options = await asyncio.wait_for(
+            options, trace = await asyncio.wait_for(
                 loop.run_in_executor(
                     None, panel_sync_field_options_sync,
                     creds["cookies"], data.get("form_resource", "items"), attr, chosen,
                 ),
-                timeout=20,
+                timeout=25,
             )
-        except Exception:
-            options = []
+        except Exception as e:
+            options, trace = [], f"ошибка: {str(e)[:60]}"
 
     if not options:
-        # Вариантов нет — пропускаем поле, сервер подскажет через 422
+        # Обязательное поле без вариантов — это тупик, показываем диагностику
+        if f.get("required") or attr in ("category", "subcategory", "type"):
+            await state.clear()
+            b = InlineKeyboardBuilder()
+            b.button(text="🌐 Создать вручную в панели",
+                     url="https://panel.yoomarket.net/goods/create")
+            b.button(text="⬅️ Назад", callback_data="menu:ads")
+            b.adjust(1)
+            await msg.edit_text(
+                f"❌ <b>Не удалось получить варианты поля «{f.get('label') or attr}»</b>\n\n"
+                f"component: <code>{f.get('component','?')}</code>\n"
+                f"связь: <code>{f.get('relationship','—')}</code>\n"
+                f"Запросы:\n<code>{trace[:400]}</code>\n\n"
+                f"Пришлите этот текст разработчику.",
+                reply_markup=b.as_markup(),
+            )
+            return
+        # Необязательное — пропускаем
         await state.update_data(select_queue=queue[1:])
         await _ask_next_select(msg, state, uid)
         return

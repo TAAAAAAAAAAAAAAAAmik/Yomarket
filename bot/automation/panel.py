@@ -535,6 +535,8 @@ def panel_get_item_form_sync(cookie_string: str) -> tuple[bool, object]:
                 "options": _normalize_options(f),
                 "required": "required" in str(f.get("rules", [])),
                 "dependsOn": f.get("dependsOn"),
+                "component": f.get("component", ""),
+                "relationship": f.get("relationshipType") or f.get("belongsToRelationship") or "",
             })
         return True, {"resource": res, "fields": form_fields}
     return False, last_err
@@ -542,12 +544,47 @@ def panel_get_item_form_sync(cookie_string: str) -> tuple[bool, object]:
 
 def panel_sync_field_options_sync(
     cookie_string: str, resource: str, field_attr: str, form_values: dict,
-) -> list[dict]:
+) -> tuple[list[dict], str]:
     """
-    Blocking: re-fetch options for a dependent select (Nova dependsOn), passing
-    already-chosen form values as query params. Returns [] if unsupported.
+    Blocking: fetch options for a select that has none inline.
+    Tries, in order:
+      1. /nova-api/{res}/associatable/{attr} — BelongsTo relation options
+      2. /nova-api/{res}/creation-fields?field={attr}&... — dependsOn sync
+    Returns (options, debug_trace). options=[] if nothing worked.
     """
     session = _make_panel_requests_session(cookie_string)
+    trace: list[str] = []
+
+    # 1. BelongsTo options endpoint (Nova "associatable")
+    assoc_params = {
+        "search": "", "first": "false", "withTrashed": "false",
+        "editing": "true", "editMode": "create",
+    }
+    for k, v in form_values.items():
+        assoc_params[k] = str(v)
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/{resource}/associatable/{field_attr}",
+            params=assoc_params, timeout=(6, 10), allow_redirects=False,
+        )
+        trace.append(f"associatable/{field_attr}: {r.status_code}")
+        if r.status_code == 200:
+            data = r.json()
+            rows = data.get("resources") if isinstance(data, dict) else None
+            if isinstance(rows, list) and rows:
+                opts = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        val = row.get("value", row.get("id"))
+                        label = row.get("display") or row.get("title") or str(val)
+                        opts.append({"label": str(label), "value": val})
+                if opts:
+                    return opts, "; ".join(trace)
+            trace.append(f"body={r.text[:120]}")
+    except Exception as e:
+        trace.append(f"associatable: {str(e)[:40]}")
+
+    # 2. dependsOn field sync via creation-fields
     params = {"editing": "true", "editMode": "create", "field": field_attr}
     for k, v in form_values.items():
         params[k] = str(v)
@@ -556,18 +593,23 @@ def panel_sync_field_options_sync(
             f"{PANEL_URL}/nova-api/{resource}/creation-fields",
             params=params, timeout=(6, 10), allow_redirects=False,
         )
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        if not isinstance(data, dict):
-            return []
-        candidates = _parse_nova_fields_payload(data) or ([data] if data.get("attribute") else [])
-        for f in candidates:
-            if f.get("attribute") == field_attr:
-                return _normalize_options(f)
-    except Exception:
-        pass
-    return []
+        trace.append(f"creation-fields?field: {r.status_code}")
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                candidates = _parse_nova_fields_payload(data) or (
+                    [data] if data.get("attribute") else []
+                )
+                for f in candidates:
+                    if f.get("attribute") == field_attr:
+                        opts = _normalize_options(f)
+                        if opts:
+                            return opts, "; ".join(trace)
+                trace.append(f"body={r.text[:120]}")
+    except Exception as e:
+        trace.append(f"creation-fields: {str(e)[:40]}")
+
+    return [], "; ".join(trace)
 
 
 def _save_refreshed_cookies(uid: int | None, cookie_string: str, session) -> None:
