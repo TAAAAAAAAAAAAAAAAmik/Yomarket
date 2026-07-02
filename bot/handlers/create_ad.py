@@ -293,7 +293,7 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
     panel_task = loop.run_in_executor(
         None,
         panel_create_product_sync,
-        creds["cookies"], title, price, description, quantity, category,
+        creds["cookies"], title, price, description, quantity, category, uid,
     )
     panel_future = asyncio.ensure_future(panel_task)
 

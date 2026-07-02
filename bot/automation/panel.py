@@ -429,6 +429,30 @@ def _extract_cookies(session: aiohttp.ClientSession, url: str) -> str:
 # Uses `requests` with real socket timeouts so it never blocks the event loop.
 # ---------------------------------------------------------------------------
 
+def _save_refreshed_cookies(uid: int | None, cookie_string: str, session) -> None:
+    """Merge rotated Laravel session cookies back into storage so the panel
+    session keeps extending instead of aging out from the original login."""
+    if uid is None:
+        return
+    try:
+        from storage import get_panel_creds, save_panel_creds
+        merged: dict[str, str] = {}
+        for part in cookie_string.split(";"):
+            part = part.strip()
+            if "=" in part:
+                k, _, v = part.partition("=")
+                if k.strip():
+                    merged[k.strip()] = v.strip()
+        for c in session.cookies:
+            if c.value:
+                merged[c.name] = c.value
+        creds = get_panel_creds(uid) or {}
+        creds["cookies"] = "; ".join(f"{k}={v}" for k, v in merged.items())
+        save_panel_creds(uid, creds)
+    except Exception:
+        logger.debug("cookie refresh save failed", exc_info=True)
+
+
 def panel_create_product_sync(
     cookie_string: str,
     title: str,
@@ -436,10 +460,12 @@ def panel_create_product_sync(
     description: str,
     quantity: int = 1,
     category: str = "",
+    uid: int | None = None,
 ) -> tuple[bool, str]:
     """
     Blocking function — call via loop.run_in_executor().
     Creates a product via the Laravel Nova API using `requests` with socket timeouts.
+    If uid is given, refreshed session cookies are saved back to storage.
     """
     import urllib.parse
     import requests
@@ -659,9 +685,11 @@ def panel_create_product_sync(
             rid = (data.get("resource") or {}).get("id") or data.get("id") or ""
             if isinstance(rid, dict):
                 rid = rid.get("value", "")
+            _save_refreshed_cookies(uid, cookie_string, session)
             return True, str(rid) if rid else "создан"
 
         if post_resp.status_code == 422:
+            _save_refreshed_cookies(uid, cookie_string, session)
             try:
                 err_body = post_resp.json()
                 err_fields = err_body.get("errors") or err_body.get("message") or post_resp.text[:300]
@@ -692,6 +720,7 @@ def panel_create_product_sync(
 
         debug.append(f"POST {res}: {post_resp.status_code} → {post_resp.text[:60]}")
 
+    _save_refreshed_cookies(uid, cookie_string, session)
     diag = "\n".join(debug[:20])
     return False, f"🔍 <b>Диагностика</b>:\n{diag}"
 
