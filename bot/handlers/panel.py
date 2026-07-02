@@ -310,10 +310,30 @@ async def panel_email_code(message: Message, state: FSMContext) -> None:
     email = data.get("email", "")
     await state.clear()
     save_panel_creds(uid, {"login": email, "cookies": result})
-    await status_msg.edit_text(
-        "✅ <b>Успешно вошли в панель!</b>\n\n"
-        "Теперь доступны функции авто-поднятия и авто-восстановления товаров."
-    )
+
+    # Immediately verify the cookies actually work for the Nova API
+    from automation.panel import panel_check_session_sync
+    loop = asyncio.get_event_loop()
+    try:
+        api_ok, api_detail = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_check_session_sync, result),
+            timeout=30,
+        )
+    except Exception as e:
+        api_ok, api_detail = False, f"проверка не удалась: {str(e)[:60]}"
+
+    if api_ok:
+        await status_msg.edit_text(
+            "✅ <b>Успешно вошли в панель!</b>\n"
+            "🔬 Куки проверены — API панели отвечает.\n\n"
+            "Теперь доступно создание товаров и авто-функции."
+        )
+    else:
+        await status_msg.edit_text(
+            "⚠️ <b>Вход выполнен, но API панели не принял куки.</b>\n\n"
+            f"Проверка:\n<code>{api_detail}</code>\n\n"
+            "Создание товаров может не работать — пришлите этот текст разработчику."
+        )
     creds = get_panel_creds(uid)
     has_token = bool(get_token(uid))
     await message.answer(_status_text(creds, has_token), reply_markup=_menu_kb(creds, has_token))

@@ -522,7 +522,9 @@ def panel_create_product_sync(
 
     debug: list[str] = [f"XSRF: {'✓' if xsrf else '✗'}"]
 
-    # Discover Nova resources
+    # Discover Nova resources.
+    # NOTE: 401/403 here is recorded but NOT fatal — 403 can mean "no access to
+    # this endpoint" while resource endpoints still work fine.
     resources: list[str] = []
     for nav_path in ("/nova-api/navigation", "/nova-api/resources"):
         try:
@@ -533,11 +535,6 @@ def panel_create_product_sync(
             if resp.status_code == 200:
                 found = re.findall(r'"uriKey"\s*:\s*"([^"]+)"', resp.text)
                 resources.extend(r for r in found if r not in resources)
-            elif resp.status_code in (401, 403):
-                return False, (
-                    "⚠️ <b>Сессия в панели истекла.</b>\n\n"
-                    "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
-                )
         except Exception as e:
             debug.append(f"{nav_path}: {str(e)[:50]}")
 
@@ -592,11 +589,16 @@ def panel_create_product_sync(
             debug.append(f"{res}: connect error {str(e)[:40]}")
             continue
 
-        if cf_resp.status_code in (401, 403):
+        if cf_resp.status_code == 401:
             return False, (
-                "⚠️ <b>Сессия в панели истекла.</b>\n\n"
+                "⚠️ <b>Панель не принимает сохранённые куки</b> "
+                f"(401 на <code>{res}/creation-fields</code>).\n\n"
                 "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
             )
+        if cf_resp.status_code == 403:
+            # No permission for THIS resource — not a dead session, keep looking
+            debug.append(f"{res}: 403 нет доступа")
+            continue
         if cf_resp.status_code == 404:
             debug.append(f"{res}: 404")
             continue
@@ -712,17 +714,76 @@ def panel_create_product_sync(
                 f"Отправлено: <code>{_json.dumps(payload, ensure_ascii=False)[:200]}</code>"
             )
 
-        if post_resp.status_code in (401, 403):
+        if post_resp.status_code == 401:
             return False, (
-                "⚠️ <b>Сессия в панели истекла.</b>\n\n"
+                "⚠️ <b>Панель не принимает сохранённые куки</b> "
+                f"(401 на POST <code>{res}</code>).\n\n"
                 "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова."
             )
+        if post_resp.status_code == 403:
+            debug.append(f"POST {res}: 403 нет доступа")
+            continue
+        if post_resp.status_code == 419:
+            debug.append(f"POST {res}: 419 CSRF mismatch")
+            continue
 
         debug.append(f"POST {res}: {post_resp.status_code} → {post_resp.text[:60]}")
 
     _save_refreshed_cookies(uid, cookie_string, session)
     diag = "\n".join(debug[:20])
     return False, f"🔍 <b>Диагностика</b>:\n{diag}"
+
+
+def panel_check_session_sync(cookie_string: str) -> tuple[bool, str]:
+    """
+    Blocking session check via requests — call through run_in_executor.
+    Returns (ok, detail) where detail lists each probe and its HTTP status.
+    """
+    import requests
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    session = requests.Session()
+    session.verify = False
+    for part in cookie_string.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            if k.strip():
+                session.cookies.set(k.strip(), v.strip(), domain="panel.yoomarket.net")
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": PANEL_URL + "/",
+    })
+
+    details = []
+    ok = False
+    for path in ("/nova-api/items/creation-fields?editing=true&editMode=create",
+                 "/api/user"):
+        try:
+            r = session.get(PANEL_URL + path, timeout=(6, 10), allow_redirects=False)
+            details.append(f"{path.split('?')[0]}: {r.status_code}")
+            if r.status_code == 200:
+                ok = True
+                break
+            if r.status_code == 401:
+                return False, "\n".join(details)
+        except Exception as e:
+            details.append(f"{path.split('?')[0]}: {str(e)[:40]}")
+
+    if not ok:
+        # Last probe: does the panel root redirect to /login?
+        try:
+            r = session.get(PANEL_URL + "/", timeout=(6, 10), allow_redirects=True)
+            final = r.url or ""
+            details.append(f"/: {r.status_code} → {final[-40:]}")
+            ok = "/login" not in final and "/auth" not in final
+        except Exception as e:
+            details.append(f"/: {str(e)[:40]}")
+
+    return ok, "\n".join(details)
 
 
 class PanelSession:
