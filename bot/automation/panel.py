@@ -515,8 +515,28 @@ def panel_create_product_sync(
         except Exception as e:
             debug.append(f"{nav_path}: {str(e)[:50]}")
 
-    # Hardcoded fallbacks
-    for d in ("goods", "products", "offers", "items", "lots", "adverts",
+    # Scan SPA HTML for resource uriKeys (navigation endpoint 404s on this panel,
+    # but resource names leak into the page config / router paths)
+    if not resources:
+        try:
+            html_resp = session.get(
+                PANEL_URL + "/", timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                allow_redirects=True,
+            )
+            html = html_resp.text
+            for r in re.findall(r'"uriKey"\s*:\s*"([^"]+)"', html):
+                if r not in resources:
+                    resources.append(r)
+            for r in re.findall(r'/resources/([a-z0-9_\-]+)', html, re.I):
+                if r not in resources:
+                    resources.append(r)
+            debug.append(f"HTML scan: {resources[:8] or 'ничего'}")
+        except Exception as e:
+            debug.append(f"HTML scan: {str(e)[:40]}")
+
+    # Hardcoded fallbacks — items first: on this panel it's the only
+    # /nova-api resource that returns 200 for creation-fields
+    for d in ("items", "goods", "products", "offers", "lots", "adverts",
               "listings", "seller-goods", "seller-products"):
         if d not in resources:
             resources.append(d)
@@ -526,7 +546,7 @@ def panel_create_product_sync(
                     "roles", "permissions", "settings", "logs", "reviews",
                     "orders", "chats", "messages", "notifications"}
     resources = [r for r in resources if r not in _NON_PRODUCT]
-    debug.append(f"Ресурсы: {resources[:6]}")
+    debug.append(f"Ресурсы: {resources[:8]}")
 
     values = {
         "title": title, "price": price,
@@ -537,7 +557,8 @@ def panel_create_product_sync(
     for res in resources[:6]:
         try:
             cf_resp = session.get(
-                f"{PANEL_URL}/nova-api/{res}/creation-fields",
+                f"{PANEL_URL}/nova-api/{res}/creation-fields"
+                f"?editing=true&editMode=create",
                 headers=hdrs, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
                 allow_redirects=False,
             )
@@ -560,16 +581,23 @@ def panel_create_product_sync(
         try:
             cf = cf_resp.json()
         except Exception:
-            debug.append(f"{res}: bad JSON")
+            debug.append(f"{res}: bad JSON: {cf_resp.text[:100]}")
             continue
 
         if not isinstance(cf, dict):
             debug.append(f"{res}: not a dict ({type(cf).__name__})")
             continue
 
-        fields = [f for f in (cf.get("fields") or []) if isinstance(f, dict)]
+        # Nova can return fields at top level or nested inside panels
+        raw_fields = cf.get("fields") or []
+        if not raw_fields and isinstance(cf.get("panels"), list):
+            for p in cf["panels"]:
+                if isinstance(p, dict) and isinstance(p.get("fields"), list):
+                    raw_fields.extend(p["fields"])
+        fields = [f for f in raw_fields if isinstance(f, dict)]
         if not fields:
-            debug.append(f"{res}: no fields")
+            # Show raw body so we can see the actual response shape
+            debug.append(f"{res}: no fields, body={cf_resp.text[:200]}")
             continue
 
         attrs = [f.get("attribute") for f in fields if f.get("attribute")]
