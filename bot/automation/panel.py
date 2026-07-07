@@ -544,12 +544,14 @@ def panel_get_item_form_sync(cookie_string: str) -> tuple[bool, object]:
 
 def panel_sync_field_options_sync(
     cookie_string: str, resource: str, field_attr: str, form_values: dict,
+    search: str = "",
 ) -> tuple[list[dict], str]:
     """
     Blocking: fetch options for a select that has none inline.
     Tries, in order:
       1. /nova-api/{res}/associatable/{attr} — BelongsTo relation options
       2. /nova-api/{res}/creation-fields?field={attr}&... — dependsOn sync
+    `search` narrows associatable results (the endpoint caps unfiltered lists).
     Returns (options, debug_trace). options=[] if nothing worked.
     """
     session = _make_panel_requests_session(cookie_string)
@@ -557,7 +559,7 @@ def panel_sync_field_options_sync(
 
     # 1. BelongsTo options endpoint (Nova "associatable")
     assoc_params = {
-        "search": "", "first": "false", "withTrashed": "false",
+        "search": search, "first": "false", "withTrashed": "false",
         "editing": "true", "editMode": "create",
     }
     for k, v in form_values.items():

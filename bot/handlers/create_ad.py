@@ -388,27 +388,132 @@ async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
         await _ask_next_select(msg, state, uid)
         return
 
-    options = options[:60]
-    await state.update_data(
-        current_attr=attr, current_options=options, select_queue=queue[1:],
-    )
-    b = InlineKeyboardBuilder()
-    for i, o in enumerate(options):
-        b.button(text=str(o.get("label", ""))[:32], callback_data=f"cadopt:{i}")
-    b.button(text="❌ Отмена", callback_data="menu:ads")
-    b.adjust(2)
+    options = options[:500]
     label = f.get("label") or attr
-    await msg.edit_text(
-        f"📋 Выберите <b>{label}</b>:",
-        reply_markup=b.as_markup(),
+    await state.update_data(
+        current_attr=attr, current_label=label,
+        current_options=options, current_view=options, current_page=0,
+        select_queue=queue[1:],
     )
+    await _render_select(msg, state, edit=True)
+
+
+_PER_PAGE = 16
+
+
+async def _render_select(msg, state: FSMContext, edit: bool = True) -> None:
+    """Render the current select page with pagination + search hint."""
+    data = await state.get_data()
+    label = data.get("current_label") or data.get("current_attr") or ""
+    view: list = data.get("current_view") or []
+    page = int(data.get("current_page") or 0)
+
+    total_pages = max(1, (len(view) + _PER_PAGE - 1) // _PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = view[page * _PER_PAGE:(page + 1) * _PER_PAGE]
+
+    b = InlineKeyboardBuilder()
+    for i, o in enumerate(chunk, start=page * _PER_PAGE):
+        b.button(text=str(o.get("label", ""))[:32], callback_data=f"cadopt:{i}")
+    b.adjust(2)
+    if total_pages > 1:
+        nav = []
+        from aiogram.types import InlineKeyboardButton
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"cadpg:{page-1}"))
+        nav.append(InlineKeyboardButton(
+            text=f"{page+1}/{total_pages}", callback_data="cadpg:noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"cadpg:{page+1}"))
+        b.row(*nav)
+    from aiogram.types import InlineKeyboardButton
+    b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="menu:ads"))
+
+    text = (
+        f"📋 Выберите <b>{label}</b> (всего: {len(view)}):\n"
+        f"<i>Не нашли нужное? Напишите название сообщением — я поищу.</i>"
+    )
+    try:
+        if edit:
+            await msg.edit_text(text, reply_markup=b.as_markup())
+        else:
+            await msg.answer(text, reply_markup=b.as_markup())
+    except Exception:
+        try:
+            await msg.answer(text, reply_markup=b.as_markup())
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("cadpg:"))
+async def select_page(callback: CallbackQuery, state: FSMContext) -> None:
+    arg = callback.data.split(":")[1]
+    if arg == "noop":
+        await callback.answer()
+        return
+    try:
+        page = int(arg)
+    except ValueError:
+        await callback.answer()
+        return
+    await state.update_data(current_page=page)
+    await _render_select(callback.message, state, edit=True)
+    await callback.answer()
+
+
+@router.message(CreateAdState.panel_select)
+async def select_search(message: Message, state: FSMContext) -> None:
+    """Free-text search over the current select's options (local + remote)."""
+    from storage import get_panel_creds
+    from automation.panel import panel_sync_field_options_sync
+
+    q = (message.text or "").strip()
+    data = await state.get_data()
+    attr = data.get("current_attr")
+    if not attr or not q:
+        return
+
+    base: list = data.get("current_options") or []
+    ql = q.lower()
+    filtered = [o for o in base if ql in str(o.get("label", "")).lower()]
+
+    if not filtered:
+        # Не нашли локально — спрашиваем сервер с параметром search
+        creds = get_panel_creds(message.from_user.id)
+        loop = asyncio.get_event_loop()
+        try:
+            remote, _tr = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, panel_sync_field_options_sync,
+                    creds["cookies"], data.get("form_resource", "items"),
+                    attr, data.get("chosen") or {}, q,
+                ),
+                timeout=25,
+            )
+        except Exception:
+            remote = []
+        if remote:
+            # Добавляем новые варианты к базе, чтобы индексы кнопок работали
+            known = {str(o.get("value")) for o in base}
+            fresh = [o for o in remote if str(o.get("value")) not in known]
+            base = base + fresh
+            filtered = [o for o in base if ql in str(o.get("label", "")).lower()] or remote
+
+    if not filtered:
+        await message.answer(f"🔍 По запросу «{q}» ничего не найдено. Попробуйте иначе.")
+        return
+
+    await state.update_data(
+        current_options=base, current_view=filtered, current_page=0,
+    )
+    await _render_select(message, state, edit=False)
 
 
 @router.callback_query(F.data.startswith("cadopt:"))
 async def choose_select_option(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     attr = data.get("current_attr")
-    options = data.get("current_options") or []
+    options = data.get("current_view") or data.get("current_options") or []
     if not attr:
         await callback.answer("Сессия создания истекла — начните заново", show_alert=True)
         return
@@ -421,7 +526,10 @@ async def choose_select_option(callback: CallbackQuery, state: FSMContext) -> No
         return
     chosen = data.get("chosen") or {}
     chosen[attr] = options[idx].get("value")
-    await state.update_data(chosen=chosen, current_attr=None, current_options=[])
+    await state.update_data(
+        chosen=chosen, current_attr=None, current_options=[],
+        current_view=[], current_page=0,
+    )
     await callback.answer(f"✅ {str(options[idx].get('label',''))[:30]}")
     await _ask_next_select(callback.message, state, callback.from_user.id)
 
