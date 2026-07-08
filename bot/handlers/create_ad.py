@@ -207,8 +207,9 @@ async def _ask_photo(msg, state: FSMContext, edit: bool) -> None:
 @router.message(CreateAdState.photo, F.photo)
 async def ad_photo(message: Message, state: FSMContext) -> None:
     import os
+    from storage import _DATA_DIR
     photo = message.photo[-1]  # самое большое разрешение
-    tmp_dir = os.path.join(os.environ.get("DATA_DIR", "/tmp"), "photos")
+    tmp_dir = os.path.join(_DATA_DIR, "photos")
     os.makedirs(tmp_dir, exist_ok=True)
     path = os.path.join(tmp_dir, f"{message.from_user.id}_{photo.file_unique_id}.jpg")
     try:

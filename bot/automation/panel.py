@@ -947,10 +947,36 @@ def panel_create_product_sync(
                 f.get("attribute") for f in fields
                 if f.get("attribute") and "required" in str(f.get("rules", []))
             ]
+            # If images failed — show the field definition to identify the component
+            img_diag = ""
+            if "images" in err_str:
+                import os as _os2
+                photo_stat = (
+                    f"фото: {'✓ ' + str(_os2.path.getsize(photo_path)) + 'б' if photo_path and _os2.path.exists(photo_path) else '✗ не приложено'}"
+                )
+                img_field = next(
+                    (f for f in fields if f.get("attribute") == "images"), None,
+                )
+                if img_field:
+                    compact = {
+                        k: img_field.get(k)
+                        for k in ("component", "type", "multiple", "meta",
+                                  "acceptedTypes", "draftId", "mode")
+                        if img_field.get(k) is not None
+                    }
+                    img_diag = (
+                        f"\n📷 {photo_stat}\n"
+                        f"images field: <code>"
+                        f"{_json.dumps(compact, ensure_ascii=False)[:400]}</code>\n"
+                        f"ключи: <code>{list(img_field.keys())[:20]}</code>"
+                    )
+                else:
+                    img_diag = f"\n📷 {photo_stat}\nimages field: не найдено в форме"
             return False, (
                 f"✅ Ресурс <b>{res}</b> найден!\n"
                 f"Поля: <code>{attrs}</code>\n"
-                f"Обязательные: <code>{required}</code>\n\n"
+                f"Обязательные: <code>{required}</code>"
+                f"{img_diag}\n\n"
                 f"Ошибка 422:\n<code>{err_str}</code>\n\n"
                 f"Отправлено: <code>{_json.dumps(payload, ensure_ascii=False)[:200]}</code>"
             )
