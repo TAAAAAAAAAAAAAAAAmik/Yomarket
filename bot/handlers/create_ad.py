@@ -646,13 +646,42 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
         )
 
     if ok:
+        item_id = result_msg if str(result_msg).isdigit() else ""
+        pub_note = ""
+        if item_id:
+            # Сразу пытаемся сделать товар публичным
+            try:
+                await status_msg.edit_text("⏳ Товар создан, делаю публичным...")
+            except Exception:
+                pass
+            from automation.panel import panel_publish_item_sync
+            try:
+                pub_ok, pub_msg = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, panel_publish_item_sync,
+                        creds["cookies"], item_id, uid,
+                    ),
+                    timeout=30,
+                )
+            except Exception as e:
+                pub_ok, pub_msg = False, f"ошибка: {str(e)[:80]}"
+            if pub_ok:
+                pub_note = f"\n🌍 Опубликован ({pub_msg})"
+            else:
+                pub_note = f"\n⚠️ Не опубликован автоматически: {pub_msg}"
+
         b = InlineKeyboardBuilder()
+        if item_id and "Опубликован" not in pub_note:
+            b.button(text="🌍 Опубликовать ещё раз",
+                     callback_data=f"cadpub:{item_id}")
         b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
         b.button(text="📦 Мои товары", callback_data="menu:ads")
         b.adjust(1)
         await msg.edit_text(
             f"✅ <b>Товар создан через панель!</b>\n\n"
-            f"📝 {values['title']}\n💰 {values['price']} ₽",
+            f"📝 {values['title']}\n💰 {values['price']} ₽"
+            f"{chr(10) + '🆔 ' + item_id if item_id else ''}"
+            f"{pub_note}",
             reply_markup=b.as_markup(),
         )
         return
@@ -681,6 +710,45 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
         f"{header}\n\n{result_msg}",
         reply_markup=b.as_markup(),
     )
+
+
+@router.callback_query(F.data.startswith("cadpub:"))
+async def publish_item(callback: CallbackQuery) -> None:
+    """Manually retry making a created item public."""
+    from storage import get_panel_creds
+    from automation.panel import panel_publish_item_sync
+
+    item_id = callback.data.split(":", 1)[1]
+    uid = callback.from_user.id
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
+        await callback.answer("❌ Нет сессии панели — войдите снова", show_alert=True)
+        return
+
+    await callback.answer("⏳ Публикую...")
+    loop = asyncio.get_event_loop()
+    try:
+        ok, msg_text = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, panel_publish_item_sync, creds["cookies"], item_id, uid,
+            ),
+            timeout=30,
+        )
+    except Exception as e:
+        ok, msg_text = False, f"ошибка: {str(e)[:80]}"
+
+    b = InlineKeyboardBuilder()
+    if not ok:
+        b.button(text="🌍 Опубликовать ещё раз", callback_data=f"cadpub:{item_id}")
+    b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
+    b.button(text="📦 Мои товары", callback_data="menu:ads")
+    b.adjust(1)
+    result = (f"🌍 <b>Товар {item_id} опубликован</b> ({msg_text})" if ok
+              else f"⚠️ <b>Не удалось опубликовать товар {item_id}</b>\n\n{msg_text}")
+    try:
+        await callback.message.edit_text(result, reply_markup=b.as_markup())
+    except Exception:
+        await callback.message.answer(result, reply_markup=b.as_markup())
 
 
 # ---------------------------------------------------------------------------
