@@ -334,6 +334,71 @@ class TaskManager:
                 logger.warning("Auto-confirm order %s: %s", oid, e)
         settings["known_orders"] = known_orders
 
+    async def _price_schedule_tick(self, api: YooMarketAPI, settings: dict) -> str:
+        """Apply/restore scheduled prices. Returns a status message or ''.
+
+        Inside the [from_hour, to_hour) window every ad price is changed by
+        `percent`; base prices are remembered and restored when the window ends.
+        The window may cross midnight (e.g. 22 → 8).
+        """
+        ps = settings["price_schedule"]
+        from_h = int(ps.get("from_hour", 22)) % 24
+        to_h = int(ps.get("to_hour", 8)) % 24
+        percent = float(ps.get("percent", -10))
+        hour = datetime.now().hour
+
+        if from_h == to_h:
+            in_window = False  # нулевое окно — ничего не делаем
+        elif from_h < to_h:
+            in_window = from_h <= hour < to_h
+        else:  # окно через полночь, например 22 → 8
+            in_window = hour >= from_h or hour < to_h
+
+        night_active = bool(ps.get("night_active"))
+
+        if in_window and not night_active:
+            data = await api.get_ads()
+            ads = data.get("data") or data.get("items") or []
+            base: dict = {}
+            changed = 0
+            for ad in ads:
+                ad_id = ad.get("id")
+                try:
+                    price = int(float(str(ad.get("price", 0))))
+                except (TypeError, ValueError):
+                    continue
+                if not ad_id or price <= 0:
+                    continue
+                new_price = max(1, round(price * (1 + percent / 100)))
+                try:
+                    await api.update_ad(ad_id, price=new_price)
+                    base[str(ad_id)] = price
+                    changed += 1
+                except Exception as e:
+                    logger.warning("Price schedule apply %s: %s", ad_id, e)
+            ps["base_prices"] = base
+            ps["night_active"] = True
+            settings["price_schedule"] = ps
+            sign = "+" if percent >= 0 else ""
+            return (f"🕐 Расписание цен: окно {from_h:02d}:00–{to_h:02d}:00, "
+                    f"применено {sign}{percent:.0f}% к {changed} товарам")
+
+        if not in_window and night_active:
+            base = ps.get("base_prices", {})
+            restored = 0
+            for ad_id, price in base.items():
+                try:
+                    await api.update_ad(ad_id, price=int(price))
+                    restored += 1
+                except Exception as e:
+                    logger.warning("Price schedule restore %s: %s", ad_id, e)
+            ps["base_prices"] = {}
+            ps["night_active"] = False
+            settings["price_schedule"] = ps
+            return f"🕐 Расписание цен: окно закончилось, восстановлено {restored} цен"
+
+        return ""
+
     def _pick_message(self, title: str, default: str, rules: list[dict], responders: dict | None = None) -> str:
         title_lower = title.lower()
         if responders:
@@ -491,6 +556,16 @@ class TaskManager:
                         ]
                 except Exception as e:
                     logger.warning("Reviews monitor error for user %s: %s", user_id, e)
+
+            # --- Price schedule (day/night pricing) ---
+            ps = settings.get("price_schedule", {})
+            if ps.get("enabled"):
+                try:
+                    msg = await self._price_schedule_tick(api, settings)
+                    if msg:
+                        messages.append(msg)
+                except Exception as e:
+                    logger.warning("Price schedule error for user %s: %s", user_id, e)
 
             # --- Bump scheduler ---
             bs = settings.get("bump_schedule", {})

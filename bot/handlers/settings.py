@@ -12,6 +12,8 @@ async def settings_menu(callback: CallbackQuery) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="🔔 Уведомления", callback_data="notif:menu")
     b.button(text="⚙️ Авто-функции", callback_data="auto:menu")
+    b.button(text="🕐 Расписание цен", callback_data="pricesched:menu")
+    b.button(text="👥 Аккаунты", callback_data="acc:menu")
     b.button(text="🛠 Инструменты", callback_data="tools:menu")
     b.button(text="🌐 Панель продавца", callback_data="panel:menu")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")

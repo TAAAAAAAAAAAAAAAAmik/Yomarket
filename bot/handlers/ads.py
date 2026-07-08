@@ -56,6 +56,7 @@ def _ads_keyboard(ads: list[dict], next_cursor: str | None):
     if next_cursor:
         b.button(text="Ещё товары ▶️", callback_data=PaginationCallback(entity="ads", cursor=next_cursor).pack())
     b.button(text="➕ Добавить товар", callback_data="create_ad:start")
+    b.button(text="🛠 Управление (панель)", callback_data="pitems:list")
     b.button(text="💰 Изменить все цены", callback_data="ads:bulk_price")
     b.button(text="📝 Изменить описание всех", callback_data="ads:bulk_desc")
     b.button(text="🔄 Обновить", callback_data="ads_load")
@@ -76,8 +77,13 @@ async def ads_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
         text = _fmt_list(ads, total)
         keyboard = _ads_keyboard(ads, next_cursor)
     except Exception as e:
-        text = f"❌ Ошибка загрузки: {e}"
-        keyboard = back_keyboard()
+        text = f"❌ Ошибка загрузки: {e}\n\n💡 Попробуйте управление через панель."
+        b = InlineKeyboardBuilder()
+        b.button(text="🛠 Управление (панель)", callback_data="pitems:list")
+        b.button(text="➕ Добавить товар", callback_data="create_ad:start")
+        b.button(text="⬅️ Главное меню", callback_data="menu:main")
+        b.adjust(1)
+        keyboard = b.as_markup()
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 

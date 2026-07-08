@@ -80,6 +80,14 @@ _DEFAULT_SETTINGS = {
     "quick_replies": ["Спасибо за заказ!", "Отправлю в течение часа.", "Уточните, пожалуйста."],
     "buyer_notes": {},
     "bump_schedule": {"enabled": False, "times": [], "last_runs": {}},
+    "price_schedule": {
+        "enabled": False,
+        "from_hour": 22,   # начало окна (напр. ночь с 22:00)
+        "to_hour": 8,      # конец окна (до 8:00)
+        "percent": -10.0,  # изменение цены в окне
+        "night_active": False,
+        "base_prices": {},  # {ad_id: базовая цена} для восстановления
+    },
     "reviews_monitor": {"enabled": False, "known_review_ids": []},
     "ad_templates": [],
     "plugins": {
@@ -90,6 +98,9 @@ _DEFAULT_SETTINGS = {
 }
 
 
+_DEFAULT_ACCOUNT = "Основной"
+
+
 def _load() -> dict:
     if os.path.exists(_FILE):
         with open(_FILE) as f:
@@ -97,21 +108,120 @@ def _load() -> dict:
     return {}
 
 
-def get_token(user_id: int) -> str | None:
-    return _load().get(str(user_id))
-
-
-def save_token(user_id: int, token: str) -> None:
+def _save_tokens(data: dict) -> None:
     os.makedirs(os.path.dirname(_FILE), exist_ok=True)
-    data = _load()
-    data[str(user_id)] = token
     with open(_FILE, "w") as f:
         json.dump(data, f)
 
 
-def delete_token(user_id: int) -> None:
+def _user_entry(data: dict, user_id: int) -> dict | None:
+    """Return the v2 accounts entry for a user, migrating a bare token string."""
+    raw = data.get(str(user_id))
+    if raw is None:
+        return None
+    if isinstance(raw, str):  # legacy single-token format
+        raw = {"accounts": {_DEFAULT_ACCOUNT: {"token": raw}},
+               "active": _DEFAULT_ACCOUNT}
+        data[str(user_id)] = raw
+        _save_tokens(data)
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# Multi-account API
+# ---------------------------------------------------------------------------
+
+def get_accounts(user_id: int) -> dict:
+    """{name: {"token": ...}} for the user (empty dict if none)."""
+    entry = _user_entry(_load(), user_id)
+    return (entry or {}).get("accounts", {})
+
+
+def get_active_account(user_id: int) -> str:
+    entry = _user_entry(_load(), user_id)
+    if not entry:
+        return ""
+    active = entry.get("active", "")
+    if active not in entry.get("accounts", {}):
+        accounts = entry.get("accounts", {})
+        return next(iter(accounts), "")
+    return active
+
+
+def set_active_account(user_id: int, name: str) -> bool:
     data = _load()
-    data.pop(str(user_id), None)
+    entry = _user_entry(data, user_id)
+    if not entry or name not in entry.get("accounts", {}):
+        return False
+    entry["active"] = name
+    _save_tokens(data)
+    return True
+
+
+def add_account(user_id: int, name: str, token: str, make_active: bool = True) -> None:
+    data = _load()
+    entry = _user_entry(data, user_id)
+    if entry is None:
+        entry = {"accounts": {}, "active": name}
+        data[str(user_id)] = entry
+    entry.setdefault("accounts", {})[name] = {"token": token}
+    if make_active:
+        entry["active"] = name
+    _save_tokens(data)
+
+
+def remove_account(user_id: int, name: str) -> bool:
+    data = _load()
+    entry = _user_entry(data, user_id)
+    if not entry or name not in entry.get("accounts", {}):
+        return False
+    entry["accounts"].pop(name)
+    if entry.get("active") == name:
+        entry["active"] = next(iter(entry["accounts"]), "")
+    if not entry["accounts"]:
+        data.pop(str(user_id), None)
+    _save_tokens(data)
+    return True
+
+
+def get_token(user_id: int) -> str | None:
+    """Token of the ACTIVE account (backward-compatible entry point)."""
+    entry = _user_entry(_load(), user_id)
+    if not entry:
+        return None
+    active = entry.get("active") or next(iter(entry.get("accounts", {})), "")
+    acc = entry.get("accounts", {}).get(active)
+    return acc.get("token") if acc else None
+
+
+def save_token(user_id: int, token: str) -> None:
+    """Set the token on the active account (creates the default account)."""
+    data = _load()
+    entry = _user_entry(data, user_id)
+    if entry is None:
+        data[str(user_id)] = {
+            "accounts": {_DEFAULT_ACCOUNT: {"token": token}},
+            "active": _DEFAULT_ACCOUNT,
+        }
+    else:
+        active = entry.get("active") or _DEFAULT_ACCOUNT
+        entry.setdefault("accounts", {}).setdefault(active, {})["token"] = token
+        entry["active"] = active
+    _save_tokens(data)
+
+
+def delete_token(user_id: int) -> None:
+    """Remove the active account (logout). Other accounts stay."""
+    data = _load()
+    entry = _user_entry(data, user_id)
+    if not entry:
+        return
+    active = entry.get("active", "")
+    entry.get("accounts", {}).pop(active, None)
+    if entry.get("accounts"):
+        entry["active"] = next(iter(entry["accounts"]))
+    else:
+        data.pop(str(user_id), None)
     os.makedirs(os.path.dirname(_FILE), exist_ok=True)
     with open(_FILE, "w") as f:
         json.dump(data, f)
@@ -147,16 +257,29 @@ def _merge_defaults(settings: dict) -> dict:
     return result
 
 
+def _account_key(user_id: int) -> str:
+    """Per-account storage key: '{uid}::{account}'. Falls back to plain uid."""
+    account = get_active_account(user_id)
+    return f"{user_id}::{account}" if account else str(user_id)
+
+
 def get_settings(user_id: int) -> dict:
     all_settings = _load_settings()
-    raw = all_settings.get(str(user_id), {})
+    key = _account_key(user_id)
+    if key not in all_settings and str(user_id) in all_settings:
+        # migrate legacy per-uid settings to the active account's key
+        all_settings[key] = all_settings.pop(str(user_id))
+        os.makedirs(os.path.dirname(_SETTINGS_FILE), exist_ok=True)
+        with open(_SETTINGS_FILE, "w") as f:
+            json.dump(all_settings, f)
+    raw = all_settings.get(key, {})
     return _merge_defaults(raw)
 
 
 def save_settings(user_id: int, settings: dict) -> None:
     os.makedirs(os.path.dirname(_SETTINGS_FILE), exist_ok=True)
     all_settings = _load_settings()
-    all_settings[str(user_id)] = settings
+    all_settings[_account_key(user_id)] = settings
     with open(_SETTINGS_FILE, "w") as f:
         json.dump(all_settings, f)
 
@@ -187,22 +310,30 @@ def _load_panel_creds() -> dict:
 
 
 def get_panel_creds(user_id: int) -> dict | None:
-    """Return {"login": "...", "password": "..."} for the user, or None."""
-    return _load_panel_creds().get(str(user_id))
+    """Panel cookies for the ACTIVE account (per-account, legacy migrated)."""
+    data = _load_panel_creds()
+    key = _account_key(user_id)
+    if key not in data and str(user_id) in data:
+        data[key] = data.pop(str(user_id))
+        os.makedirs(os.path.dirname(_PANEL_FILE), exist_ok=True)
+        with open(_PANEL_FILE, "w") as f:
+            json.dump(data, f)
+    return data.get(key)
 
 
 def save_panel_creds(user_id: int, creds: dict) -> None:
-    """Save panel credentials for the user."""
+    """Save panel credentials for the user's active account."""
     os.makedirs(os.path.dirname(_PANEL_FILE), exist_ok=True)
     data = _load_panel_creds()
-    data[str(user_id)] = creds
+    data[_account_key(user_id)] = creds
     with open(_PANEL_FILE, "w") as f:
         json.dump(data, f)
 
 
 def delete_panel_creds(user_id: int) -> None:
-    """Remove panel credentials for the user."""
+    """Remove panel credentials for the user's active account."""
     data = _load_panel_creds()
+    data.pop(_account_key(user_id), None)
     data.pop(str(user_id), None)
     os.makedirs(os.path.dirname(_PANEL_FILE), exist_ok=True)
     with open(_PANEL_FILE, "w") as f:

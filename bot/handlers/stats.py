@@ -76,6 +76,7 @@ async def show_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
 
     builder = InlineKeyboardBuilder()
     builder.button(text="🔄 Обновить", callback_data="menu:stats")
+    builder.button(text="💰 Выручка", callback_data="stats:revenue:7")
     builder.button(text="📈 График (7 дней)", callback_data="stats:chart")
     builder.button(text="🏆 Топ товаров", callback_data="stats:top")
     builder.button(text="📤 Экспорт заказов", callback_data="stats:export")
@@ -88,6 +89,75 @@ async def show_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
+
+
+_PERIODS = {1: "сегодня", 7: "7 дней", 30: "30 дней", 0: "всё время"}
+
+
+@router.callback_query(F.data.startswith("stats:revenue:"))
+async def show_revenue(callback: CallbackQuery) -> None:
+    await callback.answer()
+    try:
+        days = int(callback.data.split(":")[-1])
+    except ValueError:
+        days = 7
+
+    settings = get_settings(callback.from_user.id)
+    known_orders: dict = settings.get("known_orders", {})
+    details: dict = settings.get("known_order_details", {})
+
+    now = datetime.now(tz=timezone.utc)
+    count = 0
+    revenue = 0
+    by_title: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # [count, sum]
+
+    for oid, status in known_orders.items():
+        if status not in COMPLETED_STATUSES:
+            continue
+        det = details.get(str(oid)) or details.get(oid)
+        if not det:
+            continue
+        seen_at = det.get("seen_at")
+        if days > 0:
+            if not seen_at:
+                continue
+            try:
+                dt = datetime.fromtimestamp(int(seen_at), tz=timezone.utc)
+            except (ValueError, OSError):
+                continue
+            if (now - dt) > timedelta(days=days):
+                continue
+        try:
+            price = int(float(str(det.get("price", 0))))
+        except (ValueError, TypeError):
+            price = 0
+        count += 1
+        revenue += price
+        title = str(det.get("title") or "—")[:35]
+        by_title[title][0] += 1
+        by_title[title][1] += price
+
+    period = _PERIODS.get(days, f"{days} дней")
+    lines = [f"💰 <b>Выручка — {period}</b>\n"]
+    lines.append(f"📦 Продаж: <b>{count}</b>")
+    lines.append(f"💵 Выручка: <b>{revenue} ₽</b>")
+    if count:
+        lines.append(f"🧾 Средний чек: <b>{revenue // count} ₽</b>")
+        top = sorted(by_title.items(), key=lambda kv: kv[1][1], reverse=True)[:5]
+        lines.append("\n🏆 <b>Топ по выручке:</b>")
+        for i, (title, (cnt, total)) in enumerate(top, 1):
+            lines.append(f"{i}. {title} — {cnt} шт., <b>{total} ₽</b>")
+    else:
+        lines.append("\nНет выполненных заказов за период.")
+
+    b = InlineKeyboardBuilder()
+    for d in (1, 7, 30, 0):
+        mark = "• " if d == days else ""
+        b.button(text=f"{mark}{_PERIODS[d]}", callback_data=f"stats:revenue:{d}")
+    b.button(text="⬅️ Статистика", callback_data="menu:stats")
+    b.adjust(4, 1)
+
+    await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
 
 
 @router.callback_query(F.data == "stats:chart")

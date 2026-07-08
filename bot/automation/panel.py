@@ -666,14 +666,100 @@ def _panel_xsrf_headers(session, cookie_string: str) -> dict:
 
 _PUBLISH_KWS = ("публик", "publish", "актив", "activ", "показ", "вкл",
                 "enable", "visib", "выстав", "размест")
+_UNPUBLISH_KWS = ("скрыт", "скрыть", "hide", "unpublish", "деактив", "снять",
+                  "приостан", "disable", "выключ", "stop")
+_DANGEROUS_KWS = ("удал", "delete", "destroy", "force")
+
+
+def _build_update_form(fields: list[dict], overrides: dict) -> dict:
+    """Form data for a Nova _method=PUT update: preserve every current value
+    (media re-attached by id as __media__[attr][i]) and apply overrides."""
+    form: dict = {}
+    for f in fields:
+        fa = f.get("attribute")
+        if not fa:
+            continue
+        val = f.get("value")
+        comp = str(f.get("component") or "")
+        if "media" in comp or fa == "images":
+            if isinstance(val, list):
+                for i, m in enumerate(val):
+                    mid = m.get("id") if isinstance(m, dict) else m
+                    if mid is not None:
+                        form[f"__media__[{fa}][{i}]"] = str(mid)
+            continue
+        if fa in overrides:
+            continue  # заполним из overrides ниже
+        if val is None:
+            continue
+        if isinstance(val, bool):
+            form[fa] = "1" if val else "0"
+        elif isinstance(val, (dict, list)):
+            continue
+        else:
+            form[fa] = str(val)
+    for k, v in overrides.items():
+        if v is None:
+            continue
+        form[k] = ("1" if v else "0") if isinstance(v, bool) else str(v)
+    form["_method"] = "PUT"
+    return form
+
+
+def _get_update_fields(session, hdrs, item_id: str) -> tuple[list[dict], str]:
+    """GET update-fields for an item. Returns (fields, error)."""
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/items/{item_id}/update-fields"
+            f"?editing=true&editMode=update",
+            headers=hdrs, timeout=(6, 10), allow_redirects=False,
+        )
+        if r.status_code == 401:
+            return [], "401: сессия истекла"
+        if r.status_code != 200:
+            return [], f"update-fields: {r.status_code}"
+        cf = r.json()
+        fields = _parse_nova_fields_payload(cf) if isinstance(cf, dict) else []
+        return fields, "" if fields else "пустые поля"
+    except Exception as e:
+        return [], str(e)[:60]
+
+
+def _put_item(session, hdrs, item_id: str, form: dict):
+    return session.post(
+        f"{PANEL_URL}/nova-api/items/{item_id}?editing=true&editMode=update",
+        data=form, headers=hdrs, timeout=(6, 15),
+    )
+
+
+def panel_update_item_sync(
+    cookie_string: str, item_id: str, overrides: dict, uid: int | None = None,
+) -> tuple[bool, str]:
+    """Blocking: change item fields (e.g. {'price': 199, 'title': ...}),
+    preserving everything else including photos."""
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    fields, err = _get_update_fields(session, hdrs, item_id)
+    if not fields:
+        return False, f"не получил поля товара: {err}"
+    form = _build_update_form(fields, overrides)
+    try:
+        resp = _put_item(session, hdrs, item_id, form)
+    except Exception as e:
+        return False, f"ошибка запроса: {str(e)[:60]}"
+    _save_refreshed_cookies(uid, cookie_string, session)
+    if resp.status_code in (200, 201, 204):
+        return True, "обновлено"
+    return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
 
 
 def panel_publish_item_sync(
     cookie_string: str, item_id: str, uid: int | None = None,
+    public: bool = True,
 ) -> tuple[bool, str]:
     """
-    Blocking: make a created item public.
-    1. Look for a publish-like Nova action on the items resource and run it.
+    Blocking: make an item public (or hide it with public=False).
+    1. Run a matching Nova action (публиковать/скрыть...) if the panel has one.
     2. Fallback: flip a public/visible/active flag via PUT update, preserving
        current values (including media ids as __media__[images][i]).
     Returns (ok, human_message_with_diagnostics).
@@ -681,6 +767,8 @@ def panel_publish_item_sync(
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
     trace: list[str] = []
+    want_kws = _PUBLISH_KWS if public else _UNPUBLISH_KWS
+    avoid_kws = (_UNPUBLISH_KWS if public else _PUBLISH_KWS) + _DANGEROUS_KWS
 
     # --- 1. Nova actions -----------------------------------------------------
     actions: list[dict] = []
@@ -705,7 +793,10 @@ def panel_publish_item_sync(
         key = str(a.get("uriKey") or "")
         if not key:
             continue
-        if any(kw in name or kw in key.lower() for kw in _PUBLISH_KWS):
+        blob = name + " " + key.lower()
+        if any(kw in blob for kw in avoid_kws):
+            continue
+        if any(kw in blob for kw in want_kws):
             try:
                 resp = session.post(
                     f"{PANEL_URL}/nova-api/items/action?action={key}",
@@ -720,82 +811,196 @@ def panel_publish_item_sync(
                 trace.append(f"action {key}: {str(e)[:40]}")
 
     # --- 2. Flag flip via update ---------------------------------------------
-    try:
-        r = session.get(
-            f"{PANEL_URL}/nova-api/items/{item_id}/update-fields"
-            f"?editing=true&editMode=update",
-            headers=hdrs, timeout=(6, 10), allow_redirects=False,
+    fields, err = _get_update_fields(session, hdrs, item_id)
+    if err:
+        trace.append(err)
+    if fields:
+        flag_kws = ("public", "visible", "active", "hidden", "enabled",
+                    "status", "публик", "видим", "актив", "показ")
+        flag = next(
+            (f for f in fields
+             if any(kw in str(f.get("attribute", "")).lower()
+                    or kw in str(f.get("name", "")).lower()
+                    for kw in flag_kws)),
+            None,
         )
-        trace.append(f"update-fields: {r.status_code}")
-        if r.status_code == 200:
-            cf = r.json()
-            fields = _parse_nova_fields_payload(cf) if isinstance(cf, dict) else []
-            flag_kws = ("public", "visible", "active", "hidden", "enabled",
-                        "status", "публик", "видим", "актив", "показ")
-            flag = next(
-                (f for f in fields
-                 if any(kw in str(f.get("attribute", "")).lower()
-                        or kw in str(f.get("name", "")).lower()
-                        for kw in flag_kws)),
-                None,
-            )
-            field_names = [f.get("attribute") for f in fields]
-            if flag is None:
-                trace.append(f"нет флага публикации среди {field_names}")
-            else:
-                attr = flag["attribute"]
-                # Build form data preserving current values
-                form: dict = {}
-                media_items: list = []
-                for f in fields:
-                    fa = f.get("attribute")
-                    if not fa:
-                        continue
-                    val = f.get("value")
-                    if fa == attr:
-                        # flip to "on" (hidden → off)
-                        on = "0" if "hidden" in str(fa).lower() else "1"
-                        form[fa] = on
-                        continue
-                    comp = str(f.get("component") or "")
-                    if "media" in comp or fa == "images":
-                        # preserve existing media by id
-                        if isinstance(val, list):
-                            for i, m in enumerate(val):
-                                mid = m.get("id") if isinstance(m, dict) else m
-                                if mid is not None:
-                                    media_items.append(
-                                        (f"__media__[{fa}][{i}]", str(mid)))
-                        continue
-                    if val is None:
-                        continue
-                    if isinstance(val, bool):
-                        form[fa] = "1" if val else "0"
-                    elif isinstance(val, (dict, list)):
-                        continue
-                    else:
-                        form[fa] = str(val)
-                for k, v in media_items:
-                    form[k] = v
-                form["_method"] = "PUT"
-                resp = session.post(
-                    f"{PANEL_URL}/nova-api/items/{item_id}"
-                    f"?editing=true&editMode=update",
-                    data=form, headers=hdrs, timeout=(6, 15),
-                )
+        if flag is None:
+            trace.append(
+                f"нет флага публикации среди {[f.get('attribute') for f in fields]}")
+        else:
+            attr = flag["attribute"]
+            inverted = "hidden" in str(attr).lower() or "скрыт" in str(
+                flag.get("name", "")).lower()
+            on = public != inverted  # обычный флаг: public → 1; hidden: public → 0
+            form = _build_update_form(fields, {attr: on})
+            try:
+                resp = _put_item(session, hdrs, item_id, form)
                 trace.append(f"PUT {attr}: {resp.status_code} {resp.text[:80]}")
                 if resp.status_code in (200, 201, 204):
                     _save_refreshed_cookies(uid, cookie_string, session)
                     return True, f"через поле «{flag.get('name') or attr}»"
-    except Exception as e:
-        trace.append(f"update: {str(e)[:50]}")
+            except Exception as e:
+                trace.append(f"PUT: {str(e)[:50]}")
 
     _save_refreshed_cookies(uid, cookie_string, session)
+    verb = "публикации" if public else "скрытия"
     return False, (
-        "не нашёл способ публикации.\n"
+        f"не нашёл способ {verb}.\n"
         f"Доступные действия: <code>{action_names or 'нет'}</code>\n"
         f"Лог: <code>{'; '.join(trace)[:350]}</code>"
     )
+
+
+def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
+    """Blocking: list items from the panel. Returns (True, [{id,title,price}])
+    or (False, error)."""
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/items",
+            params={"perPage": "50"},
+            headers=hdrs, timeout=(6, 12), allow_redirects=False,
+        )
+    except Exception as e:
+        return False, f"ошибка запроса: {str(e)[:60]}"
+    if r.status_code == 401:
+        return False, "401: сессия панели истекла — войдите снова"
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}: {r.text[:150]}"
+    try:
+        data = r.json()
+    except Exception:
+        return False, f"невалидный JSON: {r.text[:120]}"
+
+    items = []
+    for res in (data.get("resources") or []):
+        if not isinstance(res, dict):
+            continue
+        rid = res.get("id")
+        if isinstance(rid, dict):
+            rid = rid.get("value")
+        raw_fields = res.get("fields")
+        if isinstance(raw_fields, dict):
+            raw_fields = list(raw_fields.values())
+        info = {"id": str(rid), "title": "", "price": ""}
+        for f in raw_fields or []:
+            if not isinstance(f, dict):
+                continue
+            fa = str(f.get("attribute", ""))
+            if fa == "title":
+                info["title"] = str(f.get("value") or "")
+            elif fa == "price":
+                info["price"] = str(f.get("value") or "")
+        if info["id"] and info["id"] != "None":
+            items.append(info)
+    return True, items
+
+
+def panel_delete_item_sync(
+    cookie_string: str, item_id: str, uid: int | None = None,
+) -> tuple[bool, str]:
+    """Blocking: delete an item via the standard Nova delete endpoint."""
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    try:
+        r = session.delete(
+            f"{PANEL_URL}/nova-api/items",
+            params={"resources[]": str(item_id)},
+            headers=hdrs, timeout=(6, 15),
+        )
+    except Exception as e:
+        return False, f"ошибка запроса: {str(e)[:60]}"
+    _save_refreshed_cookies(uid, cookie_string, session)
+    if r.status_code in (200, 204):
+        return True, "удалён"
+    return False, f"HTTP {r.status_code}: {r.text[:200]}"
+
+
+def _find_image_url(value) -> str:
+    """Dig a usable http image URL out of a media field value."""
+    if isinstance(value, list):
+        for item in value:
+            url = _find_image_url(item)
+            if url:
+                return url
+    elif isinstance(value, dict):
+        for key in ("original_url", "url", "preview_url", "full_url"):
+            v = value.get(key)
+            if isinstance(v, str) and v.startswith("http"):
+                return v
+        for v in value.values():
+            url = _find_image_url(v)
+            if url:
+                return url
+    elif isinstance(value, str) and value.startswith("http") and any(
+            ext in value.lower() for ext in (".jpg", ".jpeg", ".png", ".webp")):
+        return value
+    return ""
+
+
+def panel_clone_item_sync(
+    cookie_string: str, item_id: str, uid: int | None = None,
+) -> tuple[bool, str]:
+    """Blocking: create a copy of an item — same fields, photo re-downloaded
+    from the panel and re-uploaded to the new item."""
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    fields, err = _get_update_fields(session, hdrs, item_id)
+    if not fields:
+        return False, f"не получил поля товара: {err}"
+
+    form: dict = {}
+    img_bytes = b""
+    for f in fields:
+        fa = f.get("attribute")
+        if not fa:
+            continue
+        val = f.get("value")
+        comp = str(f.get("component") or "")
+        if "media" in comp or fa == "images":
+            url = _find_image_url(val)
+            if url:
+                try:
+                    ir = session.get(url, timeout=(6, 20))
+                    if ir.status_code == 200:
+                        img_bytes = ir.content
+                except Exception:
+                    pass
+            continue
+        if val is None:
+            continue
+        if isinstance(val, bool):
+            form[fa] = "1" if val else "0"
+        elif isinstance(val, (dict, list)):
+            continue
+        else:
+            form[fa] = str(val)
+
+    files = {}
+    if img_bytes:
+        files["__media__[images][0]"] = ("clone.jpg", img_bytes, "image/jpeg")
+
+    try:
+        resp = session.post(
+            f"{PANEL_URL}/nova-api/items?editing=true&editMode=create",
+            data=form, files=files or None, headers=hdrs, timeout=(6, 30),
+        )
+    except Exception as e:
+        return False, f"ошибка запроса: {str(e)[:60]}"
+    _save_refreshed_cookies(uid, cookie_string, session)
+    if resp.status_code in (200, 201):
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        rid = (data.get("resource") or {}).get("id") or data.get("id") or ""
+        if isinstance(rid, dict):
+            rid = rid.get("value", "")
+        return True, str(rid) if rid else "создан"
+    if resp.status_code == 422:
+        return False, f"422: {resp.text[:300]}"
+    return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
 
 
 def panel_create_product_sync(
