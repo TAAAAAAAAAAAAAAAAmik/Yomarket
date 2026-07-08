@@ -900,8 +900,11 @@ def panel_create_product_sync(
                     img_bytes = fh.read()
                 fname = _os.path.basename(photo_path) or "photo.jpg"
                 post_resp = None
-                # The field may expect a single file or an array
-                for file_key in ("images", "images[]", "images[0]"):
+                # advanced-media-library-field (Spatie Media Library for Nova)
+                # expects uploads as __media__[attribute][index]; try that first,
+                # then plain Nova file-field key formats as fallbacks
+                for file_key in ("__media__[images][0]", "images",
+                                 "images[]", "images[0]"):
                     files = {file_key: (fname, img_bytes, "image/jpeg")}
                     post_resp = session.post(
                         store_url, data=form_data, files=files, headers=hdrs,
