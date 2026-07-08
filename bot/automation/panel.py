@@ -647,6 +647,7 @@ def panel_create_product_sync(
     category: str = "",
     uid: int | None = None,
     extra: dict | None = None,
+    photo_path: str | None = None,
 ) -> tuple[bool, str]:
     """
     Blocking function — call via loop.run_in_executor().
@@ -882,12 +883,39 @@ def panel_create_product_sync(
                 if v is not None:
                     payload[k] = v
 
+        store_url = f"{PANEL_URL}/nova-api/{res}?editing=true&editMode=create"
         try:
-            post_resp = session.post(
-                f"{PANEL_URL}/nova-api/{res}?editing=true&editMode=create",
-                json=payload, headers=hdrs,
-                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-            )
+            import os as _os
+            if photo_path and _os.path.exists(photo_path):
+                # Multipart: Nova file fields only accept real uploads
+                form_data = {}
+                for k, v in payload.items():
+                    if v is None:
+                        continue
+                    if isinstance(v, bool):
+                        form_data[k] = "1" if v else "0"
+                    else:
+                        form_data[k] = str(v)
+                with open(photo_path, "rb") as fh:
+                    img_bytes = fh.read()
+                fname = _os.path.basename(photo_path) or "photo.jpg"
+                post_resp = None
+                # The field may expect a single file or an array
+                for file_key in ("images", "images[]", "images[0]"):
+                    files = {file_key: (fname, img_bytes, "image/jpeg")}
+                    post_resp = session.post(
+                        store_url, data=form_data, files=files, headers=hdrs,
+                        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT + 20),
+                    )
+                    if post_resp.status_code == 422 and '"images"' in post_resp.text:
+                        debug.append(f"POST {res} {file_key}: 422 images")
+                        continue
+                    break
+            else:
+                post_resp = session.post(
+                    store_url, json=payload, headers=hdrs,
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                )
         except Exception as e:
             debug.append(f"POST {res}: {str(e)[:50]}")
             continue

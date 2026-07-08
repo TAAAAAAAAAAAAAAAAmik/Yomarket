@@ -24,6 +24,7 @@ class CreateAdState(StatesGroup):
     description = State()
     quantity = State()
     category = State()
+    photo = State()
     confirm = State()
     panel_select = State()  # choosing category/subcategory/type from panel options
 
@@ -48,6 +49,7 @@ def _preview(data: dict) -> str:
     ]
     if category:
         lines.append(f"🏷 Категория: <b>{category}</b>")
+    lines.append(f"📷 Фото: <b>{'есть ✅' if data.get('photo_path') else 'нет'}</b>")
     lines.append(f"\n📄 Описание:\n{description}")
     return "\n".join(lines)
 
@@ -163,7 +165,7 @@ async def ad_description(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "create_ad:qty:1")
 async def ad_qty_skip(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(quantity=1)
-    await _show_preview(callback.message, state, edit=True)
+    await _ask_photo(callback.message, state, edit=True)
     await callback.answer()
 
 
@@ -178,7 +180,56 @@ async def ad_quantity(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Введи целое число, например: <b>10</b>")
         return
     await state.update_data(quantity=qty)
+    await _ask_photo(message, state, edit=False)
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Photo (панель требует хотя бы одну картинку)
+# ---------------------------------------------------------------------------
+
+async def _ask_photo(msg, state: FSMContext, edit: bool) -> None:
+    await state.set_state(CreateAdState.photo)
+    b = InlineKeyboardBuilder()
+    b.button(text="⏭ Без фото", callback_data="create_ad:photo_skip")
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    b.adjust(1)
+    text = (
+        "<b>Шаг 5/5</b> — Отправь <b>фото товара</b> 📷\n\n"
+        "<i>Панель YooMarket требует картинку для объявления.\n"
+        "Без фото создание может не пройти.</i>"
+    )
+    if edit:
+        await msg.edit_text(text, reply_markup=b.as_markup())
+    else:
+        await msg.answer(text, reply_markup=b.as_markup())
+
+
+@router.message(CreateAdState.photo, F.photo)
+async def ad_photo(message: Message, state: FSMContext) -> None:
+    import os
+    photo = message.photo[-1]  # самое большое разрешение
+    tmp_dir = os.path.join(os.environ.get("DATA_DIR", "/tmp"), "photos")
+    os.makedirs(tmp_dir, exist_ok=True)
+    path = os.path.join(tmp_dir, f"{message.from_user.id}_{photo.file_unique_id}.jpg")
+    try:
+        await message.bot.download(photo, destination=path)
+    except Exception as e:
+        await message.answer(f"❌ Не удалось скачать фото: {str(e)[:100]}\nПопробуйте ещё раз.")
+        return
+    await state.update_data(photo_path=path)
     await _show_preview(message, state, edit=False)
+
+
+@router.message(CreateAdState.photo)
+async def ad_photo_not_photo(message: Message) -> None:
+    await message.answer("📷 Отправьте фото (как изображение) или нажмите «Без фото».")
+
+
+@router.callback_query(F.data == "create_ad:photo_skip")
+async def ad_photo_skip(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(photo_path=None)
+    await _show_preview(callback.message, state, edit=True)
+    await callback.answer()
 
 
 async def _show_preview(msg, state: FSMContext, edit: bool) -> None:
@@ -241,6 +292,7 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
     values = {
         "title": title, "price": price, "description": description,
         "quantity": quantity, "category": category,
+        "photo_path": data.get("photo_path"),
     }
 
     await callback.message.edit_text("⏳ Создаю товар...")
@@ -554,6 +606,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
         panel_create_product_sync,
         creds["cookies"], values["title"], values["price"], values["description"],
         values.get("quantity", 1), values.get("category", ""), uid, extra,
+        values.get("photo_path"),
     )
     panel_future = asyncio.ensure_future(panel_task)
 
