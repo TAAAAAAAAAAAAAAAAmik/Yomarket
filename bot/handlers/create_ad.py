@@ -54,10 +54,12 @@ def _preview(data: dict) -> str:
     return "\n".join(lines)
 
 
-def _confirm_kb() -> InlineKeyboardMarkup:
+def _confirm_kb(has_photo: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="✅ Создать товар", callback_data="create_ad:submit")
     b.button(text="💾 Сохранить как шаблон", callback_data="create_ad:save_template")
+    photo_label = "📷 Заменить фото" if has_photo else "📷 Добавить фото"
+    b.button(text=photo_label, callback_data="create_ad:edit:photo")
     b.button(text="✏️ Изменить название", callback_data="create_ad:edit:title")
     b.button(text="✏️ Изменить цену", callback_data="create_ad:edit:price")
     b.button(text="✏️ Изменить описание", callback_data="create_ad:edit:description")
@@ -237,7 +239,7 @@ async def _show_preview(msg, state: FSMContext, edit: bool) -> None:
     data = await state.get_data()
     await state.set_state(CreateAdState.confirm)
     text = _preview(data)
-    kb = _confirm_kb()
+    kb = _confirm_kb(has_photo=bool(data.get("photo_path")))
     if edit:
         await msg.edit_text(text, reply_markup=kb)
     else:
@@ -251,6 +253,10 @@ async def _show_preview(msg, state: FSMContext, edit: bool) -> None:
 @router.callback_query(F.data.startswith("create_ad:edit:"))
 async def edit_field(callback: CallbackQuery, state: FSMContext) -> None:
     field = callback.data.split(":")[-1]
+    if field == "photo":
+        await _ask_photo(callback.message, state, edit=True)
+        await callback.answer()
+        return
     prompts = {
         "title": "Введи новое название:",
         "price": "Введи новую цену (₽):",
@@ -694,6 +700,7 @@ async def save_template(callback: CallbackQuery, state: FSMContext) -> None:
         "price": data.get("price", 0),
         "description": data.get("description", ""),
         "quantity": data.get("quantity", 1),
+        "photo_path": data.get("photo_path"),
     }
     templates.append(template)
     save_settings(callback.from_user.id, s)
@@ -730,11 +737,16 @@ async def use_template(callback: CallbackQuery, state: FSMContext) -> None:
         return
     t = templates[idx]
     await state.clear()
+    import os
+    photo_path = t.get("photo_path")
+    if photo_path and not os.path.exists(photo_path):
+        photo_path = None  # файл могли удалить при редеплое без volume
     await state.update_data(
         title=t.get("title", ""),
         price=t.get("price", 0),
         description=t.get("description", ""),
         quantity=t.get("quantity", 1),
+        photo_path=photo_path,
     )
     await _show_preview(callback.message, state, edit=True)
     await callback.answer()

@@ -692,7 +692,13 @@ def panel_create_product_sync(
         pass
 
     xsrf = ""
-    raw_xsrf = session.cookies.get("XSRF-TOKEN", "")
+    # Don't use cookies.get(): it raises CookieConflictError when the token
+    # exists for several domains (our preset cookie + a fresh server one).
+    # Iterate and prefer the last (freshest) match instead.
+    raw_xsrf = ""
+    for c in session.cookies:
+        if c.name in ("XSRF-TOKEN", "CSRF-TOKEN") and c.value:
+            raw_xsrf = c.value
     if raw_xsrf:
         xsrf = urllib.parse.unquote(raw_xsrf)
     if not xsrf:
