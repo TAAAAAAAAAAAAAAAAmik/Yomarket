@@ -403,7 +403,7 @@ async def broadcast_send(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "admin:admins")
 async def admins_menu(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_owner(callback.from_user.id):
-        await callback.answer("Только владелец", show_alert=True)
+        await callback.answer()  # invisible to granted admins — no hint it exists
         return
     await state.clear()
     admins = list_admins()
@@ -423,7 +423,7 @@ async def admins_menu(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "admin:add_admin")
 async def add_admin_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_owner(callback.from_user.id):
-        await callback.answer("Только владелец", show_alert=True)
+        await callback.answer()
         return
     await state.set_state(AdminState.add_admin)
     b = InlineKeyboardBuilder()
@@ -458,7 +458,7 @@ async def add_admin_input(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "admin:rm_admin")
 async def rm_admin_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not is_owner(callback.from_user.id):
-        await callback.answer("Только владелец", show_alert=True)
+        await callback.answer()
         return
     await state.set_state(AdminState.remove_admin)
     b = InlineKeyboardBuilder()
