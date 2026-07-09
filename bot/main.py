@@ -50,14 +50,10 @@ class AccessMiddleware:
                 text = getattr(event, "text", "") or ""
                 is_start = text.startswith("/start")
                 if not is_start:
+                    from storage import render_custom_text
                     price = get_bot_price()
                     price_line = f"\n💰 Стоимость: <b>{price} ₽</b>" if price else ""
-                    msg = (
-                        "🔒 <b>Требуется подписка</b>\n\n"
-                        "Для доступа к боту нужна активная подписка."
-                        f"{price_line}\n\n"
-                        "Обратитесь к владельцу бота для покупки."
-                    )
+                    msg = render_custom_text("subscription", price=price_line)
                     try:
                         from aiogram.types import CallbackQuery as _CQ, Message as _Msg
                         if isinstance(event, _CQ):

@@ -61,12 +61,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         await _send_menu(message, message.from_user.id)
         return
 
+    from storage import render_custom_text
     await state.set_state(AuthState.waiting_for_token)
-    await message.answer(
-        "👋 Добро пожаловать в <b>YooMarket бот</b>!\n\n"
-        "Отправьте ваш <b>API токен</b> из панели YooMarket:\n"
-        "<i>Мой магазин → Интеграции → API токен</i>"
-    )
+    await message.answer(render_custom_text("welcome"))
 
 
 @router.message(Command("version"))

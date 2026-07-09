@@ -12,13 +12,14 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from storage import (
-    MENU_BUTTONS, add_admin, block_user, clear_header_emoji, count_subscribers,
-    count_users, get_all_users, get_bot_price, get_header_emoji,
-    get_menu_labels, get_subscription, grant_subscription, is_admin, is_owner,
-    list_admins, list_blocked, remove_admin, require_subscription_enabled,
-    reset_menu_labels, revoke_subscription, set_bot_price, set_header_emoji,
-    set_menu_label, set_require_subscription, subscription_days_left,
-    unblock_user,
+    CUSTOM_TEXTS, MENU_BUTTONS, add_admin, block_user, clear_custom_text,
+    clear_header_emoji, count_subscribers, count_users, get_all_users,
+    get_bot_price, get_custom_text, get_header_emoji, get_menu_labels,
+    get_subscription, grant_subscription, is_admin, is_custom_text_set,
+    is_owner, list_admins, list_blocked, remove_admin,
+    require_subscription_enabled, reset_menu_labels, revoke_subscription,
+    set_bot_price, set_custom_text, set_header_emoji, set_menu_label,
+    set_require_subscription, subscription_days_left, unblock_user,
 )
 
 router = Router()
@@ -36,6 +37,7 @@ class AdminState(StatesGroup):
     remove_admin = State()
     menu_label = State()
     header_emoji = State()
+    edit_text = State()
 
 
 def _menu_kb(uid: int):
@@ -46,6 +48,7 @@ def _menu_kb(uid: int):
     b.button(text="💰 Цена бота", callback_data="admin:price")
     b.button(text="📢 Рассылка", callback_data="admin:broadcast")
     b.button(text="🎨 Оформление", callback_data="admin:appearance")
+    b.button(text="📝 Тексты сообщений", callback_data="admin:texts")
     b.button(text="🔐 Требовать подписку", callback_data="admin:toggle_sub")
     if is_owner(uid):
         b.button(text="👑 Управление админами", callback_data="admin:admins")
@@ -212,11 +215,9 @@ async def _do_grant(msg, state: FSMContext, days: int, admin_id: int, bot: Bot) 
         await msg.answer(text, reply_markup=b.as_markup())
     # notify the client
     try:
+        from storage import render_custom_text
         await bot.send_message(
-            target,
-            f"🎉 Вам выдана подписка на бота на <b>{days} дн.</b>!\n"
-            f"Осталось: <b>{left} дн.</b>",
-        )
+            target, render_custom_text("sub_granted", days=days, left=left))
     except Exception:
         pass
 
@@ -657,3 +658,133 @@ class _DummyState:
     async def set_state(self, *a, **k): pass
     async def update_data(self, **k): pass
     async def get_data(self): return {}
+
+
+# ── Редактор текстов сообщений (с кастом-эмодзи) ────────────────────────────
+
+@router.callback_query(F.data == "admin:texts")
+async def texts_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    b = InlineKeyboardBuilder()
+    for key, meta in CUSTOM_TEXTS.items():
+        mark = "✏️" if is_custom_text_set(key) else "○"
+        b.button(text=f"{mark} {meta['title']}", callback_data=f"admin:txt:{key}")
+    b.adjust(1)
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
+    await callback.message.edit_text(
+        "📝 <b>Тексты сообщений</b>\n\n"
+        "Измените тексты, которые бот шлёт пользователям. "
+        "Можно вставлять <b>кастом-эмодзи</b> и форматирование "
+        "(жирный, курсив) — бот сохранит как есть.\n\n"
+        "✏️ = изменён, ○ = стандартный",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:txt:"))
+async def text_view(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    key = callback.data.split(":")[-1]
+    meta = CUSTOM_TEXTS.get(key)
+    if not meta:
+        await callback.answer()
+        return
+    cur = get_custom_text(key)
+    vars_line = ""
+    if meta.get("vars"):
+        vars_line = ("\n\n🔤 Доступные подстановки: "
+                     + ", ".join(f"<code>{v}</code>" for v in meta["vars"])
+                     + "\n<i>Вставьте их в текст — бот подставит значения.</i>")
+    b = InlineKeyboardBuilder()
+    b.button(text="✏️ Изменить", callback_data=f"admin:txtedit:{key}")
+    if is_custom_text_set(key):
+        b.button(text="♻️ Вернуть стандартный", callback_data=f"admin:txtreset:{key}")
+    b.button(text="⬅️ К текстам", callback_data="admin:texts")
+    b.adjust(1)
+    # show a live preview (render placeholders with sample values)
+    sample = {"price": " 💰 500 ₽", "days": "30", "left": "30"}
+    preview = get_custom_text(key)
+    for v in meta.get("vars", []):
+        vk = v.strip("{}")
+        preview = preview.replace(v, str(sample.get(vk, v)))
+    await callback.message.edit_text(
+        f"📝 <b>{meta['title']}</b>\n\n"
+        f"<b>Текущий текст:</b>\n{preview}{vars_line}",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:txtedit:"))
+async def text_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    key = callback.data.split(":")[-1]
+    meta = CUSTOM_TEXTS.get(key)
+    if not meta:
+        await callback.answer()
+        return
+    await state.set_state(AdminState.edit_text)
+    await state.update_data(text_key=key)
+    vars_line = ""
+    if meta.get("vars"):
+        vars_line = ("\n🔤 Подстановки: "
+                     + ", ".join(f"<code>{v}</code>" for v in meta["vars"]))
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data=f"admin:txt:{key}")
+    await callback.message.edit_text(
+        f"✏️ <b>{meta['title']}</b>\n\n"
+        "Отправьте новый текст сообщением. Можно использовать "
+        "<b>кастом-эмодзи</b>, жирный, курсив и переносы строк.{}".format(vars_line),
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.edit_text)
+async def text_edit_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    key = data.get("text_key")
+    await state.clear()
+    if not key or key not in CUSTOM_TEXTS:
+        await message.answer("❌ Потерян ключ текста. Начните заново.")
+        return
+    # html_text preserves formatting AND custom emoji as <tg-emoji>
+    html = message.html_text if message.text else ""
+    if not html.strip():
+        await message.answer("❌ Пустой текст. Пришлите текст сообщением.")
+        return
+    set_custom_text(key, html)
+    b = InlineKeyboardBuilder()
+    b.button(text="👁 Посмотреть", callback_data=f"admin:txt:{key}")
+    b.button(text="📝 К текстам", callback_data="admin:texts")
+    b.adjust(1)
+    await message.answer("✅ Текст сохранён!", reply_markup=b.as_markup())
+    # show how it will actually look
+    try:
+        await message.answer("<b>Так это увидят пользователи:</b>")
+        await message.answer(html)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("admin:txtreset:"))
+async def text_reset(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    key = callback.data.split(":")[-1]
+    clear_custom_text(key)
+    await callback.answer("Текст сброшен к стандартному", show_alert=True)
+    await text_view(callback, state)

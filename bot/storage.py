@@ -650,3 +650,74 @@ def menu_header_html() -> str:
             return f'<tg-emoji emoji-id="{he["id"]}">{fb}</tg-emoji>'
         return fb  # plain emoji chosen by the admin
     return "🏠"
+
+
+# ---------------------------------------------------------------------------
+# Editable bot message texts (bot-wide), with custom-emoji support.
+# Stored as ready-to-send HTML (from message.html_text). Placeholders in
+# {curly} are substituted at render time.
+# ---------------------------------------------------------------------------
+
+CUSTOM_TEXTS = {
+    "welcome": {
+        "title": "Приветствие /start",
+        "vars": [],
+        "default": (
+            "👋 Добро пожаловать в <b>YooMarket бот</b>!\n\n"
+            "Отправьте ваш <b>API токен</b> из панели YooMarket:\n"
+            "<i>Мой магазин → Интеграции → API токен</i>"
+        ),
+    },
+    "subscription": {
+        "title": "Сообщение «нужна подписка»",
+        "vars": ["{price}"],
+        "default": (
+            "🔒 <b>Требуется подписка</b>\n\n"
+            "Для доступа к боту нужна активная подписка.{price}\n\n"
+            "Обратитесь к владельцу бота для покупки."
+        ),
+    },
+    "sub_granted": {
+        "title": "Уведомление о выданной подписке",
+        "vars": ["{days}", "{left}"],
+        "default": (
+            "🎉 Вам выдана подписка на бота на <b>{days} дн.</b>!\n"
+            "Осталось: <b>{left} дн.</b>"
+        ),
+    },
+}
+
+
+def get_custom_text(key: str) -> str:
+    """Stored HTML for a text key, or its default."""
+    saved = get_appearance().get("texts", {}).get(key)
+    if saved is not None:
+        return saved
+    return CUSTOM_TEXTS.get(key, {}).get("default", "")
+
+
+def set_custom_text(key: str, html: str) -> None:
+    data = _load_admin()
+    ap = data.setdefault("appearance", {})
+    texts = ap.setdefault("texts", {})
+    texts[key] = html
+    _save_admin(data)
+
+
+def clear_custom_text(key: str) -> None:
+    data = _load_admin()
+    texts = data.setdefault("appearance", {}).setdefault("texts", {})
+    texts.pop(key, None)
+    _save_admin(data)
+
+
+def is_custom_text_set(key: str) -> bool:
+    return key in get_appearance().get("texts", {})
+
+
+def render_custom_text(key: str, **subs) -> str:
+    """Render a text with {placeholder} substitution (brace-safe)."""
+    tmpl = get_custom_text(key)
+    for k, v in subs.items():
+        tmpl = tmpl.replace("{" + k + "}", str(v))
+    return tmpl
