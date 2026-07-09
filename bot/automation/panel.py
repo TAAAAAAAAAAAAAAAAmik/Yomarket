@@ -939,6 +939,25 @@ def _find_image_url(value) -> str:
     return ""
 
 
+def _field_submit_value(f: dict):
+    """Get a resubmittable scalar for a Nova field value.
+    BelongsTo/select fields expose the chosen id in `belongsToId` or as a nested
+    object in `value` — a plain str(value) would send the label and break the
+    create (this is why clone lost category/subcategory/type → 422)."""
+    if f.get("belongsToId") is not None:
+        return f.get("belongsToId")
+    rel = str(f.get("relationshipType") or f.get("belongsToRelationship") or "")
+    val = f.get("value")
+    if isinstance(val, dict):
+        for k in ("id", "value", "key"):
+            if val.get(k) is not None:
+                return val[k]
+        return None
+    if rel and isinstance(val, (str, int)) and val != "":
+        return val
+    return val
+
+
 def panel_clone_item_sync(
     cookie_string: str, item_id: str, uid: int | None = None,
 ) -> tuple[bool, str]:
@@ -968,14 +987,15 @@ def panel_clone_item_sync(
                 except Exception:
                     pass
             continue
-        if val is None:
+        sub = _field_submit_value(f)
+        if sub is None or sub == "":
             continue
-        if isinstance(val, bool):
-            form[fa] = "1" if val else "0"
-        elif isinstance(val, (dict, list)):
-            continue
+        if isinstance(sub, bool):
+            form[fa] = "1" if sub else "0"
+        elif isinstance(sub, (dict, list)):
+            continue  # nested structure we can't resubmit
         else:
-            form[fa] = str(val)
+            form[fa] = str(sub)
 
     files = {}
     if img_bytes:
