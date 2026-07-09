@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import ssl
 from typing import Any, Awaitable, Callable
 
@@ -103,7 +104,24 @@ async def main() -> None:
         session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = Dispatcher(storage=MemoryStorage())
+    # FSM state store: Redis if REDIS_URL is set (survives restarts), else memory
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    if redis_url:
+        try:
+            from aiogram.fsm.storage.redis import RedisStorage
+            fsm_storage = RedisStorage.from_url(redis_url)
+            logger.info("FSM storage: Redis")
+        except Exception as e:
+            logger.warning("Redis unavailable (%s), using memory FSM", e)
+            fsm_storage = MemoryStorage()
+    else:
+        fsm_storage = MemoryStorage()
+    dp = Dispatcher(storage=fsm_storage)
+
+    if os.environ.get("DATABASE_URL", "").strip():
+        logger.info("Data storage: PostgreSQL")
+    else:
+        logger.info("Data storage: JSON files (set DATABASE_URL for PostgreSQL)")
 
     task_manager = TaskManager(bot)
     dp["task_manager"] = task_manager

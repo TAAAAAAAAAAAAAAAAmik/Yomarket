@@ -3,3 +3,5 @@ python-dotenv==1.0.1
 playwright
 requests
 tonsdk
+psycopg2-binary
+redis

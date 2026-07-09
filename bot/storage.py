@@ -56,6 +56,7 @@ _SETTINGS_FILE = os.path.join(_DATA_DIR, "settings.json")
 _PANEL_FILE = os.path.join(_DATA_DIR, "panel_creds.json")
 # Sensitive: Fragment cookies + TON wallet seed phrase. Never logged/committed.
 _FRAGMENT_FILE = os.path.join(_DATA_DIR, "fragment_creds.json")
+_ADMIN_FILE = os.path.join(_DATA_DIR, "admin.json")
 
 _DEFAULT_SETTINGS = {
     "shop_name": "",
@@ -122,17 +123,127 @@ _DEFAULT_SETTINGS = {
 _DEFAULT_ACCOUNT = "Основной"
 
 
+# ---------------------------------------------------------------------------
+# Storage backend: PostgreSQL when DATABASE_URL is set, else JSON files.
+# The rest of the module (and the whole bot) is unchanged — only _read_blob /
+# _write_blob differ. Each legacy JSON file becomes one row in kv_store, and
+# existing files are auto-migrated into the DB on first read.
+# ---------------------------------------------------------------------------
+
+import threading as _threading
+
+_DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+_USE_DB = bool(_DATABASE_URL)
+_db_lock = _threading.Lock()
+_db_pool = None
+_cache: dict[str, str] = {}
+
+# blob key -> legacy file path (used for migration + file-mode fallback)
+_BLOBS = {
+    "tokens": _FILE,
+    "settings": _SETTINGS_FILE,
+    "panel_creds": _PANEL_FILE,
+    "fragment_creds": _FRAGMENT_FILE,
+    "admin": _ADMIN_FILE,
+}
+
+
+def _init_pool():
+    global _db_pool
+    if _db_pool is not None:
+        return
+    import psycopg2.pool
+    _db_pool = psycopg2.pool.ThreadedConnectionPool(1, 8, _DATABASE_URL)
+    conn = _db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS kv_store "
+                "(k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        conn.commit()
+    finally:
+        _db_pool.putconn(conn)
+
+
+def _db_read_raw(key: str) -> str | None:
+    _init_pool()
+    conn = _db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT v FROM kv_store WHERE k=%s", (key,))
+            row = cur.fetchone()
+            return row[0] if row else None
+    finally:
+        _db_pool.putconn(conn)
+
+
+def _db_write_raw(key: str, raw: str) -> None:
+    _init_pool()
+    conn = _db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO kv_store (k, v) VALUES (%s, %s) "
+                "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v", (key, raw))
+        conn.commit()
+    finally:
+        _db_pool.putconn(conn)
+
+
+def _read_blob(key: str) -> dict:
+    """Load a JSON blob (dict) for a storage key from DB or file."""
+    if not _USE_DB:
+        path = _BLOBS[key]
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+    with _db_lock:
+        if key not in _cache:
+            raw = _db_read_raw(key)
+            if raw is None:
+                # one-time migration from a legacy JSON file, if present
+                path = _BLOBS[key]
+                if os.path.exists(path):
+                    try:
+                        with open(path) as f:
+                            raw = f.read()
+                        json.loads(raw)  # validate
+                        _db_write_raw(key, raw)
+                    except Exception:
+                        raw = "{}"
+                else:
+                    raw = "{}"
+            _cache[key] = raw
+        try:
+            return json.loads(_cache[key])
+        except Exception:
+            return {}
+
+
+def _write_blob(key: str, data: dict) -> None:
+    """Persist a JSON blob (dict) for a storage key to DB or file."""
+    if not _USE_DB:
+        path = _BLOBS[key]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+        return
+    raw = json.dumps(data, ensure_ascii=False)
+    with _db_lock:
+        _cache[key] = raw
+        _db_write_raw(key, raw)
+
+
 def _load() -> dict:
-    if os.path.exists(_FILE):
-        with open(_FILE) as f:
-            return json.load(f)
-    return {}
+    return _read_blob("tokens")
 
 
 def _save_tokens(data: dict) -> None:
-    os.makedirs(os.path.dirname(_FILE), exist_ok=True)
-    with open(_FILE, "w") as f:
-        json.dump(data, f)
+    _write_blob("tokens", data)
 
 
 def _user_entry(data: dict, user_id: int) -> dict | None:
@@ -243,16 +354,15 @@ def delete_token(user_id: int) -> None:
         entry["active"] = next(iter(entry["accounts"]))
     else:
         data.pop(str(user_id), None)
-    os.makedirs(os.path.dirname(_FILE), exist_ok=True)
-    with open(_FILE, "w") as f:
-        json.dump(data, f)
+    _save_tokens(data)
 
 
 def _load_settings() -> dict:
-    if os.path.exists(_SETTINGS_FILE):
-        with open(_SETTINGS_FILE) as f:
-            return json.load(f)
-    return {}
+    return _read_blob("settings")
+
+
+def _save_all_settings(all_settings: dict) -> None:
+    _write_blob("settings", all_settings)
 
 
 def _merge_defaults(settings: dict) -> dict:
@@ -290,19 +400,15 @@ def get_settings(user_id: int) -> dict:
     if key not in all_settings and str(user_id) in all_settings:
         # migrate legacy per-uid settings to the active account's key
         all_settings[key] = all_settings.pop(str(user_id))
-        os.makedirs(os.path.dirname(_SETTINGS_FILE), exist_ok=True)
-        with open(_SETTINGS_FILE, "w") as f:
-            json.dump(all_settings, f)
+        _save_all_settings(all_settings)
     raw = all_settings.get(key, {})
     return _merge_defaults(raw)
 
 
 def save_settings(user_id: int, settings: dict) -> None:
-    os.makedirs(os.path.dirname(_SETTINGS_FILE), exist_ok=True)
     all_settings = _load_settings()
     all_settings[_account_key(user_id)] = settings
-    with open(_SETTINGS_FILE, "w") as f:
-        json.dump(all_settings, f)
+    _save_all_settings(all_settings)
 
 
 def get_all_users() -> list[int]:
@@ -324,10 +430,11 @@ def save_shop_name(user_id: int, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _load_panel_creds() -> dict:
-    if os.path.exists(_PANEL_FILE):
-        with open(_PANEL_FILE) as f:
-            return json.load(f)
-    return {}
+    return _read_blob("panel_creds")
+
+
+def _save_panel_data(data: dict) -> None:
+    _write_blob("panel_creds", data)
 
 
 def get_panel_creds(user_id: int) -> dict | None:
@@ -336,19 +443,15 @@ def get_panel_creds(user_id: int) -> dict | None:
     key = _account_key(user_id)
     if key not in data and str(user_id) in data:
         data[key] = data.pop(str(user_id))
-        os.makedirs(os.path.dirname(_PANEL_FILE), exist_ok=True)
-        with open(_PANEL_FILE, "w") as f:
-            json.dump(data, f)
+        _save_panel_data(data)
     return data.get(key)
 
 
 def save_panel_creds(user_id: int, creds: dict) -> None:
     """Save panel credentials for the user's active account."""
-    os.makedirs(os.path.dirname(_PANEL_FILE), exist_ok=True)
     data = _load_panel_creds()
     data[_account_key(user_id)] = creds
-    with open(_PANEL_FILE, "w") as f:
-        json.dump(data, f)
+    _save_panel_data(data)
 
 
 def delete_panel_creds(user_id: int) -> None:
@@ -356,9 +459,7 @@ def delete_panel_creds(user_id: int) -> None:
     data = _load_panel_creds()
     data.pop(_account_key(user_id), None)
     data.pop(str(user_id), None)
-    os.makedirs(os.path.dirname(_PANEL_FILE), exist_ok=True)
-    with open(_PANEL_FILE, "w") as f:
-        json.dump(data, f)
+    _save_panel_data(data)
 
 
 # ---------------------------------------------------------------------------
@@ -368,10 +469,11 @@ def delete_panel_creds(user_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 def _load_fragment_creds() -> dict:
-    if os.path.exists(_FRAGMENT_FILE):
-        with open(_FRAGMENT_FILE) as f:
-            return json.load(f)
-    return {}
+    return _read_blob("fragment_creds")
+
+
+def _save_fragment_data(data: dict) -> None:
+    _write_blob("fragment_creds", data)
 
 
 def get_fragment_creds(user_id: int) -> dict | None:
@@ -380,37 +482,28 @@ def get_fragment_creds(user_id: int) -> dict | None:
     # migrate legacy per-uid entry to the active-account key (like settings/panel)
     if key not in data and str(user_id) in data:
         data[key] = data.pop(str(user_id))
-        os.makedirs(os.path.dirname(_FRAGMENT_FILE), exist_ok=True)
-        with open(_FRAGMENT_FILE, "w") as f:
-            json.dump(data, f)
-        try:
-            os.chmod(_FRAGMENT_FILE, 0o600)
-        except OSError:
-            pass
+        _save_fragment_data(data)
     return data.get(key)
 
 
 def save_fragment_creds(user_id: int, creds: dict) -> None:
-    os.makedirs(os.path.dirname(_FRAGMENT_FILE), exist_ok=True)
     data = _load_fragment_creds()
     existing = data.get(_account_key(user_id)) or {}
     existing.update(creds)
     data[_account_key(user_id)] = existing
-    with open(_FRAGMENT_FILE, "w") as f:
-        json.dump(data, f)
-    try:  # tighten file perms — it holds a seed phrase
-        os.chmod(_FRAGMENT_FILE, 0o600)
-    except OSError:
-        pass
+    _save_fragment_data(data)
+    if not _USE_DB:
+        try:  # tighten file perms — it holds a seed phrase
+            os.chmod(_FRAGMENT_FILE, 0o600)
+        except OSError:
+            pass
 
 
 def delete_fragment_creds(user_id: int) -> None:
     data = _load_fragment_creds()
     data.pop(_account_key(user_id), None)
     data.pop(str(user_id), None)
-    os.makedirs(os.path.dirname(_FRAGMENT_FILE), exist_ok=True)
-    with open(_FRAGMENT_FILE, "w") as f:
-        json.dump(data, f)
+    _save_fragment_data(data)
 
 
 # ---------------------------------------------------------------------------
@@ -421,23 +514,14 @@ def delete_fragment_creds(user_id: int) -> None:
 import time as _time
 
 OWNER_ID = 6887373040
-_ADMIN_FILE = os.path.join(_DATA_DIR, "admin.json")
 
 
 def _load_admin() -> dict:
-    if os.path.exists(_ADMIN_FILE):
-        try:
-            with open(_ADMIN_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    return _read_blob("admin")
 
 
 def _save_admin(data: dict) -> None:
-    os.makedirs(os.path.dirname(_ADMIN_FILE), exist_ok=True)
-    with open(_ADMIN_FILE, "w") as f:
-        json.dump(data, f)
+    _write_blob("admin", data)
 
 
 def is_owner(user_id: int) -> bool:
