@@ -12,11 +12,13 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from storage import (
-    add_admin, block_user, count_subscribers, count_users, get_all_users,
-    get_bot_price, get_subscription, grant_subscription, is_admin, is_owner,
+    MENU_BUTTONS, add_admin, block_user, clear_header_emoji, count_subscribers,
+    count_users, get_all_users, get_bot_price, get_header_emoji,
+    get_menu_labels, get_subscription, grant_subscription, is_admin, is_owner,
     list_admins, list_blocked, remove_admin, require_subscription_enabled,
-    revoke_subscription, set_bot_price, set_require_subscription,
-    subscription_days_left, unblock_user,
+    reset_menu_labels, revoke_subscription, set_bot_price, set_header_emoji,
+    set_menu_label, set_require_subscription, subscription_days_left,
+    unblock_user,
 )
 
 router = Router()
@@ -32,6 +34,8 @@ class AdminState(StatesGroup):
     broadcast = State()
     add_admin = State()
     remove_admin = State()
+    menu_label = State()
+    header_emoji = State()
 
 
 def _menu_kb(uid: int):
@@ -41,11 +45,12 @@ def _menu_kb(uid: int):
     b.button(text="🚫 Чёрный список", callback_data="admin:blacklist")
     b.button(text="💰 Цена бота", callback_data="admin:price")
     b.button(text="📢 Рассылка", callback_data="admin:broadcast")
+    b.button(text="🎨 Оформление", callback_data="admin:appearance")
     b.button(text="🔐 Требовать подписку", callback_data="admin:toggle_sub")
     if is_owner(uid):
         b.button(text="👑 Управление админами", callback_data="admin:admins")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
-    b.adjust(2, 2, 2, 1, 1)
+    b.adjust(2, 2, 2, 1, 1)  # rows fill top-to-bottom; extra buttons wrap to 1-per-row
     return b.as_markup()
 
 
@@ -485,3 +490,170 @@ async def rm_admin_input(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"{'✅ Снят' if ok else 'ℹ️ Не был админом'}: <code>{target}</code>",
         reply_markup=b.as_markup())
+
+
+# ── Оформление (кнопки меню + кастом-эмодзи шапки) ──────────────────────────
+
+_MENU_KEYS = {key: default for key, default, _cb in MENU_BUTTONS}
+
+
+@router.callback_query(F.data == "admin:appearance")
+async def appearance_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    he = get_header_emoji()
+    header_line = (f"🔣 Кастом-эмодзи шапки: <b>задан</b> ({he.get('fallback')})"
+                   if he else "🔣 Кастом-эмодзи шапки: <b>нет</b>")
+    text = (
+        "🎨 <b>Оформление</b>\n\n"
+        "Настройте подписи кнопок главного меню (эмодзи + текст) и "
+        "кастом-эмодзи в шапке.\n\n"
+        f"{header_line}\n\n"
+        "ℹ️ <i>Цвет кнопок Telegram менять не даёт — «покрасить» можно "
+        "только цветными эмодзи в подписи (🔴🟢🟡🔵🟣🟠).</i>"
+    )
+    labels = get_menu_labels()
+    b = InlineKeyboardBuilder()
+    for key, _default, _cb in MENU_BUTTONS:
+        b.button(text=f"✏️ {labels.get(key, _default)}", callback_data=f"admin:lbl:{key}")
+    b.adjust(2)
+    b.button(text="🔣 Кастом-эмодзи в шапку", callback_data="admin:hdremoji")
+    if get_header_emoji():
+        b.button(text="🗑 Убрать эмодзи шапки", callback_data="admin:hdrclear")
+    b.button(text="♻️ Сбросить кнопки", callback_data="admin:lblreset")
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
+    b.adjust(2, 1, 1, 1, 1)
+    await callback.message.edit_text(text, reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:lbl:"))
+async def label_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    key = callback.data.split(":")[-1]
+    if key not in _MENU_KEYS:
+        await callback.answer()
+        return
+    await state.set_state(AdminState.menu_label)
+    await state.update_data(label_key=key)
+    cur = get_menu_labels().get(key, _MENU_KEYS[key])
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="admin:appearance")
+    await callback.message.edit_text(
+        f"✏️ <b>Кнопка меню</b>\n\nТекущая: <b>{cur}</b>\n\n"
+        "Отправьте новую подпись (эмодзи + текст).\n"
+        "Пример: <code>🟢 Мои товары</code>\n\n"
+        "<i>Цветные кружки для «покраски»: 🔴🟢🟡🔵🟣🟠⚫⚪🟤</i>",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.menu_label)
+async def label_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    label = (message.text or "").strip()[:40]
+    data = await state.get_data()
+    key = data.get("label_key")
+    await state.clear()
+    if not label or not key:
+        await message.answer("❌ Пустая подпись.")
+        return
+    set_menu_label(key, label)
+    b = InlineKeyboardBuilder()
+    b.button(text="🎨 К оформлению", callback_data="admin:appearance")
+    await message.answer(
+        f"✅ Кнопка обновлена: <b>{label}</b>\n"
+        "Изменение видно в главном меню (/start).",
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "admin:lblreset")
+async def label_reset(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    reset_menu_labels()
+    await callback.answer("Кнопки сброшены к стандартным", show_alert=True)
+    await appearance_menu(callback, _DummyState())
+
+
+@router.callback_query(F.data == "admin:hdremoji")
+async def header_emoji_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminState.header_emoji)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="admin:appearance")
+    await callback.message.edit_text(
+        "🔣 <b>Кастом-эмодзи в шапку меню</b>\n\n"
+        "Отправьте сообщение, в котором есть <b>кастом-эмодзи</b> "
+        "(премиум/из набора). Бот запомнит первый и поставит его в заголовок "
+        "«Главное меню».\n\n"
+        "<i>Обычные эмодзи тоже подойдут — возьму первый символ.</i>",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminState.header_emoji)
+async def header_emoji_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    await state.clear()
+    # find a custom_emoji entity
+    emoji_id = None
+    fallback = "🏠"
+    for ent in (message.entities or []):
+        if ent.type == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
+            emoji_id = ent.custom_emoji_id
+            # the fallback glyph is the text the entity covers
+            txt = message.text or ""
+            fallback = txt[ent.offset:ent.offset + ent.length] or "🏠"
+            break
+    b = InlineKeyboardBuilder()
+    b.button(text="🎨 К оформлению", callback_data="admin:appearance")
+    if emoji_id:
+        set_header_emoji(emoji_id, fallback)
+        await message.answer(
+            f"✅ Кастом-эмодзи сохранён (запасной символ: {fallback}).\n"
+            "Откройте /start — увидите его в шапке меню.",
+            reply_markup=b.as_markup())
+    else:
+        # no custom emoji — use the first plain glyph as the header
+        # (id="" → menu_header_html renders the fallback glyph directly)
+        txt = (message.text or "").strip()
+        if txt:
+            set_header_emoji("", txt[0])
+            await message.answer(
+                f"✅ Символ шапки: <b>{txt[0]}</b> (обычный эмодзи).",
+                reply_markup=b.as_markup())
+        else:
+            await message.answer(
+                "❌ Не нашёл эмодзи в сообщении. Пришлите сообщение с эмодзи.",
+                reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "admin:hdrclear")
+async def header_emoji_clear(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    clear_header_emoji()
+    await callback.answer("Эмодзи шапки убрано", show_alert=True)
+    await appearance_menu(callback, _DummyState())
+
+
+class _DummyState:
+    async def clear(self): pass
+    async def set_state(self, *a, **k): pass
+    async def update_data(self, **k): pass
+    async def get_data(self): return {}

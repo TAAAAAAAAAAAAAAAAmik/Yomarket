@@ -35,14 +35,11 @@ class PaginationCallback(CallbackData, prefix="page"):
 
 
 def main_menu_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
+    from storage import MENU_BUTTONS, get_menu_labels
+    labels = get_menu_labels()
     builder = InlineKeyboardBuilder()
-    builder.button(text="🚀 Объявления", callback_data="menu:ads")
-    builder.button(text="🛒 Заказы", callback_data="menu:orders")
-    builder.button(text="💬 Чаты", callback_data="menu:chats")
-    builder.button(text="💰 Баланс", callback_data="menu:balance")
-    builder.button(text="📊 Статистика", callback_data="menu:stats")
-    builder.button(text="🧩 Плагины", callback_data="plugins:menu")
-    builder.button(text="⚙️ Настройки", callback_data="settings:menu")
+    for key, _default, cb in MENU_BUTTONS:
+        builder.button(text=labels.get(key, _default), callback_data=cb)
     builder.adjust(2)
     if is_admin_user:
         builder.button(text="👑 Админ-панель", callback_data="admin:menu")

@@ -31,9 +31,10 @@ def _extract_shop(info: dict) -> tuple[str, str]:
 
 
 async def _send_menu(target: Message | CallbackQuery, user_id: int) -> None:
-    from storage import is_admin
+    from storage import is_admin, menu_header_html
     name = get_shop_name(user_id) or "Магазин"
-    text = f"🏪 <b>{name}</b>\n\n🏠 <b>Главное меню</b>\nВыберите раздел:"
+    text = (f"🏪 <b>{name}</b>\n\n{menu_header_html()} <b>Главное меню</b>\n"
+            "Выберите раздел:")
     kb = main_menu_keyboard(is_admin_user=is_admin(user_id))
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=kb)

@@ -578,3 +578,75 @@ def set_require_subscription(enabled: bool) -> None:
     data = _load_admin()
     data["require_subscription"] = bool(enabled)
     _save_admin(data)
+
+
+# ---------------------------------------------------------------------------
+# Appearance / branding (bot-wide): custom main-menu button labels and an
+# optional custom-emoji header. Buttons can't be truly colored on Telegram,
+# so "coloring" = colored emoji in the label.
+# ---------------------------------------------------------------------------
+
+# key -> (default label, callback) for the main menu
+MENU_BUTTONS = [
+    ("ads",      "🚀 Объявления", "menu:ads"),
+    ("orders",   "🛒 Заказы",     "menu:orders"),
+    ("chats",    "💬 Чаты",       "menu:chats"),
+    ("balance",  "💰 Баланс",     "menu:balance"),
+    ("stats",    "📊 Статистика", "menu:stats"),
+    ("plugins",  "🧩 Плагины",    "plugins:menu"),
+    ("settings", "⚙️ Настройки",  "settings:menu"),
+]
+
+
+def get_appearance() -> dict:
+    return _load_admin().get("appearance", {})
+
+
+def get_menu_labels() -> dict:
+    """{key: label} with admin overrides applied over defaults."""
+    overrides = get_appearance().get("menu_labels", {})
+    return {key: overrides.get(key, default) for key, default, _cb in MENU_BUTTONS}
+
+
+def set_menu_label(key: str, label: str) -> None:
+    data = _load_admin()
+    ap = data.setdefault("appearance", {})
+    labels = ap.setdefault("menu_labels", {})
+    labels[key] = label
+    _save_admin(data)
+
+
+def reset_menu_labels() -> None:
+    data = _load_admin()
+    data.setdefault("appearance", {})["menu_labels"] = {}
+    _save_admin(data)
+
+
+def get_header_emoji() -> dict | None:
+    """{'id': custom_emoji_id, 'fallback': '🏠'} or None."""
+    return get_appearance().get("header_emoji")
+
+
+def set_header_emoji(emoji_id: str, fallback: str) -> None:
+    data = _load_admin()
+    ap = data.setdefault("appearance", {})
+    ap["header_emoji"] = {"id": str(emoji_id), "fallback": fallback or "🏠"}
+    _save_admin(data)
+
+
+def clear_header_emoji() -> None:
+    data = _load_admin()
+    data.setdefault("appearance", {}).pop("header_emoji", None)
+    _save_admin(data)
+
+
+def menu_header_html() -> str:
+    """Header prefix for the main menu: custom emoji if set, else a plain
+    emoji if the admin chose one, else the default 🏠."""
+    he = get_header_emoji()
+    if he:
+        fb = he.get("fallback") or "🏠"
+        if he.get("id"):
+            return f'<tg-emoji emoji-id="{he["id"]}">{fb}</tg-emoji>'
+        return fb  # plain emoji chosen by the admin
+    return "🏠"
