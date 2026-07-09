@@ -399,3 +399,170 @@ def delete_fragment_creds(user_id: int) -> None:
     os.makedirs(os.path.dirname(_FRAGMENT_FILE), exist_ok=True)
     with open(_FRAGMENT_FILE, "w") as f:
         json.dump(data, f)
+
+
+# ---------------------------------------------------------------------------
+# Global admin / subscription store (owner + admins, subscriptions, price,
+# blocked users). Not per-account — bot-wide.
+# ---------------------------------------------------------------------------
+
+import time as _time
+
+OWNER_ID = 6887373040
+_ADMIN_FILE = os.path.join(_DATA_DIR, "admin.json")
+
+
+def _load_admin() -> dict:
+    if os.path.exists(_ADMIN_FILE):
+        try:
+            with open(_ADMIN_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_admin(data: dict) -> None:
+    os.makedirs(os.path.dirname(_ADMIN_FILE), exist_ok=True)
+    with open(_ADMIN_FILE, "w") as f:
+        json.dump(data, f)
+
+
+def is_owner(user_id: int) -> bool:
+    return int(user_id) == OWNER_ID
+
+
+def is_admin(user_id: int) -> bool:
+    if is_owner(user_id):
+        return True
+    return int(user_id) in [int(x) for x in _load_admin().get("admins", [])]
+
+
+def add_admin(user_id: int) -> None:
+    data = _load_admin()
+    admins = [int(x) for x in data.get("admins", [])]
+    if int(user_id) not in admins:
+        admins.append(int(user_id))
+    data["admins"] = admins
+    _save_admin(data)
+
+
+def remove_admin(user_id: int) -> bool:
+    data = _load_admin()
+    admins = [int(x) for x in data.get("admins", [])]
+    if int(user_id) in admins:
+        admins.remove(int(user_id))
+        data["admins"] = admins
+        _save_admin(data)
+        return True
+    return False
+
+
+def list_admins() -> list[int]:
+    return [OWNER_ID] + [int(x) for x in _load_admin().get("admins", [])
+                         if int(x) != OWNER_ID]
+
+
+# --- Subscriptions ---------------------------------------------------------
+
+def grant_subscription(user_id: int, days: int, by: int = 0) -> float:
+    """Add `days` to a user's subscription (from now, or extends existing).
+    Returns the new expiry timestamp."""
+    data = _load_admin()
+    subs = data.setdefault("subscriptions", {})
+    now = _time.time()
+    cur = subs.get(str(user_id), {})
+    base = max(now, float(cur.get("expires", 0)))
+    expires = base + days * 86400
+    subs[str(user_id)] = {"expires": expires, "by": int(by)}
+    _save_admin(data)
+    return expires
+
+
+def revoke_subscription(user_id: int) -> bool:
+    data = _load_admin()
+    subs = data.get("subscriptions", {})
+    if str(user_id) in subs:
+        subs.pop(str(user_id))
+        _save_admin(data)
+        return True
+    return False
+
+
+def get_subscription(user_id: int) -> dict | None:
+    return _load_admin().get("subscriptions", {}).get(str(user_id))
+
+
+def has_active_subscription(user_id: int) -> bool:
+    sub = get_subscription(user_id)
+    return bool(sub and float(sub.get("expires", 0)) > _time.time())
+
+
+def subscription_days_left(user_id: int) -> int:
+    sub = get_subscription(user_id)
+    if not sub:
+        return 0
+    left = float(sub.get("expires", 0)) - _time.time()
+    return max(0, int(left // 86400))
+
+
+def count_subscribers() -> int:
+    subs = _load_admin().get("subscriptions", {})
+    now = _time.time()
+    return sum(1 for s in subs.values() if float(s.get("expires", 0)) > now)
+
+
+# --- Bot price -------------------------------------------------------------
+
+def get_bot_price() -> int:
+    return int(_load_admin().get("bot_price", 0))
+
+
+def set_bot_price(price: int) -> None:
+    data = _load_admin()
+    data["bot_price"] = int(price)
+    _save_admin(data)
+
+
+# --- Blocked users (bot-wide) ----------------------------------------------
+
+def block_user(user_id: int) -> None:
+    data = _load_admin()
+    blocked = [int(x) for x in data.get("blocked", [])]
+    if int(user_id) not in blocked:
+        blocked.append(int(user_id))
+    data["blocked"] = blocked
+    _save_admin(data)
+
+
+def unblock_user(user_id: int) -> bool:
+    data = _load_admin()
+    blocked = [int(x) for x in data.get("blocked", [])]
+    if int(user_id) in blocked:
+        blocked.remove(int(user_id))
+        data["blocked"] = blocked
+        _save_admin(data)
+        return True
+    return False
+
+
+def is_blocked(user_id: int) -> bool:
+    return int(user_id) in [int(x) for x in _load_admin().get("blocked", [])]
+
+
+def list_blocked() -> list[int]:
+    return [int(x) for x in _load_admin().get("blocked", [])]
+
+
+def count_users() -> int:
+    return len(get_all_users())
+
+
+def require_subscription_enabled() -> bool:
+    return bool(_load_admin().get("require_subscription", False))
+
+
+def set_require_subscription(enabled: bool) -> None:
+    data = _load_admin()
+    data["require_subscription"] = bool(enabled)
+    _save_admin(data)

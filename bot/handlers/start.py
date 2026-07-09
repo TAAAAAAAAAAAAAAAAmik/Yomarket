@@ -31,13 +31,15 @@ def _extract_shop(info: dict) -> tuple[str, str]:
 
 
 async def _send_menu(target: Message | CallbackQuery, user_id: int) -> None:
+    from storage import is_admin
     name = get_shop_name(user_id) or "Магазин"
     text = f"🏪 <b>{name}</b>\n\n🏠 <b>Главное меню</b>\nВыберите раздел:"
+    kb = main_menu_keyboard(is_admin_user=is_admin(user_id))
     if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=main_menu_keyboard())
+        await target.message.edit_text(text, reply_markup=kb)
         await target.answer()
     else:
-        await target.answer(text, reply_markup=main_menu_keyboard())
+        await target.answer(text, reply_markup=kb)
 
 
 @router.message(CommandStart())

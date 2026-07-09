@@ -16,7 +16,7 @@ from aiogram.types import TelegramObject
 from config import BOT_TOKEN
 from api.yoomarket import YooMarketAPI
 from storage import get_token
-from handlers import accounts, ads, auto_settings, balance, chats, create_ad, notifications, orders, panel, panel_items, plugins, price_schedule, responders, selenium_settings, settings, start, stats, tools
+from handlers import accounts, admin, ads, auto_settings, balance, chats, create_ad, notifications, orders, panel, panel_items, plugins, price_schedule, responders, selenium_settings, settings, start, stats, tools
 from tasks import TaskManager
 
 logging.basicConfig(
@@ -24,6 +24,50 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+class AccessMiddleware:
+    """Blocks banned users and (optionally) gates access behind a subscription.
+    Owner and admins always pass."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        from storage import (is_admin, is_blocked, has_active_subscription,
+                             require_subscription_enabled, get_bot_price)
+        user = data.get("event_from_user")
+        if user:
+            uid = user.id
+            if is_blocked(uid) and not is_admin(uid):
+                return  # banned — silently drop
+            # Subscription gate: allow /start so the user can see the notice,
+            # and always allow admins.
+            if (require_subscription_enabled() and not is_admin(uid)
+                    and not has_active_subscription(uid)):
+                text = getattr(event, "text", "") or ""
+                is_start = text.startswith("/start")
+                if not is_start:
+                    price = get_bot_price()
+                    price_line = f"\n💰 Стоимость: <b>{price} ₽</b>" if price else ""
+                    msg = (
+                        "🔒 <b>Требуется подписка</b>\n\n"
+                        "Для доступа к боту нужна активная подписка."
+                        f"{price_line}\n\n"
+                        "Обратитесь к владельцу бота для покупки."
+                    )
+                    try:
+                        from aiogram.types import CallbackQuery as _CQ, Message as _Msg
+                        if isinstance(event, _CQ):
+                            await event.answer("🔒 Нужна подписка", show_alert=True)
+                        elif isinstance(event, _Msg):
+                            await event.answer(msg)
+                    except Exception:
+                        pass
+                    return
+        return await handler(event, data)
 
 
 class YooMarketMiddleware:
@@ -68,9 +112,12 @@ async def main() -> None:
     task_manager = TaskManager(bot)
     dp["task_manager"] = task_manager
 
+    dp.message.middleware(AccessMiddleware())
+    dp.callback_query.middleware(AccessMiddleware())
     dp.message.middleware(YooMarketMiddleware())
     dp.callback_query.middleware(YooMarketMiddleware())
 
+    dp.include_router(admin.router)
     dp.include_router(start.router)
     dp.include_router(balance.router)
     dp.include_router(ads.router)
