@@ -393,13 +393,16 @@ async def show_hours_chart(callback: CallbackQuery) -> None:
         return
 
     bar_length = 8
-    max_count = max(hour_counts.values(), default=1) or 1
+    # normalize against the max 2-hour bucket sum (bars sum two hours)
+    buckets = [hour_counts.get(b * 2, 0) + hour_counts.get(b * 2 + 1, 0)
+               for b in range(12)]
+    max_count = max(buckets) or 1
     lines = []
     for block in range(12):
         h_start = block * 2
         h_end = h_start + 1
-        count = hour_counts.get(h_start, 0) + hour_counts.get(h_end, 0)
-        filled = round((count / max_count) * bar_length)
+        count = buckets[block]
+        filled = max(0, min(bar_length, round((count / max_count) * bar_length)))
         bar = "█" * filled + "░" * (bar_length - filled)
         label = f"{h_start:02d}-{h_end:02d}"
         lines.append(f"{label} {bar} {count}")

@@ -365,7 +365,17 @@ def _load_fragment_creds() -> dict:
 def get_fragment_creds(user_id: int) -> dict | None:
     data = _load_fragment_creds()
     key = _account_key(user_id)
-    return data.get(key) or data.get(str(user_id))
+    # migrate legacy per-uid entry to the active-account key (like settings/panel)
+    if key not in data and str(user_id) in data:
+        data[key] = data.pop(str(user_id))
+        os.makedirs(os.path.dirname(_FRAGMENT_FILE), exist_ok=True)
+        with open(_FRAGMENT_FILE, "w") as f:
+            json.dump(data, f)
+        try:
+            os.chmod(_FRAGMENT_FILE, 0o600)
+        except OSError:
+            pass
+    return data.get(key)
 
 
 def save_fragment_creds(user_id: int, creds: dict) -> None:

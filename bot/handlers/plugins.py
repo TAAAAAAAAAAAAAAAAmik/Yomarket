@@ -186,7 +186,8 @@ async def stars_toggle(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "plugins:stars:settings")
-async def stars_settings(callback: CallbackQuery) -> None:
+async def stars_settings(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()  # Cancel из промптов ведёт сюда — сбрасываем ввод
     uid = callback.from_user.id
     settings = get_settings(uid)
     creds = get_fragment_creds(uid)
@@ -213,7 +214,8 @@ def _creds_kb(has: bool) -> InlineKeyboardMarkup:
 
 
 @router.callback_query(F.data == "plugins:stars:creds")
-async def stars_creds(callback: CallbackQuery) -> None:
+async def stars_creds(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()  # Cancel из промптов cookies/seed ведёт сюда
     uid = callback.from_user.id
     creds = get_fragment_creds(uid) or {}
     has_c = bool(creds.get("cookies"))
@@ -331,10 +333,10 @@ async def stars_check_creds(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "plugins:stars:del_creds")
-async def stars_del_creds(callback: CallbackQuery) -> None:
+async def stars_del_creds(callback: CallbackQuery, state: FSMContext) -> None:
     delete_fragment_creds(callback.from_user.id)
     await callback.answer("🗑 Данные Fragment удалены", show_alert=True)
-    await stars_creds(callback)
+    await stars_creds(callback, state)
 
 
 @router.callback_query(F.data == "plugins:stars:toggle_ask")
@@ -625,7 +627,8 @@ async def roblox_toggle(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "plugins:roblox:settings")
-async def roblox_settings(callback: CallbackQuery) -> None:
+async def roblox_settings(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     settings = get_settings(callback.from_user.id)
     await callback.message.edit_text(_roblox_settings_text(settings), reply_markup=_roblox_settings_keyboard())
     await callback.answer()
@@ -798,7 +801,8 @@ async def gifts_toggle(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "plugins:gifts:settings")
-async def gifts_settings(callback: CallbackQuery) -> None:
+async def gifts_settings(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     settings = get_settings(callback.from_user.id)
     await callback.message.edit_text(_gifts_settings_text(settings), reply_markup=_gifts_settings_keyboard())
     await callback.answer()

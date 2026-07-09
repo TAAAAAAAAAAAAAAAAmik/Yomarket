@@ -102,6 +102,18 @@ class TaskManager:
         self.bot = bot
         self._tasks: dict[int, asyncio.Task] = {}
         self._selenium_tasks: dict[int, asyncio.Task] = {}
+        # Per-user lock: the orders loop (60s) and the auto-tasks loop (30min)
+        # both load→mutate→save the whole settings blob. Without serializing
+        # them, whichever saves last silently clobbers the other's changes
+        # (e.g. AutoStars pending / known_orders vs bump_schedule.last_runs).
+        self._locks: dict[int, asyncio.Lock] = {}
+
+    def _lock(self, user_id: int) -> asyncio.Lock:
+        lock = self._locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[user_id] = lock
+        return lock
 
     def start_for_user(self, user_id: int) -> None:
         if user_id in self._tasks and not self._tasks[user_id].done():
@@ -139,9 +151,10 @@ class TaskManager:
         token = get_token(user_id)
         if not token:
             return
-        settings = get_settings(user_id)
-        await self._process_orders(user_id, token, settings)
-        await self._check_reminders(user_id, settings)
+        async with self._lock(user_id):
+            settings = get_settings(user_id)
+            await self._process_orders(user_id, token, settings)
+            await self._check_reminders(user_id, settings)
 
     async def _process_orders(self, user_id: int, token: str, settings: dict) -> None:
         api = YooMarketAPI(token)
@@ -603,7 +616,10 @@ class TaskManager:
         token = get_token(user_id)
         if not token:
             return
+        async with self._lock(user_id):
+            await self._tick_selenium_locked(user_id, token)
 
+    async def _tick_selenium_locked(self, user_id: int, token: str) -> None:
         settings = get_settings(user_id)
         now = time.time()
         messages = []
@@ -759,8 +775,13 @@ class TaskManager:
         finally:
             await api.close()
 
+        # Always persist: balance_notify / daily_report / reviews_monitor update
+        # their dedupe state (last_notified_balance, last_report_day,
+        # known_review_ids) WITHOUT appending to `messages`. Saving only when
+        # `messages` was non-empty lost that state every cycle → repeated spam.
+        save_settings(user_id, settings)
+
         if messages:
-            save_settings(user_id, settings)
             await self._notify(
                 user_id,
                 "🤖 <b>Авто-задачи</b>\n\n" + "\n".join(messages),

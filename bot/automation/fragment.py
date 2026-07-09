@@ -236,41 +236,58 @@ def buy_stars_sync(
     except Exception as e:
         return False, f"Не удалось получить seqno кошелька: {str(e)[:80]}"
 
-    sent = 0
-    for msg in messages:
-        to_addr = msg.get("address")
-        amount = msg.get("amount")
-        payload = msg.get("payload", "")
-        if not to_addr or amount is None:
-            continue
-        try:
-            boc = _build_signed_boc(wallet, to_addr, amount, payload, seqno)
-        except Exception as e:
-            return False, f"Ошибка сборки транзакции: {str(e)[:100]}"
-        if not _send_boc(boc):
-            return False, "TonCenter отклонил транзакцию (проверьте баланс кошелька)"
-        _post("confirmReq", {"id": req_id, "boc": boc, "account": _json_account(raw_addr)})
-        sent += 1
-        seqno += 1
-
-    if not sent:
+    valid_msgs = [m for m in messages
+                  if m.get("address") and m.get("amount") is not None]
+    if not valid_msgs:
         return False, "Fragment не вернул ни одного платёжного сообщения"
 
-    # 6. wait for on-chain confirmation (seqno advances)
-    if wait_confirm:
-        start_seqno = seqno - sent
-        deadline = time.time() + SEQNO_MAX_WAIT_SECS
-        while time.time() < deadline:
-            try:
-                if _get_seqno(bounce_addr) > start_seqno:
-                    return True, f"✅ {quantity}⭐ отправлены на @{username} (подтверждено в TON)"
-            except Exception:
-                pass
-            time.sleep(SEQNO_POLL_SECS)
-        return True, (f"⏳ {quantity}⭐ для @{username}: транзакция отправлена, "
-                      "подтверждение в сети ещё идёт")
+    # Each external message needs the previous one confirmed on-chain before the
+    # next seqno is accepted, so send sequentially and wait for seqno to advance
+    # between messages (a Stars purchase is normally a single message).
+    sent = 0
+    for i, msg in enumerate(valid_msgs):
+        try:
+            boc = _build_signed_boc(
+                wallet, msg["address"], msg["amount"], msg.get("payload", ""), seqno)
+        except Exception as e:
+            if sent:
+                break
+            return False, f"Ошибка сборки транзакции: {str(e)[:100]}"
+        if not _send_boc(boc):
+            if sent:
+                break
+            return False, "TonCenter отклонил транзакцию (проверьте баланс кошелька)"
+        _post("confirmReq", {"id": req_id, "boc": boc,
+                             "account": _json_account(raw_addr)})
+        sent += 1
+        # Wait for this tx to land (seqno advances) before sending the next
+        if wait_confirm or i < len(valid_msgs) - 1:
+            confirmed = _wait_seqno_advance(bounce_addr, seqno)
+            if confirmed:
+                seqno += 1
+            elif i < len(valid_msgs) - 1:
+                # can't safely send the next message without confirmation
+                return True, (f"⏳ {quantity}⭐ для @{username}: часть транзакций "
+                              "отправлена, подтверждение в сети ещё идёт")
 
+    if not sent:
+        return False, "Не удалось отправить ни одной транзакции"
+    if wait_confirm:
+        return True, f"✅ {quantity}⭐ отправлены на @{username} (подтверждено в TON)"
     return True, f"✅ {quantity}⭐ отправлены на @{username}"
+
+
+def _wait_seqno_advance(address: str, from_seqno: int) -> bool:
+    """Poll until wallet seqno exceeds from_seqno. Returns True if advanced."""
+    deadline = time.time() + SEQNO_MAX_WAIT_SECS
+    while time.time() < deadline:
+        try:
+            if _get_seqno(address) > from_seqno:
+                return True
+        except Exception:
+            pass
+        time.sleep(SEQNO_POLL_SECS)
+    return False
 
 
 def _json_account(raw_addr: str) -> str:

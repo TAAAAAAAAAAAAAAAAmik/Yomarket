@@ -140,8 +140,11 @@ class YooMarketAPI:
         count = 0
         last_err = ""
         for ad in inactive:
+            ad_id = ad.get("id")
+            if not ad_id:
+                continue
             try:
-                await self.restore_ad(ad["id"])
+                await self.restore_ad(ad_id)
                 count += 1
             except RuntimeError as e:
                 last_err = str(e)

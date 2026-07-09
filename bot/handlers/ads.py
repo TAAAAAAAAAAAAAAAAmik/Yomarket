@@ -115,7 +115,9 @@ async def show_ad_detail(
     callback: CallbackQuery,
     callback_data: AdCallback,
     api: YooMarketAPI,
+    state: FSMContext,
 ) -> None:
+    await state.clear()  # "Отмена" из ввода цены ведёт сюда
     await callback.message.edit_text("⏳ Загружаю...")
     try:
         ad = await api.get_ad(callback_data.ad_id)

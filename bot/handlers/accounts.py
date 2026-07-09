@@ -121,6 +121,10 @@ async def add_account_token(message: Message, state: FSMContext, **data) -> None
     if not token:
         await message.answer("❌ Токен не может быть пустым:")
         return
+    try:  # токен — секрет, убираем из истории чата
+        await message.delete()
+    except Exception:
+        pass
 
     status = await message.answer("⏳ Проверяю токен...")
     api = YooMarketAPI(token)

@@ -104,7 +104,12 @@ async def ad_title(message: Message, state: FSMContext) -> None:
     if len(title) > 100:
         await message.answer("❌ Название слишком длинное (макс. 100 символов):")
         return
+    data = await state.get_data()
     await state.update_data(title=title)
+    if data.get("editing"):
+        await state.update_data(editing=False)
+        await _show_preview(message, state, edit=False)
+        return
     await state.set_state(CreateAdState.price)
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="menu:ads")
@@ -128,7 +133,12 @@ async def ad_price(message: Message, state: FSMContext) -> None:
     except ValueError:
         await message.answer("❌ Введи цену числом, например: <b>500</b>")
         return
+    data = await state.get_data()
     await state.update_data(price=price)
+    if data.get("editing"):
+        await state.update_data(editing=False)
+        await _show_preview(message, state, edit=False)
+        return
     await state.set_state(CreateAdState.description)
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="menu:ads")
@@ -148,7 +158,12 @@ async def ad_description(message: Message, state: FSMContext) -> None:
     if not desc:
         await message.answer("❌ Описание не может быть пустым:")
         return
+    data = await state.get_data()
     await state.update_data(description=desc)
+    if data.get("editing"):
+        await state.update_data(editing=False)
+        await _show_preview(message, state, edit=False)
+        return
     await state.set_state(CreateAdState.quantity)
     b = InlineKeyboardBuilder()
     b.button(text="1️⃣ Пропустить (кол-во = 1)", callback_data="create_ad:qty:1")
@@ -270,10 +285,19 @@ async def edit_field(callback: CallbackQuery, state: FSMContext) -> None:
     if field not in prompts:
         await callback.answer()
         return
+    # editing=True → step handler returns to preview instead of walking the wizard
+    await state.update_data(editing=True)
     await state.set_state(states[field])
     b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data="menu:ads")
+    b.button(text="❌ Отмена", callback_data="create_ad:back_preview")
     await callback.message.edit_text(prompts[field], reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "create_ad:back_preview")
+async def back_to_preview(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(editing=False)
+    await _show_preview(callback.message, state, edit=True)
     await callback.answer()
 
 
@@ -492,16 +516,21 @@ async def _render_select(msg, state: FSMContext, edit: bool = True) -> None:
         f"📋 Выберите <b>{label}</b> (всего: {len(view)}):\n"
         f"<i>Не нашли нужное? Напишите название сообщением — я поищу.</i>"
     )
+    sent = None
     try:
         if edit:
-            await msg.edit_text(text, reply_markup=b.as_markup())
+            sent = await msg.edit_text(text, reply_markup=b.as_markup())
         else:
-            await msg.answer(text, reply_markup=b.as_markup())
+            sent = await msg.answer(text, reply_markup=b.as_markup())
     except Exception:
         try:
-            await msg.answer(text, reply_markup=b.as_markup())
+            sent = await msg.answer(text, reply_markup=b.as_markup())
         except Exception:
-            pass
+            sent = None
+    # Remember the live select message so search can edit it in place
+    if sent is not None and getattr(sent, "message_id", None):
+        await state.update_data(
+            select_msg_id=sent.message_id, select_chat_id=sent.chat.id)
 
 
 @router.callback_query(F.data.startswith("cadpg:"))
@@ -565,7 +594,31 @@ async def select_search(message: Message, state: FSMContext) -> None:
     await state.update_data(
         current_options=base, current_view=filtered, current_page=0,
     )
-    await _render_select(message, state, edit=False)
+    # Remove the buyer's search text to keep the chat clean
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    # Edit the SAME select message in place so its button indices always match
+    # current_view (a fresh message would leave a stale keyboard behind).
+    sel_id = data.get("select_msg_id")
+    sel_chat = data.get("select_chat_id")
+    if sel_id and sel_chat:
+        class _Editable:
+            message_id = sel_id
+            chat = type("C", (), {"id": sel_chat})()
+            def __init__(self, bot):
+                self._bot = bot
+            async def edit_text(self, text, reply_markup=None, **kw):
+                return await self._bot.edit_message_text(
+                    text=text, chat_id=sel_chat, message_id=sel_id,
+                    reply_markup=reply_markup, **kw)
+            async def answer(self, text, reply_markup=None, **kw):
+                return await self._bot.send_message(
+                    sel_chat, text, reply_markup=reply_markup, **kw)
+        await _render_select(_Editable(message.bot), state, edit=True)
+    else:
+        await _render_select(message, state, edit=False)
 
 
 @router.callback_query(F.data.startswith("cadopt:"))

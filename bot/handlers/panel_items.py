@@ -108,7 +108,8 @@ def _item_kb(item_id: str):
 
 
 @router.callback_query(F.data.startswith("pitem:"))
-async def item_detail(callback: CallbackQuery) -> None:
+async def item_detail(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()  # "Отмена" из ввода цены/названия ведёт сюда
     item_id = callback.data.split(":", 1)[1]
     await callback.message.edit_text(
         f"🛠 <b>Товар #{item_id}</b>\n\nВыберите действие:",
