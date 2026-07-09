@@ -243,15 +243,28 @@ class TaskManager:
                 is_blacklisted = buyer in blacklist
 
                 if prev_status is None:
+                    # Auto-accept: press "начать заказ" immediately so orders
+                    # don't sit unaccepted (buyer can't force a refund).
+                    accepted = False
+                    if settings.get("auto_accept", {}).get("enabled") and status in (
+                            "new", "pending", "created", "paid", "active"):
+                        try:
+                            await api.work_order(oid)
+                            known[oid] = status = "work"
+                            order_details[oid]["work_at"] = time.time()
+                            accepted = True
+                        except Exception as e:
+                            logger.warning("Auto-accept order %s: %s", oid, e)
                     if not is_blacklisted:
                         time_str = _fmt_time(time_raw)
                         time_part = f"  •  🕐 {time_str}" if time_str else ""
+                        acc_line = "\n▶️ <i>Автоматически взят в работу</i>" if accepted else ""
                         await self._notify(
                             user_id,
                             f"🛒 <b>Новая покупка!</b>\n\n"
                             f"👤 Покупатель: <b>{buyer}</b>\n"
                             f"💰 Сумма: <b>{price} ₽</b>{time_part}\n"
-                            f"📦 Товар: <b>{title}</b>",
+                            f"📦 Товар: <b>{title}</b>{acc_line}",
                             reply_markup=_order_notify_kb(oid, chat_id),
                         )
                     if ar.get("enabled"):
@@ -709,7 +722,13 @@ class TaskManager:
                 min_amount = aw.get("min_amount", 500)
                 logger.info("Auto-withdraw for user %s via API", user_id)
                 success, msg = await api.withdraw_balance(min_amount)
-                messages.append(f"💸 Авто-вывод: {msg}")
+                # only log/notify when something actually happened (not "below threshold")
+                if success or "ниже порога" not in msg:
+                    hist = settings.setdefault("withdrawal_history", [])
+                    hist.insert(0, {"amount": 0.0, "ts": now, "type": "auto",
+                                    "status": "requested" if success else "failed"})
+                    del hist[100:]
+                    messages.append(f"💸 Авто-вывод: {msg}")
 
             # --- Balance notify ---
             bn = settings.get("balance_notify", {})
@@ -834,9 +853,11 @@ class TaskManager:
                     try:
                         count, msg = await api.bump_all_ads()
                         last_runs[last_run_key] = now_dt.isoformat()
+                        bs["bumps_total"] = int(bs.get("bumps_total", 0)) + (count or 0)
                         if price_per_bump > 0 and count:
                             spent_today += count * price_per_bump
                             bs["spent_today"] = spent_today
+                            bs["spent_total"] = float(bs.get("spent_total", 0)) + count * price_per_bump
                             cap = f" (потрачено {spent_today:.0f}"
                             cap += f"/{ceiling:.0f} ₽)" if ceiling > 0 else " ₽)"
                             messages.append(f"⬆️ Поднятие ({slot}): {msg}{cap}")

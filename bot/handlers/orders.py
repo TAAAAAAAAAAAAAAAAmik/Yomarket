@@ -118,6 +118,7 @@ async def show_order_detail(
         status = _order_status(order.get("status", ""))
         address = order.get("address") or order.get("delivery_address") or "—"
         comment = order.get("comment") or "—"
+        chat_id = str(order.get("chat_id") or oid)
         text = (
             f"🛒 <b>Заказ #{oid}</b>\n\n"
             f"📦 Товар: {title}\n"
@@ -127,7 +128,7 @@ async def show_order_detail(
             f"📍 Адрес: {address}\n"
             f"💬 Комментарий: {comment}"
         )
-        keyboard = order_actions_keyboard(str(oid))
+        keyboard = order_actions_keyboard(str(oid), chat_id)
     except Exception as e:
         text = f"❌ Ошибка: {e}"
         keyboard = back_keyboard()

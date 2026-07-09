@@ -90,6 +90,13 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     builder.button(text="⬆️ Автоподнятие", callback_data="selenium:bump:menu")
     builder.button(text="💸 Авто-вывод", callback_data="selenium:withdraw:menu")
 
+    aa = s.get("auto_accept", {})
+    aa_on = aa.get("enabled", False)
+    builder.button(
+        text=f"{'🔴 Выкл' if aa_on else '🟢 Вкл'} авто-принятие заказов",
+        callback_data="auto:toggle:accept",
+    )
+
     ac = s.get("auto_confirm", {})
     ac_on = ac.get("enabled", False)
     ac_h = ac.get("hours", 24)
@@ -336,6 +343,15 @@ async def del_last_rule(callback: CallbackQuery) -> None:
 # ---------------------------------------------------------------------------
 # Auto-confirm
 # ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "auto:toggle:accept")
+async def toggle_accept(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    aa = s.setdefault("auto_accept", {"enabled": False})
+    aa["enabled"] = not aa.get("enabled", False)
+    save_settings(callback.from_user.id, s)
+    await _refresh(callback)
+
 
 @router.callback_query(F.data == "auto:toggle:confirm")
 async def toggle_confirm(callback: CallbackQuery) -> None:

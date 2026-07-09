@@ -77,6 +77,7 @@ async def show_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
     builder = InlineKeyboardBuilder()
     builder.button(text="🔄 Обновить", callback_data="menu:stats")
     builder.button(text="💰 Выручка", callback_data="stats:revenue:7")
+    builder.button(text="⬆️ Расходы на поднятия", callback_data="stats:bumpspend")
     builder.button(text="📈 График (7 дней)", callback_data="stats:chart")
     builder.button(text="🏆 Топ товаров", callback_data="stats:top")
     builder.button(text="📤 Экспорт заказов", callback_data="stats:export")
@@ -157,6 +158,32 @@ async def show_revenue(callback: CallbackQuery) -> None:
     b.button(text="⬅️ Статистика", callback_data="menu:stats")
     b.adjust(4, 1)
 
+    await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "stats:bumpspend")
+async def show_bump_spend(callback: CallbackQuery) -> None:
+    await callback.answer()
+    bs = get_settings(callback.from_user.id).get("bump_schedule", {})
+    spent_total = float(bs.get("spent_total", 0) or 0)
+    spent_today = float(bs.get("spent_today", 0) or 0)
+    bumps_total = int(bs.get("bumps_total", 0) or 0)
+    ppb = float(bs.get("price_per_bump", 0) or 0)
+    ceiling = float(bs.get("daily_ceiling", 0) or 0)
+    lines = [
+        "⬆️ <b>Расходы на поднятия (премки)</b>\n",
+        f"💵 Всего потрачено: <b>{spent_total:.0f} ₽</b>",
+        f"📅 Сегодня: <b>{spent_today:.0f} ₽</b>"
+        + (f" из {ceiling:.0f} ₽" if ceiling else ""),
+        f"🔢 Всего поднятий: <b>{bumps_total}</b>",
+        f"🏷 Цена за поднятие: <b>{ppb:g} ₽</b>",
+    ]
+    if not bs.get("enabled"):
+        lines.append("\n<i>Планировщик поднятий выключен.</i>")
+    b = InlineKeyboardBuilder()
+    b.button(text="⚙️ Настроить поднятия", callback_data="auto:menu")
+    b.button(text="⬅️ Статистика", callback_data="menu:stats")
+    b.adjust(1)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
 
 

@@ -76,7 +76,9 @@ _DEFAULT_SETTINGS = {
     "blacklist": [],  # list of buyer names to suppress notifications for
     "reminders": {"enabled": False, "hours": 24},
     "reminded_orders": [],  # order IDs already reminded (reset on status change)
+    "auto_accept": {"enabled": False},  # авто «начать заказ» при поступлении
     "auto_confirm": {"enabled": False, "hours": 24},
+    "withdrawal_history": [],  # [{amount, ts, type: manual/auto, status}]
     "balance_notify": {"enabled": False, "threshold": 1000, "last_notified_balance": 0.0},
     "daily_report": {"enabled": False, "hour": 20, "last_report_day": ""},
     "quick_replies": ["Спасибо за заказ!", "Отправлю в течение часа.", "Уточните, пожалуйста."],
@@ -87,6 +89,8 @@ _DEFAULT_SETTINGS = {
         "daily_ceiling": 0,    # потолок трат на поднятия в день (0 = без лимита)
         "spent_today": 0.0,
         "spent_day": "",
+        "spent_total": 0.0,    # накопленные расходы на поднятия
+        "bumps_total": 0,      # всего поднятий сделано
     },
     "ad_packs": {},  # {"Пак имя": [ad_id, ...]} — группы объявлений
     "complaint_notify": {"enabled": True, "seen": []},  # уведомления о жалобах

@@ -188,22 +188,42 @@ class YooMarketAPI:
                 raise
         return 0.0, "—"
 
-    async def withdraw_balance(self, min_amount: float = 0) -> tuple[bool, str]:
-        """Request balance withdrawal. Returns (success, message)."""
+    async def withdraw_balance(self, min_amount: float = 0, amount: float | None = None) -> tuple[bool, str]:
+        """Request a withdrawal. If `amount` is None, withdraws the full balance.
+        Returns (success, message)."""
         balance, balance_str = await self.get_balance()
         if balance_str == "—":
             return False, "❌ Не удалось получить баланс через API"
+        want = balance if amount is None else float(amount)
+        if want <= 0:
+            return False, "ℹ️ Нечего выводить (баланс 0)"
+        if want > balance:
+            return False, f"ℹ️ Запрошено {want:.0f} ₽, а на балансе {balance:.0f} ₽"
         if balance < min_amount:
             return False, f"ℹ️ Баланс {balance:.0f} ₽ ниже порога {min_amount:.0f} ₽"
         for path in ("/withdraw", "/wallet/withdraw", "/balance/withdraw", "/finance/withdraw"):
             try:
-                await self._post(path, json={"amount": int(balance)})
-                return True, f"✅ Вывод {balance:.0f} ₽ выполнен"
+                await self._post(path, json={"amount": int(want)})
+                return True, f"✅ Вывод {want:.0f} ₽ выполнен"
             except RuntimeError as e:
                 if "404" in str(e) or "not found" in str(e).lower():
                     continue
                 return False, f"❌ Ошибка: {e}"
         return False, "⚠️ API не поддерживает вывод средств"
+
+    async def get_withdrawals(self) -> list[dict]:
+        """Fetch withdrawal list from the API (tries common endpoints).
+        Returns [] if unsupported."""
+        for path in ("/withdrawals", "/withdraw/history", "/wallet/withdrawals",
+                     "/finance/withdrawals", "/balance/withdrawals"):
+            try:
+                data = await self._get(path)
+                return data.get("data") or data.get("items") or []
+            except RuntimeError as e:
+                if "404" in str(e) or "not found" in str(e).lower() or "405" in str(e):
+                    continue
+                raise
+        return []
 
     async def get_orders(self, cursor: str | None = None) -> dict:
         params: dict = {}
