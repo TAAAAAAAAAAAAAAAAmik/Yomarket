@@ -8,3 +8,7 @@ __pycache__/
 *.pyc
 bot/data/
 .claude/
+
+# Fragment secrets (never commit)
+bot/data/fragment_creds.json
+fragment_creds.json

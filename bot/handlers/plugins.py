@@ -1,14 +1,57 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from storage import get_settings, save_settings, get_shop_name
+from storage import (
+    get_settings, save_settings, get_shop_name,
+    get_fragment_creds, save_fragment_creds, delete_fragment_creds,
+)
 
 router = Router()
+logger = logging.getLogger(__name__)
+
+
+def _parse_cookies(text: str) -> dict:
+    """Parse a 'k=v; k2=v2' cookie string into a dict."""
+    out: dict = {}
+    for part in (text or "").split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            if k.strip():
+                out[k.strip()] = v.strip()
+    return out
+
+
+async def deliver_stars(uid: int, username: str, quantity: int) -> tuple[bool, str]:
+    """Run the blocking Fragment purchase in a thread. Returns (ok, message)."""
+    from automation.fragment import buy_stars_sync
+    creds = get_fragment_creds(uid)
+    if not creds or not creds.get("cookies") or not creds.get("mnemonic"):
+        return False, ("Не настроены данные Fragment.\n"
+                       "Плагины → AutoStars → ⚙️ Настройки → 🔑 Данные Fragment")
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                None, buy_stars_sync,
+                creds["cookies"], creds["mnemonic"], username, quantity,
+                creds.get("wallet_version", "v4r2"),
+                creds.get("api_hash", "af142ec36cafbbfa89"),
+            ),
+            timeout=180,
+        )
+    except asyncio.TimeoutError:
+        return False, "⏱ Fragment/TON не ответили за 180 секунд"
+    except Exception as e:
+        return False, f"Ошибка выдачи: {str(e)[:150]}"
 
 
 class PluginState(StatesGroup):
@@ -17,6 +60,9 @@ class PluginState(StatesGroup):
     stars_manual_amount = State()
     stars_set_amount = State()
     stars_set_note = State()
+    stars_set_cookies = State()
+    stars_set_mnemonic = State()
+    stars_set_keyword = State()
     # AutoRoblox
     roblox_manual_buyer = State()
     roblox_manual_amount = State()
@@ -83,20 +129,36 @@ def _stars_keyboard(settings: dict) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def _stars_settings_text(settings: dict) -> str:
+def _stars_settings_text(settings: dict, has_creds: bool = False) -> str:
     p = settings["plugins"]["auto_stars"]
     amount = p.get("amount", 50)
     note = p.get("note") or "—"
+    keyword = p.get("keyword") or "звёзд"
+    ask = "да" if p.get("ask_username", True) else "нет"
+    creds = "🟢 настроены" if has_creds else "🔴 не настроены"
     return (
         f"⚙️ <b>Настройки AutoStars</b>\n\n"
-        f"⭐ Кол-во звёзд: <b>{amount}</b>\n"
-        f"📝 Заметка: <i>{note}</i>"
+        f"⭐ Кол-во по умолчанию: <b>{amount}</b>\n"
+        f"🔑 Данные Fragment: <b>{creds}</b>\n"
+        f"🔍 Ключевое слово в заказе: <code>{keyword}</code>\n"
+        f"👤 Спрашивать @username: <b>{ask}</b>\n"
+        f"📝 Заметка: <i>{note}</i>\n\n"
+        "<i>Автовыдача сработает, если заголовок заказа содержит ключевое "
+        "слово. Из заголовка бот сам возьмёт число звёзд (иначе — значение "
+        "по умолчанию).</i>"
     )
 
 
-def _stars_settings_keyboard() -> InlineKeyboardMarkup:
+def _stars_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
+    ask = settings["plugins"]["auto_stars"].get("ask_username", True)
     builder = InlineKeyboardBuilder()
-    builder.button(text="✏️ Кол-во звёзд", callback_data="plugins:stars:set_amount")
+    builder.button(text="🔑 Данные Fragment", callback_data="plugins:stars:creds")
+    builder.button(text="✏️ Кол-во по умолчанию", callback_data="plugins:stars:set_amount")
+    builder.button(text="🔍 Ключевое слово", callback_data="plugins:stars:set_keyword")
+    builder.button(
+        text=("👤 Спрашивать username: вкл" if ask else "👤 Спрашивать username: выкл"),
+        callback_data="plugins:stars:toggle_ask",
+    )
     builder.button(text="📝 Заметка", callback_data="plugins:stars:set_note")
     builder.button(text="⬅️ Назад", callback_data="plugins:auto_stars")
     builder.adjust(1)
@@ -125,9 +187,197 @@ async def stars_toggle(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "plugins:stars:settings")
 async def stars_settings(callback: CallbackQuery) -> None:
-    settings = get_settings(callback.from_user.id)
-    await callback.message.edit_text(_stars_settings_text(settings), reply_markup=_stars_settings_keyboard())
+    uid = callback.from_user.id
+    settings = get_settings(uid)
+    creds = get_fragment_creds(uid)
+    has = bool(creds and creds.get("cookies") and creds.get("mnemonic"))
+    await callback.message.edit_text(
+        _stars_settings_text(settings, has),
+        reply_markup=_stars_settings_keyboard(settings),
+    )
     await callback.answer()
+
+
+# ── Данные Fragment (cookies + seed-фраза) ──────────────────────────────────
+
+def _creds_kb(has: bool) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🍪 Задать cookies Fragment", callback_data="plugins:stars:set_cookies")
+    b.button(text="🔐 Задать seed-фразу TON", callback_data="plugins:stars:set_mnemonic")
+    if has:
+        b.button(text="🧪 Проверить cookies", callback_data="plugins:stars:check_creds")
+        b.button(text="🗑 Удалить данные", callback_data="plugins:stars:del_creds")
+    b.button(text="⬅️ Назад", callback_data="plugins:stars:settings")
+    b.adjust(1)
+    return b.as_markup()
+
+
+@router.callback_query(F.data == "plugins:stars:creds")
+async def stars_creds(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
+    creds = get_fragment_creds(uid) or {}
+    has_c = bool(creds.get("cookies"))
+    has_m = bool(creds.get("mnemonic"))
+    await callback.message.edit_text(
+        "🔑 <b>Данные Fragment</b>\n\n"
+        f"🍪 Cookies: <b>{'🟢 заданы' if has_c else '🔴 нет'}</b>\n"
+        f"🔐 Seed-фраза: <b>{'🟢 задана' if has_m else '🔴 нет'}</b>\n\n"
+        "⚠️ <b>Это доступ к вашему TON-кошельку и Fragment.</b> "
+        "Данные хранятся только у бота, в чат не выводятся. "
+        "Сообщения с секретами удаляются автоматически.",
+        reply_markup=_creds_kb(has_c and has_m),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "plugins:stars:set_cookies")
+async def stars_set_cookies_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(PluginState.stars_set_cookies)
+    await callback.message.edit_text(
+        "🍪 <b>Cookies Fragment</b>\n\n"
+        "1. Войдите на <b>fragment.com</b> через TON-кошелёк\n"
+        "2. F12 → Console → введите <code>document.cookie</code> → Enter\n"
+        "3. Скопируйте результат и пришлите сюда\n\n"
+        "<i>Формат: stel_token=...; stel_ssid=...; ...</i>",
+        reply_markup=_cancel_kb("plugins:stars:creds"),
+    )
+    await callback.answer()
+
+
+@router.message(PluginState.stars_set_cookies)
+async def stars_set_cookies_input(message: Message, state: FSMContext) -> None:
+    cookies = _parse_cookies(message.text or "")
+    await state.clear()
+    try:  # remove the message containing cookies from the chat
+        await message.delete()
+    except Exception:
+        pass
+    if not cookies:
+        await message.answer(
+            "❌ Не распознал cookies. Нужен формат <code>k=v; k2=v2</code>.",
+            reply_markup=_creds_kb(False))
+        return
+    save_fragment_creds(message.from_user.id, {"cookies": cookies})
+    creds = get_fragment_creds(message.from_user.id) or {}
+    await message.answer(
+        f"✅ Cookies сохранены ({len(cookies)} шт.).",
+        reply_markup=_creds_kb(bool(creds.get("cookies") and creds.get("mnemonic"))),
+    )
+
+
+@router.callback_query(F.data == "plugins:stars:set_mnemonic")
+async def stars_set_mnemonic_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(PluginState.stars_set_mnemonic)
+    await callback.message.edit_text(
+        "🔐 <b>Seed-фраза TON-кошелька</b>\n\n"
+        "Пришлите <b>24 слова</b> через пробел — это кошелёк, с которого "
+        "будут оплачиваться звёзды.\n\n"
+        "⚠️ Держите на нём ровно столько TON, сколько нужно для продаж. "
+        "Сообщение будет немедленно удалено.",
+        reply_markup=_cancel_kb("plugins:stars:creds"),
+    )
+    await callback.answer()
+
+
+@router.message(PluginState.stars_set_mnemonic)
+async def stars_set_mnemonic_input(message: Message, state: FSMContext) -> None:
+    words = (message.text or "").split()
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if len(words) not in (12, 24):
+        await message.answer(
+            "❌ Нужно 24 слова (или 12). Проверьте seed-фразу.",
+            reply_markup=_creds_kb(False))
+        return
+    # validate the phrase derives a wallet before saving
+    try:
+        from automation.fragment import _wallet_from_mnemonic
+        wv = get_settings(message.from_user.id)["plugins"]["auto_stars"].get("wallet_version", "v4r2")
+        wallet = _wallet_from_mnemonic(" ".join(words), wv)
+        addr = wallet.address.to_string(True, True, True)
+    except Exception as e:
+        await message.answer(
+            f"❌ Seed-фраза не подошла: {str(e)[:80]}",
+            reply_markup=_creds_kb(False))
+        return
+    save_fragment_creds(message.from_user.id, {"mnemonic": " ".join(words),
+                                               "wallet_version": wv})
+    creds = get_fragment_creds(message.from_user.id) or {}
+    await message.answer(
+        f"✅ Кошелёк сохранён.\n💼 Адрес: <code>{addr}</code>\n\n"
+        "Пополните его TON для оплаты звёзд.",
+        reply_markup=_creds_kb(bool(creds.get("cookies") and creds.get("mnemonic"))),
+    )
+
+
+@router.callback_query(F.data == "plugins:stars:check_creds")
+async def stars_check_creds(callback: CallbackQuery) -> None:
+    from automation.fragment import check_fragment_session_sync
+    creds = get_fragment_creds(callback.from_user.id) or {}
+    await callback.answer("⏳ Проверяю…")
+    loop = asyncio.get_event_loop()
+    try:
+        ok, msg = await asyncio.wait_for(
+            loop.run_in_executor(None, check_fragment_session_sync, creds.get("cookies")),
+            timeout=25,
+        )
+    except Exception as e:
+        ok, msg = False, str(e)[:80]
+    await callback.message.answer(
+        ("✅ " if ok else "⚠️ ") + f"Fragment: {msg}")
+
+
+@router.callback_query(F.data == "plugins:stars:del_creds")
+async def stars_del_creds(callback: CallbackQuery) -> None:
+    delete_fragment_creds(callback.from_user.id)
+    await callback.answer("🗑 Данные Fragment удалены", show_alert=True)
+    await stars_creds(callback)
+
+
+@router.callback_query(F.data == "plugins:stars:toggle_ask")
+async def stars_toggle_ask(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
+    s = get_settings(uid)
+    p = s["plugins"]["auto_stars"]
+    p["ask_username"] = not p.get("ask_username", True)
+    save_settings(uid, s)
+    creds = get_fragment_creds(uid)
+    has = bool(creds and creds.get("cookies") and creds.get("mnemonic"))
+    await callback.message.edit_text(
+        _stars_settings_text(s, has), reply_markup=_stars_settings_keyboard(s))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "plugins:stars:set_keyword")
+async def stars_set_keyword_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(PluginState.stars_set_keyword)
+    cur = get_settings(callback.from_user.id)["plugins"]["auto_stars"].get("keyword", "звёзд")
+    await callback.message.edit_text(
+        f"🔍 Ключевое слово в заголовке заказа (сейчас: <code>{cur}</code>)\n\n"
+        "Заказы, чей заголовок содержит это слово, будут обрабатываться "
+        "автовыдачей звёзд. Введите слово:",
+        reply_markup=_cancel_kb("plugins:stars:settings"),
+    )
+    await callback.answer()
+
+
+@router.message(PluginState.stars_set_keyword)
+async def stars_set_keyword_input(message: Message, state: FSMContext) -> None:
+    kw = (message.text or "").strip().lower()
+    await state.clear()
+    if not kw:
+        await message.answer("❌ Слово не может быть пустым.")
+        return
+    uid = message.from_user.id
+    s = get_settings(uid)
+    s["plugins"]["auto_stars"]["keyword"] = kw
+    save_settings(uid, s)
+    await message.answer(
+        f"✅ Ключевое слово: <code>{kw}</code>",
+        reply_markup=_stars_settings_keyboard(s))
 
 
 @router.callback_query(F.data == "plugins:stars:set_amount")
@@ -155,7 +405,7 @@ async def stars_set_amount_input(message: Message, state: FSMContext) -> None:
     settings["plugins"]["auto_stars"]["amount"] = amount
     save_settings(uid, settings)
     await state.clear()
-    await message.answer(f"✅ Кол-во звёзд: <b>{amount}</b>", reply_markup=_stars_settings_keyboard())
+    await message.answer(f"✅ Кол-во звёзд: <b>{amount}</b>", reply_markup=_stars_settings_keyboard(settings))
 
 
 @router.callback_query(F.data == "plugins:stars:set_note")
@@ -176,7 +426,7 @@ async def stars_set_note_input(message: Message, state: FSMContext) -> None:
     settings["plugins"]["auto_stars"]["note"] = note
     save_settings(uid, settings)
     await state.clear()
-    await message.answer(f"✅ Заметка сохранена: <i>{note or '—'}</i>", reply_markup=_stars_settings_keyboard())
+    await message.answer(f"✅ Заметка сохранена: <i>{note or '—'}</i>", reply_markup=_stars_settings_keyboard(settings))
 
 
 @router.callback_query(F.data == "plugins:stars:manual")
@@ -203,7 +453,7 @@ async def stars_manual_buyer_input(message: Message, state: FSMContext) -> None:
 @router.message(PluginState.stars_manual_amount)
 async def stars_manual_amount_input(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    buyer = data.get("buyer", "—")
+    buyer = str(data.get("buyer", "")).strip()
     await state.clear()
     try:
         amount = int((message.text or "").strip())
@@ -214,12 +464,24 @@ async def stars_manual_amount_input(message: Message, state: FSMContext) -> None
     except ValueError:
         await message.answer("❌ Введите корректное число.")
         return
-    await message.answer(
-        f"⭐ <b>Выдача звёзд</b>\n\n"
-        f"👤 Покупатель: <b>{buyer}</b>\n"
+
+    status = await message.answer(
+        f"⭐ <b>Выдаю звёзды…</b>\n\n"
+        f"👤 Получатель: <b>{buyer}</b>\n"
         f"⭐ Кол-во: <b>{amount}</b>\n\n"
-        f"⚠️ Функция отправки звёзд будет доступна в следующем обновлении.",
+        f"<i>Покупка через Fragment и подтверждение в TON — до 3 минут…</i>"
     )
+    ok, msg = await deliver_stars(message.from_user.id, buyer, amount)
+    b = InlineKeyboardBuilder()
+    b.button(text="⭐ AutoStars", callback_data="plugins:auto_stars")
+    if ok:
+        await status.edit_text(
+            f"✅ <b>Звёзды выданы!</b>\n\n{msg}", reply_markup=b.as_markup())
+    else:
+        b.button(text="🔁 Повторить", callback_data="plugins:stars:manual")
+        b.adjust(1)
+        await status.edit_text(
+            f"❌ <b>Не удалось выдать</b>\n\n{msg}", reply_markup=b.as_markup())
 
 
 @router.callback_query(F.data == "plugins:stars:accumulated")

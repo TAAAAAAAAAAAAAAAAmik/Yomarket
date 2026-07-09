@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime
 
@@ -46,6 +47,38 @@ def _is_newer(msg_id: str, last_id: str) -> bool:
         return int(msg_id) > int(last_id)
     except (ValueError, TypeError):
         return msg_id > last_id
+
+
+_USERNAME_RE = re.compile(r"@?([a-zA-Z][a-zA-Z0-9_]{3,31})")
+
+
+def _extract_username(text: str) -> str:
+    """Pull a Telegram @username out of free-form buyer text."""
+    if not text:
+        return ""
+    # Prefer an explicit @mention
+    m = re.search(r"@([a-zA-Z][a-zA-Z0-9_]{3,31})", text)
+    if m:
+        return m.group(1)
+    stripped = text.strip()
+    m = _USERNAME_RE.fullmatch(stripped)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _parse_star_qty(title: str, default: int) -> int:
+    """Extract a star count from an order title like '100 звёзд Telegram'."""
+    if title:
+        nums = re.findall(r"\d{2,6}", title.replace(" ", ""))
+        if nums:
+            try:
+                val = int(nums[0])
+                if 50 <= val <= 1_000_000:
+                    return val
+            except ValueError:
+                pass
+    return default
 
 
 def _order_notify_kb(order_id: str, chat_id: str) -> InlineKeyboardMarkup:
@@ -175,6 +208,9 @@ class TaskManager:
                     if ar.get("enabled"):
                         msg = self._pick_message(title, ar.get("message", "Спасибо за заказ!"), rules, responders_map)
                         await self._send_chat(api, chat_id, msg)
+                    # AutoStars: ask the buyer for their @username in chat
+                    await self._maybe_ask_stars_username(
+                        api, settings, oid, title, chat_id)
 
                 elif prev_status != status and status in ("confirmed", "completed", "done"):
                     ev = ae.get("on_confirmed", {})
@@ -247,7 +283,14 @@ class TaskManager:
 
                     time_str = _fmt_time(msg.get("created_at") or msg.get("date"))
                     time_part = f"  •  🕐 {time_str}" if time_str else ""
-                    msg_text = (msg.get("text") or msg.get("message") or "—")[:200]
+                    raw_text = msg.get("text") or msg.get("message") or ""
+                    msg_text = raw_text[:200] or "—"
+
+                    # AutoStars: buyer replied with their @username → deliver
+                    handled = await self._maybe_deliver_stars_reply(
+                        user_id, api, settings, order_id, raw_text, chat_id)
+                    if handled:
+                        continue
 
                     await self._notify(
                         user_id,
@@ -398,6 +441,121 @@ class TaskManager:
             return f"🕐 Расписание цен: окно закончилось, восстановлено {restored} цен"
 
         return ""
+
+    # ------------------------------------------------------------------
+    # AutoStars — Telegram Stars auto-delivery via Fragment
+    # ------------------------------------------------------------------
+
+    async def _maybe_ask_stars_username(
+        self, api: YooMarketAPI, settings: dict,
+        order_id: str, title: str, chat_id: str,
+    ) -> None:
+        p = settings.get("plugins", {}).get("auto_stars", {})
+        if not p.get("enabled") or not p.get("ask_username", True):
+            return
+        keyword = (p.get("keyword") or "звёзд").lower()
+        if keyword not in (title or "").lower():
+            return
+        pending: dict = p.setdefault("pending", {})
+        delivered: list = p.setdefault("delivered", [])
+        if order_id in pending or order_id in delivered:
+            return
+        qty = _parse_star_qty(title, p.get("amount", 50))
+        pending[order_id] = {"quantity": qty, "asked_at": time.time()}
+        await self._send_chat(
+            api, chat_id,
+            "⭐ Для выдачи звёзд отправьте, пожалуйста, ваш Telegram "
+            "@username (например @durov). Звёзды придут автоматически.",
+        )
+        logger.info("AutoStars: asked username for order %s (qty=%s)", order_id, qty)
+
+    async def _maybe_deliver_stars_reply(
+        self, user_id: int, api: YooMarketAPI, settings: dict,
+        order_id: str, buyer_text: str, chat_id: str,
+    ) -> bool:
+        """If this order is awaiting a username, try to deliver. Returns True
+        if the message was consumed by the stars flow."""
+        p = settings.get("plugins", {}).get("auto_stars", {})
+        if not p.get("enabled"):
+            return False
+        pending: dict = p.get("pending", {})
+        entry = pending.get(order_id)
+        if not entry:
+            return False
+
+        username = _extract_username(buyer_text)
+        if not username:
+            await self._send_chat(
+                api, chat_id,
+                "Не разобрал username. Пришлите его в формате @username "
+                "(латиница, минимум 5 символов).",
+            )
+            return True
+
+        qty = int(entry.get("quantity", p.get("amount", 50)))
+        # Deliver via Fragment in a thread
+        from automation.fragment import buy_stars_sync
+        from storage import get_fragment_creds
+        creds = get_fragment_creds(user_id)
+        if not creds or not creds.get("cookies") or not creds.get("mnemonic"):
+            await self._notify(
+                user_id,
+                f"⚠️ <b>AutoStars</b>: заказ #{order_id} — покупатель прислал "
+                f"@{username}, но данные Fragment не настроены.\n"
+                "Плагины → AutoStars → ⚙️ Настройки → 🔑 Данные Fragment",
+            )
+            return True
+
+        await self._send_chat(
+            api, chat_id, f"⏳ Отправляю {qty}⭐ на @{username}…")
+
+        loop = asyncio.get_event_loop()
+        try:
+            ok, result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, buy_stars_sync,
+                    creds["cookies"], creds["mnemonic"], username, qty,
+                    creds.get("wallet_version", "v4r2"),
+                    creds.get("api_hash", "af142ec36cafbbfa89"),
+                ),
+                timeout=180,
+            )
+        except Exception as e:
+            ok, result = False, f"ошибка: {str(e)[:100]}"
+
+        # Update plugin state
+        pending.pop(order_id, None)
+        if ok:
+            p.setdefault("delivered", []).append(order_id)
+            await self._send_chat(
+                api, chat_id,
+                f"✅ Готово! {qty}⭐ отправлены на @{username}. Спасибо за заказ!",
+            )
+            # try to confirm the order automatically
+            try:
+                await api.confirm_order(order_id)
+            except Exception as e:
+                logger.warning("AutoStars confirm order %s: %s", order_id, e)
+            await self._notify(
+                user_id,
+                f"⭐ <b>AutoStars</b>: выдано {qty}⭐ на @{username} "
+                f"(заказ #{order_id})\n{result}",
+            )
+        else:
+            # keep pending so the seller can retry / buyer can resend
+            pending[order_id] = {"quantity": qty, "asked_at": time.time()}
+            await self._send_chat(
+                api, chat_id,
+                "⚠️ Не удалось отправить звёзды автоматически. "
+                "Продавец скоро выдаст их вручную.",
+            )
+            await self._notify(
+                user_id,
+                f"❌ <b>AutoStars</b>: заказ #{order_id}, @{username}, {qty}⭐ — "
+                f"не удалось.\n{result}\n\n"
+                "Выдайте вручную: Плагины → AutoStars → 🚀 Ручная выдача",
+            )
+        return True
 
     def _pick_message(self, title: str, default: str, rules: list[dict], responders: dict | None = None) -> str:
         title_lower = title.lower()

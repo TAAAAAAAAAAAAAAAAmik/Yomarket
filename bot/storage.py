@@ -54,6 +54,8 @@ _migrate_legacy()
 _FILE = os.path.join(_DATA_DIR, "tokens.json")
 _SETTINGS_FILE = os.path.join(_DATA_DIR, "settings.json")
 _PANEL_FILE = os.path.join(_DATA_DIR, "panel_creds.json")
+# Sensitive: Fragment cookies + TON wallet seed phrase. Never logged/committed.
+_FRAGMENT_FILE = os.path.join(_DATA_DIR, "fragment_creds.json")
 
 _DEFAULT_SETTINGS = {
     "shop_name": "",
@@ -91,7 +93,14 @@ _DEFAULT_SETTINGS = {
     "reviews_monitor": {"enabled": False, "known_review_ids": []},
     "ad_templates": [],
     "plugins": {
-        "auto_stars": {"enabled": False, "amount": 50, "note": ""},
+        "auto_stars": {
+            "enabled": False, "amount": 50, "note": "",
+            "keyword": "звёзд",       # заголовок заказа должен содержать это слово
+            "ask_username": True,      # спрашивать @username в чате заказа
+            "pending": {},             # {order_id: {quantity, asked_at}} — ждём username
+            "delivered": [],           # order_id, по которым звёзды уже выданы
+            "wallet_version": "v4r2",
+        },
         "auto_roblox": {"enabled": False, "robux": 0, "note": ""},
         "auto_gifts": {"enabled": False, "gift_type": "", "note": ""},
     },
@@ -337,4 +346,46 @@ def delete_panel_creds(user_id: int) -> None:
     data.pop(str(user_id), None)
     os.makedirs(os.path.dirname(_PANEL_FILE), exist_ok=True)
     with open(_PANEL_FILE, "w") as f:
+        json.dump(data, f)
+
+
+# ---------------------------------------------------------------------------
+# Fragment credentials (Telegram Stars auto-delivery) — SENSITIVE
+# {cookies: {...}, mnemonic: "24 words", wallet_version: "v4r2", api_hash: "..."}
+# Stored per active account. Never log the mnemonic or cookie values.
+# ---------------------------------------------------------------------------
+
+def _load_fragment_creds() -> dict:
+    if os.path.exists(_FRAGMENT_FILE):
+        with open(_FRAGMENT_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def get_fragment_creds(user_id: int) -> dict | None:
+    data = _load_fragment_creds()
+    key = _account_key(user_id)
+    return data.get(key) or data.get(str(user_id))
+
+
+def save_fragment_creds(user_id: int, creds: dict) -> None:
+    os.makedirs(os.path.dirname(_FRAGMENT_FILE), exist_ok=True)
+    data = _load_fragment_creds()
+    existing = data.get(_account_key(user_id)) or {}
+    existing.update(creds)
+    data[_account_key(user_id)] = existing
+    with open(_FRAGMENT_FILE, "w") as f:
+        json.dump(data, f)
+    try:  # tighten file perms — it holds a seed phrase
+        os.chmod(_FRAGMENT_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def delete_fragment_creds(user_id: int) -> None:
+    data = _load_fragment_creds()
+    data.pop(_account_key(user_id), None)
+    data.pop(str(user_id), None)
+    os.makedirs(os.path.dirname(_FRAGMENT_FILE), exist_ok=True)
+    with open(_FRAGMENT_FILE, "w") as f:
         json.dump(data, f)
