@@ -81,7 +81,15 @@ _DEFAULT_SETTINGS = {
     "daily_report": {"enabled": False, "hour": 20, "last_report_day": ""},
     "quick_replies": ["Спасибо за заказ!", "Отправлю в течение часа.", "Уточните, пожалуйста."],
     "buyer_notes": {},
-    "bump_schedule": {"enabled": False, "times": [], "last_runs": {}},
+    "bump_schedule": {
+        "enabled": False, "times": [], "last_runs": {},
+        "price_per_bump": 0,   # ₽ за одно поднятие (0 = бесплатно)
+        "daily_ceiling": 0,    # потолок трат на поднятия в день (0 = без лимита)
+        "spent_today": 0.0,
+        "spent_day": "",
+    },
+    "ad_packs": {},  # {"Пак имя": [ad_id, ...]} — группы объявлений
+    "complaint_notify": {"enabled": True, "seen": []},  # уведомления о жалобах
     "price_schedule": {
         "enabled": False,
         "from_hour": 22,   # начало окна (напр. ночь с 22:00)

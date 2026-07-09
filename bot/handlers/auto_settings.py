@@ -20,6 +20,8 @@ class AutoState(StatesGroup):
     waiting_rule_message = State()
     waiting_confirm_hours = State()
     waiting_bump_times = State()
+    waiting_bump_price = State()
+    waiting_bump_ceiling = State()
 
 
 def _st(on: bool) -> str:
@@ -108,6 +110,11 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     )
     if bs_on:
         builder.button(text=f"⏰ Время: {times_str}", callback_data="auto:set:bump_times")
+        ppb = bs.get("price_per_bump", 0)
+        ceil = bs.get("daily_ceiling", 0)
+        builder.button(text=f"💵 Цена поднятия: {ppb} ₽", callback_data="auto:set:bump_price")
+        ceil_str = f"{ceil} ₽/день" if ceil else "без лимита"
+        builder.button(text=f"⛔ Потолок трат: {ceil_str}", callback_data="auto:set:bump_ceiling")
 
     builder.button(text="⬅️ Настройки", callback_data="settings:menu")
     builder.adjust(1)
@@ -414,6 +421,66 @@ async def save_bump_times(message: Message, state: FSMContext) -> None:
     s["bump_schedule"]["last_runs"] = {}
     save_settings(message.from_user.id, s)
     await message.answer(f"✅ Время поднятия: <b>{', '.join(valid)}</b>")
+    await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
+
+
+@router.callback_query(F.data == "auto:set:bump_price")
+async def set_bump_price(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AutoState.waiting_bump_price)
+    cur = get_settings(callback.from_user.id).get("bump_schedule", {}).get("price_per_bump", 0)
+    await callback.message.edit_text(
+        f"💵 <b>Цена одного поднятия</b>\n\nТекущая: <b>{cur} ₽</b>\n\n"
+        "Введите стоимость поднятия в ₽ (0 — бесплатно). "
+        "Нужно для учёта потолка трат.",
+        reply_markup=_cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AutoState.waiting_bump_price)
+async def save_bump_price(message: Message, state: FSMContext) -> None:
+    try:
+        price = float((message.text or "").strip().replace(",", ".").replace(" ", ""))
+        if price < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число, например: <b>5</b>")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    s.setdefault("bump_schedule", {})["price_per_bump"] = price
+    save_settings(message.from_user.id, s)
+    await message.answer(f"✅ Цена поднятия: <b>{price:g} ₽</b>")
+    await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
+
+
+@router.callback_query(F.data == "auto:set:bump_ceiling")
+async def set_bump_ceiling(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AutoState.waiting_bump_ceiling)
+    cur = get_settings(callback.from_user.id).get("bump_schedule", {}).get("daily_ceiling", 0)
+    await callback.message.edit_text(
+        f"⛔ <b>Потолок трат на поднятия</b>\n\nТекущий: <b>{cur or 'без лимита'} ₽/день</b>\n\n"
+        "Введите максимум ₽ в день на поднятия (0 — без лимита). "
+        "При достижении бот перестанет поднимать до следующего дня.",
+        reply_markup=_cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AutoState.waiting_bump_ceiling)
+async def save_bump_ceiling(message: Message, state: FSMContext) -> None:
+    try:
+        ceil = float((message.text or "").strip().replace(",", ".").replace(" ", ""))
+        if ceil < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число, например: <b>100</b>")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    s.setdefault("bump_schedule", {})["daily_ceiling"] = ceil
+    save_settings(message.from_user.id, s)
+    await message.answer(f"✅ Потолок: <b>{ceil:g} ₽/день</b>" if ceil else "✅ Лимит снят")
     await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
 
 

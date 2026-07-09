@@ -67,6 +67,23 @@ def _extract_username(text: str) -> str:
     return ""
 
 
+_COMPLAINT_KEYWORDS = (
+    "жалоб", "жалуюсь", "проблем", "обман", "не работает", "не пришл",
+    "не пришло", "верните", "верни деньги", "возврат", "скам", "scam",
+    "развод", "кидал", "кинул", "арбитраж", "спор", "диспут", "dispute",
+    "администрац", "поддержк", "модератор", "обратился в", "напишу в поддержку",
+)
+_COMPLAINT_STATUSES = (
+    "dispute", "disputed", "complaint", "arbitration", "arbitrage",
+    "problem", "conflict", "appeal",
+)
+
+
+def _is_complaint_text(text: str) -> bool:
+    t = (text or "").lower()
+    return any(kw in t for kw in _COMPLAINT_KEYWORDS)
+
+
 def _parse_star_qty(title: str, default: int) -> int:
     """Extract a star count from an order title like '100 звёзд Telegram'."""
     if title:
@@ -204,6 +221,25 @@ class TaskManager:
                     if oid in reminded:
                         reminded.remove(oid)
 
+                # Complaint/dispute status → high-priority alert
+                cn = settings.get("complaint_notify", {"enabled": True})
+                if (cn.get("enabled", True) and prev_status != status
+                        and any(cs in str(status).lower() for cs in _COMPLAINT_STATUSES)):
+                    seen = cn.setdefault("seen", [])
+                    mark = f"status:{oid}:{status}"
+                    if mark not in seen:
+                        seen.append(mark)
+                        settings["complaint_notify"] = cn
+                        await self._notify(
+                            user_id,
+                            f"⚠️ <b>СПОР / ЖАЛОБА по заказу!</b>\n\n"
+                            f"📦 {title}\n"
+                            f"👤 {buyer}  •  💰 {price} ₽\n"
+                            f"📊 Статус: <b>{status}</b>\n\n"
+                            f"🔺 Требуется ваше вмешательство.",
+                            reply_markup=_order_notify_kb(oid, chat_id),
+                        )
+
                 is_blacklisted = buyer in blacklist
 
                 if prev_status is None:
@@ -304,6 +340,27 @@ class TaskManager:
                         user_id, api, settings, order_id, raw_text, chat_id)
                     if handled:
                         continue
+
+                    # Complaint detection → distinct high-priority alert
+                    cn = settings.get("complaint_notify", {"enabled": True})
+                    if cn.get("enabled", True) and _is_complaint_text(raw_text):
+                        seen = cn.setdefault("seen", [])
+                        mark = f"{order_id}:{msg_id}"
+                        if mark not in seen:
+                            seen.append(mark)
+                            if len(seen) > 500:
+                                del seen[:250]
+                            settings["complaint_notify"] = cn
+                            await self._notify(
+                                user_id,
+                                f"⚠️ <b>ЖАЛОБА / ПРОБЛЕМА клиента!</b>\n\n"
+                                f"👤 <b>{buyer_name}</b>{time_part}\n"
+                                f"📦 {title}\n\n"
+                                f"<i>«{msg_text}»</i>\n\n"
+                                f"🔺 Ответьте как можно быстрее.",
+                                reply_markup=_message_notify_kb(chat_id),
+                            )
+                            continue
 
                     await self._notify(
                         user_id,
@@ -741,14 +798,20 @@ class TaskManager:
                 except Exception as e:
                     logger.warning("Price schedule error for user %s: %s", user_id, e)
 
-            # --- Bump scheduler ---
+            # --- Bump scheduler (with optional paid-bump cost ceiling) ---
             bs = settings.get("bump_schedule", {})
             if bs.get("enabled") and bs.get("times"):
                 now_dt = datetime.now()
-                current_slot = now_dt.strftime("%H:%M")
                 current_mins = now_dt.hour * 60 + now_dt.minute
                 last_runs: dict = bs.get("last_runs", {})
                 today_str = now_dt.strftime("%Y-%m-%d")
+                price_per_bump = float(bs.get("price_per_bump", 0) or 0)
+                ceiling = float(bs.get("daily_ceiling", 0) or 0)
+                # reset the daily spend counter when the day changes
+                if bs.get("spent_day") != today_str:
+                    bs["spent_day"] = today_str
+                    bs["spent_today"] = 0.0
+                spent_today = float(bs.get("spent_today", 0) or 0)
                 for slot in bs["times"]:
                     try:
                         sh, sm = map(int, slot.split(":"))
@@ -761,11 +824,25 @@ class TaskManager:
                     last_run_key = f"{today_str}_{slot}"
                     if last_runs.get(last_run_key):
                         continue
+                    # Cost ceiling: skip if we've already hit the daily cap
+                    if ceiling > 0 and price_per_bump > 0 and spent_today >= ceiling:
+                        last_runs[last_run_key] = now_dt.isoformat()
+                        messages.append(
+                            f"⛔ Поднятие ({slot}) пропущено: достигнут потолок "
+                            f"{ceiling:.0f} ₽/день (потрачено {spent_today:.0f} ₽)")
+                        continue
                     try:
                         count, msg = await api.bump_all_ads()
                         last_runs[last_run_key] = now_dt.isoformat()
-                        settings["bump_schedule"]["last_runs"] = last_runs
-                        messages.append(f"⬆️ Поднятие ({slot}): {msg}")
+                        if price_per_bump > 0 and count:
+                            spent_today += count * price_per_bump
+                            bs["spent_today"] = spent_today
+                            cap = f" (потрачено {spent_today:.0f}"
+                            cap += f"/{ceiling:.0f} ₽)" if ceiling > 0 else " ₽)"
+                            messages.append(f"⬆️ Поднятие ({slot}): {msg}{cap}")
+                        else:
+                            messages.append(f"⬆️ Поднятие ({slot}): {msg}")
+                        settings["bump_schedule"] = bs
                     except Exception as e:
                         logger.warning("Bump scheduler error for user %s slot %s: %s", user_id, slot, e)
 

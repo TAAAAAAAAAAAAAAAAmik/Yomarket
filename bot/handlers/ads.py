@@ -57,6 +57,7 @@ def _ads_keyboard(ads: list[dict], next_cursor: str | None):
         b.button(text="Ещё товары ▶️", callback_data=PaginationCallback(entity="ads", cursor=next_cursor).pack())
     b.button(text="➕ Добавить товар", callback_data="create_ad:start")
     b.button(text="🛠 Управление (панель)", callback_data="pitems:list")
+    b.button(text="📦 Паки", callback_data="packs:menu")
     b.button(text="💰 Изменить все цены", callback_data="ads:bulk_price")
     b.button(text="📝 Изменить описание всех", callback_data="ads:bulk_desc")
     b.button(text="🔄 Обновить", callback_data="ads_load")
