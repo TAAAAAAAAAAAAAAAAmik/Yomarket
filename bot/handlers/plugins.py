@@ -496,7 +496,48 @@ async def stars_profit(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "plugins:stars:balance")
 async def stars_balance(callback: CallbackQuery) -> None:
-    await callback.answer("💰 Баланс звёзд появится в следующем обновлении", show_alert=True)
+    from automation.fragment import get_wallet_balance_sync
+    uid = callback.from_user.id
+    creds = get_fragment_creds(uid)
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Обновить", callback_data="plugins:stars:balance")
+    b.button(text="⬅️ Назад", callback_data="plugins:auto_stars")
+    b.adjust(1)
+    if not creds or not creds.get("mnemonic"):
+        await callback.message.edit_text(
+            "💰 <b>Баланс TON-кошелька</b>\n\n"
+            "🔴 Seed-фраза не настроена.\n"
+            "Настройки → 🔑 Данные Fragment → 🔐 Задать seed-фразу TON",
+            reply_markup=b.as_markup(),
+        )
+        await callback.answer()
+        return
+    await callback.answer("⏳ Запрашиваю баланс…")
+    loop = asyncio.get_event_loop()
+    try:
+        ok, res = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, get_wallet_balance_sync,
+                creds["mnemonic"], creds.get("wallet_version", "v4r2"),
+            ),
+            timeout=25,
+        )
+    except Exception as e:
+        ok, res = False, str(e)[:80]
+    if ok:
+        ton = res["ton"]
+        # грубая оценка: ~0.0155 TON за звезду (можно уточнить)
+        approx_stars = int(ton / 0.016) if ton > 0 else 0
+        warn = "\n\n⚠️ <b>Мало TON — пополните кошелёк!</b>" if ton < 1 else ""
+        text = (
+            "💰 <b>Баланс TON-кошелька</b>\n\n"
+            f"💎 <b>{ton:.4f} TON</b>\n"
+            f"≈ хватит на <b>{approx_stars}</b>⭐ (ориентировочно){warn}\n\n"
+            f"💼 <code>{res['address']}</code>"
+        )
+    else:
+        text = f"💰 <b>Баланс TON-кошелька</b>\n\n❌ {res}"
+    await callback.message.edit_text(text, reply_markup=b.as_markup())
 
 
 @router.callback_query(F.data == "plugins:stars:notifs")

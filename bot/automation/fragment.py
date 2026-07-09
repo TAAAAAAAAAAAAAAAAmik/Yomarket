@@ -127,6 +127,36 @@ def _send_boc(boc_b64: str) -> bool:
         return False
 
 
+def get_wallet_balance_sync(
+    mnemonic: str, wallet_version: str = "v4r2",
+) -> tuple[bool, object]:
+    """Return (True, {"ton": float, "nano": int, "address": str}) or (False, err).
+    Blocking — run in an executor."""
+    if not mnemonic or len(mnemonic.split()) < 12:
+        return False, "Не настроена seed-фраза кошелька"
+    try:
+        wallet = _wallet_from_mnemonic(mnemonic, wallet_version)
+        address = wallet.address.to_string(True, True, True)
+    except Exception as e:
+        return False, f"Ошибка кошелька: {str(e)[:80]}"
+    try:
+        r = requests.get(
+            "https://toncenter.com/api/v2/getAddressBalance",
+            params={"address": address}, timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return False, f"TonCenter недоступен: {str(e)[:80]}"
+    if not data.get("ok"):
+        return False, f"TonCenter: {str(data)[:100]}"
+    try:
+        nano = int(data["result"])
+    except (KeyError, ValueError, TypeError):
+        nano = 0
+    return True, {"ton": nano / 1_000_000_000, "nano": nano, "address": address}
+
+
 def buy_stars_sync(
     cookies: dict,
     mnemonic: str,
