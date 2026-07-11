@@ -136,6 +136,26 @@ async def show_order_detail(
     await callback.answer()
 
 
+@router.callback_query(OrderCallback.filter(F.action == "refundask"))
+async def ask_refund(
+    callback: CallbackQuery,
+    callback_data: OrderCallback,
+) -> None:
+    oid = callback_data.order_id
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Да, оформить возврат",
+             callback_data=OrderCallback(order_id=oid, action="refund").pack())
+    b.button(text="❌ Отмена",
+             callback_data=OrderCallback(order_id=oid, action="view").pack())
+    b.adjust(1)
+    await callback.message.edit_text(
+        f"↩️ <b>Оформить возврат по заказу #{oid}?</b>\n\n"
+        "⚠️ Действие вернёт деньги покупателю и его нельзя отменить.",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
 @router.callback_query(OrderCallback.filter(F.action.in_({"work", "confirm", "refund"})))
 async def handle_order_action(
     callback: CallbackQuery,

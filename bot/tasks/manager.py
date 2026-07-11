@@ -141,9 +141,13 @@ def _parse_star_qty(title: str, default: int) -> int:
 
 def _order_notify_kb(order_id: str, chat_id: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="📋 К сделке", callback_data=f"chat:{chat_id}:")
-    builder.button(text="↩️ Возврат", callback_data=f"order:{order_id}:refund")
-    builder.adjust(2)
+    # Quick actions straight from the notification (no need to open the order)
+    builder.button(text="▶️ В работу", callback_data=f"order:{order_id}:work")
+    builder.button(text="✅ Подтвердить", callback_data=f"order:{order_id}:confirm")
+    builder.button(text="↩️ Возврат", callback_data=f"order:{order_id}:refundask")
+    builder.button(text="💬 Чат", callback_data=f"chat:{chat_id}:")
+    builder.button(text="🔍 Детали", callback_data=f"order:{order_id}:view")
+    builder.adjust(3, 2)
     return builder.as_markup()
 
 
