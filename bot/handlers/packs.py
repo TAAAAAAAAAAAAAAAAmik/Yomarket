@@ -84,7 +84,7 @@ async def pack_new_name(message: Message, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="📦 К паку", callback_data=f"pack:view:{len(packs)-1}")
     b.button(text="⬅️ Паки", callback_data="packs:menu")
-    b.adjust(1)
+    b.adjust(2)
     await message.answer(f"✅ Пак «{name}» создан. Добавьте в него объявления.",
                          reply_markup=b.as_markup())
 
@@ -119,7 +119,7 @@ async def pack_view(callback: CallbackQuery) -> None:
         b.button(text="🗑 Очистить", callback_data=f"pack:clear:{idx}")
     b.button(text="❌ Удалить пак", callback_data=f"pack:del:{idx}")
     b.button(text="⬅️ Паки", callback_data="packs:menu")
-    b.adjust(1)
+    b.adjust(2, 1, 1)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
     await callback.answer()
 
@@ -260,7 +260,7 @@ async def pack_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="📦 К паку", callback_data=f"pack:view:{idx}")
     b.button(text="⬅️ Паки", callback_data="packs:menu")
-    b.adjust(1)
+    b.adjust(2)
     text = f"⬆️ <b>Пак «{name}» поднят</b>\n\n✅ Поднято: <b>{ok}</b>"
     if fail:
         text += f"\n❌ Ошибок: <b>{fail}</b>"

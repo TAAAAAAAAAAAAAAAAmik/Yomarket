@@ -278,7 +278,7 @@ async def publish_all_hidden(callback: CallbackQuery) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 К товарам", callback_data="pitems:list")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
-    b.adjust(1)
+    b.adjust(2)
     text = f"🌍 <b>Публикация завершена</b>\n\n✅ Опубликовано: <b>{ok}</b>"
     if fail:
         text += f"\n❌ Не удалось: <b>{fail}</b>"

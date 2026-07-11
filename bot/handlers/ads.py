@@ -46,24 +46,28 @@ def _fmt_list(ads: list[dict], total: int | None) -> str:
 
 def _ads_keyboard(ads: list[dict], next_cursor: str | None):
     b = InlineKeyboardBuilder()
+    # 1 per row: the item list (long labels) + optional "more"
     for ad in ads:
         ad_id = str(ad.get("id", ""))
         title = ad.get("title") or ad.get("name") or f"Товар {ad_id}"
         price = ad.get("price", "")
         label = f"{title[:28]} — {price} ₽" if price else title[:35]
         b.button(text=label, callback_data=AdCallback(ad_id=ad_id).pack())
-    b.adjust(1)
+    n_list = len(ads)
     if next_cursor:
         b.button(text="Ещё товары ▶️", callback_data=PaginationCallback(entity="ads", cursor=next_cursor).pack())
+        n_list += 1
+    # 2 columns: fixed actions
     b.button(text="➕ Добавить товар", callback_data="create_ad:start")
-    b.button(text="🌍 Публикация / скрытие", callback_data="pitems:list")
-    b.button(text="🛠 Управление (панель)", callback_data="pitems:list")
+    b.button(text="🌍 Публикация", callback_data="pitems:list")
+    b.button(text="🛠 Управление", callback_data="pitems:list")
     b.button(text="📦 Паки", callback_data="packs:menu")
-    b.button(text="💰 Изменить все цены", callback_data="ads:bulk_price")
-    b.button(text="📝 Изменить описание всех", callback_data="ads:bulk_desc")
+    b.button(text="💰 Все цены", callback_data="ads:bulk_price")
+    b.button(text="📝 Описание всех", callback_data="ads:bulk_desc")
+    # nav on its own row
     b.button(text="🔄 Обновить", callback_data="ads_load")
     b.button(text="⬅️ Меню", callback_data="menu:main")
-    b.adjust(1)
+    b.adjust(*([1] * n_list), 2, 2, 2, 2)
     return b.as_markup()
 
 
@@ -84,7 +88,7 @@ async def ads_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
         b.button(text="🛠 Управление (панель)", callback_data="pitems:list")
         b.button(text="➕ Добавить товар", callback_data="create_ad:start")
         b.button(text="⬅️ Главное меню", callback_data="menu:main")
-        b.adjust(1)
+        b.adjust(2, 1)
         keyboard = b.as_markup()
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
@@ -146,7 +150,7 @@ async def show_ad_detail(
         elif status_raw in ("inactive", "disabled", "paused"):
             b.button(text="▶️ Активировать", callback_data=f"ad_activate:{callback_data.ad_id}")
         b.button(text="⬅️ К товарам", callback_data="ads_load")
-        b.adjust(1)
+        b.adjust(2, 1, 1)
         keyboard = b.as_markup()
     except Exception as e:
         text = f"❌ Ошибка: {e}"
@@ -199,7 +203,7 @@ async def ad_price_save(message: Message, state: FSMContext, api: YooMarketAPI) 
         b = InlineKeyboardBuilder()
         b.button(text="📦 К товару", callback_data=f"ad:{ad_id}")
         b.button(text="⬅️ Все товары", callback_data="ads_load")
-        b.adjust(1)
+        b.adjust(2)
         await message.answer(f"✅ Цена обновлена: <b>{price} ₽</b>", reply_markup=b.as_markup())
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}", reply_markup=back_keyboard())
@@ -230,7 +234,7 @@ async def ad_pause(callback: CallbackQuery, api: YooMarketAPI) -> None:
         if status_raw in ("inactive", "disabled", "paused"):
             b.button(text="▶️ Активировать", callback_data=f"ad_activate:{ad_id}")
         b.button(text="⬅️ К товарам", callback_data="ads_load")
-        b.adjust(1)
+        b.adjust(2, 1, 1)
         await callback.message.edit_text(text, reply_markup=b.as_markup())
     except Exception:
         await callback.message.edit_text("✅ Статус обновлён", reply_markup=back_keyboard())
@@ -261,7 +265,7 @@ async def ad_activate(callback: CallbackQuery, api: YooMarketAPI) -> None:
         if status_raw == "active":
             b.button(text="⏸ Приостановить", callback_data=f"ad_pause:{ad_id}")
         b.button(text="⬅️ К товарам", callback_data="ads_load")
-        b.adjust(1)
+        b.adjust(2, 1, 1)
         await callback.message.edit_text(text, reply_markup=b.as_markup())
     except Exception:
         await callback.message.edit_text("✅ Статус обновлён", reply_markup=back_keyboard())

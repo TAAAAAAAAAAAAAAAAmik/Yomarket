@@ -63,6 +63,7 @@ def _build_orders_keyboard(orders: list[dict], next_cursor: str | None) -> Inlin
     builder.button(text="⏳ Активные", callback_data="orders:filter:active")
     builder.button(text="↩️ Возвраты", callback_data="orders:filter:refunds")
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -239,6 +240,7 @@ async def orders_search_exec(message: Message, state: FSMContext) -> None:
         )
     b.adjust(1)
     b.button(text="⬅️ Заказы", callback_data="menu:orders")
+    b.adjust(1)
     await message.answer("\n".join(lines), reply_markup=b.as_markup())
 
 
@@ -283,6 +285,7 @@ async def filter_orders_done(callback: CallbackQuery) -> None:
         )
     b.adjust(1)
     b.button(text="⬅️ Заказы", callback_data="menu:orders")
+    b.adjust(1)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
 
 
@@ -330,6 +333,7 @@ async def filter_orders_active(callback: CallbackQuery) -> None:
         )
     b.adjust(1)
     b.button(text="⬅️ Заказы", callback_data="menu:orders")
+    b.adjust(1)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
 
 
@@ -374,4 +378,5 @@ async def filter_orders_refunds(callback: CallbackQuery) -> None:
         )
     b.adjust(1)
     b.button(text="⬅️ Заказы", callback_data="menu:orders")
+    b.adjust(1)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
