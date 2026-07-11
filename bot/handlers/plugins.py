@@ -90,7 +90,7 @@ def _plugins_menu_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="🎮 AutoRoblox", callback_data="plugins:auto_roblox")
     builder.button(text="🎁 AutoGifts", callback_data="plugins:auto_gifts")
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
-    builder.adjust(1)
+    builder.adjust(2, 1, 1)
     return builder.as_markup()
 
 
@@ -123,9 +123,9 @@ def _stars_keyboard(settings: dict) -> InlineKeyboardMarkup:
     builder.button(text="🔔 Уведомления", callback_data="plugins:stars:notifs")
     builder.button(text="💬 Ответы", callback_data="plugins:stars:replies")
     builder.button(text="▶️ Включить" if not enabled else "⏸ Выключить", callback_data="plugins:stars:toggle")
-    builder.button(text="⬅️ Назад", callback_data="plugins:menu")
     builder.button(text="⚙️ Настройки", callback_data="plugins:stars:settings")
-    builder.adjust(1, 1, 2, 3, 2)
+    builder.button(text="⬅️ Назад", callback_data="plugins:menu")
+    builder.adjust(2, 2, 2, 1, 2)
     return builder.as_markup()
 
 
@@ -161,7 +161,7 @@ def _stars_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
     )
     builder.button(text="📝 Заметка", callback_data="plugins:stars:set_note")
     builder.button(text="⬅️ Назад", callback_data="plugins:auto_stars")
-    builder.adjust(1)
+    builder.adjust(2, 2, 1, 1)
     return builder.as_markup()
 
 
@@ -209,7 +209,7 @@ def _creds_kb(has: bool) -> InlineKeyboardMarkup:
         b.button(text="🧪 Проверить cookies", callback_data="plugins:stars:check_creds")
         b.button(text="🗑 Удалить данные", callback_data="plugins:stars:del_creds")
     b.button(text="⬅️ Назад", callback_data="plugins:stars:settings")
-    b.adjust(1)
+    b.adjust(2, 2, 1)
     return b.as_markup()
 
 
@@ -504,7 +504,7 @@ async def stars_balance(callback: CallbackQuery) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить", callback_data="plugins:stars:balance")
     b.button(text="⬅️ Назад", callback_data="plugins:auto_stars")
-    b.adjust(1)
+    b.adjust(2)
     if not creds or not creds.get("mnemonic"):
         await callback.message.edit_text(
             "💰 <b>Баланс TON-кошелька</b>\n\n"
@@ -581,9 +581,9 @@ def _roblox_keyboard(settings: dict) -> InlineKeyboardMarkup:
     builder.button(text="🔔 Уведомления", callback_data="plugins:roblox:notifs")
     builder.button(text="💬 Ответы", callback_data="plugins:roblox:replies")
     builder.button(text="▶️ Включить" if not enabled else "⏸ Выключить", callback_data="plugins:roblox:toggle")
-    builder.button(text="⬅️ Назад", callback_data="plugins:menu")
     builder.button(text="⚙️ Настройки", callback_data="plugins:roblox:settings")
-    builder.adjust(1, 1, 2, 3, 2)
+    builder.button(text="⬅️ Назад", callback_data="plugins:menu")
+    builder.adjust(2, 2, 2, 1, 2)
     return builder.as_markup()
 
 
@@ -603,7 +603,7 @@ def _roblox_settings_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="✏️ Кол-во Robux", callback_data="plugins:roblox:set_amount")
     builder.button(text="📝 Заметка", callback_data="plugins:roblox:set_note")
     builder.button(text="⬅️ Назад", callback_data="plugins:auto_roblox")
-    builder.adjust(1)
+    builder.adjust(2, 1)
     return builder.as_markup()
 
 
@@ -755,9 +755,9 @@ def _gifts_keyboard(settings: dict) -> InlineKeyboardMarkup:
     builder.button(text="🔔 Уведомления", callback_data="plugins:gifts:notifs")
     builder.button(text="💬 Ответы", callback_data="plugins:gifts:replies")
     builder.button(text="▶️ Включить" if not enabled else "⏸ Выключить", callback_data="plugins:gifts:toggle")
-    builder.button(text="⬅️ Назад", callback_data="plugins:menu")
     builder.button(text="⚙️ Настройки", callback_data="plugins:gifts:settings")
-    builder.adjust(1, 1, 2, 3, 2)
+    builder.button(text="⬅️ Назад", callback_data="plugins:menu")
+    builder.adjust(2, 2, 2, 1, 2)
     return builder.as_markup()
 
 
@@ -777,7 +777,7 @@ def _gifts_settings_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="✏️ Тип подарка", callback_data="plugins:gifts:set_type")
     builder.button(text="📝 Заметка", callback_data="plugins:gifts:set_note")
     builder.button(text="⬅️ Назад", callback_data="plugins:auto_gifts")
-    builder.adjust(1)
+    builder.adjust(2, 1)
     return builder.as_markup()
 
 

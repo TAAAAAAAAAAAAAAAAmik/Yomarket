@@ -71,7 +71,7 @@ def _bump_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
     b.button(text=f"{'🔴 Выкл' if on else '🟢 Вкл'}", callback_data="selenium:bump:toggle")
     b.button(text=f"⏱ Интервал: {interval} ч", callback_data="selenium:bump:set_interval")
     b.button(text="⬅️ Назад", callback_data="auto:menu")
-    b.adjust(1, 2, 1)
+    b.adjust(2, 1, 1)
     return b.as_markup()
 
 
@@ -161,7 +161,7 @@ def _restore_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
     b.button(text="▶️ Запустить сейчас", callback_data="selenium:run:restore")
     b.button(text=f"{'🔴 Выкл' if on else '🟢 Вкл'}", callback_data="selenium:restore:toggle")
     b.button(text="⬅️ Назад", callback_data="auto:menu")
-    b.adjust(1)
+    b.adjust(2, 1)
     return b.as_markup()
 
 
@@ -226,7 +226,7 @@ def _withdraw_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
     b.button(text=f"{'🔴 Выкл' if on else '🟢 Вкл'}", callback_data="selenium:withdraw:toggle")
     b.button(text=f"💰 Порог: {min_amount} ₽", callback_data="selenium:withdraw:set_amount")
     b.button(text="⬅️ Назад", callback_data="auto:menu")
-    b.adjust(1, 2, 1)
+    b.adjust(2, 1, 1)
     return b.as_markup()
 
 

@@ -51,7 +51,7 @@ def _kb() -> InlineKeyboardMarkup:
     b.button(text="📜 История выводов", callback_data="balance:history")
     b.button(text="🔄 Обновить", callback_data="menu:balance")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
-    b.adjust(1, 2, 1, 1)
+    b.adjust(2, 1, 2)
     return b.as_markup()
 
 
@@ -133,7 +133,7 @@ async def _do_withdraw(msg, uid: int, api: YooMarketAPI, amount: float | None) -
     b = InlineKeyboardBuilder()
     b.button(text="📜 История", callback_data="balance:history")
     b.button(text="⬅️ Баланс", callback_data="menu:balance")
-    b.adjust(1)
+    b.adjust(2)
     await status.edit_text(
         (f"✅ {result}" if ok else f"❌ {result}"), reply_markup=b.as_markup())
 
@@ -173,7 +173,7 @@ async def active_withdrawals(callback: CallbackQuery, api: YooMarketAPI) -> None
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить", callback_data="balance:active")
     b.button(text="⬅️ Баланс", callback_data="menu:balance")
-    b.adjust(1)
+    b.adjust(2)
     active_st = ("pending", "processing", "new", "in_progress", "wait", "created")
     active = [w for w in items
               if str(w.get("status", "")).lower() in active_st]
@@ -209,7 +209,7 @@ async def withdrawal_history(callback: CallbackQuery, api: YooMarketAPI) -> None
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить", callback_data="balance:history")
     b.button(text="⬅️ Баланс", callback_data="menu:balance")
-    b.adjust(1)
+    b.adjust(2)
     if api_items:
         lines = [f"📜 <b>История выводов</b> ({len(api_items)})\n"]
         for w in api_items[:25]:

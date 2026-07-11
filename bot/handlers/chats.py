@@ -106,11 +106,13 @@ async def show_chat_messages(
         quick_replies: list = settings.get("quick_replies", [])
         builder = InlineKeyboardBuilder()
         builder.button(text="✉️ Ответить", callback_data=f"reply_init:{chat_id}")
+        # quick replies each full-width (long text), then 2-col nav
         for i, qr in enumerate(quick_replies[:3]):
             builder.button(text=f"💬 {qr[:28]}", callback_data=f"qr:{chat_id}:{i}")
         builder.button(text="🔄 Обновить", callback_data=ChatCallback(chat_id=chat_id).pack())
         builder.button(text="⬅️ Чаты", callback_data="menu:chats")
-        builder.adjust(1)
+        n_qr = len(quick_replies[:3])
+        builder.adjust(1, *([1] * n_qr), 2)  # reply, each qr, then nav pair
         keyboard = builder.as_markup()
     except Exception as e:
         text = f"❌ Ошибка: {e}"

@@ -45,19 +45,23 @@ def _status_text(creds: dict | None, has_token: bool = False) -> str:
 def _menu_kb(creds: dict | None, has_token: bool = False):
     b = InlineKeyboardBuilder()
     if creds:
-        b.button(text="🔄 Проверить сессию", callback_data="panel:check")
+        b.button(text="🔄 Проверить", callback_data="panel:check")
+        b.button(text="🚪 Выйти", callback_data="panel:logout")
+        b.button(text="📧 Вход по email", callback_data="panel:sms_start")
+        b.button(text="🍪 Обновить cookies", callback_data="panel:cookies_start")
         if has_token:
-            b.button(text="🔑 Обновить через токен", callback_data="panel:token_login")
-        b.button(text="📧 Обновить вход (email)", callback_data="panel:sms_start")
-        b.button(text="🍪 Обновить cookies вручную", callback_data="panel:cookies_start")
-        b.button(text="🚪 Выйти из панели", callback_data="panel:logout")
+            b.button(text="🔑 Через токен", callback_data="panel:token_login")
     else:
+        b.button(text="📧 Вход по email", callback_data="panel:sms_start")
+        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         if has_token:
-            b.button(text="🔑 Войти автоматически (через токен)", callback_data="panel:token_login")
-        b.button(text="📧 Войти через email", callback_data="panel:sms_start")
-        b.button(text="🍪 Вставить cookies вручную", callback_data="panel:cookies_start")
+            b.button(text="🔑 Через токен", callback_data="panel:token_login")
     b.button(text="⬅️ Настройки", callback_data="settings:menu")
-    b.adjust(1)
+    # 2 columns for actions, "⬅️ Настройки" on its own row at the bottom
+    if creds:
+        b.adjust(2, 2, 1, 1) if has_token else b.adjust(2, 2, 1)
+    else:
+        b.adjust(2, 1, 1) if has_token else b.adjust(2, 1)
     return b.as_markup()
 
 

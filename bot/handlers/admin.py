@@ -53,7 +53,10 @@ def _menu_kb(uid: int):
     if is_owner(uid):
         b.button(text="👑 Управление админами", callback_data="admin:admins")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
-    b.adjust(2, 2, 2, 1, 1)  # rows fill top-to-bottom; extra buttons wrap to 1-per-row
+    if is_owner(uid):
+        b.adjust(2, 2, 2, 2, 1, 1)  # 9 actions (2-per-row) + nav on its own row
+    else:
+        b.adjust(2, 2, 2, 2, 1)  # 8 actions (2-per-row) + nav on its own row
     return b.as_markup()
 
 
@@ -117,7 +120,7 @@ async def admin_stats(callback: CallbackQuery) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить", callback_data="admin:stats")
     b.button(text="⬅️ Назад", callback_data="admin:menu")
-    b.adjust(1)
+    b.adjust(2)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
     await callback.answer()
 
@@ -155,7 +158,7 @@ async def sub_user_input(message: Message, state: FSMContext) -> None:
     for d in (7, 30, 90, 365):
         b.button(text=f"{d} дн.", callback_data=f"admin:subdays:{d}")
     b.button(text="❌ Отмена", callback_data="admin:menu")
-    b.adjust(4, 1)
+    b.adjust(2, 2, 1)
     await message.answer(
         f"🎫 Пользователь <code>{target}</code>\n\n"
         "Выберите срок или введите число дней:",
@@ -525,7 +528,10 @@ async def appearance_menu(callback: CallbackQuery, state: FSMContext) -> None:
         b.button(text="🗑 Убрать эмодзи шапки", callback_data="admin:hdrclear")
     b.button(text="♻️ Сбросить кнопки", callback_data="admin:lblreset")
     b.button(text="⬅️ Назад", callback_data="admin:menu")
-    b.adjust(2, 1, 1, 1, 1)
+    if get_header_emoji():
+        b.adjust(2, 2, 2, 2, 2, 1)  # 10 action buttons (2-per-row) + nav on its own row
+    else:
+        b.adjust(2, 2, 2, 2, 1, 1)  # 9 action buttons (2-per-row) + nav on its own row
     await callback.message.edit_text(text, reply_markup=b.as_markup())
     await callback.answer()
 
@@ -707,7 +713,10 @@ async def text_view(callback: CallbackQuery, state: FSMContext) -> None:
     if is_custom_text_set(key):
         b.button(text="♻️ Вернуть стандартный", callback_data=f"admin:txtreset:{key}")
     b.button(text="⬅️ К текстам", callback_data="admin:texts")
-    b.adjust(1)
+    if is_custom_text_set(key):
+        b.adjust(2, 1)  # 2 actions on one row + nav on its own row
+    else:
+        b.adjust(1)
     # show a live preview (render placeholders with sample values)
     sample = {"price": " 💰 500 ₽", "days": "30", "left": "30"}
     preview = get_custom_text(key)
