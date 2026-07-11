@@ -11,7 +11,7 @@ from storage import delete_token, get_token, save_token, get_settings, save_sett
 router = Router()
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-06-24-v3"
+BOT_VERSION = "2026-07-11-v4"
 
 
 class AuthState(StatesGroup):
@@ -68,19 +68,47 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @router.message(Command("version"))
 async def cmd_version(message: Message) -> None:
-    """Show running bot version and data directory — for debugging deploys."""
+    """Show running bot version and where/how data is stored — deploy diagnostics."""
     import os
-    data_files = []
-    try:
-        for f in ("tokens.json", "settings.json", "panel_creds.json"):
-            p = os.path.join(_DATA_DIR, f)
-            data_files.append(f"{'✅' if os.path.exists(p) else '❌'} {f}")
-    except Exception:
-        pass
+    import storage
+
+    uid = message.from_user.id
+
+    # 1. Storage backend
+    if storage._USE_DB:
+        backend = "🟢 PostgreSQL (постоянная БД)"
+        db_ok = "?"
+        try:
+            storage._db_read_raw("tokens")  # touch the DB
+            db_ok = "✅ подключение работает"
+        except Exception as e:
+            db_ok = f"❌ ошибка: {str(e)[:60]}"
+        storage_lines = [f"💾 Хранилище: {backend}", f"   {db_ok}"]
+    else:
+        backend = "🔴 JSON-файлы (эфемерно на Railway!)"
+        storage_lines = [
+            f"💾 Хранилище: {backend}",
+            "   ⚠️ DATABASE_URL не задан — данные сотрутся при редеплое!",
+            f"   📁 {_DATA_DIR}",
+        ]
+
+    # 2. Redis (FSM)
+    redis_on = bool(os.environ.get("REDIS_URL", "").strip())
+    redis_line = "🧩 FSM: 🟢 Redis" if redis_on else "🧩 FSM: ⚪ память (сбрасывается при рестарте)"
+
+    # 3. Is THIS user's token actually stored right now?
+    has_token = bool(storage.get_token(uid))
+    accounts = storage.get_accounts(uid)
+    token_line = (f"🔑 Ваш токен: {'✅ сохранён' if has_token else '❌ нет'}"
+                  f"  ({len(accounts)} аккаунт(ов))")
+    panel = storage.get_panel_creds(uid)
+    panel_line = f"🌐 Куки панели: {'✅ есть' if panel and panel.get('cookies') else '❌ нет'}"
+
     await message.answer(
-        f"🤖 <b>Версия бота:</b> <code>{BOT_VERSION}</code>\n"
-        f"📁 <b>Данные:</b> <code>{_DATA_DIR}</code>\n\n"
-        + "\n".join(data_files)
+        f"🤖 <b>Версия:</b> <code>{BOT_VERSION}</code>\n\n"
+        + "\n".join(storage_lines)
+        + f"\n{redis_line}\n\n"
+        + f"{token_line}\n{panel_line}"
     )
 
 
