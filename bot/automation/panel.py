@@ -883,15 +883,30 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
         raw_fields = res.get("fields")
         if isinstance(raw_fields, dict):
             raw_fields = list(raw_fields.values())
-        info = {"id": str(rid), "title": "", "price": ""}
+        info = {"id": str(rid), "title": "", "price": "", "public": None}
+        _vis_kws = ("public", "visible", "active", "published", "status",
+                    "hidden", "публич", "видим", "актив", "показ", "скрыт")
         for f in raw_fields or []:
             if not isinstance(f, dict):
                 continue
             fa = str(f.get("attribute", ""))
+            fn = str(f.get("name", ""))
             if fa == "title":
                 info["title"] = str(f.get("value") or "")
             elif fa == "price":
                 info["price"] = str(f.get("value") or "")
+            elif info["public"] is None and any(
+                    kw in fa.lower() or kw in fn.lower() for kw in _vis_kws):
+                val = f.get("value")
+                inverted = "hidden" in fa.lower() or "скрыт" in fn.lower()
+                if isinstance(val, bool):
+                    info["public"] = (not val) if inverted else val
+                elif isinstance(val, str):
+                    on = val.lower() in ("1", "true", "да", "active", "published",
+                                         "public", "on", "visible")
+                    info["public"] = (not on) if inverted else on
+                elif isinstance(val, (int, float)):
+                    info["public"] = (not bool(val)) if inverted else bool(val)
         if info["id"] and info["id"] != "None":
             items.append(info)
     return True, items

@@ -76,18 +76,29 @@ async def list_items(callback: CallbackQuery) -> None:
         await callback.answer()
         return
 
+    hidden = [it for it in items if it.get("public") is False]
     b = InlineKeyboardBuilder()
     for it in items[:40]:
-        label = f"{(it['title'] or ('Товар ' + it['id']))[:28]}"
+        pub = it.get("public")
+        mark = "🌍 " if pub is True else ("🙈 " if pub is False else "")
+        label = f"{mark}{(it['title'] or ('Товар ' + it['id']))[:26]}"
         if it.get("price"):
             label += f" — {it['price']} ₽"
         b.button(text=label, callback_data=f"pitem:{it['id']}")
+    b.adjust(1)
+    if hidden:
+        b.button(text=f"🌍 Опубликовать все скрытые ({len(hidden)})",
+                 callback_data="pitems:pubhidden")
     b.button(text="➕ Добавить товар", callback_data="create_ad:start")
     b.button(text="🔄 Обновить", callback_data="pitems:list")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
     b.adjust(1)
+    status_hint = ""
+    if any(it.get("public") is not None for it in items):
+        status_hint = "\n🌍 = виден в маркете, 🙈 = скрыт"
     await callback.message.edit_text(
-        f"🛠 <b>Товары в панели</b> (всего: {len(items)})\n\n"
+        f"🛠 <b>Товары в панели</b> (всего: {len(items)})"
+        f"{status_hint}\n\n"
         "Нажмите на товар для управления:",
         reply_markup=b.as_markup(),
     )
@@ -236,6 +247,45 @@ async def item_show(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("pitem_hide:"))
 async def item_hide(callback: CallbackQuery) -> None:
     await _toggle(callback, public=False)
+
+
+@router.callback_query(F.data == "pitems:pubhidden")
+async def publish_all_hidden(callback: CallbackQuery) -> None:
+    """Publish every currently-hidden item in one tap."""
+    from automation.panel import panel_list_items_sync, panel_publish_item_sync
+    uid = callback.from_user.id
+    await callback.answer("⏳")
+    result, err = await _run(uid, panel_list_items_sync)
+    if not (result and result[0]):
+        await callback.message.edit_text(
+            f"❌ {result[1] if result else err}", reply_markup=_no_session_kb())
+        return
+    hidden = [it for it in result[1] if it.get("public") is False]
+    if not hidden:
+        await callback.answer("Скрытых товаров нет", show_alert=True)
+        await list_items(callback)
+        return
+    await callback.message.edit_text(
+        f"⏳ Публикую {len(hidden)} скрытых товаров…")
+    ok = fail = 0
+    last_err = ""
+    for it in hidden:
+        r, e = await _run(uid, panel_publish_item_sync, it["id"], uid, True)
+        if r and r[0]:
+            ok += 1
+        else:
+            fail += 1
+            last_err = (r[1] if r else e) or ""
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 К товарам", callback_data="pitems:list")
+    b.button(text="⬅️ Назад", callback_data="menu:ads")
+    b.adjust(1)
+    text = f"🌍 <b>Публикация завершена</b>\n\n✅ Опубликовано: <b>{ok}</b>"
+    if fail:
+        text += f"\n❌ Не удалось: <b>{fail}</b>"
+        if last_err:
+            text += f"\n<i>{last_err[:120]}</i>"
+    await callback.message.edit_text(text, reply_markup=b.as_markup())
 
 
 # ── Клонировать ─────────────────────────────────────────────────────────────
