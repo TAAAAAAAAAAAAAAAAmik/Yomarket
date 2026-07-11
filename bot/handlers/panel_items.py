@@ -111,10 +111,9 @@ def _item_kb(item_id: str):
     b.button(text="✏️ Название", callback_data=f"pitem_title:{item_id}")
     b.button(text="🌍 Показать", callback_data=f"pitem_show:{item_id}")
     b.button(text="🙈 Скрыть", callback_data=f"pitem_hide:{item_id}")
-    b.button(text="📋 Клонировать", callback_data=f"pitem_clone:{item_id}")
     b.button(text="🗑 Удалить", callback_data=f"pitem_del:{item_id}")
     b.button(text="⬅️ К товарам", callback_data="pitems:list")
-    b.adjust(2, 2, 2, 1)
+    b.adjust(2, 2, 1, 1)
     return b.as_markup()
 
 
@@ -286,36 +285,6 @@ async def publish_all_hidden(callback: CallbackQuery) -> None:
         if last_err:
             text += f"\n<i>{last_err[:120]}</i>"
     await callback.message.edit_text(text, reply_markup=b.as_markup())
-
-
-# ── Клонировать ─────────────────────────────────────────────────────────────
-
-@router.callback_query(F.data.startswith("pitem_clone:"))
-async def item_clone(callback: CallbackQuery) -> None:
-    from automation.panel import panel_clone_item_sync
-
-    item_id = callback.data.split(":", 1)[1]
-    uid = callback.from_user.id
-    await callback.answer("⏳ Клонирую...")
-    await callback.message.edit_text(f"⏳ Клонирую товар #{item_id}...")
-    result, err = await _run(uid, panel_clone_item_sync, item_id, uid)
-    if result and result[0]:
-        new_id = result[1]
-        b = InlineKeyboardBuilder()
-        if str(new_id).isdigit():
-            b.button(text="🛠 К новому товару", callback_data=f"pitem:{new_id}")
-        b.button(text="⬅️ К товарам", callback_data="pitems:list")
-        b.adjust(1)
-        await callback.message.edit_text(
-            f"✅ Товар #{item_id} клонирован → <b>#{new_id}</b>",
-            reply_markup=b.as_markup(),
-        )
-    else:
-        detail = result[1] if result else err
-        await callback.message.edit_text(
-            f"❌ Не удалось клонировать:\n{detail}",
-            reply_markup=_item_kb(item_id),
-        )
 
 
 # ── Удаление (с подтверждением) ─────────────────────────────────────────────
