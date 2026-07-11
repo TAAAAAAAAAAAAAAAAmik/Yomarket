@@ -84,6 +84,47 @@ def _is_complaint_text(text: str) -> bool:
     return any(kw in t for kw in _COMPLAINT_KEYWORDS)
 
 
+def _order_field(order: dict, *keys, default=None):
+    """First non-empty value among keys (supports nested buyer.*)."""
+    for k in keys:
+        if "." in k:
+            a, b = k.split(".", 1)
+            v = (order.get(a) or {})
+            v = v.get(b) if isinstance(v, dict) else None
+        else:
+            v = order.get(k)
+        if v not in (None, "", "—"):
+            return v
+    return default
+
+
+def _order_username(order: dict) -> str:
+    """Buyer @username / contact if the API exposes it."""
+    u = _order_field(order, "buyer_username", "username", "buyer.username",
+                     "buyer.login", "contact", "buyer.contact")
+    if not u:
+        return ""
+    u = str(u)
+    return u if u.startswith("@") else f"@{u}"
+
+
+def _today_stats(order_details: dict, known_orders: dict) -> tuple[int, int]:
+    """(orders today, revenue today ₽) from locally tracked order details."""
+    now = time.time()
+    day_start = now - (now % 86400)
+    cnt = 0
+    rev = 0
+    for oid, det in order_details.items():
+        seen = det.get("seen_at", 0)
+        if seen and seen >= day_start:
+            cnt += 1
+            try:
+                rev += int(float(str(det.get("price", 0))))
+            except (ValueError, TypeError):
+                pass
+    return cnt, rev
+
+
 def _parse_star_qty(title: str, default: int) -> int:
     """Extract a star count from an order title like '100 звёзд Telegram'."""
     if title:
@@ -197,11 +238,14 @@ class TaskManager:
 
                 status = str(order.get("status", ""))
                 prev_status = known.get(oid)
-                title = order.get("title") or order.get("ad_title") or order.get("product_name") or "—"
-                buyer = order.get("buyer_name") or (order.get("buyer") or {}).get("name") or "—"
-                price = order.get("price") or order.get("total") or "—"
+                title = _order_field(order, "title", "ad_title", "product_name", default="—")
+                buyer = _order_field(order, "buyer_name", "buyer.name", default="—")
+                price = _order_field(order, "price", "total", "amount", default="—")
                 time_raw = order.get("created_at") or order.get("date") or order.get("created")
                 chat_id = str(order.get("chat_id") or oid)
+                username = _order_username(order)
+                quantity = _order_field(order, "quantity", "count", "qty", "amount_items")
+                category = _order_field(order, "category", "category_name", "ad_category")
 
                 prev_det = order_details.get(oid, {})
                 work_at = prev_det.get("work_at")
@@ -212,6 +256,9 @@ class TaskManager:
                     "buyer": buyer,
                     "price": price,
                     "chat_id": chat_id,
+                    "username": username,
+                    "quantity": quantity,
+                    "category": category,
                     "seen_at": prev_det.get("seen_at") or time.time(),
                     "work_at": work_at,
                 }
@@ -230,11 +277,13 @@ class TaskManager:
                     if mark not in seen:
                         seen.append(mark)
                         settings["complaint_notify"] = cn
+                        who = f"{buyer}" + (f" ({username})" if username else "")
                         await self._notify(
                             user_id,
                             f"⚠️ <b>СПОР / ЖАЛОБА по заказу!</b>\n\n"
+                            f"🧾 Заказ <code>#{oid}</code>\n"
                             f"📦 {title}\n"
-                            f"👤 {buyer}  •  💰 {price} ₽\n"
+                            f"👤 {who}  •  💰 {price} ₽\n"
                             f"📊 Статус: <b>{status}</b>\n\n"
                             f"🔺 Требуется ваше вмешательство.",
                             reply_markup=_order_notify_kb(oid, chat_id),
@@ -257,14 +306,31 @@ class TaskManager:
                             logger.warning("Auto-accept order %s: %s", oid, e)
                     if not is_blacklisted:
                         time_str = _fmt_time(time_raw)
-                        time_part = f"  •  🕐 {time_str}" if time_str else ""
-                        acc_line = "\n▶️ <i>Автоматически взят в работу</i>" if accepted else ""
+                        cnt_today, rev_today = _today_stats(order_details, known)
+                        lines = [
+                            "🛒 <b>Новая покупка!</b>",
+                            f"🧾 Заказ <code>#{oid}</code>",
+                            "",
+                            f"📦 Товар: <b>{title}</b>",
+                        ]
+                        if category:
+                            lines.append(f"🏷 Категория: {category}")
+                        if quantity:
+                            lines.append(f"🔢 Количество: <b>{quantity}</b>")
+                        lines.append(f"💰 Сумма: <b>{price} ₽</b>")
+                        buyer_line = f"👤 Покупатель: <b>{buyer}</b>"
+                        if username:
+                            buyer_line += f"  ({username})"
+                        lines.append(buyer_line)
+                        if time_str:
+                            lines.append(f"🕐 Время: {time_str}")
+                        if accepted:
+                            lines.append("▶️ <i>Автоматически взят в работу</i>")
+                        lines.append("")
+                        lines.append(f"📊 Сегодня: <b>{cnt_today}</b> заказ(ов) на "
+                                     f"<b>{rev_today} ₽</b>")
                         await self._notify(
-                            user_id,
-                            f"🛒 <b>Новая покупка!</b>\n\n"
-                            f"👤 Покупатель: <b>{buyer}</b>\n"
-                            f"💰 Сумма: <b>{price} ₽</b>{time_part}\n"
-                            f"📦 Товар: <b>{title}</b>{acc_line}",
+                            user_id, "\n".join(lines),
                             reply_markup=_order_notify_kb(oid, chat_id),
                         )
                     if ar.get("enabled"):
@@ -279,14 +345,35 @@ class TaskManager:
                     if ev.get("enabled"):
                         msg = self._pick_message(title, ev.get("message", "Заказ подтверждён!"), rules, responders_map)
                         await self._send_chat(api, chat_id, msg)
-                    await self._notify(user_id, f"✅ Заказ #{oid} подтверждён\n📦 {title}")
+                    cnt_today, rev_today = _today_stats(order_details, known)
+                    buyer_line = f"👤 {buyer}" + (f" ({username})" if username else "")
+                    await self._notify(
+                        user_id,
+                        f"✅ <b>Заказ выполнен!</b>\n"
+                        f"🧾 <code>#{oid}</code>\n\n"
+                        f"📦 {title}\n"
+                        f"💰 <b>{price} ₽</b>\n"
+                        f"{buyer_line}\n\n"
+                        f"📊 Сегодня выполнено на <b>{rev_today} ₽</b>",
+                        reply_markup=_order_notify_kb(oid, chat_id),
+                    )
 
                 elif prev_status != status and status in ("refunded", "cancelled", "returned"):
                     ev = ae.get("on_refunded", {})
                     if ev.get("enabled"):
                         msg = self._pick_message(title, ev.get("message", "Возврат оформлен."), rules, responders_map)
                         await self._send_chat(api, chat_id, msg)
-                    await self._notify(user_id, f"↩️ Заказ #{oid} — возврат\n📦 {title}")
+                    buyer_line = f"👤 {buyer}" + (f" ({username})" if username else "")
+                    await self._notify(
+                        user_id,
+                        f"↩️ <b>Возврат по заказу</b>\n"
+                        f"🧾 <code>#{oid}</code>\n\n"
+                        f"📦 {title}\n"
+                        f"💰 <b>{price} ₽</b>\n"
+                        f"{buyer_line}\n"
+                        f"📊 Статус: {status}",
+                        reply_markup=_order_notify_kb(oid, chat_id),
+                    )
 
                 known[oid] = status
 
@@ -334,6 +421,10 @@ class TaskManager:
                 title = details.get("title", f"Заказ #{order_id}")
                 buyer_name = details.get("buyer", "Покупатель")
                 chat_id = details.get("chat_id", order_id)
+                d_username = details.get("username", "")
+                d_price = details.get("price", "")
+                who = f"{buyer_name}" + (f" ({d_username})" if d_username else "")
+                order_line = f"📦 {title}" + (f"  •  💰 {d_price} ₽" if d_price and d_price != "—" else "")
 
                 for msg in messages:
                     msg_id = str(msg.get("id", ""))
@@ -367,8 +458,9 @@ class TaskManager:
                             await self._notify(
                                 user_id,
                                 f"⚠️ <b>ЖАЛОБА / ПРОБЛЕМА клиента!</b>\n\n"
-                                f"👤 <b>{buyer_name}</b>{time_part}\n"
-                                f"📦 {title}\n\n"
+                                f"👤 <b>{who}</b>{time_part}\n"
+                                f"🧾 Заказ <code>#{order_id}</code>\n"
+                                f"{order_line}\n\n"
                                 f"<i>«{msg_text}»</i>\n\n"
                                 f"🔺 Ответьте как можно быстрее.",
                                 reply_markup=_message_notify_kb(chat_id),
@@ -378,8 +470,9 @@ class TaskManager:
                     await self._notify(
                         user_id,
                         f"💬 <b>Новое сообщение</b>\n\n"
-                        f"👤 <b>{buyer_name}</b>{time_part}\n"
-                        f"📦 {title}\n\n"
+                        f"👤 <b>{who}</b>{time_part}\n"
+                        f"🧾 Заказ <code>#{order_id}</code>\n"
+                        f"{order_line}\n\n"
                         f"<i>«{msg_text}»</i>",
                         reply_markup=_message_notify_kb(chat_id),
                     )
@@ -419,12 +512,16 @@ class TaskManager:
             buyer = det.get("buyer", "—")
             price = det.get("price", "—")
             chat_id = det.get("chat_id", oid)
+            uname = det.get("username", "")
+            who = f"{buyer}" + (f" ({uname})" if uname else "")
 
             await self._notify(
                 user_id,
                 f"⏰ <b>Напоминание о заказе</b>\n\n"
+                f"🧾 Заказ <code>#{oid}</code>\n"
                 f"📦 {title}\n"
-                f"👤 {buyer}  •  💰 {price} ₽\n\n"
+                f"👤 {who}  •  💰 {price} ₽\n"
+                f"📊 Статус: {status}\n\n"
                 f"⏳ Ждёт подтверждения уже <b>{hours_waiting} ч</b>",
                 reply_markup=_order_notify_kb(oid, chat_id),
             )
