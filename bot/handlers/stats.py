@@ -352,7 +352,7 @@ async def reviews_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить", callback_data="stats:reviews")
     b.button(text="⬅️ Статистика", callback_data="menu:stats")
-    b.adjust(1)
+    b.adjust(2)
 
     if not api:
         await callback.message.edit_text(

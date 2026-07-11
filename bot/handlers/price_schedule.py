@@ -44,7 +44,7 @@ def _menu_kb(ps: dict):
     b.button(text="📊 Изменить процент", callback_data="pricesched:percent")
     b.button(text="🕐 Изменить окно", callback_data="pricesched:window")
     b.button(text="⬅️ Настройки", callback_data="settings:menu")
-    b.adjust(1)
+    b.adjust(2, 1, 1)
     return b.as_markup()
 
 

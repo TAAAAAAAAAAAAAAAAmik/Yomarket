@@ -26,7 +26,7 @@ def _tools_kb():
     b.button(text="💬 Быстрые ответы", callback_data="tools:quick_replies")
     b.button(text="💾 Бэкап настроек", callback_data="tools:backup")
     b.button(text="⬅️ Настройки", callback_data="settings:menu")
-    b.adjust(1)
+    b.adjust(2, 1, 1)
     return b.as_markup()
 
 
