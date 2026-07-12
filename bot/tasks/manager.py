@@ -235,6 +235,12 @@ class TaskManager:
             blacklist: list = settings.get("blacklist", [])
             reminded: list = settings.setdefault("reminded_orders", [])
 
+            # First-run baseline: on the very first pass (fresh DB / new account)
+            # record existing orders SILENTLY — otherwise every old order would
+            # be treated as "new" and spam a notification. Only orders that
+            # appear AFTER initialization trigger alerts/auto-actions.
+            initialized = settings.get("orders_initialized", False)
+
             for order in orders:
                 oid = str(order.get("id", ""))
                 if not oid:
@@ -274,7 +280,7 @@ class TaskManager:
 
                 # Complaint/dispute status → high-priority alert
                 cn = settings.get("complaint_notify", {"enabled": True})
-                if (cn.get("enabled", True) and prev_status != status
+                if (initialized and cn.get("enabled", True) and prev_status != status
                         and any(cs in str(status).lower() for cs in _COMPLAINT_STATUSES)):
                     seen = cn.setdefault("seen", [])
                     mark = f"status:{oid}:{status}"
@@ -294,6 +300,11 @@ class TaskManager:
                         )
 
                 is_blacklisted = buyer in blacklist
+
+                if prev_status is None and not initialized:
+                    # baseline pass: record silently, no notify / no auto-actions
+                    known[oid] = status
+                    continue
 
                 if prev_status is None:
                     # Auto-accept: press "начать заказ" immediately so orders
@@ -382,6 +393,7 @@ class TaskManager:
                 known[oid] = status
 
             settings["reminded_orders"] = reminded
+            settings["orders_initialized"] = True  # baseline established
 
             settings["known_orders"] = known
             settings["known_order_ids"] = list(known.keys())

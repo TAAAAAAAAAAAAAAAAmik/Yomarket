@@ -64,9 +64,30 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
             reply_markup=back_keyboard())
         await callback.answer()
         return
+    name = "Магазин"
+    balance = None
+    pending = None
+    raw = None
+    err = None
     try:
         data = await api.check()
+        raw = data
         name, balance, pending = _parse_check(data)
+    except Exception as e:
+        err = str(e)[:200]
+        logger.error("Balance check error: %s", e)
+
+    # If /check didn't give a usable number, try the dedicated balance endpoints
+    if balance in (None, "", "0", "—"):
+        try:
+            amount, bal_str = await api.get_balance()
+            if bal_str not in ("—", None):
+                balance = bal_str.replace(" ₽", "")
+        except Exception as e:
+            if err is None:
+                err = str(e)[:200]
+
+    if balance not in (None, "", "—"):
         text = (
             f"🏪 <b>{name}</b>\n\n"
             f"💰 Баланс: <b>{balance} ₽</b>\n"
@@ -75,10 +96,16 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
             text += f"⏳ В ожидании: <b>{pending} ₽</b>\n"
         text += "✅ Статус: Активен"
         kb = _kb()
-    except Exception as e:
-        logger.error("Balance error: %s", e)
-        text = f"❌ Ошибка загрузки баланса:\n<code>{e}</code>"
-        kb = back_keyboard()
+    else:
+        # Nothing usable — show diagnostics so the real response shape is visible
+        text = "❌ <b>Не удалось получить баланс</b>\n\n"
+        if err:
+            text += f"Ошибка: <code>{err}</code>\n\n"
+        if raw is not None:
+            text += f"Ответ API <code>/check</code>:\n<code>{str(raw)[:400]}</code>"
+        else:
+            text += "API не ответил. Проверьте токен и попробуйте снова."
+        kb = _kb()
 
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
