@@ -132,7 +132,31 @@ _DEFAULT_ACCOUNT = "Основной"
 
 import threading as _threading
 
-_DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+def _resolve_database_url() -> str:
+    """Find a Postgres URL from the common env-var names Railway/Heroku use,
+    or assemble one from PG* parts. Returns '' if none configured."""
+    for var in ("DATABASE_URL", "DATABASE_PRIVATE_URL", "POSTGRES_URL",
+                "POSTGRESQL_URL", "PG_URL", "DATABASE_PUBLIC_URL"):
+        url = os.environ.get(var, "").strip()
+        if url:
+            # psycopg2 accepts postgres:// but normalize to postgresql://
+            if url.startswith("postgres://"):
+                url = "postgresql://" + url[len("postgres://"):]
+            return url
+    # Assemble from individual PG* variables if present
+    host = os.environ.get("PGHOST", "").strip()
+    if host:
+        user = os.environ.get("PGUSER", "postgres")
+        pwd = os.environ.get("PGPASSWORD", "")
+        port = os.environ.get("PGPORT", "5432")
+        db = os.environ.get("PGDATABASE", "railway")
+        auth = f"{user}:{pwd}@" if pwd else f"{user}@"
+        return f"postgresql://{auth}{host}:{port}/{db}"
+    return ""
+
+
+_DATABASE_URL = _resolve_database_url()
 _USE_DB = bool(_DATABASE_URL)
 _db_lock = _threading.Lock()
 _db_pool = None

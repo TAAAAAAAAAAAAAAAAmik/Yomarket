@@ -118,7 +118,8 @@ async def main() -> None:
         fsm_storage = MemoryStorage()
     dp = Dispatcher(storage=fsm_storage)
 
-    if os.environ.get("DATABASE_URL", "").strip():
+    import storage as _storage
+    if _storage._USE_DB:
         logger.info("Data storage: PostgreSQL")
     else:
         logger.info("Data storage: JSON files (set DATABASE_URL for PostgreSQL)")

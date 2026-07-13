@@ -4,8 +4,33 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # Persistent storage in Postgres; FSM state in Redis
+      DATABASE_URL: postgresql://bot:botpass@db:5432/botdb
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
     volumes:
-      - bot_data:/app/data
+      - bot_data:/app/data   # photos + legacy fallback
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bot
+      POSTGRES_PASSWORD: botpass
+      POSTGRES_DB: botdb
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
 
 volumes:
   bot_data:
+  pg_data:
+  redis_data:
