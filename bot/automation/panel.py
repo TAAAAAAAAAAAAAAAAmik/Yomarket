@@ -431,80 +431,67 @@ class YooMarketPanelHTTP:
         )
 
     async def probe_login_ui(self) -> str:
-        """Report what the login screen is actually built from.
+        """Find the login endpoint by reading the storefront's own JS.
 
-        The panel is an SPA, so the form exists only inside the JS bundles.
-        Looking for the UI strings themselves settles whether the screen asks
-        for a password or for a mailed code, and dumps the request the
-        code-related code path makes. Purely diagnostic.
+        yoomarket.net is a Next.js app, so its login call lives in the shipped
+        chunks under /_next/static. Reading those needs no browser at all —
+        which matters, because Chromium does not fit in a 512 MB instance.
+        Purely diagnostic: reports the API host and the auth paths it finds.
         """
         timeout = aiohttp.ClientTimeout(total=25)
-        blobs: list[tuple[str, str]] = []
-        try:
-            async with self._session.get(PANEL_URL + "/login", timeout=timeout) as r:
-                blobs.append(("HTML", await r.text()))
-        except Exception as e:
-            return f"не смог открыть /login: {str(e)[:80]}"
+        report: list[str] = []
 
-        js_files = list(dict.fromkeys(
-            re.findall(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', blobs[0][1], re.I)
-            + re.findall(r'["\'](/(?:assets|build)/[^"\']+\.js)["\']', blobs[0][1], re.I)
+        html = ""
+        for page in ("/login", "/"):
+            try:
+                async with self._session.get(
+                    MAIN_URL + page, timeout=timeout,
+                    headers=self._host_headers(MAIN_URL),
+                ) as r:
+                    html = await r.text()
+                    report.append(f"GET {page} → {r.status}, {len(html)}б")
+                if len(html) > 2000:
+                    break
+            except Exception as e:
+                report.append(f"GET {page}: {str(e)[:60]}")
+
+        if not html:
+            return "\n".join(report) or "страница не открылась"
+
+        chunks = list(dict.fromkeys(
+            re.findall(r'src="(/_next/static/[^"]+\.js)"', html)
+            + re.findall(r'"(/_next/static/[^"]+\.js)"', html)
+            + re.findall(r'src="([^"]+\.js)"', html)
         ))
-        for src in js_files[:8]:
-            url = src if src.startswith("http") else PANEL_URL + src
+        report.append(f"JS-чанков: {len(chunks)}")
+
+        api_hosts: set[str] = set()
+        auth_paths: set[str] = set()
+        total = 0
+        for src in chunks[:25]:
+            url = src if src.startswith("http") else MAIN_URL + src
             try:
                 async with self._session.get(url, timeout=timeout) as r:
-                    blobs.append((src.split("/")[-1][:18], await r.text()))
+                    js = await r.text()
+                total += len(js)
             except Exception:
                 continue
 
-        needles = ["Получить код", "получить код", "Пароль", "пароль",
-                   "Код из письма", "одноразов", "Забыли", "Войти"]
-        found: dict[str, int] = {}
-        for _, blob in blobs:
-            for n in needles:
-                if n in blob:
-                    found[n] = found.get(n, 0) + blob.count(n)
+            for m in re.findall(r'https?://([a-z0-9.-]*yoo[a-z0-9.-]*)', js, re.I):
+                api_hosts.add(m.lower())
+            # Paths that look like auth endpoints
+            for m in re.findall(
+                r'["\'`](/(?:api/)?[a-z0-9/_-]*'
+                r'(?:auth|login|code|otp|verify|confirm|signin|sign-in)'
+                r'[a-z0-9/_-]*)["\'`]', js, re.I,
+            ):
+                if len(m) < 60:
+                    auth_paths.add(m)
 
-        # Dump what happens around the code-related UI text
-        ctx: list[str] = []
-        for name, blob in blobs:
-            for m in re.finditer(r"Получить код|получить код", blob):
-                s = max(0, m.start() - 260)
-                frag = blob[s:m.end() + 260]
-                calls = re.findall(
-                    r'(?:post|get|visit|submit)\(\s*["\'`]([^"\'`]{2,60})["\'`]', frag)
-                route = re.findall(r'route\(\s*["\'`]([^"\'`]{2,40})["\'`]', frag)
-                ctx.append(f"[{name}] вызовы={calls[:4]} route={route[:4]}")
-                if len(ctx) >= 4:
-                    break
-            if len(ctx) >= 4:
-                break
-
-        # The marketplace's own API lives on another host — the code may be
-        # requested there rather than from the panel.
-        api_probe: list[str] = []
-        for base in ("https://api.yoo.market", "https://yoo.market"):
-            for path in ("/auth/code", "/auth/send-code", "/api/auth/code",
-                         "/integration/v1/auth/code"):
-                try:
-                    async with self._session.post(
-                        base + path, json={"email": self._email},
-                        timeout=aiohttp.ClientTimeout(total=8),
-                        allow_redirects=False,
-                    ) as r:
-                        t = await r.text()
-                        if r.status != 404:
-                            api_probe.append(
-                                f"{base}{path} → {r.status}: {t[:60]}")
-                except Exception:
-                    continue
-
-        return (
-            f"надписи: {found or 'ничего не найдено'}\n"
-            f"контекст «Получить код»: {ctx or 'нет'}\n"
-            f"другой хост: {api_probe or 'всё 404'}"
-        )
+        report.append(f"JS прочитано: {total}б")
+        report.append(f"хосты: {sorted(api_hosts)[:8] or 'нет'}")
+        report.append(f"пути входа: {sorted(auth_paths)[:20] or 'нет'}")
+        return "\n".join(report)
 
     async def _discover_ziggy_routes(self) -> tuple[list[str], str]:
         """Read the app's own route table instead of guessing URLs.

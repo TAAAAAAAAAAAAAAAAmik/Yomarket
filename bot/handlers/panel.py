@@ -57,19 +57,21 @@ def _menu_kb(creds: dict | None, has_token: bool = False):
         b.button(text="🚪 Выйти", callback_data="panel:logout")
         b.button(text="📧 Вход по коду", callback_data="panel:sms_start")
         b.button(text="🍪 Обновить cookies", callback_data="panel:cookies_start")
+        b.button(text="🔍 Найти адрес входа", callback_data="panel:probe_ui")
         if has_token:
             b.button(text="🎟 Через токен", callback_data="panel:token_login")
     else:
         b.button(text="📧 Вход по коду", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
+        b.button(text="🔍 Найти адрес входа", callback_data="panel:probe_ui")
         if has_token:
             b.button(text="🎟 Через токен", callback_data="panel:token_login")
     b.button(text="⬅️ Настройки", callback_data="settings:menu")
     # 2 columns for actions, "⬅️ Настройки" on its own row at the bottom
     if creds:
-        b.adjust(2, 2, 1, 1) if has_token else b.adjust(2, 2, 1)
+        b.adjust(2, 2, 1, 1, 1) if has_token else b.adjust(2, 2, 1, 1)
     else:
-        b.adjust(2, 1, 1) if has_token else b.adjust(2, 1)
+        b.adjust(2, 1, 1, 1) if has_token else b.adjust(2, 1, 1)
     return b.as_markup()
 
 
@@ -477,8 +479,9 @@ async def panel_password_input(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "panel:probe_ui")
 async def panel_probe_ui(callback: CallbackQuery) -> None:
-    await callback.answer("⏳ Смотрю страницу входа...")
-    status_msg = await callback.message.answer("⏳ Читаю страницу входа панели...")
+    await callback.answer("⏳ Ищу адрес входа...")
+    status_msg = await callback.message.answer(
+        "⏳ Читаю код страницы входа yoomarket.net...")
 
     http = YooMarketPanelHTTP()
     try:
@@ -495,7 +498,7 @@ async def panel_probe_ui(callback: CallbackQuery) -> None:
             pass
 
     await status_msg.edit_text(
-        f"🔍 <b>Страница входа панели</b>\n\n<code>{report[:3500]}</code>"
+        f"🔍 <b>Адреса входа yoomarket.net</b>\n\n<code>{report[:3500]}</code>"
     )
 
 
