@@ -353,6 +353,7 @@ async def panel_password_input(message: Message, state: FSMContext) -> None:
         await status_msg.edit_text(f"❌ {result}")
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
+        b.button(text="🔍 Что на странице входа", callback_data="panel:probe_ui")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
         b.adjust(1)
@@ -360,6 +361,34 @@ async def panel_password_input(message: Message, state: FSMContext) -> None:
         return
 
     await _finish_login(message, status_msg, uid, email, result)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics: what the panel's login screen is actually made of
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "panel:probe_ui")
+async def panel_probe_ui(callback: CallbackQuery) -> None:
+    await callback.answer("⏳ Смотрю страницу входа...")
+    status_msg = await callback.message.answer("⏳ Читаю страницу входа панели...")
+
+    http = YooMarketPanelHTTP()
+    try:
+        await http.start()
+        report = await asyncio.wait_for(http.probe_login_ui(), timeout=90)
+    except asyncio.TimeoutError:
+        report = "не успел за 90 секунд"
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    finally:
+        try:
+            await http.close()
+        except Exception:
+            pass
+
+    await status_msg.edit_text(
+        f"🔍 <b>Страница входа панели</b>\n\n<code>{report[:3500]}</code>"
+    )
 
 
 # ---------------------------------------------------------------------------
