@@ -269,7 +269,9 @@ class YooMarketPanelHTTP:
             return False, "Сессия не запущена"
 
         self._email = email.strip()
-        timeout = aiohttp.ClientTimeout(total=12)
+        # Short per-request budget: one unreachable path must not stall the
+        # whole scan (batches run concurrently below).
+        timeout = aiohttp.ClientTimeout(total=7, connect=4)
 
         # Laravel CSRF handshake + pick up a _token from the login page
         for csrf_path in ("/sanctum/csrf-cookie", "/api/csrf-cookie", "/csrf-cookie"):
@@ -351,20 +353,35 @@ class YooMarketPanelHTTP:
                 interesting.append(f"<code>{path}</code> → {str(e)[:60]}")
             return False
 
+        # Probe in parallel batches — done one by one this takes minutes and the
+        # user just watches a frozen "requesting code" message.
+        async def _run(jobs: list[tuple[str, str, dict]]) -> bool:
+            for i in range(0, len(jobs), 8):
+                batch = jobs[i:i + 8]
+                results = await asyncio.gather(
+                    *[_probe(b, p, pl) for b, p, pl in batch],
+                    return_exceptions=True,
+                )
+                if any(r is True for r in results):
+                    return True
+            return False
+
         # The marketplace first — that is where sellers actually sign in.
-        for base in (MAIN_URL, PANEL_URL):
-            for path in candidates:
-                if await _probe(base, path, {"email": self._email}):
-                    return True, ""
+        jobs = [(MAIN_URL, p, {"email": self._email}) for p in candidates]
+        jobs += [(PANEL_URL, p, {"email": self._email}) for p in candidates]
+        if await _run(jobs):
+            return True, ""
 
         # Some passwordless setups want an explicit intent flag
-        for base in (MAIN_URL,):
-            for path in ("/login", "/code", "/api/login"):
-                for payload in ({"email": self._email, "type": "code"},
-                                {"email": self._email, "send": True},
-                                {"login": self._email}):
-                    if await _probe(base, path, payload):
-                        return True, ""
+        extra_jobs = [
+            (MAIN_URL, p, pl)
+            for p in ("/login", "/code", "/api/login")
+            for pl in ({"email": self._email, "type": "code"},
+                       {"email": self._email, "send": True},
+                       {"login": self._email})
+        ]
+        if await _run(extra_jobs):
+            return True, ""
 
         hint = (f"\n\n<b>Проверка кода:</b> <code>{self._verify_path}</code> "
                 f"на {self._auth_host}" if self._verify_path else "")

@@ -239,14 +239,21 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         except Exception:
             pass
 
-    status_msg = await message.answer("⏳ Запрашиваю код на почту...")
+    status_msg = await message.answer(
+        "⏳ Запрашиваю код на почту...\n"
+        "<i>Проверяю адреса входа — это занимает до минуты.</i>"
+    )
 
     http = YooMarketPanelHTTP()
     try:
         await http.start()
-        ok, err = await asyncio.wait_for(http.send_code(email), timeout=90)
+        ok, err = await asyncio.wait_for(http.send_code(email), timeout=100)
     except asyncio.TimeoutError:
-        ok, err = False, "Сайт не ответил вовремя. Попробуйте ещё раз."
+        ok, err = False, (
+            "Сайт не ответил вовремя.\n\n"
+            "Если бот на бесплатном хостинге — он мог засыпать. "
+            "Откройте адрес сервиса в браузере и попробуйте снова."
+        )
     except Exception as e:
         ok, err = False, f"Ошибка запроса: {str(e)[:200]}"
 
