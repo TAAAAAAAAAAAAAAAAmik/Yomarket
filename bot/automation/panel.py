@@ -209,6 +209,9 @@ class YooMarketPanelHTTP:
         # The send-code path that actually worked — used to derive the matching
         # verify path (same base) in verify_code().
         self._send_path: str = ""
+        # A path that answered "code required" during the scan — that is the
+        # verify endpoint itself, so verify_code() should try it first.
+        self._verify_path: str = ""
 
     async def start(self) -> None:
         connector = aiohttp.TCPConnector(ssl=False)
@@ -342,11 +345,18 @@ class YooMarketPanelHTTP:
                         self._send_path = path
                         return True, ""
                     if resp.status == 422:
+                        low = text.lower()
                         # A 422 demanding a password means we hit the classic
                         # password-login route (e.g. /login), NOT the send-code
-                        # route — keep looking instead of reporting it as the
-                        # endpoint.
-                        if "password" in text.lower():
+                        # route — keep looking.
+                        if "password" in low:
+                            continue
+                        # A 422 demanding a code means we hit the VERIFY route
+                        # (e.g. /code). Remember it for verify_code() and keep
+                        # looking for the route that actually sends the code.
+                        if '"code"' in low or "код" in low:
+                            if not self._verify_path:
+                                self._verify_path = path
                             continue
                         # Otherwise the endpoint is real but rejected our data
                         # (e.g. unknown email). Remember it, but a clean 200
@@ -356,13 +366,50 @@ class YooMarketPanelHTTP:
             except Exception as e:
                 diag_lines.append(f"<code>{path}</code> → {str(e)[:60]}")
 
+        # Second pass: the send route is usually a sibling of the verify route
+        # (e.g. /code → /code/send). Only worth doing once we know the latter.
+        if self._verify_path:
+            base = self._verify_path.rstrip("/")
+            siblings = [
+                f"{base}/send", f"{base}/request", f"{base}/new",
+                f"{base}/resend", f"{base}/email", f"{base}/create",
+                base.rsplit("/", 1)[0] + "/send-code" if "/" in base.strip("/") else "/send-code",
+            ]
+            for path in dict.fromkeys(siblings):
+                if path in all_paths:
+                    continue
+                try:
+                    async with self._session.post(
+                        PANEL_URL + path,
+                        json={"email": self._email},
+                        headers=extra_headers,
+                        timeout=timeout,
+                        allow_redirects=False,
+                    ) as resp:
+                        text = await resp.text()
+                        short = text[:100].replace("\n", " ")
+                        diag_lines.append(
+                            f"<code>{path}</code> → <b>{resp.status}</b>: {short}")
+                        logger.info("POST %s → %s: %s", path, resp.status, text[:300])
+                        if resp.status in (200, 201) and not _looks_like_html(text):
+                            self._send_path = path
+                            return True, ""
+                except Exception as e:
+                    diag_lines.append(f"<code>{path}</code> → {str(e)[:60]}")
+
         if first_422 is not None:
             path, text = first_422
-            self._send_path = path  # treat as the real endpoint for verify
-            return False, f"422 на <code>{path}</code>:\n<code>{text[:400]}</code>"
+            self._send_path = path
+            return False, f"422 на <code>{path}</code>:\n<code>{text[:300]}</code>"
 
-        diag = "\n".join(diag_lines)
-        return False, f"🔍 <b>Диагностика JS:</b>\n{disc_debug}\n\n<b>Ответы сервера:</b>\n\n{diag}"
+        diag = "\n".join(diag_lines[:25])
+        hint = (f"\n\n<b>Похоже, проверка кода:</b> <code>{self._verify_path}</code>"
+                if self._verify_path else "")
+        return False, (
+            f"🔍 <b>Не нашёл, куда отправлять код.</b>{hint}\n\n"
+            f"<b>Поиск по JS:</b>\n{disc_debug}\n\n"
+            f"<b>Ответы сервера:</b>\n{diag}"
+        )
 
     async def _discover_api_paths(self) -> tuple[list[str], str]:
         """Fetch every JS bundle of the login SPA and extract candidate auth
@@ -447,6 +494,10 @@ class YooMarketPanelHTTP:
         # Derive verify candidates from the send-code path that actually worked
         # (e.g. /auth/send-code → /auth/verify, /auth/confirm, /auth/code).
         derived: list[str] = []
+        # A path that already answered "code required" is the verify endpoint —
+        # try it before any guess.
+        if self._verify_path:
+            derived.append(self._verify_path)
         if self._send_path:
             base = self._send_path.rsplit("/", 1)[0]
             for tail in ("verify", "confirm", "check-code", "check", "code",
@@ -455,7 +506,8 @@ class YooMarketPanelHTTP:
 
         guesses = [
             # web.php routes
-            "/auth/verify", "/auth/confirm", "/auth/code", "/auth/check-code",
+            "/code", "/auth/verify", "/auth/confirm", "/auth/code",
+            "/auth/check-code",
             "/login/verify", "/login/code", "/verify-code", "/verify",
             # api.php routes
             "/api/auth/verify", "/api/auth/confirm", "/api/verify",
