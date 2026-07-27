@@ -253,7 +253,7 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
     page = context = None
     try:
         await asyncio.wait_for(panel.start(), timeout=60)
-        page, context = await asyncio.wait_for(panel.open_login_page(), timeout=90)
+        page, context = await asyncio.wait_for(panel.open_login_page(), timeout=120)
         await status_msg.edit_text("⏳ Ввожу email и запрашиваю код...")
         ok, err = await asyncio.wait_for(panel.submit_email(page, email), timeout=60)
     except asyncio.TimeoutError:

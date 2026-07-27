@@ -2470,49 +2470,76 @@ class YooMarketPanel:
         page = await context.new_page()
         self._watch_requests(page)
 
-        for url in (MAIN_URL + "/login", MAIN_URL + "/", PANEL_URL + "/login"):
+        _EMAIL_SEL = ('input[type="email"], input[name="email"], '
+                      'input[placeholder*="почт" i], input[placeholder*="mail" i], '
+                      'input[type="text"]')
+
+        async def _find_email():
             try:
-                await page.goto(url, timeout=25000, wait_until="domcontentloaded")
+                return await page.query_selector(_EMAIL_SEL)
             except Exception:
-                continue
-            # Let the SPA render, then check for an email field
-            for _ in range(6):
-                await asyncio.sleep(1)
-                try:
-                    el = await page.query_selector(
-                        'input[type="email"], input[name="email"], '
-                        'input[placeholder*="почт" i], input[placeholder*="mail" i]')
-                    if el:
-                        logger.info("login form found at %s", page.url)
-                        return page, context
-                except Exception:
-                    pass
-            # No field here — the storefront opens the form from a button
-            for sel in ('button:has-text("Войти")', 'a:has-text("Войти")',
-                        'button:has-text("Вход")', '[href*="login"]',
-                        'button:has-text("Профиль")', '[aria-label*="вход" i]'):
+                return None
+
+        async def _dismiss_overlays() -> None:
+            """Close the consent dialog ("Хорошо") that covers the form."""
+            for sel in ('button:has-text("Хорошо")', 'button:has-text("Принять")',
+                        'button:has-text("Согласен")', 'button:has-text("Понятно")',
+                        'button:has-text("ОК")'):
                 try:
                     btn = await page.query_selector(sel)
-                    if btn:
+                    if btn and await btn.is_visible():
                         await btn.click()
-                        await asyncio.sleep(2)
-                        el = await page.query_selector(
-                            'input[type="email"], input[name="email"], '
-                            'input[placeholder*="почт" i]')
-                        if el:
-                            logger.info("login form opened via %s", sel)
-                            return page, context
+                        logger.info("dismissed overlay via %s", sel)
+                        await asyncio.sleep(1)
+                except Exception:
+                    continue
+
+        # Straight to the login page — walking several URLs first is what ate
+        # the time budget before.
+        for url in (MAIN_URL + "/login", MAIN_URL + "/"):
+            try:
+                await page.goto(url, timeout=20000, wait_until="domcontentloaded")
+            except Exception:
+                continue
+
+            await asyncio.sleep(2)
+            await _dismiss_overlays()
+
+            for _ in range(6):
+                if await _find_email():
+                    logger.info("login form found at %s", page.url)
+                    return page, context
+                await asyncio.sleep(1)
+
+            # The storefront opens the form from a button — "Профиль" is the
+            # entry point on this site.
+            for sel in ('button:has-text("Профиль")', 'a:has-text("Профиль")',
+                        'button:has-text("Войти")', 'a:has-text("Войти")',
+                        'button:has-text("Вход")', 'a[href*="login"]'):
+                try:
+                    btn = await page.query_selector(sel)
+                    if not btn or not await btn.is_visible():
+                        continue
+                    await btn.click()
+                    await asyncio.sleep(2)
+                    await _dismiss_overlays()
+                    if await _find_email():
+                        logger.info("login form opened via %s", sel)
+                        return page, context
                 except Exception:
                     continue
 
             # Record what this page offered, so a miss is explainable
             try:
-                texts = await page.evaluate(
-                    "() => [...document.querySelectorAll('button,a')]"
-                    ".map(e => (e.innerText||'').trim()).filter(t => t && t.length < 30)"
-                    ".slice(0, 25)"
+                info = await page.evaluate(
+                    "() => ({url: location.href,"
+                    " inputs: [...document.querySelectorAll('input')].map(i =>"
+                    "   ({t: i.type, n: i.name, p: i.placeholder})).slice(0, 10),"
+                    " buttons: [...document.querySelectorAll('button,a')]"
+                    "   .map(e => (e.innerText||'').trim())"
+                    "   .filter(t => t && t.length < 30).slice(0, 20)})"
                 )
-                self.page_debug.append(f"{page.url} → {texts}")
+                self.page_debug.append(str(info)[:600])
             except Exception:
                 pass
 
