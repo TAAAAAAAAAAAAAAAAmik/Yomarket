@@ -234,7 +234,17 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
     except Exception as e:
         await panel.close()
         await state.clear()
-        await status_msg.edit_text(f"❌ Ошибка при открытии браузера:\n<code>{str(e)[:300]}</code>")
+        emsg = str(e).lower()
+        if "executable" in emsg or "playwright" in emsg or "browser" in emsg or "chromium" in emsg:
+            # Chromium not installed (lean free-hosting image) — guide to cookies
+            await status_msg.edit_text(
+                "ℹ️ <b>Вход по email недоступен на этом хостинге</b> "
+                "(нет браузера).\n\n"
+                "Используйте <b>🍪 Вставить cookies</b> — это надёжнее и работает "
+                "везде. Как получить cookies — покажу по кнопке ниже."
+            )
+        else:
+            await status_msg.edit_text(f"❌ Ошибка при открытии браузера:\n<code>{str(e)[:300]}</code>")
         b = InlineKeyboardBuilder()
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
