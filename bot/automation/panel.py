@@ -278,6 +278,24 @@ class YooMarketPanelHTTP:
         # Short per-request budget: one unreachable path must not stall the
         # whole scan (batches run concurrently below).
         timeout = aiohttp.ClientTimeout(total=6, connect=4)
+        deadline = asyncio.get_event_loop().time() + 35  # hard cap for the scan
+
+        # Is the marketplace reachable from this host at all? One quick request
+        # answers that, instead of every probe silently timing out in turn.
+        try:
+            async with self._session.get(
+                MAIN_URL + "/", timeout=aiohttp.ClientTimeout(total=10, connect=6),
+                headers=self._host_headers(MAIN_URL), allow_redirects=True,
+            ) as resp:
+                reach = f"HTTP {resp.status}"
+                logger.info("reachability %s → %s", MAIN_URL, resp.status)
+        except Exception as e:
+            return False, (
+                f"🌐 <b>Сайт {MAIN_URL} недоступен с сервера бота.</b>\n\n"
+                f"<code>{str(e)[:200]}</code>\n\n"
+                "Хостинг блокирует запросы к нему. Войдите через "
+                "<b>🍪 Вставить cookies</b> — это работает без обращений к сайту."
+            )
 
         # Laravel CSRF handshake + pick up a _token from the login page
         for csrf_path in ("/sanctum/csrf-cookie", "/api/csrf-cookie", "/csrf-cookie"):
@@ -367,6 +385,9 @@ class YooMarketPanelHTTP:
         # user just watches a frozen "requesting code" message.
         async def _run(jobs: list[tuple[str, str, dict]]) -> bool:
             for i in range(0, len(jobs), 12):
+                if asyncio.get_event_loop().time() > deadline:
+                    logger.warning("send_code: deadline reached, stopping scan")
+                    return False
                 batch = jobs[i:i + 12]
                 results = await asyncio.gather(
                     *[_probe(b, p, pl) for b, p, pl in batch],
@@ -394,6 +415,7 @@ class YooMarketPanelHTTP:
 
         hint = (f"\n\n<b>Проверка кода:</b> <code>{self._verify_path}</code> "
                 f"на {self._auth_host}" if self._verify_path else "")
+        hint += f"\n<b>Доступность {MAIN_URL}:</b> {reach}"
         miss = ", ".join(dict.fromkeys(m.lstrip("/") for m in missing))[:300] or "—"
         return False, (
             f"🔍 <b>Не нашёл, куда отправлять код.</b>{hint}\n\n"
