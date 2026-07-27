@@ -320,96 +320,189 @@ class YooMarketPanelHTTP:
             "/otp/send",
             "/auth/otp",
         ]
-        all_paths = list(dict.fromkeys(discovered + fallback_paths))
+        # Step 3b: the panel is a Laravel+Inertia app, so its real route table is
+        # published to the frontend (Ziggy). Reading it beats guessing paths —
+        # everything not in that table answers "route could not be found".
+        routes, routes_debug = await self._discover_ziggy_routes()
 
-        diag_lines = []
+        all_paths = list(dict.fromkeys(routes + discovered + fallback_paths))
+
+        interesting: list[str] = []   # responses worth showing
+        missing: list[str] = []       # plain 404s — collapse into one line
         first_422: tuple[str, str] | None = None
-        for path in all_paths:
+
+        async def _probe(path: str, payload: dict) -> tuple[bool, str]:
+            """POST payload to path. Returns (is_send_endpoint, '')."""
+            nonlocal first_422
             try:
                 async with self._session.post(
                     PANEL_URL + path,
-                    json={"email": self._email},
+                    json=payload,
                     headers=extra_headers,
                     timeout=timeout,
                     allow_redirects=False,
                 ) as resp:
                     text = await resp.text()
-                    short = text[:100].replace("\n", " ")
-                    diag_lines.append(f"<code>{path}</code> → <b>{resp.status}</b>: {short}")
                     logger.info("POST %s → %s: %s", path, resp.status, text[:300])
-                    if resp.status in (200, 201):
-                        # Guard against the SPA catch-all returning its HTML shell
-                        # with a 200 — that is not the code-send API.
-                        if _looks_like_html(text):
-                            continue
+                    if resp.status == 404 and "could not be found" in text:
+                        missing.append(path)
+                        return False, ""
+                    short = text[:90].replace("\n", " ")
+                    interesting.append(
+                        f"<code>{path}</code> → <b>{resp.status}</b>: {short}")
+                    if resp.status in (200, 201, 302) and not _looks_like_html(text):
                         self._send_path = path
                         return True, ""
                     if resp.status == 422:
                         low = text.lower()
-                        # A 422 demanding a password means we hit the classic
-                        # password-login route (e.g. /login), NOT the send-code
-                        # route — keep looking.
                         if "password" in low:
-                            continue
-                        # A 422 demanding a code means we hit the VERIFY route
-                        # (e.g. /code). Remember it for verify_code() and keep
-                        # looking for the route that actually sends the code.
+                            return False, ""
                         if '"code"' in low or "код" in low:
                             if not self._verify_path:
                                 self._verify_path = path
-                            continue
-                        # Otherwise the endpoint is real but rejected our data
-                        # (e.g. unknown email). Remember it, but a clean 200
-                        # elsewhere still wins.
+                            return False, ""
                         if first_422 is None:
                             first_422 = (path, text)
             except Exception as e:
-                diag_lines.append(f"<code>{path}</code> → {str(e)[:60]}")
+                interesting.append(f"<code>{path}</code> → {str(e)[:60]}")
+            return False, ""
 
-        # Second pass: the send route is usually a sibling of the verify route
-        # (e.g. /code → /code/send). Only worth doing once we know the latter.
+        # Pass 1: every candidate route, plain {email}
+        for path in all_paths:
+            ok, _ = await _probe(path, {"email": self._email})
+            if ok:
+                return True, ""
+
+        # Pass 2: siblings of the verify route (/code → /code/send, ...)
         if self._verify_path:
             base = self._verify_path.rstrip("/")
-            siblings = [
+            for path in dict.fromkeys([
                 f"{base}/send", f"{base}/request", f"{base}/new",
                 f"{base}/resend", f"{base}/email", f"{base}/create",
-                base.rsplit("/", 1)[0] + "/send-code" if "/" in base.strip("/") else "/send-code",
-            ]
-            for path in dict.fromkeys(siblings):
+                f"{base}-send", f"{base}/get",
+            ]):
                 if path in all_paths:
                     continue
+                ok, _ = await _probe(path, {"email": self._email})
+                if ok:
+                    return True, ""
+
+        # Pass 3: the live routes take {email} plus a flag — some passwordless
+        # setups reuse the verify route to (re)send the code.
+        for path in [p for p in (self._verify_path, "/login") if p]:
+            for payload in (
+                {"email": self._email, "send": True},
+                {"email": self._email, "resend": True},
+                {"email": self._email, "code": ""},
+            ):
+                ok, _ = await _probe(path, payload)
+                if ok:
+                    return True, ""
+
+        # Pass 4: maybe the code is requested with GET on the verify route
+        if self._verify_path:
+            for path in (self._verify_path, self._verify_path + "/send"):
                 try:
-                    async with self._session.post(
+                    async with self._session.get(
                         PANEL_URL + path,
-                        json={"email": self._email},
+                        params={"email": self._email},
                         headers=extra_headers,
                         timeout=timeout,
                         allow_redirects=False,
                     ) as resp:
                         text = await resp.text()
-                        short = text[:100].replace("\n", " ")
-                        diag_lines.append(
-                            f"<code>{path}</code> → <b>{resp.status}</b>: {short}")
-                        logger.info("POST %s → %s: %s", path, resp.status, text[:300])
+                        logger.info("GET %s → %s: %s", path, resp.status, text[:200])
+                        if resp.status == 404 and "could not be found" in text:
+                            continue
+                        short = text[:90].replace("\n", " ")
+                        interesting.append(
+                            f"GET <code>{path}</code> → <b>{resp.status}</b>: {short}")
                         if resp.status in (200, 201) and not _looks_like_html(text):
                             self._send_path = path
                             return True, ""
-                except Exception as e:
-                    diag_lines.append(f"<code>{path}</code> → {str(e)[:60]}")
+                except Exception:
+                    pass
 
         if first_422 is not None:
             path, text = first_422
             self._send_path = path
             return False, f"422 на <code>{path}</code>:\n<code>{text[:300]}</code>"
 
-        diag = "\n".join(diag_lines[:25])
-        hint = (f"\n\n<b>Похоже, проверка кода:</b> <code>{self._verify_path}</code>"
+        hint = (f"\n\n<b>Проверка кода:</b> <code>{self._verify_path}</code>"
                 if self._verify_path else "")
+        miss = ", ".join(m.lstrip("/") for m in missing[:30]) or "—"
         return False, (
             f"🔍 <b>Не нашёл, куда отправлять код.</b>{hint}\n\n"
-            f"<b>Поиск по JS:</b>\n{disc_debug}\n\n"
-            f"<b>Ответы сервера:</b>\n{diag}"
+            f"<b>Маршруты приложения:</b>\n{routes_debug}\n\n"
+            f"<b>JS:</b> {disc_debug}\n\n"
+            f"<b>Существующие (ответили):</b>\n" + "\n".join(interesting[:15]) +
+            f"\n\n<b>Не существует ({len(missing)}):</b> <code>{miss[:400]}</code>"
         )
+
+    async def _discover_ziggy_routes(self) -> tuple[list[str], str]:
+        """Read the app's own route table instead of guessing URLs.
+
+        Laravel+Inertia panels ship their routes to the frontend via Ziggy, as
+        {"uri":"code","methods":["POST"],...} entries embedded in the page (or
+        in a JS bundle). Anything absent from that table answers "route could
+        not be found", so this is the only reliable source of real endpoints.
+        Returns (auth_related_paths, debug_info).
+        """
+        uris: list[str] = []
+        debug: list[str] = []
+        timeout = aiohttp.ClientTimeout(total=20)
+
+        blobs: list[str] = []
+        try:
+            async with self._session.get(PANEL_URL + "/login", timeout=timeout) as resp:
+                blobs.append(await resp.text())
+        except Exception as e:
+            debug.append(f"HTML: {str(e)[:40]}")
+
+        # Ziggy is often split into its own JS asset
+        if blobs:
+            for src in re.findall(
+                r'["\'](/(?:assets|build|js)/[^"\']*(?:ziggy|route|app)[^"\']*\.js)["\']',
+                blobs[0], re.I,
+            )[:4]:
+                try:
+                    async with self._session.get(PANEL_URL + src, timeout=timeout) as r:
+                        blobs.append(await r.text())
+                except Exception:
+                    continue
+
+        for blob in blobs:
+            # Ziggy entry: "uri":"code"  /  'uri':'admin/users/{user}'
+            uris += re.findall(r'["\']uri["\']\s*:\s*["\']([^"\']{1,80})["\']', blob)
+            # Inertia/Ziggy named-route map: "login":{"uri":"login"...}
+            uris += re.findall(r'["\']url["\']\s*:\s*["\']/([a-z0-9/_-]{2,60})["\']', blob, re.I)
+
+        clean: list[str] = []
+        for u in uris:
+            u = u.strip()
+            if not u or "{" in u or u.startswith("http"):
+                continue
+            p = u if u.startswith("/") else "/" + u
+            if p not in clean:
+                clean.append(p)
+
+        debug.append(f"всего маршрутов: {len(clean)}")
+
+        kws = ("code", "otp", "auth", "login", "email", "verify", "confirm",
+               "send", "sign", "password")
+        auth_paths = [p for p in clean if any(k in p.lower() for k in kws)]
+
+        def _rank(p: str) -> int:
+            pl = p.lower()
+            if any(k in pl for k in ("send", "otp")) or pl.endswith("/code"):
+                return 0
+            if pl.rstrip("/") in ("/login", "/api/login"):
+                return 2
+            return 1
+
+        auth_paths.sort(key=_rank)
+        debug.append(f"похожие на вход: {auth_paths[:12] or 'нет'}")
+        return auth_paths[:25], " | ".join(debug)
 
     async def _discover_api_paths(self) -> tuple[list[str], str]:
         """Fetch every JS bundle of the login SPA and extract candidate auth
