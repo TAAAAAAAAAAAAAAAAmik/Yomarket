@@ -458,6 +458,103 @@ class YooMarketPanelHTTP:
 
         return False, "❌ Неверный код или срок действия истёк."
 
+    async def login_password(self, email: str, password: str) -> tuple[bool, str]:
+        """
+        Email + password login via the panel's Laravel /login endpoint.
+        Returns (True, cookie_string) on success, (False, human_error) otherwise.
+        """
+        if not self._session:
+            return False, "Сессия не запущена"
+
+        self._email = email.strip()
+        timeout = aiohttp.ClientTimeout(total=15)
+
+        # Step 1: Sanctum CSRF handshake (sets the XSRF-TOKEN cookie)
+        for csrf_path in ("/sanctum/csrf-cookie", "/api/csrf-cookie", "/csrf-cookie"):
+            try:
+                async with self._session.get(
+                    PANEL_URL + csrf_path, timeout=timeout
+                ) as resp:
+                    if resp.status < 400:
+                        break
+            except Exception:
+                continue
+
+        # Step 2: GET /login to pick up a _token from the HTML if present
+        try:
+            async with self._session.get(PANEL_URL + "/login", timeout=timeout) as resp:
+                html = await resp.text()
+                for pattern in [
+                    r'"csrfToken"\s*:\s*"([^"]+)"',
+                    r'name=["\']_token["\']\s+value=["\']([^"\']+)["\']',
+                    r'"_token"\s*:\s*"([^"]+)"',
+                    r'<meta[^>]+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']',
+                ]:
+                    m = re.search(pattern, html)
+                    if m:
+                        self._csrf = m.group(1)
+                        break
+        except Exception as e:
+            logger.warning("GET /login failed: %s", e)
+
+        xsrf = self._xsrf_token()
+        extra_headers = {"X-XSRF-TOKEN": xsrf} if xsrf else {}
+
+        payload = {"email": self._email, "password": password}
+        if self._csrf:
+            payload["_token"] = self._csrf
+
+        last_err = ""
+        for path in ("/login", "/api/login", "/auth/login", "/api/auth/login"):
+            try:
+                async with self._session.post(
+                    PANEL_URL + path,
+                    json=payload,
+                    headers=extra_headers,
+                    timeout=timeout,
+                    allow_redirects=True,
+                ) as resp:
+                    text = await resp.text()
+                    logger.info("login POST %s → %s: %s", path, resp.status, text[:200])
+                    if resp.status in (200, 201, 204):
+                        cookies = _extract_cookies(self._session, PANEL_URL)
+                        if cookies:
+                            return True, cookies
+                        # Token returned in the JSON body instead of a cookie
+                        try:
+                            data = _json.loads(text)
+                            for key in ("token", "access_token", "api_token"):
+                                if data.get(key):
+                                    return True, f"{key}={data[key]}"
+                        except Exception:
+                            pass
+                        last_err = "вход прошёл, но сессия не получена"
+                        continue
+                    if resp.status == 422:
+                        # Wrong credentials / validation error — surface the message
+                        try:
+                            data = _json.loads(text)
+                            msg = data.get("message") or ""
+                            errs = data.get("errors") or {}
+                            # A "password required" here means the path exists but
+                            # our body wasn't accepted — keep trying other paths.
+                            if "password" in errs and not password:
+                                last_err = msg
+                                continue
+                            return False, msg or "Неверный email или пароль."
+                        except Exception:
+                            return False, f"422: {text[:200]}"
+                    if resp.status in (401, 403):
+                        return False, "Неверный email или пароль."
+                    if resp.status == 419:
+                        last_err = "CSRF token mismatch (419)"
+                        continue
+                    last_err = f"HTTP {resp.status}"
+            except Exception as e:
+                last_err = str(e)[:80]
+
+        return False, last_err or "Не удалось войти. Проверьте email и пароль."
+
 
 def _extract_cookies(session: aiohttp.ClientSession, url: str) -> str:
     """Pull all cookies matching the given URL from an aiohttp session."""

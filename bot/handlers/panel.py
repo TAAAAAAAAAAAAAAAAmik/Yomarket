@@ -15,14 +15,9 @@ from storage import get_panel_creds, save_panel_creds, delete_panel_creds, get_t
 logger = logging.getLogger(__name__)
 router = Router()
 
-# {user_id: YooMarketPanelHTTP} — the live HTTP login session kept between the
-# send_code and verify_code steps (holds cookies + CSRF, no browser needed).
-_login_sessions: dict[int, YooMarketPanelHTTP] = {}
-
-
 class PanelState(StatesGroup):
-    waiting_phone = State()
-    waiting_sms_code = State()
+    waiting_email = State()
+    waiting_password = State()
     waiting_cookies = State()
 
 
@@ -81,16 +76,6 @@ async def _refresh_menu(callback: CallbackQuery) -> None:
         reply_markup=_menu_kb(creds, has_token),
     )
     await callback.answer()
-
-
-async def _close_session(uid: int) -> None:
-    """Close and remove any active HTTP login session for the user."""
-    inst = _login_sessions.pop(uid, None)
-    if inst:
-        try:
-            await inst.close()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -182,118 +167,74 @@ async def panel_token_login(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "panel:sms_start")
 async def panel_email_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(PanelState.waiting_phone)
+    await state.set_state(PanelState.waiting_email)
     await callback.message.edit_text(
-        "📧 <b>Вход через email</b>\n\n"
-        "Введите электронную почту, привязанную к аккаунту YooMarket:\n\n"
+        "📧 <b>Вход по email и паролю</b>\n\n"
+        "Введите <b>email</b>, привязанный к аккаунту YooMarket:\n\n"
         "<i>Пример: mail@example.com</i>",
         reply_markup=_cancel_kb(),
     )
     await callback.answer()
 
 
-@router.message(PanelState.waiting_phone)
+@router.message(PanelState.waiting_email)
 async def panel_email_input(message: Message, state: FSMContext) -> None:
     email = (message.text or "").strip()
     if not email or "@" not in email:
         await message.answer("❌ Введите корректный email адрес")
         return
 
-    uid = message.from_user.id
-    await _close_session(uid)
-
-    status_msg = await message.answer("⏳ Отправляю код на почту...")
-
-    # HTTP-only login (no browser): send the OTP code to the email via the
-    # panel's own API. Works on any host, including the lean free-tier image.
-    http = YooMarketPanelHTTP()
-    try:
-        await http.start()
-        ok, err = await asyncio.wait_for(http.send_code(email), timeout=45)
-    except asyncio.TimeoutError:
-        await http.close()
-        await state.clear()
-        await status_msg.edit_text(
-            "⏰ <b>Панель не ответила вовремя.</b>\n\n"
-            "Попробуйте ещё раз или войдите через 🍪 cookies."
-        )
-        b = InlineKeyboardBuilder()
-        b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
-        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
-        b.button(text="↩️ Назад", callback_data="panel:menu")
-        b.adjust(1)
-        await message.answer("Выберите действие:", reply_markup=b.as_markup())
-        return
-    except Exception as e:
-        await http.close()
-        await state.clear()
-        await status_msg.edit_text(f"❌ Ошибка запроса:\n<code>{str(e)[:300]}</code>")
-        b = InlineKeyboardBuilder()
-        b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
-        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
-        b.button(text="↩️ Назад", callback_data="panel:menu")
-        b.adjust(1)
-        await message.answer("Выберите действие:", reply_markup=b.as_markup())
-        return
-
-    if not ok:
-        await http.close()
-        await state.clear()
-        await status_msg.edit_text(f"❌ {err or 'Не удалось отправить код'}")
-        b = InlineKeyboardBuilder()
-        b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
-        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
-        b.button(text="↩️ Назад", callback_data="panel:menu")
-        b.adjust(1)
-        await message.answer("Выберите действие:", reply_markup=b.as_markup())
-        return
-
-    _login_sessions[uid] = http
     await state.update_data(email=email)
-    await state.set_state(PanelState.waiting_sms_code)
-    await status_msg.edit_text(
-        "✅ <b>Код отправлен на почту!</b>\n\n"
-        "Введите <b>код из письма</b>:",
+    await state.set_state(PanelState.waiting_password)
+    await message.answer(
+        "🔑 Теперь введите <b>пароль</b> от аккаунта YooMarket:\n\n"
+        "<i>Сообщение с паролем можно удалить после входа.</i>",
         reply_markup=_cancel_kb(),
     )
 
 
 # ---------------------------------------------------------------------------
-# Email login: step 2 — verify code
+# Email login: step 2 — password → POST /login
 # ---------------------------------------------------------------------------
 
-@router.message(PanelState.waiting_sms_code)
-async def panel_email_code(message: Message, state: FSMContext) -> None:
-    code = (message.text or "").strip()
-    if not code:
-        await message.answer("❌ Введите код из письма")
+@router.message(PanelState.waiting_password)
+async def panel_password_input(message: Message, state: FSMContext) -> None:
+    password = message.text or ""
+    if not password.strip():
+        await message.answer("❌ Введите пароль")
         return
 
+    data = await state.get_data()
+    email = data.get("email", "")
     uid = message.from_user.id
-    http = _login_sessions.get(uid)
-    if not http:
-        await state.clear()
-        await message.answer(
-            "❌ Сессия входа истекла. Начните заново.",
-            reply_markup=_cancel_kb("panel:menu"),
-        )
-        return
 
-    status_msg = await message.answer("⏳ Проверяю код...")
-
+    # Wipe the password message so the plaintext secret doesn't linger in chat.
     try:
-        ok, result = await asyncio.wait_for(http.verify_code(code), timeout=30)
+        await message.delete()
+    except Exception:
+        pass
+
+    status_msg = await message.answer("⏳ Вхожу в панель...")
+
+    http = YooMarketPanelHTTP()
+    try:
+        await http.start()
+        ok, result = await asyncio.wait_for(
+            http.login_password(email, password), timeout=40
+        )
     except asyncio.TimeoutError:
         ok, result = False, "Превышено время ожидания. Попробуйте ещё раз."
+    except Exception as e:
+        ok, result = False, f"Ошибка запроса: {str(e)[:200]}"
     finally:
-        _login_sessions.pop(uid, None)
         try:
-            await asyncio.wait_for(http.close(), timeout=5)
+            await http.close()
         except Exception:
             pass
 
+    await state.clear()
+
     if not ok:
-        await state.clear()
         await status_msg.edit_text(f"❌ {result}")
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
@@ -303,9 +244,6 @@ async def panel_email_code(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите действие:", reply_markup=b.as_markup())
         return
 
-    data = await state.get_data()
-    email = data.get("email", "")
-    await state.clear()
     save_panel_creds(uid, {"login": email, "cookies": result})
 
     # Immediately verify the cookies actually work for the Nova API
