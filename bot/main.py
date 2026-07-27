@@ -154,12 +154,35 @@ async def main() -> None:
     dp.include_router(panel.router)
 
     logger.info("Bot starting…")
+    await _start_health_server()  # для Koyeb/Render/Fly (health-check по $PORT)
     try:
         await task_manager.start_all()
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await bot.session.close()
         logger.info("Bot stopped.")
+
+
+async def _start_health_server() -> None:
+    """Tiny HTTP server on $PORT so platforms that require a listening port
+    (Koyeb, Render, Fly) keep the container alive. No-op if PORT is unset."""
+    port = os.environ.get("PORT")
+    if not port:
+        return
+    try:
+        from aiohttp import web
+        app = web.Application()
+        async def _ok(_req):
+            return web.Response(text="OK — bot running")
+        app.router.add_get("/", _ok)
+        app.router.add_get("/health", _ok)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", int(port))
+        await site.start()
+        logger.info("Health server on :%s", port)
+    except Exception as e:
+        logger.warning("Health server failed: %s", e)
 
 
 if __name__ == "__main__":
