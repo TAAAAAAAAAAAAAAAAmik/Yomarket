@@ -16,6 +16,9 @@ PANEL_URL = "https://panel.yoomarket.net"
 # session up, because the cookies are issued for the shared .yoomarket.net
 # domain. So the code is requested here, not from PANEL_URL.
 MAIN_URL = "https://yoomarket.net"
+# The storefront is a Next.js app, so its login form talks to a separate API
+# host rather than posting to itself — this is the one the bot already uses.
+API_URL = "https://api.yoo.market"
 
 # Email input selectors (страница входа: "Введите электронную почту")
 _EMAIL_SELECTORS = [
@@ -338,6 +341,8 @@ class YooMarketPanelHTTP:
             "/send-code", "/auth/send-code", "/login/code",
             "/api/login", "/api/code", "/api/auth/code",
             "/api/auth/login", "/api/auth/send-code",
+            "/v1/auth/code", "/v1/auth/login", "/v1/auth/send-code",
+            "/integration/v1/auth/code",
         ]
 
         interesting: list[str] = []
@@ -359,7 +364,8 @@ class YooMarketPanelHTTP:
                         missing.append(path + "(405)")
                         return False
                     short = text[:90].replace("\n", " ")
-                    host = "main" if base == MAIN_URL else "panel"
+                    host = {MAIN_URL: "main", API_URL: "api",
+                            PANEL_URL: "panel"}.get(base, base)
                     interesting.append(
                         f"[{host}] <code>{path}</code> → <b>{resp.status}</b>: {short}")
                     if resp.status in (200, 201, 204, 302) and not _looks_like_html(text):
@@ -398,7 +404,8 @@ class YooMarketPanelHTTP:
             return False
 
         # The marketplace first — that is where sellers actually sign in.
-        jobs = [(MAIN_URL, p, {"email": self._email}) for p in candidates]
+        jobs = [(API_URL, p, {"email": self._email}) for p in candidates]
+        jobs += [(MAIN_URL, p, {"email": self._email}) for p in candidates]
         if await _run(jobs):
             return True, ""
 
@@ -2366,6 +2373,12 @@ class YooMarketPanel:
                     return
                 url = request.url
                 if any(x in url for x in (".js", ".css", ".png", ".jpg", ".woff")):
+                    return
+                # Keep only the site's own calls: analytics and anti-fraud
+                # (Sentry, mail.ru fingerprinting, ...) otherwise flood the list
+                # and push the actual login request out of it.
+                if not any(h in url for h in
+                           ("yoomarket.net", "yoo.market", "yoomarket.ru")):
                     return
                 body = ""
                 try:

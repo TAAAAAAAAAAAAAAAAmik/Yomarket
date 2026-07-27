@@ -278,7 +278,7 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         except Exception:
             pass
         await state.clear()
-        seen = "\n".join(panel.captured[:8])
+        seen = "\n".join(panel.captured[:15])
         extra = f"\n\n<b>Запросы страницы:</b>\n<code>{seen[:800]}</code>" if seen else ""
         await status_msg.edit_text(f"❌ {err or 'Не удалось отправить код'}{extra}")
         b = InlineKeyboardBuilder()
@@ -364,7 +364,7 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
         ok, result = False, f"Ошибка запроса: {str(e)[:200]}"
 
     # What the page actually called — this is the recipe for the HTTP version.
-    seen = "\n".join(panel.captured[:12])
+    seen = "\n".join(panel.captured[:15])
     logger.info("LOGIN REQUESTS:\n%s", seen)
 
     _login_sessions.pop(uid, None)
