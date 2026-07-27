@@ -22,10 +22,12 @@ _login_sessions: dict[int, YooMarketPanelHTTP] = {}
 
 
 class PanelState(StatesGroup):
-    # Login: email → password → code (the code step only if the panel asks).
+    # Main flow: email → code mailed by the marketplace.
     waiting_email = State()
-    waiting_pw_password = State()
     waiting_code = State()
+    # Fallback: the panel's own password login.
+    waiting_pw_email = State()
+    waiting_pw_password = State()
     waiting_cookies = State()
 
 
@@ -51,12 +53,12 @@ def _menu_kb(creds: dict | None, has_token: bool = False):
     if creds:
         b.button(text="🔄 Проверить", callback_data="panel:check")
         b.button(text="🚪 Выйти", callback_data="panel:logout")
-        b.button(text="📧 Вход по email", callback_data="panel:sms_start")
+        b.button(text="📧 Вход по коду", callback_data="panel:sms_start")
         b.button(text="🍪 Обновить cookies", callback_data="panel:cookies_start")
         if has_token:
             b.button(text="🎟 Через токен", callback_data="panel:token_login")
     else:
-        b.button(text="📧 Вход по email", callback_data="panel:sms_start")
+        b.button(text="📧 Вход по коду", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         if has_token:
             b.button(text="🎟 Через токен", callback_data="panel:token_login")
@@ -214,8 +216,8 @@ async def panel_token_login(callback: CallbackQuery) -> None:
 async def panel_email_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PanelState.waiting_email)
     await callback.message.edit_text(
-        "📧 <b>Вход в панель</b>\n\n"
-        "Введите <b>email</b>, привязанный к аккаунту YooMarket:\n\n"
+        "📧 <b>Вход по коду</b>\n\n"
+        "Введите <b>email</b> от аккаунта YooMarket — на него придёт код:\n\n"
         "<i>Пример: mail@example.com</i>",
         reply_markup=_cancel_kb(),
     )
@@ -229,12 +231,78 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Введите корректный email адрес")
         return
 
+    uid = message.from_user.id
+    old = _login_sessions.pop(uid, None)
+    if old:
+        try:
+            await old.close()
+        except Exception:
+            pass
+
+    status_msg = await message.answer("⏳ Запрашиваю код на почту...")
+
+    http = YooMarketPanelHTTP()
+    try:
+        await http.start()
+        ok, err = await asyncio.wait_for(http.send_code(email), timeout=90)
+    except asyncio.TimeoutError:
+        ok, err = False, "Сайт не ответил вовремя. Попробуйте ещё раз."
+    except Exception as e:
+        ok, err = False, f"Ошибка запроса: {str(e)[:200]}"
+
+    if not ok:
+        try:
+            await http.close()
+        except Exception:
+            pass
+        await state.clear()
+        await status_msg.edit_text(f"❌ {err or 'Не удалось отправить код'}")
+        b = InlineKeyboardBuilder()
+        b.button(text="🔑 Войти по паролю", callback_data="panel:pw_start")
+        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
+        b.button(text="↩️ Назад", callback_data="panel:menu")
+        b.adjust(1)
+        await message.answer("Выберите действие:", reply_markup=b.as_markup())
+        return
+
+    _login_sessions[uid] = http
+    await state.update_data(email=email)
+    await state.set_state(PanelState.waiting_code)
+    await status_msg.edit_text(
+        "✅ <b>Код отправлен на почту!</b>\n\n"
+        "Введите <b>код из письма</b>:",
+        reply_markup=_cancel_kb(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Password login — kept for the panel's own admin login
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "panel:pw_start")
+async def panel_pw_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(PanelState.waiting_pw_email)
+    await callback.message.edit_text(
+        "🔑 <b>Вход по паролю</b>\n\n"
+        "Запасной вариант, если у аккаунта задан пароль.\n\n"
+        "Введите <b>email</b>:",
+        reply_markup=_cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(PanelState.waiting_pw_email)
+async def panel_pw_email_input(message: Message, state: FSMContext) -> None:
+    email = (message.text or "").strip()
+    if not email or "@" not in email:
+        await message.answer("❌ Введите корректный email адрес")
+        return
+
     await state.update_data(email=email)
     await state.set_state(PanelState.waiting_pw_password)
     await message.answer(
-        "🔑 Введите <b>пароль</b> от аккаунта YooMarket:\n\n"
-        "<i>Если панель запросит код из письма — я спрошу его следующим шагом.\n"
-        "Сообщение с паролем будет удалено автоматически.</i>",
+        "🔑 Теперь введите <b>пароль</b>:\n\n"
+        "<i>Сообщение с паролем будет удалено автоматически.</i>",
         reply_markup=_cancel_kb(),
     )
 

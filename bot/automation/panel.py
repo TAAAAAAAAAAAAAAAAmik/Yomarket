@@ -11,6 +11,11 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 PANEL_URL = "https://panel.yoomarket.net"
+# The seller panel has no login of its own for sellers: you sign in on the
+# marketplace itself (email → code from the letter) and the panel picks that
+# session up, because the cookies are issued for the shared .yoomarket.net
+# domain. So the code is requested here, not from PANEL_URL.
+MAIN_URL = "https://yoomarket.net"
 
 # Email input selectors (страница входа: "Введите электронную почту")
 _EMAIL_SELECTORS = [
@@ -212,6 +217,8 @@ class YooMarketPanelHTTP:
         # A path that answered "code required" during the scan — that is the
         # verify endpoint itself, so verify_code() should try it first.
         self._verify_path: str = ""
+        # Host that actually handles the login (the marketplace, normally).
+        self._auth_host: str = MAIN_URL
 
     async def start(self) -> None:
         connector = aiohttp.TCPConnector(ssl=False)
@@ -249,8 +256,14 @@ class YooMarketPanelHTTP:
 
     async def send_code(self, email: str) -> tuple[bool, str]:
         """
-        POST email to trigger OTP code sent to inbox.
-        Returns (True, '') on success, (False, error) on failure.
+        Ask the marketplace to mail a login code.
+
+        Sellers do not sign in on the panel itself — they sign in on
+        yoomarket.net and the panel reuses that session (cookies are issued for
+        the shared .yoomarket.net domain). So the code is requested from
+        MAIN_URL; PANEL_URL only exposes an admin password login.
+
+        Returns (True, '') on success, (False, error/diagnostic) on failure.
         """
         if not self._session:
             return False, "Сессия не запущена"
@@ -258,185 +271,108 @@ class YooMarketPanelHTTP:
         self._email = email.strip()
         timeout = aiohttp.ClientTimeout(total=12)
 
-        # Step 1: Laravel Sanctum CSRF handshake
+        # Laravel CSRF handshake + pick up a _token from the login page
         for csrf_path in ("/sanctum/csrf-cookie", "/api/csrf-cookie", "/csrf-cookie"):
             try:
                 async with self._session.get(
-                    PANEL_URL + csrf_path, timeout=timeout
+                    MAIN_URL + csrf_path, timeout=timeout
                 ) as resp:
                     if resp.status < 400:
                         break
             except Exception:
                 continue
-
-        # Step 2: GET /login to pick up any _token in HTML
-        try:
-            async with self._session.get(PANEL_URL + "/login", timeout=timeout) as resp:
-                html = await resp.text()
-                for pattern in [
+        for page in ("/login", "/"):
+            try:
+                async with self._session.get(MAIN_URL + page, timeout=timeout) as resp:
+                    html = await resp.text()
+                for pattern in (
                     r'"csrfToken"\s*:\s*"([^"]+)"',
                     r'name=["\']_token["\']\s+value=["\']([^"\']+)["\']',
                     r'"_token"\s*:\s*"([^"]+)"',
                     r'<meta[^>]+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']',
-                ]:
+                ):
                     m = re.search(pattern, html)
                     if m:
                         self._csrf = m.group(1)
                         break
-        except Exception as e:
-            logger.warning("GET /login failed: %s", e)
+                if self._csrf:
+                    break
+            except Exception as e:
+                logger.warning("GET %s failed: %s", page, e)
 
         xsrf = self._xsrf_token()
         extra_headers = {"X-XSRF-TOKEN": xsrf} if xsrf else {}
 
-        # Step 3: Discover real API paths from the JS bundle
-        discovered, disc_debug = await self._discover_api_paths()
-
-        fallback_paths = [
-            # web.php routes (no /api/ prefix) — most likely for Laravel SPA
-            "/auth/send-code",
-            "/auth/email",
-            "/auth/login",
-            "/auth/code",
-            "/send-code",
-            "/login/send-code",
-            "/login/code",
-            "/login/email",
-            "/sign-in",
-            "/auth/sign-in",
-            # api.php routes
-            "/api/auth/send-code",
-            "/api/auth/email",
-            "/api/send-code",
-            "/api/login",
-            "/api/auth/login",
-            "/api/v1/auth/send-code",
-            "/api/v1/auth/email",
-            "/api/user/send-code",
-            # OTP-style routes
-            "/api/auth/otp",
-            "/api/send-otp",
-            "/api/otp/send",
-            "/otp/send",
-            "/auth/otp",
+        candidates = [
+            "/login", "/code", "/auth/code", "/auth/login", "/auth/email",
+            "/send-code", "/auth/send-code", "/login/code", "/email-code",
+            "/api/login", "/api/code", "/api/auth/code", "/api/auth/login",
+            "/api/auth/send-code", "/api/send-code", "/api/v1/auth/code",
+            "/api/auth/email", "/api/otp", "/api/auth/otp",
         ]
-        # Step 3b: the panel is a Laravel+Inertia app, so its real route table is
-        # published to the frontend (Ziggy). Reading it beats guessing paths —
-        # everything not in that table answers "route could not be found".
-        routes, routes_debug = await self._discover_ziggy_routes()
 
-        all_paths = list(dict.fromkeys(routes + discovered + fallback_paths))
+        interesting: list[str] = []
+        missing: list[str] = []
 
-        interesting: list[str] = []   # responses worth showing
-        missing: list[str] = []       # plain 404s — collapse into one line
-        first_422: tuple[str, str] | None = None
-
-        async def _probe(path: str, payload: dict) -> tuple[bool, str]:
-            """POST payload to path. Returns (is_send_endpoint, '')."""
-            nonlocal first_422
+        async def _probe(base: str, path: str, payload: dict) -> bool:
             try:
                 async with self._session.post(
-                    PANEL_URL + path,
-                    json=payload,
-                    headers=extra_headers,
-                    timeout=timeout,
-                    allow_redirects=False,
+                    base + path, json=payload, headers=extra_headers,
+                    timeout=timeout, allow_redirects=False,
                 ) as resp:
                     text = await resp.text()
-                    logger.info("POST %s → %s: %s", path, resp.status, text[:300])
+                    logger.info("POST %s%s → %s: %s", base, path, resp.status, text[:250])
                     if resp.status == 404 and "could not be found" in text:
                         missing.append(path)
-                        return False, ""
+                        return False
+                    if resp.status == 405:
+                        missing.append(path + "(405)")
+                        return False
                     short = text[:90].replace("\n", " ")
+                    host = "main" if base == MAIN_URL else "panel"
                     interesting.append(
-                        f"<code>{path}</code> → <b>{resp.status}</b>: {short}")
-                    if resp.status in (200, 201, 302) and not _looks_like_html(text):
+                        f"[{host}] <code>{path}</code> → <b>{resp.status}</b>: {short}")
+                    if resp.status in (200, 201, 204, 302) and not _looks_like_html(text):
+                        low = text.lower()
+                        # A body that still complains about a missing field is
+                        # not a sent code.
+                        if '"errors"' in low:
+                            return False
+                        self._auth_host = base
                         self._send_path = path
-                        return True, ""
+                        return True
                     if resp.status == 422:
                         low = text.lower()
-                        if "password" in low:
-                            return False, ""
                         if '"code"' in low or "код" in low:
-                            if not self._verify_path:
-                                self._verify_path = path
-                            return False, ""
-                        if first_422 is None:
-                            first_422 = (path, text)
+                            self._auth_host = base
+                            self._verify_path = path
+                        return False
             except Exception as e:
                 interesting.append(f"<code>{path}</code> → {str(e)[:60]}")
-            return False, ""
+            return False
 
-        # Pass 1: every candidate route, plain {email}
-        for path in all_paths:
-            ok, _ = await _probe(path, {"email": self._email})
-            if ok:
-                return True, ""
-
-        # Pass 2: siblings of the verify route (/code → /code/send, ...)
-        if self._verify_path:
-            base = self._verify_path.rstrip("/")
-            for path in dict.fromkeys([
-                f"{base}/send", f"{base}/request", f"{base}/new",
-                f"{base}/resend", f"{base}/email", f"{base}/create",
-                f"{base}-send", f"{base}/get",
-            ]):
-                if path in all_paths:
-                    continue
-                ok, _ = await _probe(path, {"email": self._email})
-                if ok:
+        # The marketplace first — that is where sellers actually sign in.
+        for base in (MAIN_URL, PANEL_URL):
+            for path in candidates:
+                if await _probe(base, path, {"email": self._email}):
                     return True, ""
 
-        # Pass 3: the live routes take {email} plus a flag — some passwordless
-        # setups reuse the verify route to (re)send the code.
-        for path in [p for p in (self._verify_path, "/login") if p]:
-            for payload in (
-                {"email": self._email, "send": True},
-                {"email": self._email, "resend": True},
-                {"email": self._email, "code": ""},
-            ):
-                ok, _ = await _probe(path, payload)
-                if ok:
-                    return True, ""
+        # Some passwordless setups want an explicit intent flag
+        for base in (MAIN_URL,):
+            for path in ("/login", "/code", "/api/login"):
+                for payload in ({"email": self._email, "type": "code"},
+                                {"email": self._email, "send": True},
+                                {"login": self._email}):
+                    if await _probe(base, path, payload):
+                        return True, ""
 
-        # Pass 4: maybe the code is requested with GET on the verify route
-        if self._verify_path:
-            for path in (self._verify_path, self._verify_path + "/send"):
-                try:
-                    async with self._session.get(
-                        PANEL_URL + path,
-                        params={"email": self._email},
-                        headers=extra_headers,
-                        timeout=timeout,
-                        allow_redirects=False,
-                    ) as resp:
-                        text = await resp.text()
-                        logger.info("GET %s → %s: %s", path, resp.status, text[:200])
-                        if resp.status == 404 and "could not be found" in text:
-                            continue
-                        short = text[:90].replace("\n", " ")
-                        interesting.append(
-                            f"GET <code>{path}</code> → <b>{resp.status}</b>: {short}")
-                        if resp.status in (200, 201) and not _looks_like_html(text):
-                            self._send_path = path
-                            return True, ""
-                except Exception:
-                    pass
-
-        if first_422 is not None:
-            path, text = first_422
-            self._send_path = path
-            return False, f"422 на <code>{path}</code>:\n<code>{text[:300]}</code>"
-
-        hint = (f"\n\n<b>Проверка кода:</b> <code>{self._verify_path}</code>"
-                if self._verify_path else "")
-        miss = ", ".join(m.lstrip("/") for m in missing[:30]) or "—"
+        hint = (f"\n\n<b>Проверка кода:</b> <code>{self._verify_path}</code> "
+                f"на {self._auth_host}" if self._verify_path else "")
+        miss = ", ".join(dict.fromkeys(m.lstrip("/") for m in missing))[:300] or "—"
         return False, (
             f"🔍 <b>Не нашёл, куда отправлять код.</b>{hint}\n\n"
-            f"<b>Маршруты приложения:</b>\n{routes_debug}\n\n"
-            f"<b>JS:</b> {disc_debug}\n\n"
-            f"<b>Существующие (ответили):</b>\n" + "\n".join(interesting[:15]) +
-            f"\n\n<b>Не существует ({len(missing)}):</b> <code>{miss[:400]}</code>"
+            f"<b>Ответили:</b>\n" + "\n".join(interesting[:14]) +
+            f"\n\n<b>Нет таких ({len(missing)}):</b> <code>{miss}</code>"
         )
 
     async def probe_login_ui(self) -> str:
@@ -686,24 +622,26 @@ class YooMarketPanelHTTP:
         all_paths = list(dict.fromkeys(derived + guesses))
 
         last_msg = ""
+        host = self._auth_host or MAIN_URL
         for path in all_paths:
             try:
                 async with self._session.post(
-                    PANEL_URL + path,
+                    host + path,
                     json={"email": self._email, "code": code},
                     headers=extra_headers,
                     timeout=timeout,
                     allow_redirects=True,
                 ) as resp:
                     text = await resp.text()
-                    logger.info("verify POST %s → %s: %s", path, resp.status, text[:200])
+                    logger.info("verify POST %s%s → %s: %s",
+                                host, path, resp.status, text[:200])
                     if resp.status == 404 and "could not be found" in text:
                         continue
                     if resp.status in (200, 201, 204, 302) and not _looks_like_html(text):
                         # Only treat it as done once the session really works —
-                        # the panel answers 200 to a wrong code as well.
+                        # the site answers 200 to a wrong code as well.
                         if await self._session_ok():
-                            cookies = _extract_cookies(self._session, PANEL_URL)
+                            cookies = _extract_all_cookies(self._session)
                             if cookies:
                                 return True, cookies
                         try:
@@ -862,6 +800,24 @@ class YooMarketPanelHTTP:
                 last_err = str(e)[:80]
 
         return "error", last_err or "Не удалось войти. Проверьте email и пароль."
+
+
+def _extract_all_cookies(session: aiohttp.ClientSession) -> str:
+    """Merge cookies visible to both hosts.
+
+    Signing in on the marketplace sets cookies for the shared .yoomarket.net
+    domain, which is exactly why the panel accepts that session — so collect
+    from both and let the panel-scoped ones win.
+    """
+    merged: dict[str, str] = {}
+    for url in (MAIN_URL, PANEL_URL):
+        try:
+            for name, cookie in session.cookie_jar.filter_cookies(url).items():
+                if cookie.value:
+                    merged[name] = cookie.value
+        except Exception:
+            continue
+    return "; ".join(f"{k}={v}" for k, v in merged.items())
 
 
 def _extract_cookies(session: aiohttp.ClientSession, url: str) -> str:
