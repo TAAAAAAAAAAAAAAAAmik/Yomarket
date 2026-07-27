@@ -279,7 +279,10 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
             pass
         await state.clear()
         seen = "\n".join(panel.captured[:15])
-        extra = f"\n\n<b>Запросы страницы:</b>\n<code>{seen[:800]}</code>" if seen else ""
+        pages = "\n".join(panel.page_debug[:3])
+        extra = f"\n\n<b>Запросы:</b>\n<code>{seen[:700]}</code>" if seen else ""
+        if pages:
+            extra += f"\n\n<b>Что на странице:</b>\n<code>{pages[:700]}</code>"
         await status_msg.edit_text(f"❌ {err or 'Не удалось отправить код'}{extra}")
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")

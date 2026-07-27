@@ -2364,6 +2364,9 @@ class YooMarketPanel:
         # the browser performs the login, we read off what it called, and the
         # pure-HTTP version is written from that instead of guesswork.
         self.captured: list[str] = []
+        # What each visited page offered when no email field was found —
+        # makes a failed form hunt explainable instead of silent.
+        self.page_debug: list[str] = []
 
     def _watch_requests(self, page) -> None:
         """Record the login requests the page fires."""
@@ -2374,11 +2377,15 @@ class YooMarketPanel:
                 url = request.url
                 if any(x in url for x in (".js", ".css", ".png", ".jpg", ".woff")):
                     return
-                # Keep only the site's own calls: analytics and anti-fraud
-                # (Sentry, mail.ru fingerprinting, ...) otherwise flood the list
-                # and push the actual login request out of it.
-                if not any(h in url for h in
-                           ("yoomarket.net", "yoo.market", "yoomarket.ru")):
+                # Keep only the site's own calls. Match on the HOST, not on the
+                # URL text: trackers embed the page address in their query
+                # string (mc.yandex.com/...?page-url=https://yoomarket.net/),
+                # so a substring test lets exactly the noise through.
+                import urllib.parse
+                host = (urllib.parse.urlparse(url).hostname or "").lower()
+                if not (host.endswith("yoomarket.net")
+                        or host.endswith("yoo.market")
+                        or host.endswith("yoomarket.ru")):
                     return
                 body = ""
                 try:
@@ -2480,21 +2487,34 @@ class YooMarketPanel:
                         return page, context
                 except Exception:
                     pass
-            # No field here — maybe a "Войти" button opens the form
+            # No field here — the storefront opens the form from a button
             for sel in ('button:has-text("Войти")', 'a:has-text("Войти")',
-                        '[href*="login"]'):
+                        'button:has-text("Вход")', '[href*="login"]',
+                        'button:has-text("Профиль")', '[aria-label*="вход" i]'):
                 try:
                     btn = await page.query_selector(sel)
                     if btn:
                         await btn.click()
                         await asyncio.sleep(2)
                         el = await page.query_selector(
-                            'input[type="email"], input[name="email"]')
+                            'input[type="email"], input[name="email"], '
+                            'input[placeholder*="почт" i]')
                         if el:
                             logger.info("login form opened via %s", sel)
                             return page, context
                 except Exception:
                     continue
+
+            # Record what this page offered, so a miss is explainable
+            try:
+                texts = await page.evaluate(
+                    "() => [...document.querySelectorAll('button,a')]"
+                    ".map(e => (e.innerText||'').trim()).filter(t => t && t.length < 30)"
+                    ".slice(0, 25)"
+                )
+                self.page_debug.append(f"{page.url} → {texts}")
+            except Exception:
+                pass
 
         return page, context
 
