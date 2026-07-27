@@ -2352,13 +2352,55 @@ class YooMarketPanel:
         self.cookie_string = cookie_string
         self._playwright = None
         self._browser = None
+        # Every non-GET request the login page makes, as
+        # "METHOD url | payload". This is how the real endpoints get found:
+        # the browser performs the login, we read off what it called, and the
+        # pure-HTTP version is written from that instead of guesswork.
+        self.captured: list[str] = []
+
+    def _watch_requests(self, page) -> None:
+        """Record the login requests the page fires."""
+        def on_request(request):
+            try:
+                if request.method == "GET":
+                    return
+                url = request.url
+                if any(x in url for x in (".js", ".css", ".png", ".jpg", ".woff")):
+                    return
+                body = ""
+                try:
+                    body = (request.post_data or "")[:200]
+                except Exception:
+                    pass
+                entry = f"{request.method} {url}"
+                if body:
+                    entry += f" | {body}"
+                if entry not in self.captured:
+                    self.captured.append(entry)
+                    logger.info("CAPTURED %s", entry)
+            except Exception:
+                pass
+
+        page.on("request", on_request)
 
     async def start(self) -> None:
         from playwright.async_api import async_playwright
         self._playwright = await async_playwright().start()
+        # Lean flags: a free 512 MB instance cannot afford Chromium's default
+        # multi-process layout, and images are useless for a login form.
         self._browser = await self._playwright.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--single-process",
+                "--no-zygote",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--blink-settings=imagesEnabled=false",
+            ],
         )
 
     async def close(self) -> None:
@@ -2389,7 +2431,12 @@ class YooMarketPanel:
     # ------------------------------------------------------------------
 
     async def open_login_page(self) -> tuple[object, object]:
-        """Open a fresh browser context at the login page. Returns (page, context)."""
+        """Open a login page that actually has an email field.
+
+        Sellers sign in on the marketplace and the panel reuses that session
+        (shared .yoomarket.net cookies), so try the marketplace first and fall
+        back to the panel's own login. Returns (page, context).
+        """
         if not self._browser:
             await self.start()
         context = await self._browser.new_context(
@@ -2398,14 +2445,44 @@ class YooMarketPanel:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Mobile Safari/537.36"
             ),
+            viewport={"width": 412, "height": 915},
         )
         page = await context.new_page()
-        try:
-            await page.goto(PANEL_URL + "/login", timeout=20000, wait_until="domcontentloaded")
-        except Exception:
-            pass
-        # Let the SPA render the form
-        await asyncio.sleep(3)
+        self._watch_requests(page)
+
+        for url in (MAIN_URL + "/login", MAIN_URL + "/", PANEL_URL + "/login"):
+            try:
+                await page.goto(url, timeout=25000, wait_until="domcontentloaded")
+            except Exception:
+                continue
+            # Let the SPA render, then check for an email field
+            for _ in range(6):
+                await asyncio.sleep(1)
+                try:
+                    el = await page.query_selector(
+                        'input[type="email"], input[name="email"], '
+                        'input[placeholder*="почт" i], input[placeholder*="mail" i]')
+                    if el:
+                        logger.info("login form found at %s", page.url)
+                        return page, context
+                except Exception:
+                    pass
+            # No field here — maybe a "Войти" button opens the form
+            for sel in ('button:has-text("Войти")', 'a:has-text("Войти")',
+                        '[href*="login"]'):
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn:
+                        await btn.click()
+                        await asyncio.sleep(2)
+                        el = await page.query_selector(
+                            'input[type="email"], input[name="email"]')
+                        if el:
+                            logger.info("login form opened via %s", sel)
+                            return page, context
+                except Exception:
+                    continue
+
         return page, context
 
     async def submit_email(self, page, email: str) -> tuple[bool, str]:
@@ -2581,6 +2658,15 @@ class YooMarketPanel:
             cur_url = page.url
 
             if "/login" not in cur_url and "/auth" not in cur_url and "/signin" not in cur_url:
+                # Warm the panel in the same context so it issues its own
+                # session cookie on top of the shared .yoomarket.net one.
+                try:
+                    await page.goto(PANEL_URL + "/", timeout=20000,
+                                    wait_until="domcontentloaded")
+                    await asyncio.sleep(2)
+                except Exception:
+                    pass
+
                 cookies = await context.cookies()
                 cookie_string = "; ".join(
                     f"{c['name']}={c['value']}" for c in cookies
@@ -2588,7 +2674,7 @@ class YooMarketPanel:
                 )
                 if not cookie_string:
                     cookie_string = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-                logger.info("Login OK: %d cookies, url=%s", len(cookies), cur_url)
+                logger.info("Login OK: %d cookies, url=%s", len(cookies), page.url)
                 return True, cookie_string
 
             # Still on login — extract error message via JS

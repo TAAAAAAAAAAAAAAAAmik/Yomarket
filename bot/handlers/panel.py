@@ -9,7 +9,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from automation.panel import YooMarketPanelHTTP, PanelSession, try_token_login
+from automation.panel import (
+    YooMarketPanel, YooMarketPanelHTTP, PanelSession, try_token_login,
+)
 from storage import get_panel_creds, save_panel_creds, delete_panel_creds, get_token
 
 logger = logging.getLogger(__name__)
@@ -240,40 +242,54 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
             pass
 
     status_msg = await message.answer(
-        "⏳ Запрашиваю код на почту...\n"
-        "<i>Проверяю адреса входа — это занимает до минуты.</i>"
+        "⏳ Открываю страницу входа в браузере...\n"
+        "<i>Первый запуск может занять до минуты.</i>"
     )
 
-    http = YooMarketPanelHTTP()
+    # Driven with a real browser: the site's login cannot be reproduced with
+    # plain requests, and the browser also records the requests it makes, which
+    # is what the HTTP version will later be built from.
+    panel = YooMarketPanel()
+    page = context = None
     try:
-        await http.start()
-        ok, err = await asyncio.wait_for(http.send_code(email), timeout=55)
+        await asyncio.wait_for(panel.start(), timeout=60)
+        page, context = await asyncio.wait_for(panel.open_login_page(), timeout=90)
+        await status_msg.edit_text("⏳ Ввожу email и запрашиваю код...")
+        ok, err = await asyncio.wait_for(panel.submit_email(page, email), timeout=60)
     except asyncio.TimeoutError:
-        ok, err = False, (
-            "Сайт не ответил за 55 секунд.\n\n"
-            "Скорее всего хостинг бота не пропускает запросы к yoomarket.net. "
-            "Войдите через <b>🍪 Вставить cookies</b> — этот способ работает "
-            "всегда, обращений к сайту не требуется."
-        )
+        ok, err = False, "Браузер не успел загрузить страницу входа."
     except Exception as e:
-        ok, err = False, f"Ошибка запроса: {str(e)[:200]}"
+        emsg = str(e)
+        if any(k in emsg.lower() for k in
+               ("executable", "playwright", "browser", "chromium")):
+            err = ("Браузер не установлен в этом образе.\n"
+                   "Нужна пересборка с Chromium — она уже в коде, "
+                   "дождитесь окончания деплоя.")
+        elif "memory" in emsg.lower() or "killed" in emsg.lower():
+            err = ("Браузеру не хватило памяти на бесплатном тарифе (512 МБ).\n"
+                   "Нужен тариф побольше или вход через cookies.")
+        else:
+            err = f"Ошибка браузера:\n<code>{emsg[:300]}</code>"
+        ok = False
 
     if not ok:
         try:
-            await http.close()
+            await panel.close()
         except Exception:
             pass
         await state.clear()
-        await status_msg.edit_text(f"❌ {err or 'Не удалось отправить код'}")
+        seen = "\n".join(panel.captured[:8])
+        extra = f"\n\n<b>Запросы страницы:</b>\n<code>{seen[:800]}</code>" if seen else ""
+        await status_msg.edit_text(f"❌ {err or 'Не удалось отправить код'}{extra}")
         b = InlineKeyboardBuilder()
-        b.button(text="🔑 Войти по паролю", callback_data="panel:pw_start")
+        b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
         b.adjust(1)
         await message.answer("Выберите действие:", reply_markup=b.as_markup())
         return
 
-    _login_sessions[uid] = http
+    _login_sessions[uid] = (panel, page, context)
     await state.update_data(email=email)
     await state.set_state(PanelState.waiting_code)
     await status_msg.edit_text(
@@ -327,8 +343,8 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
         return
 
     uid = message.from_user.id
-    http = _login_sessions.get(uid)
-    if not http:
+    entry = _login_sessions.get(uid)
+    if not entry:
         await state.clear()
         await message.answer(
             "❌ Сессия входа истекла. Начните заново.",
@@ -336,26 +352,34 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
         )
         return
 
+    panel, page, context = entry
     status_msg = await message.answer("⏳ Проверяю код...")
     try:
-        ok, result = await asyncio.wait_for(http.verify_code(code), timeout=40)
+        ok, result = await asyncio.wait_for(
+            panel.submit_code(page, context, code), timeout=60
+        )
     except asyncio.TimeoutError:
         ok, result = False, "Превышено время ожидания. Попробуйте ещё раз."
     except Exception as e:
         ok, result = False, f"Ошибка запроса: {str(e)[:200]}"
-    finally:
-        _login_sessions.pop(uid, None)
-        try:
-            await http.close()
-        except Exception:
-            pass
+
+    # What the page actually called — this is the recipe for the HTTP version.
+    seen = "\n".join(panel.captured[:12])
+    logger.info("LOGIN REQUESTS:\n%s", seen)
+
+    _login_sessions.pop(uid, None)
+    try:
+        await panel.close()
+    except Exception:
+        pass
 
     data = await state.get_data()
     email = data.get("email", "")
     await state.clear()
 
     if not ok:
-        await status_msg.edit_text(f"❌ {result}")
+        extra = f"\n\n<b>Запросы страницы:</b>\n<code>{seen[:900]}</code>" if seen else ""
+        await status_msg.edit_text(f"❌ {result}{extra}")
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
@@ -365,6 +389,11 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
         return
 
     await _finish_login(message, status_msg, uid, email, result)
+    if seen:
+        await message.answer(
+            "🔎 <b>Запросы, которые сделал вход</b> — по ним сделаем "
+            f"версию без браузера:\n<code>{seen[:900]}</code>"
+        )
 
 
 # ---------------------------------------------------------------------------
