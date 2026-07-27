@@ -221,7 +221,10 @@ class YooMarketPanelHTTP:
         self._auth_host: str = MAIN_URL
 
     async def start(self) -> None:
-        connector = aiohttp.TCPConnector(ssl=False)
+        connector = aiohttp.TCPConnector(ssl=False, limit=16)
+        # Origin/Referer must match the host being called — pinning them to the
+        # panel made every request to the marketplace look cross-origin, which
+        # Laravel rejects. They are set per request in _host_headers() instead.
         self._session = aiohttp.ClientSession(
             connector=connector,
             headers={
@@ -232,10 +235,13 @@ class YooMarketPanelHTTP:
                 ),
                 "Accept": "application/json, text/html, */*",
                 "Accept-Language": "ru-RU,ru;q=0.9",
-                "Origin": PANEL_URL,
-                "Referer": PANEL_URL + "/login",
+                "X-Requested-With": "XMLHttpRequest",
             },
         )
+
+    def _host_headers(self, base: str) -> dict:
+        """Origin/Referer for the host actually being called."""
+        return {"Origin": base, "Referer": base + "/login"}
 
     async def close(self) -> None:
         if self._session:
@@ -271,13 +277,14 @@ class YooMarketPanelHTTP:
         self._email = email.strip()
         # Short per-request budget: one unreachable path must not stall the
         # whole scan (batches run concurrently below).
-        timeout = aiohttp.ClientTimeout(total=7, connect=4)
+        timeout = aiohttp.ClientTimeout(total=6, connect=4)
 
         # Laravel CSRF handshake + pick up a _token from the login page
         for csrf_path in ("/sanctum/csrf-cookie", "/api/csrf-cookie", "/csrf-cookie"):
             try:
                 async with self._session.get(
-                    MAIN_URL + csrf_path, timeout=timeout
+                    MAIN_URL + csrf_path, timeout=timeout,
+                    headers=self._host_headers(MAIN_URL),
                 ) as resp:
                     if resp.status < 400:
                         break
@@ -285,7 +292,10 @@ class YooMarketPanelHTTP:
                 continue
         for page in ("/login", "/"):
             try:
-                async with self._session.get(MAIN_URL + page, timeout=timeout) as resp:
+                async with self._session.get(
+                    MAIN_URL + page, timeout=timeout,
+                    headers=self._host_headers(MAIN_URL),
+                ) as resp:
                     html = await resp.text()
                 for pattern in (
                     r'"csrfToken"\s*:\s*"([^"]+)"',
@@ -306,11 +316,10 @@ class YooMarketPanelHTTP:
         extra_headers = {"X-XSRF-TOKEN": xsrf} if xsrf else {}
 
         candidates = [
-            "/login", "/code", "/auth/code", "/auth/login", "/auth/email",
-            "/send-code", "/auth/send-code", "/login/code", "/email-code",
-            "/api/login", "/api/code", "/api/auth/code", "/api/auth/login",
-            "/api/auth/send-code", "/api/send-code", "/api/v1/auth/code",
-            "/api/auth/email", "/api/otp", "/api/auth/otp",
+            "/login", "/code", "/auth/code", "/auth/login",
+            "/send-code", "/auth/send-code", "/login/code",
+            "/api/login", "/api/code", "/api/auth/code",
+            "/api/auth/login", "/api/auth/send-code",
         ]
 
         interesting: list[str] = []
@@ -319,7 +328,8 @@ class YooMarketPanelHTTP:
         async def _probe(base: str, path: str, payload: dict) -> bool:
             try:
                 async with self._session.post(
-                    base + path, json=payload, headers=extra_headers,
+                    base + path, json=payload,
+                    headers={**extra_headers, **self._host_headers(base)},
                     timeout=timeout, allow_redirects=False,
                 ) as resp:
                     text = await resp.text()
@@ -356,8 +366,8 @@ class YooMarketPanelHTTP:
         # Probe in parallel batches — done one by one this takes minutes and the
         # user just watches a frozen "requesting code" message.
         async def _run(jobs: list[tuple[str, str, dict]]) -> bool:
-            for i in range(0, len(jobs), 8):
-                batch = jobs[i:i + 8]
+            for i in range(0, len(jobs), 12):
+                batch = jobs[i:i + 12]
                 results = await asyncio.gather(
                     *[_probe(b, p, pl) for b, p, pl in batch],
                     return_exceptions=True,
@@ -368,7 +378,6 @@ class YooMarketPanelHTTP:
 
         # The marketplace first — that is where sellers actually sign in.
         jobs = [(MAIN_URL, p, {"email": self._email}) for p in candidates]
-        jobs += [(PANEL_URL, p, {"email": self._email}) for p in candidates]
         if await _run(jobs):
             return True, ""
 
@@ -645,7 +654,7 @@ class YooMarketPanelHTTP:
                 async with self._session.post(
                     host + path,
                     json={"email": self._email, "code": code},
-                    headers=extra_headers,
+                    headers={**extra_headers, **self._host_headers(host)},
                     timeout=timeout,
                     allow_redirects=True,
                 ) as resp:
