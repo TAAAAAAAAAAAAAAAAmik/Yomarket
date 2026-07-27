@@ -609,6 +609,7 @@ class YooMarketPanelHTTP:
         ]
         all_paths = list(dict.fromkeys(derived + guesses))
 
+        last_msg = ""
         for path in all_paths:
             try:
                 async with self._session.post(
@@ -620,11 +621,15 @@ class YooMarketPanelHTTP:
                 ) as resp:
                     text = await resp.text()
                     logger.info("verify POST %s → %s: %s", path, resp.status, text[:200])
-                    if resp.status in (200, 201) and not _looks_like_html(text):
-                        cookies = _extract_cookies(self._session, PANEL_URL)
-                        if cookies:
-                            return True, cookies
-                        # Token in JSON body
+                    if resp.status == 404 and "could not be found" in text:
+                        continue
+                    if resp.status in (200, 201, 204, 302) and not _looks_like_html(text):
+                        # Only treat it as done once the session really works —
+                        # the panel answers 200 to a wrong code as well.
+                        if await self._session_ok():
+                            cookies = _extract_cookies(self._session, PANEL_URL)
+                            if cookies:
+                                return True, cookies
                         try:
                             data = _json.loads(text)
                             for key in ("token", "access_token", "api_token"):
@@ -632,18 +637,56 @@ class YooMarketPanelHTTP:
                                     return True, f"{key}={data[key]}"
                         except Exception:
                             pass
+                    if resp.status == 422:
+                        try:
+                            last_msg = (_json.loads(text) or {}).get("message") or ""
+                        except Exception:
+                            last_msg = ""
             except Exception as e:
                 logger.debug("verify_code %s: %s", path, e)
 
-        return False, "❌ Неверный код или срок действия истёк."
+        return False, last_msg or "❌ Неверный код или срок действия истёк."
 
-    async def login_password(self, email: str, password: str) -> tuple[bool, str]:
+    async def _session_ok(self) -> bool:
+        """True if the current cookie jar is an authenticated panel session."""
+        timeout = aiohttp.ClientTimeout(total=10)
+        hdrs = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
+        for path in ("/nova-api/navigation", "/api/user"):
+            try:
+                async with self._session.get(
+                    PANEL_URL + path, headers=hdrs, timeout=timeout,
+                    allow_redirects=False,
+                ) as resp:
+                    if resp.status == 200:
+                        return True
+                    if resp.status in (401, 403):
+                        return False
+            except Exception:
+                continue
+        try:
+            async with self._session.get(
+                PANEL_URL + "/", timeout=timeout, allow_redirects=True,
+            ) as resp:
+                final = str(resp.url)
+                return not any(k in final for k in ("/login", "/code", "/auth"))
+        except Exception:
+            return False
+
+    async def login_password(self, email: str, password: str) -> tuple[str, str]:
         """
-        Email + password login via the panel's Laravel /login endpoint.
-        Returns (True, cookie_string) on success, (False, human_error) otherwise.
+        Email + password login via the panel's Laravel /login route.
+
+        The panel has exactly two auth routes — POST /login (email+password) and
+        POST /code (email+code) — and no route that mails a code on its own, so
+        the code is a second factor issued after a successful password login.
+
+        Returns (status, detail):
+          ("ok",    cookie_string)  — logged in, no code needed
+          ("code",  message)        — password accepted, a code was sent
+          ("error", message)        — login failed
         """
         if not self._session:
-            return False, "Сессия не запущена"
+            return "error", "Сессия не запущена"
 
         self._email = email.strip()
         timeout = aiohttp.ClientTimeout(total=15)
@@ -695,36 +738,46 @@ class YooMarketPanelHTTP:
                 ) as resp:
                     text = await resp.text()
                     logger.info("login POST %s → %s: %s", path, resp.status, text[:200])
-                    if resp.status in (200, 201, 204):
-                        cookies = _extract_cookies(self._session, PANEL_URL)
-                        if cookies:
-                            return True, cookies
-                        # Token returned in the JSON body instead of a cookie
+                    if resp.status in (200, 201, 204, 302):
+                        # Password accepted. Either we already hold a usable
+                        # session, or the panel now wants the emailed code.
+                        if await self._session_ok():
+                            cookies = _extract_cookies(self._session, PANEL_URL)
+                            if cookies:
+                                return "ok", cookies
                         try:
                             data = _json.loads(text)
                             for key in ("token", "access_token", "api_token"):
                                 if data.get(key):
-                                    return True, f"{key}={data[key]}"
+                                    return "ok", f"{key}={data[key]}"
                         except Exception:
                             pass
-                        last_err = "вход прошёл, но сессия не получена"
-                        continue
+                        # Not authenticated yet → the code is the second factor.
+                        self._verify_path = self._verify_path or "/code"
+                        msg = ""
+                        try:
+                            msg = (_json.loads(text) or {}).get("message") or ""
+                        except Exception:
+                            pass
+                        return "code", msg or "Код отправлен на почту."
                     if resp.status == 422:
-                        # Wrong credentials / validation error — surface the message
                         try:
                             data = _json.loads(text)
                             msg = data.get("message") or ""
                             errs = data.get("errors") or {}
-                            # A "password required" here means the path exists but
-                            # our body wasn't accepted — keep trying other paths.
+                            # This route wants a code, not a password — the
+                            # password step already passed on a previous try.
+                            if "code" in errs:
+                                self._verify_path = path
+                                return "code", msg or "Введите код из письма."
                             if "password" in errs and not password:
                                 last_err = msg
                                 continue
-                            return False, msg or "Неверный email или пароль."
+                            return "error", msg or "Неверный email или пароль."
                         except Exception:
-                            return False, f"422: {text[:200]}"
+                            return "error", f"422: {text[:200]}"
                     if resp.status in (401, 403):
-                        return False, "Неверный email или пароль."
+                        return "error", "Неверный email или пароль."
                     if resp.status == 419:
                         last_err = "CSRF token mismatch (419)"
                         continue
@@ -732,7 +785,7 @@ class YooMarketPanelHTTP:
             except Exception as e:
                 last_err = str(e)[:80]
 
-        return False, last_err or "Не удалось войти. Проверьте email и пароль."
+        return "error", last_err or "Не удалось войти. Проверьте email и пароль."
 
 
 def _extract_cookies(session: aiohttp.ClientSession, url: str) -> str:
