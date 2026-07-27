@@ -5,9 +5,11 @@ services:
     env_file:
       - .env
     environment:
-      # Persistent storage in Postgres; FSM state in Redis
-      DATABASE_URL: postgresql://bot:botpass@db:5432/botdb
-      REDIS_URL: redis://redis:6379/0
+      # Persistent storage in Postgres; FSM state in Redis.
+      # Set DATABASE_URL in .env to use a managed database (e.g. Neon) instead
+      # of the local one — the value here is only the fallback.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://bot:botpass@db:5432/botdb}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     depends_on:
       - db
       - redis
