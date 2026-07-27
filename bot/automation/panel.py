@@ -341,11 +341,18 @@ class YooMarketPanelHTTP:
                             continue
                         self._send_path = path
                         return True, ""
-                    # A 422 almost always means we hit the RIGHT endpoint but
-                    # validation failed (e.g. email not registered). Remember the
-                    # first one, but keep scanning for a clean 200 first.
-                    if resp.status == 422 and first_422 is None:
-                        first_422 = (path, text)
+                    if resp.status == 422:
+                        # A 422 demanding a password means we hit the classic
+                        # password-login route (e.g. /login), NOT the send-code
+                        # route — keep looking instead of reporting it as the
+                        # endpoint.
+                        if "password" in text.lower():
+                            continue
+                        # Otherwise the endpoint is real but rejected our data
+                        # (e.g. unknown email). Remember it, but a clean 200
+                        # elsewhere still wins.
+                        if first_422 is None:
+                            first_422 = (path, text)
             except Exception as e:
                 diag_lines.append(f"<code>{path}</code> → {str(e)[:60]}")
 
@@ -358,45 +365,72 @@ class YooMarketPanelHTTP:
         return False, f"🔍 <b>Диагностика JS:</b>\n{disc_debug}\n\n<b>Ответы сервера:</b>\n\n{diag}"
 
     async def _discover_api_paths(self) -> tuple[list[str], str]:
-        """Fetch the JS bundle and extract API paths. Returns (paths, debug_info)."""
-        discovered = []
-        debug = []
+        """Fetch every JS bundle of the login SPA and extract candidate auth
+        endpoints. Returns (paths, debug_info).
+
+        Scans all bundles (not just the first hit) because the login call
+        usually lives in a lazily-loaded chunk, and ranks paths that mention
+        code/OTP above generic auth ones so the code-send route is tried first.
+        """
+        discovered: list[str] = []
+        debug: list[str] = []
         timeout = aiohttp.ClientTimeout(total=15)
         try:
             async with self._session.get(PANEL_URL + "/login", timeout=timeout) as resp:
                 html = await resp.text()
                 debug.append(f"HTML {len(html)}б")
 
-            script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html)
-            js_files = [s for s in script_srcs if ".js" in s]
-            debug.append(f"Скриптов: {len(js_files)} → {[s[-40:] for s in js_files[:3]]}")
+            js_files: list[str] = []
+            js_files += re.findall(
+                r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', html, re.I)
+            js_files += re.findall(
+                r'<link[^>]+href=["\']([^"\']+\.js[^"\']*)["\']', html, re.I)
+            js_files += re.findall(r'["\'](/assets/[^"\']+\.js)["\']', html, re.I)
+            js_files += re.findall(r'["\'](/build/[^"\']+\.js)["\']', html, re.I)
+            js_files = list(dict.fromkeys(js_files))
+            debug.append(f"JS-файлов: {len(js_files)}")
 
-            for src in js_files[:3]:
+            patterns = [
+                r'["\'`]((?:/api)?/[a-z0-9/_-]{3,60})["\'`]',
+                r'\.(?:post|put|patch)\(\s*["\'`](/?[a-z0-9/_-]{3,60})["\'`]',
+                r'axios\.[a-z]+\(["\'`](/?[^"\'`\s]{3,60})["\'`]',
+                r'fetch\(["\'`](/?[^"\'`\s?]{3,60})["\'`]',
+            ]
+            kws = ("auth", "login", "code", "send", "verify", "confirm",
+                   "email", "otp", "sign")
+            total = 0
+            for src in js_files[:10]:
                 url = src if src.startswith("http") else PANEL_URL + src
                 try:
                     async with self._session.get(url, timeout=timeout) as resp:
                         js = await resp.text()
-                    debug.append(f"JS {url[-30:]}: {len(js)}б")
-                    patterns = [
-                        r'["\']((?:/api)?/[a-z0-9/_-]{3,60})["\']',
-                        r'post\(["\`](/?[a-z0-9/_-]{3,60})["\`]',
-                        r'axios\.[a-z]+\(["\`](/?[^"\'`\s]{3,60})["\`]',
-                        r'fetch\(["\`](/?[^"\'`\s?]{3,60})["\`]',
-                    ]
-                    kws = ("auth", "login", "code", "send", "verify", "confirm", "email")
+                    total += len(js)
                     for pat in patterns:
                         for match in re.findall(pat, js, re.I):
-                            if any(kw in match.lower() for kw in kws):
-                                if not match.startswith("http") and match not in discovered:
-                                    discovered.append(match)
-                    if discovered:
-                        break
+                            m = match if match.startswith("/") else "/" + match
+                            if any(kw in m.lower() for kw in kws) \
+                                    and not m.startswith("http") \
+                                    and m not in discovered:
+                                discovered.append(m)
                 except Exception as e:
-                    debug.append(f"JS ошибка: {e}")
-        except Exception as e:
-            debug.append(f"Ошибка: {e}")
+                    debug.append(f"JS {url[-24:]}: {str(e)[:30]}")
+            debug.append(f"JS прочитано: {total}б")
 
-        debug.append(f"Найдено путей: {discovered[:5]}")
+            # Rank code/OTP-specific routes first — a generic /login is the
+            # password route and must not shadow the real send-code endpoint.
+            def _rank(p: str) -> int:
+                pl = p.lower()
+                if any(k in pl for k in ("send", "code", "otp")):
+                    return 0
+                if pl.rstrip("/") in ("/login", "/api/login"):
+                    return 2
+                return 1
+
+            discovered.sort(key=_rank)
+        except Exception as e:
+            debug.append(f"Ошибка: {str(e)[:60]}")
+
+        debug.append(f"Найдено: {discovered[:8] or 'ничего'}")
         return discovered, " | ".join(debug)
 
     async def verify_code(self, code: str) -> tuple[bool, str]:
