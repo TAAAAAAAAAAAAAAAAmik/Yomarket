@@ -101,6 +101,14 @@ async def _click_first(page, selectors: list[str]) -> bool:
     return False
 
 
+def _looks_like_html(text: str) -> bool:
+    """True if a response body is the SPA's HTML shell rather than a JSON API
+    reply. A Laravel SPA serves index.html with 200 for unknown routes, which
+    would otherwise be mistaken for a successful send-code/verify call."""
+    head = (text or "").lstrip()[:200].lower()
+    return head.startswith("<!doctype") or head.startswith("<html") or "<head" in head
+
+
 async def try_token_login(api_token: str) -> tuple[bool, str]:
     """
     Try to log into the panel using the existing API token (token exchange / SSO).
@@ -198,6 +206,9 @@ class YooMarketPanelHTTP:
         self._session: aiohttp.ClientSession | None = None
         self._email: str = ""
         self._csrf: str = ""
+        # The send-code path that actually worked — used to derive the matching
+        # verify path (same base) in verify_code().
+        self._send_path: str = ""
 
     async def start(self) -> None:
         connector = aiohttp.TCPConnector(ssl=False)
@@ -299,10 +310,17 @@ class YooMarketPanelHTTP:
             "/api/v1/auth/send-code",
             "/api/v1/auth/email",
             "/api/user/send-code",
+            # OTP-style routes
+            "/api/auth/otp",
+            "/api/send-otp",
+            "/api/otp/send",
+            "/otp/send",
+            "/auth/otp",
         ]
         all_paths = list(dict.fromkeys(discovered + fallback_paths))
 
         diag_lines = []
+        first_422: tuple[str, str] | None = None
         for path in all_paths:
             try:
                 async with self._session.post(
@@ -317,11 +335,24 @@ class YooMarketPanelHTTP:
                     diag_lines.append(f"<code>{path}</code> → <b>{resp.status}</b>: {short}")
                     logger.info("POST %s → %s: %s", path, resp.status, text[:300])
                     if resp.status in (200, 201):
+                        # Guard against the SPA catch-all returning its HTML shell
+                        # with a 200 — that is not the code-send API.
+                        if _looks_like_html(text):
+                            continue
+                        self._send_path = path
                         return True, ""
-                    if resp.status == 422:
-                        return False, f"422 на <code>{path}</code>:\n<code>{text[:400]}</code>"
+                    # A 422 almost always means we hit the RIGHT endpoint but
+                    # validation failed (e.g. email not registered). Remember the
+                    # first one, but keep scanning for a clean 200 first.
+                    if resp.status == 422 and first_422 is None:
+                        first_422 = (path, text)
             except Exception as e:
                 diag_lines.append(f"<code>{path}</code> → {str(e)[:60]}")
+
+        if first_422 is not None:
+            path, text = first_422
+            self._send_path = path  # treat as the real endpoint for verify
+            return False, f"422 на <code>{path}</code>:\n<code>{text[:400]}</code>"
 
         diag = "\n".join(diag_lines)
         return False, f"🔍 <b>Диагностика JS:</b>\n{disc_debug}\n\n<b>Ответы сервера:</b>\n\n{diag}"
@@ -379,16 +410,27 @@ class YooMarketPanelHTTP:
         xsrf = self._xsrf_token()
         extra_headers = {"X-XSRF-TOKEN": xsrf} if xsrf else {}
 
-        json_paths = [
-            "/api/auth/verify",
-            "/api/auth/confirm",
-            "/api/verify",
-            "/api/auth/check-code",
-            "/api/login/verify",
-            "/api/v1/auth/verify",
-            "/api/v1/auth/confirm",
+        # Derive verify candidates from the send-code path that actually worked
+        # (e.g. /auth/send-code → /auth/verify, /auth/confirm, /auth/code).
+        derived: list[str] = []
+        if self._send_path:
+            base = self._send_path.rsplit("/", 1)[0]
+            for tail in ("verify", "confirm", "check-code", "check", "code",
+                         "verify-code", "confirm-code", "login"):
+                derived.append(f"{base}/{tail}")
+
+        guesses = [
+            # web.php routes
+            "/auth/verify", "/auth/confirm", "/auth/code", "/auth/check-code",
+            "/login/verify", "/login/code", "/verify-code", "/verify",
+            # api.php routes
+            "/api/auth/verify", "/api/auth/confirm", "/api/verify",
+            "/api/auth/check-code", "/api/login/verify", "/api/v1/auth/verify",
+            "/api/v1/auth/confirm", "/api/auth/otp", "/api/verify-otp",
         ]
-        for path in json_paths:
+        all_paths = list(dict.fromkeys(derived + guesses))
+
+        for path in all_paths:
             try:
                 async with self._session.post(
                     PANEL_URL + path,
@@ -399,7 +441,7 @@ class YooMarketPanelHTTP:
                 ) as resp:
                     text = await resp.text()
                     logger.info("verify POST %s → %s: %s", path, resp.status, text[:200])
-                    if resp.status in (200, 201):
+                    if resp.status in (200, 201) and not _looks_like_html(text):
                         cookies = _extract_cookies(self._session, PANEL_URL)
                         if cookies:
                             return True, cookies
