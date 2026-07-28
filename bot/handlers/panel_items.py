@@ -565,14 +565,22 @@ async def items_debug(message: Message) -> None:
         fields = row.get("fields")
         if isinstance(fields, dict):
             fields = list(fields.values())
+        from automation.panel import _html_badges, _strip_html
+
         for f in (fields or [])[:14]:
             if not isinstance(f, dict):
                 continue
             val = f.get("value")
             if isinstance(val, (dict, list)):
-                val = _json.dumps(val, ensure_ascii=False)[:60]
-            out.append(f"• {f.get('attribute')} | {f.get('name')} = "
-                       f"{str(val)[:60]}")
+                val = _json.dumps(val, ensure_ascii=False)[:80]
+            name = str(f.get("name") or "")
+            line = f"• {f.get('attribute')} | {name} = {str(val)[:80]}"
+            # These columns render HTML; show what is actually read out of them
+            if isinstance(val, str) and "<" in val:
+                badges = _html_badges(val)
+                line += (f"\n   → бейджи: {badges}" if badges
+                         else f"\n   → текст: {_strip_html(val)[:80]}")
+            out.append(line)
         return "\n".join(out)
 
     status = await message.answer("⏳ Читаю структуру товара...")

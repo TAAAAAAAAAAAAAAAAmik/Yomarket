@@ -956,6 +956,32 @@ _CAT_ATTRS = ("category", "subcategory", "categories", "type", "ad", "game",
               "group", "adGroup", "ad_group", "product")
 
 
+def _strip_html(value) -> str:
+    """Plain text out of a Nova ComputedField, which renders raw HTML."""
+    if not isinstance(value, str):
+        return "" if value is None else str(value)
+    text = re.sub(r"<[^>]+>", " ", value)
+    import html as _h
+    return " ".join(_h.unescape(text).split())
+
+
+def _html_badges(value) -> list[str]:
+    """Texts of the <span> badges inside a ComputedField.
+
+    The listing rows carry no category field; what a seller reads as the
+    category lives in these badges of the «Детали» column.
+    """
+    if not isinstance(value, str):
+        return []
+    import html as _h
+    out = []
+    for chunk in re.findall(r"<span[^>]*>(.*?)</span>", value, re.S | re.I):
+        txt = " ".join(_h.unescape(re.sub(r"<[^>]+>", " ", chunk)).split())
+        if txt:
+            out.append(txt)
+    return out
+
+
 def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
     """Blocking: list items from the panel. Returns (True, [{id,title,price}])
     or (False, error)."""
@@ -994,7 +1020,7 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
         if isinstance(row_title, dict):
             row_title = row_title.get("value") or ""
         info = {"id": str(rid), "title": str(row_title or ""), "price": "",
-                "public": None, "category": "", "stock": None}
+                "public": None, "category": "", "stock": None, "badges": []}
         cat_rank = 99  # lower = better source for the grouping label
         seen_attrs: list[str] = []
         _vis_kws = ("public", "visible", "active", "published", "status",
@@ -1018,9 +1044,17 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
             elif not info["price"] and (
                     "price" in fa.lower() or "цен" in fn.lower()
                     or "стоим" in fn.lower()):
-                v = f.get("value")
-                if v not in (None, ""):
-                    info["price"] = str(v)
+                # Rendered as HTML by ComputedField: "<div ...>149 ₽</div>"
+                txt = _strip_html(f.get("value")).replace("₽", "").strip()
+                if txt:
+                    info["price"] = txt
+            elif "детал" in fn.lower() or "detail" in fa.lower():
+                # Badges hold what the seller reads as the category
+                badges = _html_badges(f.get("value"))
+                if badges and cat_rank > 1:
+                    info["category"] = badges[0]
+                    cat_rank = 1
+                    info["badges"] = badges[:6]
             elif (fa in _CAT_ATTRS or "категор" in fn.lower()
                   or f.get("belongsToRelationship") or f.get("belongsToId")):
                 # The grouping value is a belongsTo. On this panel an item
