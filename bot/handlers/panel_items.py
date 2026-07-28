@@ -54,140 +54,128 @@ async def _run(uid: int, fn, *args):
 
 
 @router.callback_query(F.data == "pitems:cats")
-async def list_categories(callback: CallbackQuery) -> None:
-    """Seller's categories; picking one lists that category's items."""
-    from automation.panel import panel_list_categories_sync
+async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    """Seller's categories, grouped from the API.
+
+    The panel's item rows carry no category at all — only the API does, as
+    category_id, which the reference list turns into a name.
+    """
+    if not api:
+        await callback.message.edit_text(
+            "⚠️ Не настроен API-токен.", reply_markup=_no_session_kb())
+        await callback.answer()
+        return
 
     await callback.message.edit_text("⏳ Загружаю категории...")
-    result, err = await _run(callback.from_user.id, panel_list_categories_sync)
-    if err == "no_session":
+    try:
+        data = await api.get_ads()
+        ads = data.get("data") or data.get("items") or []
+        names = await _category_names(api, callback.from_user.id)
+    except Exception as e:
         await callback.message.edit_text(
-            "❌ Нет сессии панели. Войдите через email.",
-            reply_markup=_no_session_kb())
-        await callback.answer()
-        return
-    if result is None or not result[0]:
-        detail = result[1] if result else err
-        await callback.message.edit_text(
-            f"❌ Не удалось получить категории:\n{detail}",
+            f"❌ Не удалось загрузить объявления:\n<code>{str(e)[:200]}</code>",
             reply_markup=_no_session_kb())
         await callback.answer()
         return
 
-    cats = result[1]
-    _CAT_CACHE[callback.from_user.id] = [c["name"] for c in cats]
+    groups: dict[str, int] = {}
+    for ad in ads:
+        groups[_ad_category(ad, names)] = groups.get(_ad_category(ad, names), 0) + 1
+
+    if not groups:
+        await callback.message.edit_text(
+            "📦 Товаров пока нет.", reply_markup=_no_session_kb())
+        await callback.answer()
+        return
+
+    ordered = sorted(groups.items(), key=lambda kv: (-kv[1], kv[0]))
+    _CAT_CACHE[callback.from_user.id] = [name for name, _ in ordered]
+
     b = InlineKeyboardBuilder()
-    for i, c in enumerate(cats[:40]):
-        b.button(text=f"📂 {c['name'][:24]} ({c['count']})",
-                 callback_data=f"pcat:{i}")
+    for i, (name, cnt) in enumerate(ordered[:40]):
+        b.button(text=f"📂 {name[:24]} ({cnt})", callback_data=f"pcat:{i}")
     b.adjust(1)
-    b.button(text="📋 Все товары", callback_data="pitems:list")
+    b.button(text="📋 Все товары", callback_data="pitems:allads")
     b.button(text="🔄 Обновить", callback_data="pitems:cats")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
     b.adjust(2, 1)
     await callback.message.edit_text(
         f"📦 <b>Товары по категориям</b>\n\n"
-        f"Категорий: <b>{len(cats)}</b>\nВыберите категорию:",
+        f"Всего товаров: <b>{len(ads)}</b>\n"
+        f"Категорий: <b>{len(ordered)}</b>\n\nВыберите категорию:",
         reply_markup=b.as_markup())
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("pcat:"))
-async def list_category_items(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id
+async def list_category_items(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    names_cache = _CAT_CACHE.get(callback.from_user.id) or []
     try:
-        idx = int(callback.data.split(":")[-1])
-    except ValueError:
-        await callback.answer()
-        return
-    names = _CAT_CACHE.get(uid) or []
-    if idx >= len(names):
+        idx = int(callback.data.split(":", 1)[1])
+        wanted = names_cache[idx]
+    except (ValueError, IndexError):
         await callback.answer("Список устарел — обновите категории",
                               show_alert=True)
         return
-    await _render_items(callback, category=names[idx])
+    await _render_ads(callback, api, category=wanted)
 
 
-@router.callback_query(F.data == "pitems:list")
-async def list_items(callback: CallbackQuery) -> None:
-    await _render_items(callback, category=None)
+@router.callback_query(F.data == "pitems:allads")
+async def list_all_ads(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    await _render_ads(callback, api, category=None)
 
 
-async def _render_items(callback: CallbackQuery, category: str | None) -> None:
-    from automation.panel import panel_list_items_sync
+_STATUS_LABELS = {
+    "active": "🟢", "published": "🟢", "moderate": "🕓", "moderation": "🕓",
+    "draft": "📝", "inactive": "🔴", "hidden": "🙈", "sold": "💤",
+    "archived": "📦", "fraud": "⛔",
+}
 
-    await callback.message.edit_text("⏳ Загружаю товары из панели...")
-    result, err = await _run(callback.from_user.id, panel_list_items_sync)
-    if err == "no_session":
-        await callback.message.edit_text(
-            "❌ Нет сессии панели. Войдите через email.",
-            reply_markup=_no_session_kb(),
-        )
-        await callback.answer()
+
+async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
+                      category: str | None) -> None:
+    """List ads, optionally limited to one category."""
+    if not api:
+        await callback.answer("⚠️ Не настроен API-токен", show_alert=True)
         return
-    if result is None:
-        await callback.message.edit_text(f"❌ {err}", reply_markup=_no_session_kb())
-        await callback.answer()
-        return
-
-    ok, items = result
-    if not ok:
+    await callback.message.edit_text("⏳ Загружаю товары...")
+    try:
+        data = await api.get_ads()
+        ads = data.get("data") or data.get("items") or []
+        names = await _category_names(api, callback.from_user.id)
+    except Exception as e:
         await callback.message.edit_text(
-            f"❌ Не удалось получить товары:\n{items}",
-            reply_markup=_no_session_kb(),
-        )
+            f"❌ Ошибка загрузки:\n<code>{str(e)[:200]}</code>",
+            reply_markup=_no_session_kb())
         await callback.answer()
         return
 
     if category:
-        items = [it for it in items
-                 if (it.get("category") or "Без категории") == category]
+        ads = [a for a in ads if _ad_category(a, names) == category]
 
-    hidden = [it for it in items if it.get("public") is False]
     b = InlineKeyboardBuilder()
-    for it in items[:40]:
-        pub = it.get("public")
-        mark = "🌍 " if pub is True else ("🙈 " if pub is False else "")
-        stock_mark = "⚠️" if it.get("stock") == 0 else ""
-        label = f"{mark}{stock_mark}{(it['title'] or ('Товар ' + it['id']))[:24]}"
-        if it.get("price"):
-            label += f" — {it['price']} ₽"
-        b.button(text=label, callback_data=f"pitem:{it['id']}")
+    lines = []
+    for ad in ads[:40]:
+        mark = _STATUS_LABELS.get(str(ad.get("status", "")).lower(), "•")
+        title = str(ad.get("title") or f"Товар {ad.get('id')}")
+        price = _ad_price(ad)
+        stock = ad.get("stock")
+        lines.append(
+            f"{mark} <b>{title}</b> — {price} ₽"
+            + (f" · остаток {stock}" if stock is not None else ""))
+        b.button(text=f"{mark} {title[:26]} — {price} ₽",
+                 callback_data=f"pitem:{ad.get('id')}")
     b.adjust(1)
-    if hidden:
-        b.button(text=f"🌍 Опубликовать все скрытые ({len(hidden)})",
-                 callback_data="pitems:pubhidden")
-        b.adjust(1)
     b.button(text="📂 По категориям", callback_data="pitems:cats")
-    b.button(text="➕ Добавить товар", callback_data="create_ad:start")
-    b.button(text="🔄 Обновить",
-             callback_data="pitems:cats" if category else "pitems:list")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
-    b.adjust(2, 2)
-    status_hint = ""
-    if any(it.get("public") is not None for it in items):
-        status_hint = "\n🌍 = виден, 🙈 = скрыт, ⚠️ = нет остатков"
-    head = f"📂 <b>{category}</b>" if category else "🛠 <b>Товары в панели</b>"
+    b.adjust(2)
+
+    header = f"📂 <b>{category}</b>" if category else "📋 <b>Все товары</b>"
+    body = "\n".join(lines) if lines else "Здесь пока пусто."
     await callback.message.edit_text(
-        f"{head} (всего: {len(items)})"
-        f"{status_hint}\n\n"
-        "Нажмите на товар для управления:",
-        reply_markup=b.as_markup(),
-    )
+        f"{header}\n\nТоваров: <b>{len(ads)}</b>\n\n{body[:3000]}",
+        reply_markup=b.as_markup())
     await callback.answer()
-
-
-def _item_kb(item_id: str):
-    b = InlineKeyboardBuilder()
-    b.button(text="✏️ Цена", callback_data=f"pitem_price:{item_id}")
-    b.button(text="✏️ Название", callback_data=f"pitem_title:{item_id}")
-    b.button(text="📦 Остатки", callback_data=f"pitem_stock:{item_id}")
-    b.button(text="🌍 Показать", callback_data=f"pitem_show:{item_id}")
-    b.button(text="🙈 Скрыть", callback_data=f"pitem_hide:{item_id}")
-    b.button(text="🗑 Удалить", callback_data=f"pitem_del:{item_id}")
-    b.button(text="⬅️ К товарам", callback_data="pitems:list")
-    b.adjust(2, 2, 2, 1)
-    return b.as_markup()
 
 
 @router.callback_query(F.data.startswith("pitem:"))
@@ -534,25 +522,51 @@ async def item_stock_save(message: Message, state: FSMContext,
         )
 
 
-def _ad_category(ad: dict) -> str:
-    """Category label of an ad, whatever the API calls it.
+_CATS_NAMES: dict[int, dict[int, str]] = {}   # uid -> {category_id: name}
 
-    The panel's rows carry no category, so grouping comes from the API. Field
-    naming is not documented in the parts of the spec available here, so a few
-    shapes are accepted: a plain name, a nested object, or a bare id.
-    """
-    for key in ("category", "category_name", "category_title", "categoryName"):
-        v = ad.get(key)
-        if isinstance(v, dict):
-            label = v.get("name") or v.get("title") or v.get("label")
-            if label:
-                return str(label)
-        elif v not in (None, "", 0):
-            return str(v)
-    for key in ("category_id", "categoryId"):
-        if ad.get(key) not in (None, "", 0):
-            return f"Категория #{ad[key]}"
-    return "Без категории"
+
+def _ad_price(ad: dict) -> int:
+    """Price of an ad. GET /ads returns it nested:
+    {"amount": 149, "base_amount": 149, "currency": "RUB"} — reading it as a
+    plain number silently skipped every ad in bulk operations."""
+    p = ad.get("price")
+    if isinstance(p, dict):
+        p = p.get("amount", p.get("base_amount", 0))
+    try:
+        return int(float(str(p or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _category_names(api: YooMarketAPI, uid: int) -> dict[int, str]:
+    """category_id -> name. Ads only carry the id, so the reference list is
+    fetched once and cached — the spec says it changes rarely."""
+    cached = _CATS_NAMES.get(uid)
+    if cached:
+        return cached
+    names: dict[int, str] = {}
+    try:
+        for c in await api.get_categories():
+            cid = c.get("id")
+            label = c.get("name") or c.get("title")
+            if cid is not None and label:
+                names[int(cid)] = str(label)
+    except Exception as e:
+        logger.info("categories fetch failed: %s", e)
+    _CATS_NAMES[uid] = names
+    return names
+
+
+def _ad_category(ad: dict, names: dict[int, str]) -> str:
+    """Category label of an ad, resolved through the reference list."""
+    cid = ad.get("category_id")
+    if cid in (None, "", 0):
+        return "Без категории"
+    try:
+        cid = int(cid)
+    except (TypeError, ValueError):
+        return str(cid)
+    return names.get(cid) or f"Категория #{cid}"
 
 
 @router.message(Command("ads_debug"))

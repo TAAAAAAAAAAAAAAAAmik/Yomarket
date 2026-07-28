@@ -105,6 +105,8 @@ class YooMarketAPI:
         """Restore all inactive/sold ads. Returns (count, message)."""
         data = await self.get_ads()
         ads = data.get("data") or data.get("items") or []
+        # Deliberately excludes "moderate" and "draft": those are ads on their
+        # way to being published, not ones taken down.
         _DEAD = ("inactive", "sold", "expired", "archived", "disabled",
                  "closed", "hidden", "not_active", "paused", "stopped")
 
@@ -449,8 +451,13 @@ class YooMarketAPI:
         last_err = ""
         for ad in ads:
             ad_id = ad.get("id")
+            # GET /ads returns price nested:
+            # {"amount": 149, "base_amount": 149, "currency": "RUB"}
+            raw = ad.get("price")
+            if isinstance(raw, dict):
+                raw = raw.get("amount", raw.get("base_amount", 0))
             try:
-                current_price = int(float(str(ad.get("price", 0))))
+                current_price = int(float(str(raw or 0)))
             except (TypeError, ValueError):
                 continue
             if not ad_id or current_price <= 0:
