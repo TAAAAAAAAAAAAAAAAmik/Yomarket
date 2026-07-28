@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -558,9 +559,8 @@ async def _category_names(api: YooMarketAPI, uid: int,
         except Exception as e:
             logger.info("categories fetch failed: %s", e)
 
-    for cid in sorted(wanted or ()):
-        if cid in names:
-            continue
+    missing = {c for c in (wanted or ()) if c not in names}
+    for cid in sorted(missing):
         try:
             label = await api.resolve_category(cid)
         except Exception as e:
@@ -568,6 +568,15 @@ async def _category_names(api: YooMarketAPI, uid: int,
             label = ""
         if label:
             names[cid] = label
+
+    # Anything still unresolved lives deeper in the tree — walk it, bounded,
+    # and only for the ids that are actually needed.
+    missing = {c for c in (wanted or ()) if c not in names}
+    if missing:
+        try:
+            names.update(await api.find_categories(missing))
+        except Exception as e:
+            logger.info("find_categories failed: %s", e)
     return names
 
 
@@ -584,16 +593,40 @@ def _wanted_cats(ads: list[dict]) -> set[int]:
     return out
 
 
+def _label_from_title(title: str) -> str:
+    """A grouping label derived from the ad's own title.
+
+    Used when the API will not give a category name. Titles on this shop read
+    like "100 звезд" / "500 звезд", so dropping the leading quantity groups
+    them the way a seller thinks of them.
+    """
+    text = re.sub(r"№\s*\d+", " ", str(title or ""))
+    text = re.sub(r"^[\d\s.,x×*+-]+", " ", text)
+    text = re.sub(r"\b\d+\s*(шт|штук|pcs)\b", " ", text, flags=re.I)
+    text = " ".join(text.split())
+    if not text:
+        return "Прочее"
+    text = text[:30]
+    # capitalize() would lowercase the rest and turn "Telegram Stars" into
+    # "Telegram stars"
+    return text[0].upper() + text[1:]
+
+
 def _ad_category(ad: dict, names: dict[int, str]) -> str:
-    """Category label of an ad, resolved through the reference list."""
+    """Category label of an ad.
+
+    Prefers the real name; falls back to a label derived from the title rather
+    than showing a bare id, which tells the seller nothing.
+    """
     cid = ad.get("category_id")
-    if cid in (None, "", 0):
-        return "Без категории"
-    try:
-        cid = int(cid)
-    except (TypeError, ValueError):
-        return str(cid)
-    return names.get(cid) or f"Категория #{cid}"
+    if cid not in (None, "", 0):
+        try:
+            label = names.get(int(cid))
+        except (TypeError, ValueError):
+            label = None
+        if label:
+            return label
+    return _label_from_title(ad.get("title", ""))
 
 
 @router.message(Command("ads_debug"))

@@ -421,6 +421,59 @@ class YooMarketAPI:
         """First page of /categories untouched — for diagnosing its shape."""
         return await self._get("/categories")
 
+    async def find_categories(self, wanted: set[int],
+                              max_requests: int = 120) -> dict[int, str]:
+        """Names for specific category ids, walking the tree only as far as
+        needed.
+
+        /categories returns the top of a tree; products sit in its leaves, so a
+        leaf id is never in that first response. This walks level by level and
+        stops the moment every wanted id is found, rather than mapping the
+        whole catalogue.
+        """
+        found: dict[int, str] = {}
+        if not wanted:
+            return found
+
+        frontier: list[int | None] = [None]      # None = the root level
+        visited: set[int | None] = set()
+        requests_made = 0
+
+        while frontier and requests_made < max_requests:
+            parent = frontier.pop(0)
+            if parent in visited:
+                continue
+            visited.add(parent)
+            try:
+                rows = await self.get_categories(max_pages=5, parent_id=parent)
+            except RuntimeError as e:
+                logger.info("categories(parent=%s): %s", parent, e)
+                continue
+            requests_made += 1
+
+            for row in rows:
+                cid = row.get("id")
+                if cid is None:
+                    continue
+                try:
+                    cid = int(cid)
+                except (TypeError, ValueError):
+                    continue
+                label = row.get("name") or row.get("title")
+                if cid in wanted and label:
+                    found[cid] = str(label)
+                    if len(found) == len(wanted):
+                        logger.info("categories found in %d requests",
+                                    requests_made)
+                        return found
+                # Only branches can contain the leaves we are after
+                if not row.get("is_leaf") and cid not in visited:
+                    frontier.append(cid)
+
+        logger.info("categories: %d/%d found in %d requests",
+                    len(found), len(wanted), requests_made)
+        return found
+
     async def resolve_category(self, category_id: int | str) -> str:
         """Name of one category without walking the whole tree.
 
