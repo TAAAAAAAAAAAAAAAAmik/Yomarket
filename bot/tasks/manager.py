@@ -1033,7 +1033,7 @@ class TaskManager:
                             f"{ceiling:.0f} ₽/день (потрачено {spent_today:.0f} ₽)")
                         continue
                     try:
-                        count, msg = await api.bump_all_ads()
+                        count, msg = await self._panel_bump(user_id)
                         last_runs[last_run_key] = now_dt.isoformat()
                         bs["bumps_total"] = int(bs.get("bumps_total", 0)) + (count or 0)
                         if price_per_bump > 0 and count:
