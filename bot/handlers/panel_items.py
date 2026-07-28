@@ -593,12 +593,29 @@ def _wanted_cats(ads: list[dict]) -> set[int]:
     return out
 
 
-def _label_from_title(title: str) -> str:
-    """A grouping label derived from the ad's own title.
+# Titles read like "100 звезд" — a quantity plus the goods in the genitive.
+# Stripping the number leaves that case ("Звезд"), which is not a category
+# name, so the common goods on this marketplace are mapped back to nominative.
+_GOODS_FORMS = {
+    "звезд": "Звезды", "звёзд": "Звезды", "stars": "Stars",
+    "подписчиков": "Подписчики", "подписчика": "Подписчики",
+    "просмотров": "Просмотры", "просмотра": "Просмотры",
+    "лайков": "Лайки", "лайка": "Лайки",
+    "монет": "Монеты", "монеты": "Монеты",
+    "ключей": "Ключи", "ключа": "Ключи",
+    "аккаунтов": "Аккаунты", "аккаунта": "Аккаунты",
+    "робуксов": "Робуксы", "гемов": "Гемы", "алмазов": "Алмазы",
+    "кристаллов": "Кристаллы", "рублей": "Рубли", "донатов": "Донат",
+    "бустов": "Бусты", "реакций": "Реакции", "премиума": "Премиум",
+}
 
-    Used when the API will not give a category name. Titles on this shop read
-    like "100 звезд" / "500 звезд", so dropping the leading quantity groups
-    them the way a seller thinks of them.
+
+def _label_from_title(title: str) -> str:
+    """A category label derived from the ad's own title.
+
+    Used when the API gives no category name. "100 звезд" and
+    "500 звезд №219206" both come out as «Звезды», so a seller sees the goods,
+    not a quantity or an id.
     """
     text = re.sub(r"№\s*\d+", " ", str(title or ""))
     text = re.sub(r"^[\d\s.,x×*+-]+", " ", text)
@@ -606,6 +623,14 @@ def _label_from_title(title: str) -> str:
     text = " ".join(text.split())
     if not text:
         return "Прочее"
+
+    words = text.split()
+    # Whole phrase first, then the leading word: "звезд telegram" -> Звезды
+    for candidate in (text.lower(), words[0].lower()):
+        form = _GOODS_FORMS.get(candidate)
+        if form:
+            return form
+
     text = text[:30]
     # capitalize() would lowercase the rest and turn "Telegram Stars" into
     # "Telegram stars"
