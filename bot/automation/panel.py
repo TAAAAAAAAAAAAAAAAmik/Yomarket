@@ -109,6 +109,15 @@ async def _click_first(page, selectors: list[str]) -> bool:
     return False
 
 
+def _esc(value) -> str:
+    """Escape text that came from a web page before it goes into a Telegram
+    HTML-parsed message. Raw page dumps contain tags like <!doctype html>,
+    which Telegram rejects — the send then fails and the user is left staring
+    at the previous "in progress" message."""
+    import html as _html
+    return _html.escape(str(value), quote=False)
+
+
 def _looks_like_html(text: str) -> bool:
     """True if a response body is the SPA's HTML shell rather than a JSON API
     reply. A Laravel SPA serves index.html with 200 for unknown routes, which
@@ -363,7 +372,7 @@ class YooMarketPanelHTTP:
                     if resp.status == 405:
                         missing.append(path + "(405)")
                         return False
-                    short = text[:90].replace("\n", " ")
+                    short = _esc(text[:90].replace("\n", " "))
                     host = {MAIN_URL: "main", API_URL: "api",
                             PANEL_URL: "panel"}.get(base, base)
                     interesting.append(
@@ -1659,7 +1668,7 @@ def panel_create_product_sync(
         try:
             cf = cf_resp.json()
         except Exception:
-            debug.append(f"{res}: bad JSON: {cf_resp.text[:100]}")
+            debug.append(f"{res}: bad JSON: {_esc(cf_resp.text[:100])}")
             continue
 
         if not isinstance(cf, dict):
@@ -2382,6 +2391,7 @@ class YooMarketPanel:
                 entry = f"{request.method} {url}"
                 if body:
                     entry += f" | {body}"
+                entry = _esc(entry)
                 if entry not in self.captured:
                     self.captured.append(entry)
                     logger.info("CAPTURED %s", entry)
@@ -2525,7 +2535,7 @@ class YooMarketPanel:
                     "   .map(e => (e.innerText||'').trim())"
                     "   .filter(t => t && t.length < 30).slice(0, 20)})"
                 )
-                self.page_debug.append(str(info)[:600])
+                self.page_debug.append(_esc(str(info)[:600]))
             except Exception:
                 pass
 
@@ -2566,7 +2576,7 @@ class YooMarketPanel:
 
             if not filled:
                 html = await page.content()
-                return False, f"Поле email не найдено.\nHTML: <code>{html[:300]}</code>"
+                return False, f"Поле email не найдено.\nHTML: <code>{_esc(html[:300])}</code>"
             logger.info("submit_email: email filled")
 
             # Small pause so Vue can register the value before we click
@@ -2583,7 +2593,7 @@ class YooMarketPanel:
 
             if not clicked:
                 html = await page.content()
-                return False, f"Кнопка «Получить код» не найдена.\nHTML: <code>{html[:300]}</code>"
+                return False, f"Кнопка «Получить код» не найдена.\nHTML: <code>{_esc(html[:300])}</code>"
             logger.info("submit_email: submit clicked, waiting for network")
 
             # Wait for the browser to finish the form-submission network request,
@@ -2683,8 +2693,8 @@ class YooMarketPanel:
                 html = await page.content()
                 return False, (
                     f"Поле для кода не найдено.\n"
-                    f"Inputs: <code>{str(inputs_info)[:300]}</code>\n"
-                    f"HTML: <code>{html[:200]}</code>"
+                    f"Inputs: <code>{_esc(str(inputs_info)[:300])}</code>\n"
+                    f"HTML: <code>{_esc(html[:200])}</code>"
                 )
 
             await asyncio.sleep(0.5)

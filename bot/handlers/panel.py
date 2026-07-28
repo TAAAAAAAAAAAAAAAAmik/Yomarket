@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -79,6 +80,23 @@ def _cancel_kb(back: str = "panel:menu"):
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data=back)
     return b.as_markup()
+
+
+async def _safe_edit(msg: Message, text: str, **kwargs) -> None:
+    """Edit a message, falling back to unformatted text if Telegram rejects the
+    markup. Diagnostics carry page dumps and URLs; one stray tag used to make
+    the send fail, leaving the user looking at a frozen "in progress" message."""
+    try:
+        await msg.edit_text(text, **kwargs)
+        return
+    except Exception as e:
+        logger.warning("edit_text failed (%s), retrying as plain text", e)
+    try:
+        import html as _html
+        plain = _html.unescape(re.sub(r"<[^>]+>", "", text))
+        await msg.edit_text(plain[:4000], parse_mode=None, **kwargs)
+    except Exception:
+        logger.exception("edit_text failed even as plain text")
 
 
 async def _refresh_menu(callback: CallbackQuery) -> None:
@@ -285,7 +303,7 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         extra = f"\n\n<b>Запросы:</b>\n<code>{seen[:700]}</code>" if seen else ""
         if pages:
             extra += f"\n\n<b>Что на странице:</b>\n<code>{pages[:700]}</code>"
-        await status_msg.edit_text(f"❌ {err or 'Не удалось отправить код'}{extra}")
+        await _safe_edit(status_msg, f"❌ {err or 'Не удалось отправить код'}{extra}")
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
@@ -384,7 +402,7 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
 
     if not ok:
         extra = f"\n\n<b>Запросы страницы:</b>\n<code>{seen[:900]}</code>" if seen else ""
-        await status_msg.edit_text(f"❌ {result}{extra}")
+        await _safe_edit(status_msg, f"❌ {result}{extra}")
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
@@ -497,8 +515,9 @@ async def panel_probe_ui(callback: CallbackQuery) -> None:
         except Exception:
             pass
 
-    await status_msg.edit_text(
-        f"🔍 <b>Адреса входа yoomarket.net</b>\n\n<code>{report[:3500]}</code>"
+    await _safe_edit(
+        status_msg,
+        f"🔍 <b>Адреса входа yoomarket.net</b>\n\n<code>{report[:3500]}</code>",
     )
 
 
