@@ -48,7 +48,7 @@ def _auto_text(s: dict) -> str:
     rst_on = s.get("auto_restore", {}).get("enabled", False)
     lines.append(f"\n🔄 <b>Авто-восстановление товаров</b> — {_st(rst_on)}")
     bump_on = s.get("auto_bump", {}).get("enabled", False)
-    lines.append(f"⬆️ <b>Автоподнятие</b> — {_st(bump_on)}")
+    lines.append(f"⭐ <b>Премиум продвижение</b> — {_st(bump_on)}")
 
     ac = s.get("auto_confirm", {})
     ac_on = ac.get("enabled", False)
@@ -86,8 +86,7 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     if ref_on:
         builder.button(text="✏️ Текст возврата", callback_data="auto:set:refunded_msg")
 
-    builder.button(text="🔄 Авто-восстановление товаров", callback_data="selenium:restore:menu")
-    builder.button(text="⬆️ Автоподнятие", callback_data="selenium:bump:menu")
+    # Ad automation (premium promotion, auto-restore) now lives in «Объявления»
     builder.button(text="💸 Авто-вывод", callback_data="selenium:withdraw:menu")
 
     aa = s.get("auto_accept", {})

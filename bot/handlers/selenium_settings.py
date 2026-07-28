@@ -52,13 +52,17 @@ def _bump_text(s: dict, creds=None) -> str:
     on = ab.get("enabled", False)
     interval = ab.get("interval_hours", 24)
     last_run = _fmt_ts(ab.get("last_bump_run"))
+    ceiling = s.get("bump_stats", {}).get("daily_ceiling", 0)
+    limit = f"{ceiling:.0f} ₽/день" if ceiling else "не задан"
     return "\n".join([
-        "⬆️ <b>Авто-поднятие</b>\n",
+        "⭐ <b>Премиум продвижение</b>\n",
         f"Статус: {_st(on)}",
         f"Интервал: каждые {interval} ч",
         f"Последний запуск: {last_run}",
+        f"Потолок трат: {limit}",
         "",
-        "Поднимает все объявления через API.",
+        "⚠️ <b>Платно.</b> На Юмаркете поднятие — это «Премиум», деньги "
+        "списываются с баланса магазина за каждое объявление.",
     ])
 
 
@@ -70,7 +74,7 @@ def _bump_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
     b.button(text="▶️ Запустить сейчас", callback_data="selenium:run:bump")
     b.button(text=f"{'🔴 Выкл' if on else '🟢 Вкл'}", callback_data="selenium:bump:toggle")
     b.button(text=f"⏱ Интервал: {interval} ч", callback_data="selenium:bump:set_interval")
-    b.button(text="⬅️ Назад", callback_data="auto:menu")
+    b.button(text="⬅️ К объявлениям", callback_data="menu:ads")
     b.adjust(2, 1, 1)
     return b.as_markup()
 
@@ -193,7 +197,7 @@ def _restore_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="▶️ Запустить сейчас", callback_data="selenium:run:restore")
     b.button(text=f"{'🔴 Выкл' if on else '🟢 Вкл'}", callback_data="selenium:restore:toggle")
-    b.button(text="⬅️ Назад", callback_data="auto:menu")
+    b.button(text="⬅️ К объявлениям", callback_data="menu:ads")
     b.adjust(2, 1)
     return b.as_markup()
 

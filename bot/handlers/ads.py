@@ -64,10 +64,14 @@ def _ads_keyboard(ads: list[dict], next_cursor: str | None):
     b.button(text="📦 Паки", callback_data="packs:menu")
     b.button(text="💰 Все цены", callback_data="ads:bulk_price")
     b.button(text="📝 Описание всех", callback_data="ads:bulk_desc")
+    # Listing automation lives here rather than in the auto-settings menu:
+    # both act on ads, so this is where they are looked for.
+    b.button(text="⭐ Премиум продвижение", callback_data="selenium:bump:menu")
+    b.button(text="🔄 Авто-восстановление", callback_data="selenium:restore:menu")
     # nav on its own row
     b.button(text="🔄 Обновить", callback_data="ads_load")
     b.button(text="⬅️ Меню", callback_data="menu:main")
-    b.adjust(*([1] * n_list), 2, 2, 2, 2)
+    b.adjust(*([1] * n_list), 2, 2, 2, 2, 2)
     return b.as_markup()
 
 
