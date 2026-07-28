@@ -161,11 +161,30 @@ async def show_ad_detail(
 
 @router.callback_query(F.data.startswith("ad_bump:"))
 async def bump_ad(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    """Raise one listing through the panel — the Integration API has no bump."""
+    import asyncio
+
+    from automation.panel import panel_bump_item_sync
+    from storage import get_panel_creds
+
     ad_id = callback.data.split(":", 1)[1]
+    creds = get_panel_creds(callback.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await callback.answer(
+            "⚠️ Нужен вход в панель продавца", show_alert=True)
+        return
+
     await callback.answer("⏳ Поднимаю товар...", show_alert=False)
     try:
-        await api.bump_ad(ad_id)
-        await callback.answer("✅ Товар поднят!", show_alert=True)
+        loop = asyncio.get_event_loop()
+        ok, msg = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, panel_bump_item_sync, creds["cookies"], ad_id,
+                callback.from_user.id),
+            timeout=60,
+        )
+        await callback.answer(
+            f"✅ Поднято: {msg}" if ok else f"❌ {msg[:180]}", show_alert=True)
     except Exception as e:
         await callback.answer(f"❌ {e}", show_alert=True)
 
@@ -228,6 +247,7 @@ async def ad_pause(callback: CallbackQuery, api: YooMarketAPI) -> None:
             f"📊 Статус: {status}"
         )
         b = InlineKeyboardBuilder()
+        b.button(text="⬆️ Поднять товар", callback_data=f"ad_bump:{ad_id}")
         b.button(text="✏️ Изменить цену", callback_data=f"ad_price:{ad_id}")
         if status_raw in ("inactive", "disabled", "paused"):
             b.button(text="▶️ Активировать", callback_data=f"ad_activate:{ad_id}")
@@ -258,6 +278,7 @@ async def ad_activate(callback: CallbackQuery, api: YooMarketAPI) -> None:
             f"📊 Статус: {status}"
         )
         b = InlineKeyboardBuilder()
+        b.button(text="⬆️ Поднять товар", callback_data=f"ad_bump:{ad_id}")
         b.button(text="✏️ Изменить цену", callback_data=f"ad_price:{ad_id}")
         if status_raw == "active":
             b.button(text="⏸ Приостановить", callback_data=f"ad_pause:{ad_id}")

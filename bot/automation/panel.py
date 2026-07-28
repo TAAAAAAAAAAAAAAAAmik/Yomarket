@@ -624,6 +624,11 @@ _PUBLISH_KWS = ("публик", "publish", "актив", "activ", "показ", 
 _UNPUBLISH_KWS = ("скрыт", "скрыть", "hide", "unpublish", "деактив", "снять",
                   "приостан", "disable", "выключ", "stop")
 _DANGEROUS_KWS = ("удал", "delete", "destroy", "force")
+# Raising a listing back to the top of the feed. The Integration API has no
+# such method at all, but the panel does — it is a Nova action, reachable the
+# same way publishing is.
+_BUMP_KWS = ("подня", "поднят", "bump", "raise", "up", "продвин", "буст",
+             "boost", "обнов", "refresh")
 
 
 def _build_update_form(fields: list[dict], overrides: dict) -> dict:
@@ -804,6 +809,94 @@ def panel_publish_item_sync(
         f"Доступные действия: <code>{action_names or 'нет'}</code>\n"
         f"Лог: <code>{'; '.join(trace)[:350]}</code>"
     )
+
+
+def panel_bump_item_sync(
+    cookie_string: str, item_id: str, uid: int | None = None,
+) -> tuple[bool, str]:
+    """Blocking: raise one listing via the panel's Nova action.
+
+    Returns (ok, message_or_diagnostics).
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    trace: list[str] = []
+
+    actions: list[dict] = []
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/items/actions",
+            params={"resources": str(item_id)},
+            headers=hdrs, timeout=(6, 10), allow_redirects=False,
+        )
+        trace.append(f"actions: {r.status_code}")
+        if r.status_code == 401:
+            return False, "401: сессия панели истекла — войдите снова"
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                actions = [a for a in (data.get("actions") or [])
+                           if isinstance(a, dict)]
+    except Exception as e:
+        return False, f"не получил список действий: {str(e)[:60]}"
+
+    names = [(a.get("name") or a.get("uriKey") or "?") for a in actions]
+    for a in actions:
+        name = str(a.get("name") or "").lower()
+        key = str(a.get("uriKey") or "")
+        if not key:
+            continue
+        blob = name + " " + key.lower()
+        if any(kw in blob for kw in _DANGEROUS_KWS + _UNPUBLISH_KWS):
+            continue
+        if not any(kw in blob for kw in _BUMP_KWS):
+            continue
+        try:
+            resp = session.post(
+                f"{PANEL_URL}/nova-api/items/action?action={key}",
+                data={"resources": str(item_id)},
+                headers=hdrs, timeout=(6, 15),
+            )
+            trace.append(f"action {key}: {resp.status_code}")
+            if resp.status_code in (200, 201, 204):
+                _save_refreshed_cookies(uid, cookie_string, session)
+                return True, str(a.get("name") or key)
+        except Exception as e:
+            trace.append(f"action {key}: {str(e)[:40]}")
+
+    _save_refreshed_cookies(uid, cookie_string, session)
+    return False, (f"действие поднятия не найдено. "
+                   f"Доступные: {names or 'нет'}; лог: {'; '.join(trace)[:200]}")
+
+
+def panel_bump_all_sync(
+    cookie_string: str, uid: int | None = None,
+) -> tuple[int, str]:
+    """Blocking: raise every listing the panel shows. Returns (count, message)."""
+    ok, items = panel_list_items_sync(cookie_string)
+    if not ok:
+        return 0, f"⚠️ {items}"
+    if not items:
+        return 0, "ℹ️ Нет объявлений"
+
+    count = 0
+    last = ""
+    for it in items:
+        item_id = it.get("id")
+        if not item_id:
+            continue
+        done, msg = panel_bump_item_sync(cookie_string, item_id, uid)
+        if done:
+            count += 1
+        else:
+            last = msg
+            # A missing action will be missing for every item — stop early
+            # instead of repeating the same failure for the whole list.
+            if "не найдено" in msg or "401" in msg:
+                break
+    if count:
+        return count, f"✅ Поднято: {count}"
+    return 0, f"⚠️ Не удалось поднять: {last}"
 
 
 def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:

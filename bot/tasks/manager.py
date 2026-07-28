@@ -771,6 +771,25 @@ class TaskManager:
         except Exception as e:
             logger.warning("Auto chat send failed (chat %s): %s", chat_id, e)
 
+    async def _panel_bump(self, user_id: int) -> tuple[int, str]:
+        """Raise all listings through the panel (needs a live panel session)."""
+        from storage import get_panel_creds
+        from automation.panel import panel_bump_all_sync
+
+        creds = get_panel_creds(user_id)
+        if not creds or not creds.get("cookies"):
+            return 0, "нужен вход в панель — откройте «Панель продавца»"
+
+        loop = asyncio.get_event_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, panel_bump_all_sync, creds["cookies"], user_id),
+                timeout=180,
+            )
+        except asyncio.TimeoutError:
+            return 0, "панель не ответила вовремя"
+
     async def _check_panel_session(self, user_id: int, settings: dict, now: float) -> None:
         """Warn once when the stored panel session stops working.
 
@@ -854,8 +873,11 @@ class TaskManager:
                 interval_hours = ab.get("interval_hours", 24)
                 last_run = ab.get("last_bump_run", 0)
                 if (now - last_run) / 3600 >= interval_hours:
-                    logger.info("Auto-bump for user %s via API", user_id)
-                    count, msg = await api.bump_all_ads()
+                    # Bumping runs against the panel, not the Integration API:
+                    # the API has no such method, the panel exposes it as a
+                    # Nova action.
+                    logger.info("Auto-bump for user %s via panel", user_id)
+                    count, msg = await self._panel_bump(user_id)
                     settings["auto_bump"]["last_bump_run"] = now
                     messages.append(f"⬆️ Авто-поднятие: {msg}")
 

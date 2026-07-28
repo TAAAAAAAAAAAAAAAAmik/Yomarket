@@ -121,17 +121,34 @@ async def bump_save_interval(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "selenium:run:bump")
 async def run_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    if not api:
-        await callback.answer("⚠️ API токен не настроен", show_alert=True)
+    # Bumping goes through the panel: the Integration API has no method for it.
+    import asyncio
+
+    from automation.panel import panel_bump_all_sync
+    from storage import get_panel_creds
+
+    uid = callback.from_user.id
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
+        await callback.answer(
+            "⚠️ Нужен вход в панель продавца", show_alert=True)
         return
+
     await callback.answer("⏳ Поднимаю объявления...", show_alert=False)
-    await callback.message.edit_text("⏳ Поднимаю все объявления через API...")
-    s = get_settings(callback.from_user.id)
+    await callback.message.edit_text("⏳ Поднимаю объявления через панель...")
+    s = get_settings(uid)
     try:
-        count, msg = await api.bump_all_ads()
+        loop = asyncio.get_event_loop()
+        count, msg = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, panel_bump_all_sync, creds["cookies"], uid),
+            timeout=180,
+        )
         s["auto_bump"]["last_bump_run"] = _time.time()
-        save_settings(callback.from_user.id, s)
+        save_settings(uid, s)
         result_text = f"⬆️ <b>Поднятие завершено</b>\n\n{msg}"
+    except asyncio.TimeoutError:
+        result_text = "⏰ Панель не ответила вовремя"
     except Exception as e:
         logger.error("Manual bump error: %s", e)
         result_text = f"❌ Ошибка: {e}"
