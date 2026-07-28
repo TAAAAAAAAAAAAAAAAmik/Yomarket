@@ -77,14 +77,19 @@ class YooMarketAPI:
 
     async def bump_ad(self, ad_id: int | str) -> dict:
         """Bump a single ad. Tries common endpoint patterns."""
+        tried = []
         for path in (f"/ads/{ad_id}/up", f"/ads/{ad_id}/bump", f"/ads/{ad_id}/raise"):
             try:
                 return await self._post(path)
             except RuntimeError as e:
-                if "404" in str(e) or "not found" in str(e).lower():
+                msg = str(e)
+                tried.append(f"{path}: {msg[:60]}")
+                if "404" in msg or "not found" in msg.lower():
                     continue
                 raise
-        raise RuntimeError("not supported")
+        # Keep what the server actually said — "not supported" alone hides
+        # whether the path is wrong or the request was rejected.
+        raise RuntimeError("; ".join(tried) or "not supported")
 
     async def bump_all_ads(self) -> tuple[int, str]:
         """Bump all active ads. Returns (count, message)."""
@@ -109,6 +114,7 @@ class YooMarketAPI:
 
     async def restore_ad(self, ad_id: int | str) -> dict:
         """Restore / reactivate a single ad."""
+        tried = []
         for path in (
             f"/ads/{ad_id}/activate",
             f"/ads/{ad_id}/restore",
@@ -118,25 +124,43 @@ class YooMarketAPI:
             try:
                 return await self._post(path)
             except RuntimeError as e:
-                if "404" in str(e) or "not found" in str(e).lower():
+                msg = str(e)
+                tried.append(f"{path}: {msg[:60]}")
+                if "404" in msg or "not found" in msg.lower():
                     continue
                 raise
         try:
             return await self._patch(f"/ads/{ad_id}", {"status": "active"})
-        except RuntimeError:
-            pass
-        raise RuntimeError("not supported")
+        except RuntimeError as e:
+            tried.append(f"PATCH /ads/{ad_id}: {str(e)[:60]}")
+        raise RuntimeError("; ".join(tried) or "not supported")
 
     async def restore_all_ads(self) -> tuple[int, str]:
         """Restore all inactive/sold ads. Returns (count, message)."""
         data = await self.get_ads()
         ads = data.get("data") or data.get("items") or []
-        inactive = [
-            ad for ad in ads
-            if ad.get("status") in ("inactive", "sold", "expired", "archived", "disabled", "closed")
-        ]
+        _DEAD = ("inactive", "sold", "expired", "archived", "disabled",
+                 "closed", "hidden", "not_active", "paused", "stopped")
+
+        def _is_dead(ad: dict) -> bool:
+            raw = ad.get("status", ad.get("state", ad.get("is_active")))
+            if isinstance(raw, bool):
+                return not raw          # is_active=False means it needs restoring
+            if isinstance(raw, (int, float)):
+                return raw == 0
+            return str(raw).lower() in _DEAD
+
+        inactive = [ad for ad in ads if _is_dead(ad)]
         if not inactive:
-            return 0, "ℹ️ Нет товаров для восстановления"
+            # Report the statuses actually seen: the list above is a guess, and
+            # a silent "nothing to do" would hide an unrecognised value.
+            seen = sorted({
+                str(ad.get("status", ad.get("state", ad.get("is_active", "?"))))
+                for ad in ads
+            })
+            logger.info("restore_all_ads: no dead ads; statuses seen: %s", seen)
+            return 0, (f"ℹ️ Нет товаров для восстановления "
+                       f"(статусы объявлений: {', '.join(seen[:8])})")
         count = 0
         last_err = ""
         for ad in inactive:
