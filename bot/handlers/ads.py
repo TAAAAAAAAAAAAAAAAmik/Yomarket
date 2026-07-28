@@ -30,36 +30,26 @@ def _status(raw: str) -> str:
 
 
 def _fmt_list(ads: list[dict], total: int | None) -> str:
+    """Summary only. The listings are browsed under «📦 Товары», so repeating
+    them here just makes the menu scroll."""
     if not ads:
-        return "📦 Товаров не найдено."
-    header = "📦 <b>Ваши товары</b>"
-    if total:
-        header += f" (всего: {total})"
-    lines = [header, ""]
-    for i, ad in enumerate(ads, 1):
-        title = ad.get("title") or ad.get("name") or "—"
-        price = ad.get("price", "—")
-        status = _status(ad.get("status", ""))
-        lines.append(f"{i}. <b>{title}</b>\n   💰 {price} ₽  |  {status}")
-    return "\n".join(lines)
+        return ("🚀 <b>Объявления</b>\n\n"
+                "Товаров пока нет — добавьте первый.")
+    count = total or len(ads)
+    return (f"🚀 <b>Объявления</b>\n\n"
+            f"Всего товаров: <b>{count}</b>\n\n"
+            f"Откройте «📦 Товары», чтобы посмотреть их по категориям.")
 
 
 def _ads_keyboard(ads: list[dict], next_cursor: str | None):
+    """Actions only — the listings themselves live behind «📦 Товары».
+
+    This menu used to repeat every ad as its own button, which duplicated the
+    category browser and pushed the actions off the screen.
+    """
     b = InlineKeyboardBuilder()
-    # 1 per row: the item list (long labels) + optional "more"
-    for ad in ads:
-        ad_id = str(ad.get("id", ""))
-        title = ad.get("title") or ad.get("name") or f"Товар {ad_id}"
-        price = ad.get("price", "")
-        label = f"{title[:28]} — {price} ₽" if price else title[:35]
-        b.button(text=label, callback_data=AdCallback(ad_id=ad_id).pack())
-    n_list = len(ads)
-    if next_cursor:
-        b.button(text="Ещё товары ▶️", callback_data=PaginationCallback(entity="ads", cursor=next_cursor).pack())
-        n_list += 1
-    # 2 columns: fixed actions
-    b.button(text="➕ Добавить товар", callback_data="create_ad:start")
     b.button(text="📦 Товары", callback_data="pitems:cats")
+    b.button(text="➕ Добавить товар", callback_data="create_ad:start")
     b.button(text="🛠 Управление", callback_data="pitems:list")
     b.button(text="📦 Паки", callback_data="packs:menu")
     b.button(text="💰 Все цены", callback_data="ads:bulk_price")
@@ -68,10 +58,9 @@ def _ads_keyboard(ads: list[dict], next_cursor: str | None):
     # both act on ads, so this is where they are looked for.
     b.button(text="⭐ Премиум продвижение", callback_data="selenium:bump:menu")
     b.button(text="🔄 Авто-восстановление", callback_data="selenium:restore:menu")
-    # nav on its own row
     b.button(text="🔄 Обновить", callback_data="ads_load")
     b.button(text="⬅️ Меню", callback_data="menu:main")
-    b.adjust(*([1] * n_list), 2, 2, 2, 2, 2)
+    b.adjust(2, 2, 2, 2, 2)
     return b.as_markup()
 
 

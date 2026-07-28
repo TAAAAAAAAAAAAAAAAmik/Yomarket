@@ -950,6 +950,12 @@ def panel_list_categories_sync(cookie_string: str) -> tuple[bool, object]:
     return True, cats
 
 
+# Attributes that name a real category; anything else that is a belongsTo is
+# accepted as a weaker fallback for grouping.
+_CAT_ATTRS = ("category", "subcategory", "categories", "type", "ad", "game",
+              "group", "adGroup", "ad_group", "product")
+
+
 def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
     """Blocking: list items from the panel. Returns (True, [{id,title,price}])
     or (False, error)."""
@@ -984,6 +990,8 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
             raw_fields = list(raw_fields.values())
         info = {"id": str(rid), "title": "", "price": "", "public": None,
                 "category": "", "stock": None}
+        cat_rank = 99  # lower = better source for the grouping label
+        seen_attrs: list[str] = []
         _vis_kws = ("public", "visible", "active", "published", "status",
                     "hidden", "публич", "видим", "актив", "показ", "скрыт")
         for f in raw_fields or []:
@@ -991,21 +999,30 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
                 continue
             fa = str(f.get("attribute", ""))
             fn = str(f.get("name", ""))
+            if fa:
+                seen_attrs.append(fa)
             if fa == "title":
                 info["title"] = str(f.get("value") or "")
             elif fa == "price":
                 info["price"] = str(f.get("value") or "")
-            elif fa in ("category", "subcategory") or "категор" in fn.lower():
-                # belongsTo → the value may be an object carrying the label
+            elif (fa in _CAT_ATTRS or "категор" in fn.lower()
+                  or f.get("belongsToRelationship") or f.get("belongsToId")):
+                # The grouping value is a belongsTo. On this panel an item
+                # hangs off a parent listing (game/product), not off a field
+                # literally called "category", so any belongsTo counts —
+                # ranked, so a real category still wins over the parent.
                 v = f.get("value")
                 label = ""
                 if isinstance(v, dict):
                     label = str(v.get("title") or v.get("name")
-                                or v.get("display") or "")
+                                or v.get("display") or v.get("label") or "")
                 elif v not in (None, ""):
                     label = str(v)
-                if label and not info["category"]:
-                    info["category"] = label
+                if label:
+                    rank = 0 if fa in _CAT_ATTRS or "категор" in fn.lower() else 1
+                    if rank < cat_rank:
+                        info["category"] = label
+                        cat_rank = rank
             elif any(k in fa.lower() or k in fn.lower()
                      for k in ("count", "quantity", "stock", "остат", "количеств")):
                 try:
@@ -1024,6 +1041,9 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
                     info["public"] = (not on) if inverted else on
                 elif isinstance(val, (int, float)):
                     info["public"] = (not bool(val)) if inverted else bool(val)
+        if not info["category"]:
+            logger.info("no category for item %s; fields: %s",
+                        info["id"], seen_attrs[:15])
         if info["id"] and info["id"] != "None":
             items.append(info)
     return True, items
