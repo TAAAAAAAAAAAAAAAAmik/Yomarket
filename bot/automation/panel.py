@@ -2521,27 +2521,70 @@ class YooMarketPanel:
                     return page, context
                 await asyncio.sleep(1)
 
-            # The storefront opens the form from a button — "Профиль" is the
-            # entry point on this site.
-            for sel in ('button:has-text("Профиль")', 'a:has-text("Профиль")',
-                        'button:has-text("Войти")', 'a:has-text("Войти")',
-                        'button:has-text("Вход")', 'a[href*="login"]'):
+            # /login just renders the storefront: the login form is a modal
+            # opened from inside the site. The entry point is the hamburger
+            # menu (an icon, so it has to be matched by label, not by text).
+            async def _click_and_wait(sel: str, secs: int = 8) -> bool:
                 try:
                     btn = await page.query_selector(sel)
                     if not btn or not await btn.is_visible():
-                        continue
-                    logger.info("clicking opener %s", sel)
+                        return False
+                    logger.info("clicking %s", sel)
                     await btn.click()
                     await _dismiss_overlays()
-                    # A modal animates in and Next.js hydrates lazily — poll
-                    # instead of checking once.
-                    for _ in range(8):
+                    for _ in range(secs):
                         await asyncio.sleep(1)
                         if await _find_email():
-                            logger.info("login form opened via %s", sel)
+                            logger.info("login form appeared after %s", sel)
+                            return True
+                except Exception as e:
+                    logger.debug("click %s failed: %s", sel, e)
+                return False
+
+            # 1. Open the burger menu, then take whatever login entry it offers
+            for menu_sel in ('button:has-text("Меню")', '[aria-label*="Меню" i]',
+                             'button[aria-label*="menu" i]', 'header button'):
+                try:
+                    menu = await page.query_selector(menu_sel)
+                    if not menu or not await menu.is_visible():
+                        continue
+                    logger.info("opening menu via %s", menu_sel)
+                    await menu.click()
+                    await asyncio.sleep(2)
+                    await _dismiss_overlays()
+                    if await _find_email():
+                        return page, context
+
+                    # Log what the opened menu contains — that is where the
+                    # login entry lives, and its wording is unknown.
+                    try:
+                        items = await page.evaluate(
+                            "() => [...document.querySelectorAll('a,button')]"
+                            ".map(e => (e.innerText||'').trim())"
+                            ".filter(t => t && t.length < 30).slice(0, 30)"
+                        )
+                        logger.info("menu items: %s", items)
+                        self.page_debug.append(_esc(f"меню: {items}"))
+                    except Exception:
+                        pass
+
+                    for sel in ('button:has-text("Войти")', 'a:has-text("Войти")',
+                                'button:has-text("Вход")', 'a:has-text("Вход")',
+                                'button:has-text("Профиль")', 'a:has-text("Профиль")',
+                                'button:has-text("Регистрация")',
+                                'a[href*="login"]', 'a[href*="auth"]'):
+                        if await _click_and_wait(sel):
                             return page, context
                 except Exception:
                     continue
+
+            # 2. Fall back to the controls sitting directly on the page
+            for sel in ('button:has-text("Профиль")', 'a:has-text("Профиль")',
+                        'button:has-text("Войти")', 'a:has-text("Войти")',
+                        'button:has-text("Вход")', 'a[href*="login"]',
+                        'nav a:last-child', 'footer a[href*="login"]'):
+                if await _click_and_wait(sel):
+                    return page, context
 
             # Record what this page offered, so a miss is explainable
             try:
