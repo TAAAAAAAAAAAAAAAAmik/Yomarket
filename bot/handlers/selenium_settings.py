@@ -121,7 +121,23 @@ async def bump_save_interval(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "selenium:run:bump")
 async def run_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    # Bumping goes through the panel: the Integration API has no method for it.
+    """Ask first — promoting every listing spends money on each one."""
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Да, продвинуть все", callback_data="selenium:run:bump_ok")
+    b.button(text="❌ Отмена", callback_data="selenium:bump:menu")
+    b.adjust(1)
+    await callback.message.edit_text(
+        "⚠️ <b>Продвижение платное</b>\n\n"
+        "На Юмаркете поднятие — это «Премиум», деньги списываются "
+        "с баланса магазина <b>за каждое объявление</b>.\n\n"
+        "Продвинуть все объявления?",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "selenium:run:bump_ok")
+async def run_bump_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
     import asyncio
 
     from automation.panel import panel_bump_all_sync
@@ -130,29 +146,29 @@ async def run_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
     uid = callback.from_user.id
     creds = get_panel_creds(uid)
     if not creds or not creds.get("cookies"):
-        await callback.answer(
-            "⚠️ Нужен вход в панель продавца", show_alert=True)
+        await callback.answer("⚠️ Нужен вход в панель продавца", show_alert=True)
         return
 
-    await callback.answer("⏳ Поднимаю объявления...", show_alert=False)
-    await callback.message.edit_text("⏳ Поднимаю объявления через панель...")
+    await callback.answer("⏳ Продвигаю объявления...", show_alert=False)
+    await callback.message.edit_text("⏳ Продвигаю объявления через панель...")
     s = get_settings(uid)
     try:
         loop = asyncio.get_event_loop()
         count, msg = await asyncio.wait_for(
             loop.run_in_executor(
-                None, panel_bump_all_sync, creds["cookies"], uid),
-            timeout=180,
+                None, panel_bump_all_sync, creds["cookies"], uid, True),
+            timeout=300,
         )
         s["auto_bump"]["last_bump_run"] = _time.time()
         save_settings(uid, s)
-        result_text = f"⬆️ <b>Поднятие завершено</b>\n\n{msg}"
+        result_text = f"⬆️ <b>Продвижение завершено</b>\n\n{msg}"
     except asyncio.TimeoutError:
         result_text = "⏰ Панель не ответила вовремя"
     except Exception as e:
         logger.error("Manual bump error: %s", e)
         result_text = f"❌ Ошибка: {e}"
-    await callback.message.edit_text(result_text + "\n\n" + _bump_text(s), reply_markup=_bump_kb(s))
+    await callback.message.edit_text(
+        result_text + "\n\n" + _bump_text(s), reply_markup=_bump_kb(s))
 
 
 # ---------------------------------------------------------------------------

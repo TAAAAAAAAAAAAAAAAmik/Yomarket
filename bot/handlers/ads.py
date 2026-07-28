@@ -161,7 +161,24 @@ async def show_ad_detail(
 
 @router.callback_query(F.data.startswith("ad_bump:"))
 async def bump_ad(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    """Raise one listing through the panel — the Integration API has no bump."""
+    """Ask before promoting: «Премиум» is a paid action on this marketplace."""
+    ad_id = callback.data.split(":", 1)[1]
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Да, продвинуть", callback_data=f"ad_bump_ok:{ad_id}")
+    b.button(text="❌ Отмена", callback_data=f"ad:{ad_id}")
+    b.adjust(1)
+    await callback.message.answer(
+        "⚠️ <b>Продвижение платное</b>\n\n"
+        "На Юмаркете поднятие — это действие «Премиум», оно списывает деньги "
+        "с баланса магазина.\n\nПродвинуть этот товар?",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ad_bump_ok:"))
+async def bump_ad_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    """Run the paid promotion through the panel — the API has no such method."""
     import asyncio
 
     from automation.panel import panel_bump_item_sync
@@ -170,23 +187,22 @@ async def bump_ad(callback: CallbackQuery, api: YooMarketAPI) -> None:
     ad_id = callback.data.split(":", 1)[1]
     creds = get_panel_creds(callback.from_user.id)
     if not creds or not creds.get("cookies"):
-        await callback.answer(
-            "⚠️ Нужен вход в панель продавца", show_alert=True)
+        await callback.answer("⚠️ Нужен вход в панель продавца", show_alert=True)
         return
 
-    await callback.answer("⏳ Поднимаю товар...", show_alert=False)
+    await callback.answer("⏳ Продвигаю...", show_alert=False)
     try:
         loop = asyncio.get_event_loop()
         ok, msg = await asyncio.wait_for(
             loop.run_in_executor(
                 None, panel_bump_item_sync, creds["cookies"], ad_id,
-                callback.from_user.id),
+                callback.from_user.id, True),
             timeout=60,
         )
-        await callback.answer(
-            f"✅ Поднято: {msg}" if ok else f"❌ {msg[:180]}", show_alert=True)
+        await callback.message.edit_text(
+            f"✅ Продвинуто: {msg}" if ok else f"❌ {msg[:300]}")
     except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
+        await callback.message.edit_text(f"❌ Ошибка: {str(e)[:200]}")
 
 
 @router.callback_query(F.data.startswith("ad_price:"))

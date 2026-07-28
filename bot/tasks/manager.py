@@ -772,7 +772,12 @@ class TaskManager:
             logger.warning("Auto chat send failed (chat %s): %s", chat_id, e)
 
     async def _panel_bump(self, user_id: int) -> tuple[int, str]:
-        """Raise all listings through the panel (needs a live panel session)."""
+        """Promote all listings through the panel.
+
+        Runs only from schedules the owner switched on themselves, so
+        confirm=True is passed here; the daily spend ceiling still applies at
+        the call site.
+        """
         from storage import get_panel_creds
         from automation.panel import panel_bump_all_sync
 
@@ -784,7 +789,7 @@ class TaskManager:
         try:
             return await asyncio.wait_for(
                 loop.run_in_executor(
-                    None, panel_bump_all_sync, creds["cookies"], user_id),
+                    None, panel_bump_all_sync, creds["cookies"], user_id, True),
                 timeout=180,
             )
         except asyncio.TimeoutError:

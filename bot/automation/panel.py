@@ -627,8 +627,11 @@ _DANGEROUS_KWS = ("удал", "delete", "destroy", "force")
 # Raising a listing back to the top of the feed. The Integration API has no
 # such method at all, but the panel does — it is a Nova action, reachable the
 # same way publishing is.
-_BUMP_KWS = ("подня", "поднят", "bump", "raise", "up", "продвин", "буст",
-             "boost", "обнов", "refresh")
+# On this marketplace there is no plain "raise" action — promotion is the paid
+# «Премиум» action, so that is what bumping maps to. It SPENDS MONEY, which is
+# why callers must pass confirm=True and the daily ceiling is enforced.
+_BUMP_KWS = ("премиум", "premium", "подня", "поднят", "bump", "raise",
+             "продвин", "буст", "boost")
 
 
 def _build_update_form(fields: list[dict], overrides: dict) -> dict:
@@ -813,8 +816,14 @@ def panel_publish_item_sync(
 
 def panel_bump_item_sync(
     cookie_string: str, item_id: str, uid: int | None = None,
+    confirm: bool = False,
 ) -> tuple[bool, str]:
-    """Blocking: raise one listing via the panel's Nova action.
+    """Blocking: promote one listing via the panel's «Премиум» Nova action.
+
+    This is a PAID action on Yoomarket, so it refuses to run unless the caller
+    passes confirm=True. If the action needs parameters, they are reported
+    rather than guessed — submitting arbitrary values could buy the wrong
+    placement.
 
     Returns (ok, message_or_diagnostics).
     """
@@ -851,13 +860,40 @@ def panel_bump_item_sync(
             continue
         if not any(kw in blob for kw in _BUMP_KWS):
             continue
+
+        if not confirm:
+            return False, (
+                f"«{a.get('name') or key}» — платное действие. "
+                f"Запуск только с подтверждением."
+            )
+
+        # Report required parameters instead of inventing values for a
+        # purchase (duration, placement, budget, ...).
+        fields = [f for f in (a.get("fields") or []) if isinstance(f, dict)]
+        required = [
+            f.get("name") or f.get("attribute")
+            for f in fields
+            if "required" in str(f.get("rules", []))
+        ]
+        if required:
+            return False, (
+                f"«{a.get('name') or key}» требует параметры: {required}. "
+                f"Запустите его в панели — я не подставляю значения для платной "
+                f"операции."
+            )
+
+        payload = {"resources": str(item_id)}
+        for f in fields:
+            attr = f.get("attribute")
+            val = f.get("value")
+            if attr and val not in (None, ""):
+                payload[attr] = val
         try:
             resp = session.post(
                 f"{PANEL_URL}/nova-api/items/action?action={key}",
-                data={"resources": str(item_id)},
-                headers=hdrs, timeout=(6, 15),
+                data=payload, headers=hdrs, timeout=(6, 15),
             )
-            trace.append(f"action {key}: {resp.status_code}")
+            trace.append(f"action {key}: {resp.status_code} {resp.text[:80]}")
             if resp.status_code in (200, 201, 204):
                 _save_refreshed_cookies(uid, cookie_string, session)
                 return True, str(a.get("name") or key)
@@ -865,12 +901,12 @@ def panel_bump_item_sync(
             trace.append(f"action {key}: {str(e)[:40]}")
 
     _save_refreshed_cookies(uid, cookie_string, session)
-    return False, (f"действие поднятия не найдено. "
+    return False, (f"действие продвижения не найдено. "
                    f"Доступные: {names or 'нет'}; лог: {'; '.join(trace)[:200]}")
 
 
 def panel_bump_all_sync(
-    cookie_string: str, uid: int | None = None,
+    cookie_string: str, uid: int | None = None, confirm: bool = False,
 ) -> tuple[int, str]:
     """Blocking: raise every listing the panel shows. Returns (count, message)."""
     ok, items = panel_list_items_sync(cookie_string)
@@ -885,14 +921,14 @@ def panel_bump_all_sync(
         item_id = it.get("id")
         if not item_id:
             continue
-        done, msg = panel_bump_item_sync(cookie_string, item_id, uid)
+        done, msg = panel_bump_item_sync(cookie_string, item_id, uid, confirm)
         if done:
             count += 1
         else:
             last = msg
             # A missing action will be missing for every item — stop early
             # instead of repeating the same failure for the whole list.
-            if "не найдено" in msg or "401" in msg:
+            if any(k in msg for k in ("не найдено", "401", "подтвержд", "требует")):
                 break
     if count:
         return count, f"✅ Поднято: {count}"
