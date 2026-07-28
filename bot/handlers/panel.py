@@ -7,20 +7,18 @@ import re
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from automation.panel import (
-    YooMarketPanel, YooMarketPanelHTTP, PanelSession, try_token_login,
-)
+from automation.panel import YooMarketPanelHTTP, PanelSession, try_token_login
 from storage import get_panel_creds, save_panel_creds, delete_panel_creds, get_token
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-# {user_id: YooMarketPanelHTTP} — live HTTP session kept between the password
-# step and the code step, so the code is verified on the same login attempt
-# (holds cookies + CSRF, no browser).
+# {user_id: YooMarketPanelHTTP} — live HTTP session kept between the send-code
+# and enter-code steps, so the code is verified on the same session (it holds
+# the cookies and CSRF token the panel issued).
 _login_sessions: dict[int, YooMarketPanelHTTP] = {}
 
 
@@ -261,65 +259,26 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         except Exception:
             pass
 
-    status_msg = await message.answer(
-        "⏳ Открываю страницу входа в браузере...\n"
-        "<i>Первый запуск может занять до минуты.</i>"
-    )
+    status_msg = await message.answer("⏳ Запрашиваю код на почту...")
 
-    # Driven with a real browser: the site's login cannot be reproduced with
-    # plain requests, and the browser also records the requests it makes, which
-    # is what the HTTP version will later be built from.
-    panel = YooMarketPanel()
-    page = context = None
+    # Plain HTTP: the endpoint and payload were captured from the site itself
+    # (POST /token with an empty "code" field), so no browser is needed.
+    http = YooMarketPanelHTTP()
     try:
-        await asyncio.wait_for(panel.start(), timeout=60)
-        page, context = await asyncio.wait_for(panel.open_login_page(), timeout=120)
-        await status_msg.edit_text("⏳ Ввожу email и запрашиваю код...")
-        ok, err = await asyncio.wait_for(panel.submit_email(page, email), timeout=60)
+        await http.start()
+        ok, err = await asyncio.wait_for(http.send_code(email), timeout=60)
     except asyncio.TimeoutError:
-        ok, err = False, "Браузер не успел загрузить страницу входа."
+        ok, err = False, "Панель не ответила вовремя."
     except Exception as e:
-        emsg = str(e)
-        if any(k in emsg.lower() for k in
-               ("executable", "playwright", "browser", "chromium")):
-            err = ("Браузер не установлен в этом образе.\n"
-                   "Нужна пересборка с Chromium — она уже в коде, "
-                   "дождитесь окончания деплоя.")
-        elif "memory" in emsg.lower() or "killed" in emsg.lower():
-            err = ("Браузеру не хватило памяти на бесплатном тарифе (512 МБ).\n"
-                   "Нужен тариф побольше или вход через cookies.")
-        else:
-            err = f"Ошибка браузера:\n<code>{emsg[:300]}</code>"
-        ok = False
+        ok, err = False, f"Ошибка запроса: {str(e)[:200]}"
 
     if not ok:
-        # Grab the picture BEFORE closing the browser — a screenshot shows a
-        # form that never rendered, which no markup dump can.
-        shot = b""
         try:
-            shot = await asyncio.wait_for(panel.screenshot(), timeout=20)
-        except Exception as e:
-            logger.warning("screenshot failed: %s", e)
-        try:
-            await panel.close()
+            await http.close()
         except Exception:
             pass
-
         await state.clear()
-        seen = "\n".join(panel.captured[:15])
-        pages = "\n".join(panel.page_debug[:3])
-        extra = f"\n\n<b>Запросы:</b>\n<code>{seen[:700]}</code>" if seen else ""
-        if pages:
-            extra += f"\n\n<b>Что на странице:</b>\n<code>{pages[:700]}</code>"
-        await _safe_edit(status_msg, f"❌ {err or 'Не удалось отправить код'}{extra}")
-        if shot:
-            try:
-                await message.answer_photo(
-                    BufferedInputFile(shot, filename="login.png"),
-                    caption="📸 Что видит браузер на странице входа",
-                )
-            except Exception as e:
-                logger.warning("screenshot send failed: %s", e)
+        await _safe_edit(status_msg, f"❌ {err or 'Не удалось отправить код'}")
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
@@ -328,7 +287,8 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите действие:", reply_markup=b.as_markup())
         return
 
-    _login_sessions[uid] = (panel, page, context)
+    _login_sessions[uid] = http
+
     await state.update_data(email=email)
     await state.set_state(PanelState.waiting_code)
     await status_msg.edit_text(
@@ -391,24 +351,18 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
         )
         return
 
-    panel, page, context = entry
+    http = entry
     status_msg = await message.answer("⏳ Проверяю код...")
     try:
-        ok, result = await asyncio.wait_for(
-            panel.submit_code(page, context, code), timeout=60
-        )
+        ok, result = await asyncio.wait_for(http.verify_code(code), timeout=60)
     except asyncio.TimeoutError:
         ok, result = False, "Превышено время ожидания. Попробуйте ещё раз."
     except Exception as e:
         ok, result = False, f"Ошибка запроса: {str(e)[:200]}"
 
-    # What the page actually called — this is the recipe for the HTTP version.
-    seen = "\n".join(panel.captured[:15])
-    logger.info("LOGIN REQUESTS:\n%s", seen)
-
     _login_sessions.pop(uid, None)
     try:
-        await panel.close()
+        await http.close()
     except Exception:
         pass
 
@@ -417,8 +371,7 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
     await state.clear()
 
     if not ok:
-        extra = f"\n\n<b>Запросы страницы:</b>\n<code>{seen[:900]}</code>" if seen else ""
-        await _safe_edit(status_msg, f"❌ {result}{extra}")
+        await _safe_edit(status_msg, f"❌ {result}")
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
