@@ -2480,6 +2480,13 @@ class YooMarketPanel:
         self._page = page
         self._watch_requests(page)
 
+        # Hard budget: three URLs plus menu hunting can otherwise outlast the
+        # caller's timeout and look like a freeze.
+        deadline = asyncio.get_event_loop().time() + 100
+
+        def _time_left() -> bool:
+            return asyncio.get_event_loop().time() < deadline
+
         _EMAIL_SEL = ('input[type="email"], input[name="email"], '
                       'input[placeholder*="почт" i], input[placeholder*="mail" i], '
                       'input[type="text"]')
@@ -2504,9 +2511,15 @@ class YooMarketPanel:
                 except Exception:
                     continue
 
-        # Straight to the login page — walking several URLs first is what ate
-        # the time budget before.
-        for url in (MAIN_URL + "/login", MAIN_URL + "/"):
+        # The panel's own login page comes FIRST: it is what the original
+        # selectors ("Получить код") were written against and what used to
+        # work. Prioritising the storefront here was a regression — the HTTP
+        # findings were about where the code is mailed from, not about where
+        # the form lives.
+        for url in (PANEL_URL + "/login", MAIN_URL + "/login", MAIN_URL + "/"):
+            if not _time_left():
+                logger.warning("open_login_page: out of time budget")
+                break
             try:
                 await page.goto(url, timeout=20000, wait_until="domcontentloaded")
             except Exception:
@@ -2524,7 +2537,7 @@ class YooMarketPanel:
             # /login just renders the storefront: the login form is a modal
             # opened from inside the site. The entry point is the hamburger
             # menu (an icon, so it has to be matched by label, not by text).
-            async def _click_and_wait(sel: str, secs: int = 8) -> bool:
+            async def _click_and_wait(sel: str, secs: int = 4) -> bool:
                 try:
                     btn = await page.query_selector(sel)
                     if not btn or not await btn.is_visible():
@@ -2533,6 +2546,8 @@ class YooMarketPanel:
                     await btn.click()
                     await _dismiss_overlays()
                     for _ in range(secs):
+                        if not _time_left():
+                            return False
                         await asyncio.sleep(1)
                         if await _find_email():
                             logger.info("login form appeared after %s", sel)
@@ -2544,6 +2559,8 @@ class YooMarketPanel:
             # 1. Open the burger menu, then take whatever login entry it offers
             for menu_sel in ('button:has-text("Меню")', '[aria-label*="Меню" i]',
                              'button[aria-label*="menu" i]', 'header button'):
+                if not _time_left():
+                    break
                 try:
                     menu = await page.query_selector(menu_sel)
                     if not menu or not await menu.is_visible():
