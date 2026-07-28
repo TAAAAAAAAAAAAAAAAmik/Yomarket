@@ -2393,15 +2393,14 @@ class YooMarketPanel:
     async def start(self) -> None:
         from playwright.async_api import async_playwright
         self._playwright = await async_playwright().start()
-        # Lean flags: a free 512 MB instance cannot afford Chromium's default
-        # multi-process layout, and images are useless for a login form.
+        # NOTE: no --single-process / --no-zygote here. They save memory but
+        # routinely hang Playwright on navigation, which is exactly how this
+        # showed up: the login froze after the email step with no error.
         self._browser = await self._playwright.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--single-process",
-                "--no-zygote",
                 "--disable-gpu",
                 "--disable-software-rasterizer",
                 "--disable-extensions",
@@ -2537,6 +2536,7 @@ class YooMarketPanel:
         Fill the email field and click "Получить код".
         Returns (True, '') on success, (False, error) on failure.
         """
+        logger.info("submit_email: start, url=%s", page.url)
         try:
             # Fill email — first try standard selectors, then JS fallback
             filled = await _fill_first(page, _EMAIL_SELECTORS, email)
@@ -2567,6 +2567,7 @@ class YooMarketPanel:
             if not filled:
                 html = await page.content()
                 return False, f"Поле email не найдено.\nHTML: <code>{html[:300]}</code>"
+            logger.info("submit_email: email filled")
 
             # Small pause so Vue can register the value before we click
             await asyncio.sleep(0.4)
@@ -2583,14 +2584,18 @@ class YooMarketPanel:
             if not clicked:
                 html = await page.content()
                 return False, f"Кнопка «Получить код» не найдена.\nHTML: <code>{html[:300]}</code>"
+            logger.info("submit_email: submit clicked, waiting for network")
 
             # Wait for the browser to finish the form-submission network request,
             # then give the SPA a moment to re-render the code input.
+            # networkidle never settles on pages with analytics beacons or
+            # long-polling, so treat a miss as normal rather than waiting it out.
             try:
-                await page.wait_for_load_state("networkidle", timeout=8000)
+                await page.wait_for_load_state("networkidle", timeout=6000)
             except Exception:
-                pass
+                logger.info("submit_email: networkidle not reached (ok)")
             await asyncio.sleep(1)
+            logger.info("submit_email: done, url=%s", page.url)
 
             # If already navigated away from login — logged in without code
             if "/login" not in page.url:
