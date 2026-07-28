@@ -294,11 +294,66 @@ async def edit_title_save(message: Message, state: FSMContext) -> None:
 
 # ── Показать / Скрыть ───────────────────────────────────────────────────────
 
-async def _toggle(callback: CallbackQuery, public: bool) -> None:
+async def _stock_left(api: YooMarketAPI, item_id: str) -> tuple[bool, str]:
+    """How much stock an ad has. Returns (has_stock, human_note).
+
+    Publishing is refused by the marketplace when an ad has nothing to sell, so
+    this is checked BEFORE the publish call — otherwise the user just gets a
+    rejection with no idea what to fix.
+    On any error it returns True: a failed check must not block publishing.
+    """
+    try:
+        ad = await api.get_ad(item_id)
+        inner = ad.get("data") or ad
+        ad_type = str(inner.get("type") or "")
+
+        if ad_type == "auto-delivery":
+            data = await api.get_ad_items(item_id)
+            rows = data.get("data") or data.get("items") or []
+            free = [r for r in rows
+                    if str((r or {}).get("status", "available")) == "available"]
+            return bool(free), f"позиций в наличии: {len(free)}"
+
+        if ad_type == "auto-value":
+            val = await api.get_ad_value(item_id)
+            inner_v = val.get("data") or val
+            stock = inner_v.get("stock")
+            return bool(stock), f"остаток: {stock}"
+
+        stock = inner.get("stock")
+        if stock is None:
+            return True, ""
+        return bool(stock), f"остаток: {stock}"
+    except Exception as e:
+        logger.info("stock check skipped for %s: %s", item_id, e)
+        return True, ""
+
+
+async def _toggle(callback: CallbackQuery, public: bool,
+                  api: YooMarketAPI | None = None) -> None:
     from automation.panel import panel_publish_item_sync
 
     item_id = callback.data.split(":", 1)[1]
     uid = callback.from_user.id
+
+    # Refuse to publish an empty listing — offer to fill it instead.
+    if public and api:
+        has_stock, note = await _stock_left(api, item_id)
+        if not has_stock:
+            b = InlineKeyboardBuilder()
+            b.button(text="📦 Добавить остатки",
+                     callback_data=f"pitem_stock:{item_id}")
+            b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
+            b.adjust(1)
+            await callback.answer("Нет остатков", show_alert=True)
+            await callback.message.edit_text(
+                f"📦 <b>Нельзя опубликовать — нет остатков</b>\n\n"
+                f"Товар #{item_id}: {note}.\n\n"
+                f"Сначала добавьте позиции, потом публикуйте.",
+                reply_markup=b.as_markup(),
+            )
+            return
+
     await callback.answer("⏳ Выполняю...")
     result, err = await _run(uid, panel_publish_item_sync, item_id, uid, public)
     verb = "показан" if public else "скрыт"
@@ -311,8 +366,8 @@ async def _toggle(callback: CallbackQuery, public: bool) -> None:
 
 
 @router.callback_query(F.data.startswith("pitem_show:"))
-async def item_show(callback: CallbackQuery) -> None:
-    await _toggle(callback, public=True)
+async def item_show(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    await _toggle(callback, public=True, api=api)
 
 
 @router.callback_query(F.data.startswith("pitem_hide:"))
@@ -321,7 +376,7 @@ async def item_hide(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "pitems:pubhidden")
-async def publish_all_hidden(callback: CallbackQuery) -> None:
+async def publish_all_hidden(callback: CallbackQuery, api: YooMarketAPI) -> None:
     """Publish every currently-hidden item in one tap."""
     from automation.panel import panel_list_items_sync, panel_publish_item_sync
     uid = callback.from_user.id
@@ -339,8 +394,16 @@ async def publish_all_hidden(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         f"⏳ Публикую {len(hidden)} скрытых товаров…")
     ok = fail = 0
+    empty: list[str] = []
     last_err = ""
     for it in hidden:
+        # Skip listings with nothing to sell instead of publishing them into
+        # a rejection — they are reported separately so they can be filled.
+        if api:
+            has_stock, _note = await _stock_left(api, it["id"])
+            if not has_stock:
+                empty.append(str(it["id"]))
+                continue
         r, e = await _run(uid, panel_publish_item_sync, it["id"], uid, True)
         if r and r[0]:
             ok += 1
@@ -352,6 +415,9 @@ async def publish_all_hidden(callback: CallbackQuery) -> None:
     b.button(text="⬅️ Назад", callback_data="menu:ads")
     b.adjust(2)
     text = f"🌍 <b>Публикация завершена</b>\n\n✅ Опубликовано: <b>{ok}</b>"
+    if empty:
+        text += (f"\n📦 Пропущено без остатков: <b>{len(empty)}</b>"
+                 f"\n<i>#{', #'.join(empty[:10])}</i>")
     if fail:
         text += f"\n❌ Не удалось: <b>{fail}</b>"
         if last_err:

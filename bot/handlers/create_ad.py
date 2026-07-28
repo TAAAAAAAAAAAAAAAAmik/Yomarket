@@ -721,11 +721,19 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
             if pub_ok:
                 pub_note = f"\n🌍 Опубликован ({pub_msg})"
             else:
-                pub_note = f"\n⚠️ Не опубликован автоматически: {pub_msg}"
+                # A fresh listing usually has nothing to sell yet, and the
+                # marketplace refuses to publish an empty one — say what to do
+                # instead of just reporting a failure.
+                pub_note = (
+                    f"\n📦 Не опубликован — сначала добавьте остатки."
+                    f"\n<i>{pub_msg[:150]}</i>"
+                )
 
         b = InlineKeyboardBuilder()
         if item_id and "Опубликован" not in pub_note:
-            b.button(text="🌍 Опубликовать ещё раз",
+            b.button(text="📦 Добавить остатки",
+                     callback_data=f"pitem_stock:{item_id}")
+            b.button(text="🌍 Опубликовать",
                      callback_data=f"cadpub:{item_id}")
         b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
         b.button(text="📦 Мои товары", callback_data="menu:ads")
