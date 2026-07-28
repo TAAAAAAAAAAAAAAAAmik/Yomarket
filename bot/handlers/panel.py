@@ -23,12 +23,9 @@ _login_sessions: dict[int, YooMarketPanelHTTP] = {}
 
 
 class PanelState(StatesGroup):
-    # Main flow: email → code mailed by the marketplace.
+    # email → code mailed by the panel
     waiting_email = State()
     waiting_code = State()
-    # Fallback: the panel's own password login.
-    waiting_pw_email = State()
-    waiting_pw_password = State()
     waiting_cookies = State()
 
 
@@ -56,21 +53,19 @@ def _menu_kb(creds: dict | None, has_token: bool = False):
         b.button(text="🚪 Выйти", callback_data="panel:logout")
         b.button(text="📧 Вход по коду", callback_data="panel:sms_start")
         b.button(text="🍪 Обновить cookies", callback_data="panel:cookies_start")
-        b.button(text="🔍 Найти адрес входа", callback_data="panel:probe_ui")
         if has_token:
             b.button(text="🎟 Через токен", callback_data="panel:token_login")
     else:
         b.button(text="📧 Вход по коду", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
-        b.button(text="🔍 Найти адрес входа", callback_data="panel:probe_ui")
         if has_token:
             b.button(text="🎟 Через токен", callback_data="panel:token_login")
     b.button(text="⬅️ Настройки", callback_data="settings:menu")
     # 2 columns for actions, "⬅️ Настройки" on its own row at the bottom
     if creds:
-        b.adjust(2, 2, 1, 1, 1) if has_token else b.adjust(2, 2, 1, 1)
+        b.adjust(2, 2, 1, 1) if has_token else b.adjust(2, 2, 1)
     else:
-        b.adjust(2, 1, 1, 1) if has_token else b.adjust(2, 1, 1)
+        b.adjust(2, 1, 1) if has_token else b.adjust(2, 1)
     return b.as_markup()
 
 
@@ -298,37 +293,6 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Password login — kept for the panel's own admin login
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data == "panel:pw_start")
-async def panel_pw_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(PanelState.waiting_pw_email)
-    await callback.message.edit_text(
-        "🔑 <b>Вход по паролю</b>\n\n"
-        "Запасной вариант, если у аккаунта задан пароль.\n\n"
-        "Введите <b>email</b>:",
-        reply_markup=_cancel_kb(),
-    )
-    await callback.answer()
-
-
-@router.message(PanelState.waiting_pw_email)
-async def panel_pw_email_input(message: Message, state: FSMContext) -> None:
-    email = (message.text or "").strip()
-    if not email or "@" not in email:
-        await message.answer("❌ Введите корректный email адрес")
-        return
-
-    await state.update_data(email=email)
-    await state.set_state(PanelState.waiting_pw_password)
-    await message.answer(
-        "🔑 Теперь введите <b>пароль</b>:\n\n"
-        "<i>Сообщение с паролем будет удалено автоматически.</i>",
-        reply_markup=_cancel_kb(),
-    )
-
 
 # ---------------------------------------------------------------------------
 # OTP login: step 2 — verify the code from the letter
@@ -387,107 +351,6 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
             f"версию без браузера:\n<code>{seen[:900]}</code>"
         )
 
-
-# ---------------------------------------------------------------------------
-# Login step 2 — password → POST /login (may hand off to the code step)
-# ---------------------------------------------------------------------------
-
-@router.message(PanelState.waiting_pw_password)
-async def panel_password_input(message: Message, state: FSMContext) -> None:
-    password = message.text or ""
-    if not password.strip():
-        await message.answer("❌ Введите пароль")
-        return
-
-    data = await state.get_data()
-    email = data.get("email", "")
-    uid = message.from_user.id
-
-    # Wipe the password message so the plaintext secret doesn't linger in chat.
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    status_msg = await message.answer("⏳ Вхожу в панель...")
-
-    old = _login_sessions.pop(uid, None)
-    if old:
-        try:
-            await old.close()
-        except Exception:
-            pass
-
-    http = YooMarketPanelHTTP()
-    try:
-        await http.start()
-        status, result = await asyncio.wait_for(
-            http.login_password(email, password), timeout=45
-        )
-    except asyncio.TimeoutError:
-        status, result = "error", "Превышено время ожидания. Попробуйте ещё раз."
-    except Exception as e:
-        status, result = "error", f"Ошибка запроса: {str(e)[:200]}"
-
-    # The panel wants the emailed code as a second factor — keep the session
-    # alive so the code lands on the very same login attempt.
-    if status == "code":
-        _login_sessions[uid] = http
-        await state.set_state(PanelState.waiting_code)
-        await status_msg.edit_text(
-            f"📨 <b>{result}</b>\n\nВведите <b>код из письма</b>:",
-            reply_markup=_cancel_kb(),
-        )
-        return
-
-    try:
-        await http.close()
-    except Exception:
-        pass
-    await state.clear()
-
-    if status != "ok":
-        await status_msg.edit_text(f"❌ {result}")
-        b = InlineKeyboardBuilder()
-        b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
-        b.button(text="🔍 Что на странице входа", callback_data="panel:probe_ui")
-        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
-        b.button(text="↩️ Назад", callback_data="panel:menu")
-        b.adjust(1)
-        await message.answer("Выберите действие:", reply_markup=b.as_markup())
-        return
-
-    await _finish_login(message, status_msg, uid, email, result)
-
-
-# ---------------------------------------------------------------------------
-# Diagnostics: what the panel's login screen is actually made of
-# ---------------------------------------------------------------------------
-
-@router.callback_query(F.data == "panel:probe_ui")
-async def panel_probe_ui(callback: CallbackQuery) -> None:
-    await callback.answer("⏳ Ищу адрес входа...")
-    status_msg = await callback.message.answer(
-        "⏳ Читаю код страницы входа yoomarket.net...")
-
-    http = YooMarketPanelHTTP()
-    try:
-        await http.start()
-        report = await asyncio.wait_for(http.probe_login_ui(), timeout=90)
-    except asyncio.TimeoutError:
-        report = "не успел за 90 секунд"
-    except Exception as e:
-        report = f"ошибка: {str(e)[:200]}"
-    finally:
-        try:
-            await http.close()
-        except Exception:
-            pass
-
-    await _safe_edit(
-        status_msg,
-        f"🔍 <b>Адреса входа yoomarket.net</b>\n\n<code>{report[:3500]}</code>",
-    )
 
 
 # ---------------------------------------------------------------------------

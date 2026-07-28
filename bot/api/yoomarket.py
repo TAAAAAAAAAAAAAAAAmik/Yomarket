@@ -158,14 +158,21 @@ class YooMarketAPI:
         try:
             data = await self._get("/check")
             shop = data.get("data") or data.get("shop") or data.get("seller") or data
-            if isinstance(shop, dict):
-                raw = (
-                    shop.get("balance") or shop.get("wallet") or shop.get("money") or
-                    shop.get("balance_rub") or shop.get("amount") or
-                    data.get("balance") or data.get("wallet") or data.get("money") or 0
-                )
+            raw = None
+            for src in (shop, data):
+                if not isinstance(src, dict):
+                    continue
+                for key in ("balance", "wallet", "money", "balance_rub", "amount"):
+                    # `in` rather than a truthiness chain: a balance of 0 is a
+                    # real value, not a missing one.
+                    if key in src and src[key] not in (None, ""):
+                        raw = src[key]
+                        break
+                if raw is not None:
+                    break
+            if raw is not None:
                 try:
-                    amount = float(str(raw).replace(" ", "").replace(",", ".") or 0)
+                    amount = float(str(raw).replace(" ", "").replace(",", "."))
                     return amount, f"{amount:.0f} ₽"
                 except (ValueError, TypeError):
                     pass
@@ -179,8 +186,12 @@ class YooMarketAPI:
                 inner = data.get("data") or data
                 if isinstance(inner, dict):
                     for key in ("balance", "amount", "available", "total"):
-                        if key in inner:
-                            amount = float(inner[key])
+                        if key in inner and inner[key] not in (None, ""):
+                            try:
+                                amount = float(
+                                    str(inner[key]).replace(" ", "").replace(",", "."))
+                            except (ValueError, TypeError):
+                                continue
                             return amount, f"{amount:.0f} ₽"
             except RuntimeError as e:
                 if "404" in str(e) or "not found" in str(e).lower():

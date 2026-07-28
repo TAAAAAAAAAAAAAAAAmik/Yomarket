@@ -18,7 +18,7 @@ from storage import get_token, get_settings, save_settings
 logger = logging.getLogger(__name__)
 
 # Selenium loop interval in seconds (check every 30 minutes)
-_SELENIUM_LOOP_INTERVAL = 30 * 60
+_AUTO_LOOP_INTERVAL = 30 * 60
 
 
 def _fmt_time(raw) -> str:
@@ -163,7 +163,7 @@ class TaskManager:
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
         self._tasks: dict[int, asyncio.Task] = {}
-        self._selenium_tasks: dict[int, asyncio.Task] = {}
+        self._auto_tasks: dict[int, asyncio.Task] = {}
         # Per-user lock: the orders loop (60s) and the auto-tasks loop (30min)
         # both load→mutate→save the whole settings blob. Without serializing
         # them, whichever saves last silently clobbers the other's changes
@@ -181,18 +181,18 @@ class TaskManager:
         if user_id in self._tasks and not self._tasks[user_id].done():
             self._tasks[user_id].cancel()
         self._tasks[user_id] = asyncio.create_task(self._user_loop(user_id))
-        # Also start the selenium automation loop
-        if user_id in self._selenium_tasks and not self._selenium_tasks[user_id].done():
-            self._selenium_tasks[user_id].cancel()
-        self._selenium_tasks[user_id] = asyncio.create_task(self._selenium_loop(user_id))
+        # Also start the auto-features loop
+        if user_id in self._auto_tasks and not self._auto_tasks[user_id].done():
+            self._auto_tasks[user_id].cancel()
+        self._auto_tasks[user_id] = asyncio.create_task(self._auto_loop(user_id))
 
     def stop_for_user(self, user_id: int) -> None:
         if user_id in self._tasks:
             self._tasks[user_id].cancel()
             del self._tasks[user_id]
-        if user_id in self._selenium_tasks:
-            self._selenium_tasks[user_id].cancel()
-            del self._selenium_tasks[user_id]
+        if user_id in self._auto_tasks:
+            self._auto_tasks[user_id].cancel()
+            del self._auto_tasks[user_id]
 
     async def start_all(self) -> None:
         from storage import get_all_users
@@ -771,6 +771,44 @@ class TaskManager:
         except Exception as e:
             logger.warning("Auto chat send failed (chat %s): %s", chat_id, e)
 
+    async def _check_panel_session(self, user_id: int, settings: dict, now: float) -> None:
+        """Warn once when the stored panel session stops working.
+
+        Checked at most every 6 hours, and the warning is sent only on the
+        transition from working to dead, so a logged-out user is not nagged.
+        """
+        from storage import get_panel_creds
+
+        creds = get_panel_creds(user_id)
+        if not creds or not creds.get("cookies"):
+            return
+
+        state = settings.setdefault("panel_session", {})
+        if now - state.get("last_check", 0) < 6 * 3600:
+            return
+        state["last_check"] = now
+
+        from automation.panel import panel_check_session_sync
+        loop = asyncio.get_event_loop()
+        ok, _detail = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_check_session_sync, creds["cookies"]),
+            timeout=30,
+        )
+        was_ok = state.get("ok", True)
+        state["ok"] = ok
+
+        if not ok and was_ok:
+            b = InlineKeyboardBuilder()
+            b.button(text="📧 Войти по коду", callback_data="panel:sms_start")
+            b.adjust(1)
+            await self._notify(
+                user_id,
+                "⚠️ <b>Сессия панели истекла</b>\n\n"
+                "Создание товаров и управление объявлениями сейчас недоступны. "
+                "Войдите заново — код придёт на почту.",
+                reply_markup=b.as_markup(),
+            )
+
     async def _notify(self, user_id: int, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
         try:
             await self.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=reply_markup)
@@ -778,31 +816,31 @@ class TaskManager:
             logger.warning("Notify failed (user %s): %s", user_id, e)
 
     # ------------------------------------------------------------------
-    # Selenium / Playwright automation loop (separate from orders loop)
+    # Auto-features loop (separate from the orders loop)
     # ------------------------------------------------------------------
 
-    async def _selenium_loop(self, user_id: int) -> None:
-        """Background loop that runs browser automation tasks every 30 minutes."""
+    async def _auto_loop(self, user_id: int) -> None:
+        """Background loop for the auto features (bump / restore / withdraw)."""
         # Initial delay so it doesn't run immediately on startup
         await asyncio.sleep(60)
         while True:
             try:
-                await self._tick_selenium(user_id)
+                await self._tick_auto(user_id)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Selenium task error for user %s: %s", user_id, e)
-            await asyncio.sleep(_SELENIUM_LOOP_INTERVAL)
+                logger.error("Auto-task error for user %s: %s", user_id, e)
+            await asyncio.sleep(_AUTO_LOOP_INTERVAL)
 
-    async def _tick_selenium(self, user_id: int) -> None:
+    async def _tick_auto(self, user_id: int) -> None:
         """Run auto-bump / auto-restore / auto-withdraw via the Integration API."""
         token = get_token(user_id)
         if not token:
             return
         async with self._lock(user_id):
-            await self._tick_selenium_locked(user_id, token)
+            await self._tick_auto_locked(user_id, token)
 
-    async def _tick_selenium_locked(self, user_id: int, token: str) -> None:
+    async def _tick_auto_locked(self, user_id: int, token: str) -> None:
         settings = get_settings(user_id)
         now = time.time()
         messages = []
@@ -842,6 +880,15 @@ class TaskManager:
                                     "status": "requested" if success else "failed"})
                     del hist[100:]
                     messages.append(f"💸 Авто-вывод: {msg}")
+
+            # --- Panel session health ---
+            # Panel operations (product creation, item management) run on
+            # cookies that expire silently; without this the user only finds
+            # out when an action fails mid-use.
+            try:
+                await self._check_panel_session(user_id, settings, now)
+            except Exception as e:
+                logger.warning("Panel session check failed for %s: %s", user_id, e)
 
             # --- Balance notify ---
             bn = settings.get("balance_notify", {})

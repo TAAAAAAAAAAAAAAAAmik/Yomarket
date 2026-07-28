@@ -20,27 +20,36 @@ class WithdrawState(StatesGroup):
     waiting_amount = State()
 
 
+def _pick(*sources_and_keys) -> object | None:
+    """First value whose key is actually present.
+
+    A plain `a.get(x) or a.get(y)` chain drops a real balance of 0, because
+    zero is falsy — the value is discarded and the search moves on.
+    """
+    sources, keys = sources_and_keys[0], sources_and_keys[1:]
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for key in keys:
+            if key in src and src[key] not in (None, ""):
+                return src[key]
+    return None
+
+
 def _parse_check(data: dict) -> tuple[str, str, str | None]:
     """Parse /check response → (name, balance, pending)."""
     logger.info("CHECK raw response: %s", data)
     shop = data.get("shop") or data.get("data") or data
     if not isinstance(shop, dict):
         shop = data
-    name = (
-        shop.get("name") or shop.get("shop_name") or shop.get("title") or
-        data.get("name") or "—"
-    )
-    balance = (
-        shop.get("balance") or shop.get("wallet") or shop.get("money") or
-        shop.get("balance_rub") or shop.get("amount") or
-        data.get("balance") or data.get("wallet") or data.get("money")
-    )
-    pending = (
-        shop.get("pending_balance") or shop.get("pending") or
-        shop.get("hold") or shop.get("frozen")
-    )
-    bal_str = str(balance) if balance is not None and balance != "" else "0"
-    pend_str = str(pending) if pending is not None and pending != "" else None
+    srcs = (shop, data)
+
+    name = _pick(srcs, "name", "shop_name", "title") or "—"
+    balance = _pick(srcs, "balance", "wallet", "money", "balance_rub", "amount")
+    pending = _pick(srcs, "pending_balance", "pending", "hold", "frozen")
+
+    bal_str = str(balance) if balance is not None else "0"
+    pend_str = str(pending) if pending is not None else None
     return str(name), bal_str, pend_str
 
 

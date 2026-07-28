@@ -165,7 +165,7 @@ async def toggle_refunded(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "auto:toggle:restore")
 async def toggle_restore(callback: CallbackQuery) -> None:
-    # Redirect to the Playwright-based selenium restore menu
+    # Redirect to the restore menu (runs over the Integration API)
     from handlers.selenium_settings import _restore_text, _restore_kb
     from storage import get_panel_creds
     uid = callback.from_user.id
@@ -177,7 +177,7 @@ async def toggle_restore(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "auto:toggle:bump")
 async def toggle_bump(callback: CallbackQuery) -> None:
-    # Redirect to the Playwright-based selenium bump menu
+    # Redirect to the bump menu (runs over the Integration API)
     from handlers.selenium_settings import _bump_text, _bump_kb
     from storage import get_panel_creds
     uid = callback.from_user.id
