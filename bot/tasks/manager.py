@@ -610,7 +610,7 @@ class TaskManager:
                     continue
                 new_price = max(1, round(price * (1 + percent / 100)))
                 try:
-                    await api.update_ad(ad_id, price=new_price)
+                    await api.update_price(ad_id, new_price)
                     base[str(ad_id)] = price
                     changed += 1
                 except Exception as e:
@@ -627,7 +627,7 @@ class TaskManager:
             restored = 0
             for ad_id, price in base.items():
                 try:
-                    await api.update_ad(ad_id, price=int(price))
+                    await api.update_price(ad_id, int(price))
                     restored += 1
                 except Exception as e:
                     logger.warning("Price schedule restore %s: %s", ad_id, e)

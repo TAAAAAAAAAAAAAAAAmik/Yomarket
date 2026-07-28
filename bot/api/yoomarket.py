@@ -76,64 +76,30 @@ class YooMarketAPI:
         return await self._get(f"/ads/{ad_id}")
 
     async def bump_ad(self, ad_id: int | str) -> dict:
-        """Bump a single ad. Tries common endpoint patterns."""
-        tried = []
-        for path in (f"/ads/{ad_id}/up", f"/ads/{ad_id}/bump", f"/ads/{ad_id}/raise"):
-            try:
-                return await self._post(path)
-            except RuntimeError as e:
-                msg = str(e)
-                tried.append(f"{path}: {msg[:60]}")
-                if "404" in msg or "not found" in msg.lower():
-                    continue
-                raise
-        # Keep what the server actually said — "not supported" alone hides
-        # whether the path is wrong or the request was rejected.
-        raise RuntimeError("; ".join(tried) or "not supported")
+        """Not available: the Integration API v1.4 has no bump endpoint.
+
+        The spec lists only publish / unpublish / price / items / value for an
+        ad — nothing that raises it in the listing. Previous code guessed
+        /up, /bump and /raise, which simply 404.
+        """
+        raise RuntimeError(
+            "Интеграционное API не поддерживает поднятие объявлений — "
+            "такого метода нет в спецификации v1.4"
+        )
 
     async def bump_all_ads(self) -> tuple[int, str]:
-        """Bump all active ads. Returns (count, message)."""
-        data = await self.get_ads()
-        ads = data.get("data") or data.get("items") or []
-        if not ads:
-            return 0, "ℹ️ Нет объявлений"
-        count = 0
-        last_err = ""
-        for ad in ads:
-            ad_id = ad.get("id")
-            if not ad_id:
-                continue
-            try:
-                await self.bump_ad(ad_id)
-                count += 1
-            except RuntimeError as e:
-                last_err = str(e)
-        if count:
-            return count, f"✅ Поднято: {count}"
-        return 0, f"⚠️ API не поддерживает поднятие ({last_err})"
+        """Not available — see bump_ad(). Fails fast instead of walking every
+        ad only to 404 on each one."""
+        return 0, ("⚠️ Поднятие недоступно: в Интеграционном API нет такого "
+                   "метода. Поднимайте объявления в панели.")
 
     async def restore_ad(self, ad_id: int | str) -> dict:
-        """Restore / reactivate a single ad."""
-        tried = []
-        for path in (
-            f"/ads/{ad_id}/activate",
-            f"/ads/{ad_id}/restore",
-            f"/ads/{ad_id}/republish",
-            f"/ads/{ad_id}/publish",
-        ):
-            try:
-                return await self._post(path)
-            except RuntimeError as e:
-                msg = str(e)
-                tried.append(f"{path}: {msg[:60]}")
-                if "404" in msg or "not found" in msg.lower():
-                    continue
-                raise
-        try:
-            return await self._patch(f"/ads/{ad_id}", {"status": "active"})
-        except RuntimeError as e:
-            tried.append(f"PATCH /ads/{ad_id}: {str(e)[:60]}")
-        raise RuntimeError("; ".join(tried) or "not supported")
+        """Put an ad back on sale — POST /ads/{ad_id}/publish (per the spec)."""
+        return await self._post(f"/ads/{ad_id}/publish")
+
+    async def unpublish_ad(self, ad_id: int | str) -> dict:
+        """Take an ad off sale — POST /ads/{ad_id}/unpublish."""
+        return await self._post(f"/ads/{ad_id}/unpublish")
 
     async def restore_all_ads(self) -> tuple[int, str]:
         """Restore all inactive/sold ads. Returns (count, message)."""
@@ -203,24 +169,10 @@ class YooMarketAPI:
         except RuntimeError:
             pass
 
-        # Fallback: dedicated balance endpoints
-        for path in ("/balance", "/wallet", "/finance", "/account/balance", "/account"):
-            try:
-                data = await self._get(path)
-                inner = data.get("data") or data
-                if isinstance(inner, dict):
-                    for key in ("balance", "amount", "available", "total"):
-                        if key in inner and inner[key] not in (None, ""):
-                            try:
-                                amount = float(
-                                    str(inner[key]).replace(" ", "").replace(",", "."))
-                            except (ValueError, TypeError):
-                                continue
-                            return amount, f"{amount:.0f} ₽"
-            except RuntimeError as e:
-                if "404" in str(e) or "not found" in str(e).lower():
-                    continue
-                raise
+        # No dedicated balance endpoint exists: the spec lists /check as the
+        # only place shop data is returned. Report the shape we got instead of
+        # probing paths that are guaranteed to 404.
+        logger.warning("Balance not found in /check response")
         return 0.0, "—"
 
     async def withdraw_balance(self, min_amount: float = 0, amount: float | None = None) -> tuple[bool, str]:
@@ -288,23 +240,23 @@ class YooMarketAPI:
         return await self._post(f"/chats/{chat_id}/sendMessage", json={"text": text})
 
     async def create_ad(self, title: str, price: int, description: str,
-                        quantity: int = 1, category: str = "") -> dict:
-        """Create a new product listing."""
-        payload: dict = {"title": title, "price": price, "description": description, "quantity": quantity}
+                        quantity: int = 1, category: str = "",
+                        **extra) -> dict:
+        """Create a listing — POST /ads (available since API v1.4.0).
+
+        Ads can only be created in leaf categories (is_leaf: true); images are
+        uploaded separately via POST /media and attached by media_id.
+        """
+        payload: dict = {
+            "title": title,
+            "price": price,
+            "description": description,
+            "stock": quantity,
+        }
         if category:
-            payload["category"] = category
-        for path in ("/ads", "/products", "/listings"):
-            try:
-                return await self._post(path, json=payload)
-            except RuntimeError as e:
-                err = str(e)
-                if "404" in err or "not found" in err.lower() or "405" in err or "method" in err.lower():
-                    continue
-                raise
-        raise RuntimeError(
-            "YooMarket Integration API не поддерживает создание товаров.\n"
-            "Создай товар вручную в панели <b>panel.yoomarket.net</b>"
-        )
+            payload["category_id"] = category
+        payload.update(extra)
+        return await self._post("/ads", json=payload)
 
     async def get_categories(self) -> list[dict]:
         """Fetch available categories."""
@@ -318,9 +270,17 @@ class YooMarketAPI:
                 raise
         return []
 
-    async def update_ad(self, ad_id: int | str, **fields) -> dict:
-        """Update ad fields via PATCH /ads/{id}."""
-        return await self._patch(f"/ads/{ad_id}", json=fields)
+    async def update_price(self, ad_id: int | str, price: int,
+                           discount: int | None = None) -> dict:
+        """Update price (and optional discount) — PATCH /ads/{ad_id}/price.
+
+        There is no PATCH /ads/{ad_id} in the spec; the old update_ad() posted
+        to that non-existent path, so every price change failed.
+        """
+        payload: dict = {"price": price}
+        if discount is not None:
+            payload["discount"] = discount
+        return await self._patch(f"/ads/{ad_id}/price", json=payload)
 
     async def bulk_change_prices(self, percent: float) -> tuple[int, str]:
         """Change all ad prices by percent (+/-). Returns (count, message)."""
@@ -340,7 +300,7 @@ class YooMarketAPI:
                 continue
             new_price = max(1, round(current_price * (1 + percent / 100)))
             try:
-                await self.update_ad(ad_id, price=new_price)
+                await self.update_price(ad_id, new_price)
                 count += 1
             except RuntimeError as e:
                 last_err = str(e)

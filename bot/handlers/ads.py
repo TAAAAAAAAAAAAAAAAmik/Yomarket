@@ -143,7 +143,6 @@ async def show_ad_detail(
             f"📝 <b>Описание:</b>\n{description}"
         )
         b = InlineKeyboardBuilder()
-        b.button(text="⬆️ Поднять товар", callback_data=f"ad_bump:{callback_data.ad_id}")
         b.button(text="✏️ Изменить цену", callback_data=f"ad_price:{callback_data.ad_id}")
         if status_raw == "active":
             b.button(text="⏸ Приостановить", callback_data=f"ad_pause:{callback_data.ad_id}")
@@ -199,7 +198,7 @@ async def ad_price_save(message: Message, state: FSMContext, api: YooMarketAPI) 
     ad_id = data.get("ad_id", "")
     await state.clear()
     try:
-        await api.update_ad(ad_id, price=price)
+        await api.update_price(ad_id, price)
         b = InlineKeyboardBuilder()
         b.button(text="📦 К товару", callback_data=f"ad:{ad_id}")
         b.button(text="⬅️ Все товары", callback_data="ads_load")
@@ -213,7 +212,7 @@ async def ad_price_save(message: Message, state: FSMContext, api: YooMarketAPI) 
 async def ad_pause(callback: CallbackQuery, api: YooMarketAPI) -> None:
     ad_id = callback.data.split(":", 1)[1]
     try:
-        await api.update_ad(ad_id, status="inactive")
+        await api.unpublish_ad(ad_id)
         await callback.answer("⏸ Товар приостановлен", show_alert=True)
     except Exception as e:
         await callback.answer(f"❌ {e}", show_alert=True)
@@ -229,12 +228,11 @@ async def ad_pause(callback: CallbackQuery, api: YooMarketAPI) -> None:
             f"📊 Статус: {status}"
         )
         b = InlineKeyboardBuilder()
-        b.button(text="⬆️ Поднять товар", callback_data=f"ad_bump:{ad_id}")
         b.button(text="✏️ Изменить цену", callback_data=f"ad_price:{ad_id}")
         if status_raw in ("inactive", "disabled", "paused"):
             b.button(text="▶️ Активировать", callback_data=f"ad_activate:{ad_id}")
         b.button(text="⬅️ К товарам", callback_data="ads_load")
-        b.adjust(2, 1, 1)
+        b.adjust(1, 1, 1)
         await callback.message.edit_text(text, reply_markup=b.as_markup())
     except Exception:
         await callback.message.edit_text("✅ Статус обновлён", reply_markup=back_keyboard())
@@ -244,7 +242,7 @@ async def ad_pause(callback: CallbackQuery, api: YooMarketAPI) -> None:
 async def ad_activate(callback: CallbackQuery, api: YooMarketAPI) -> None:
     ad_id = callback.data.split(":", 1)[1]
     try:
-        await api.update_ad(ad_id, status="active")
+        await api.restore_ad(ad_id)
         await callback.answer("▶️ Товар активирован", show_alert=True)
     except Exception as e:
         await callback.answer(f"❌ {e}", show_alert=True)
@@ -260,12 +258,11 @@ async def ad_activate(callback: CallbackQuery, api: YooMarketAPI) -> None:
             f"📊 Статус: {status}"
         )
         b = InlineKeyboardBuilder()
-        b.button(text="⬆️ Поднять товар", callback_data=f"ad_bump:{ad_id}")
         b.button(text="✏️ Изменить цену", callback_data=f"ad_price:{ad_id}")
         if status_raw == "active":
             b.button(text="⏸ Приостановить", callback_data=f"ad_pause:{ad_id}")
         b.button(text="⬅️ К товарам", callback_data="ads_load")
-        b.adjust(2, 1, 1)
+        b.adjust(1, 1, 1)
         await callback.message.edit_text(text, reply_markup=b.as_markup())
     except Exception:
         await callback.message.edit_text("✅ Статус обновлён", reply_markup=back_keyboard())
@@ -317,7 +314,12 @@ async def bulk_desc_save(message: Message, state: FSMContext, api: YooMarketAPI)
             if not ad_id:
                 continue
             try:
-                await api.update_ad(ad_id, description=desc)
+                # The spec has no endpoint for editing a description:
+                # only price, publish/unpublish, items and value are exposed.
+                raise RuntimeError(
+                    "API не поддерживает изменение описания — "
+                    "отредактируйте товар в панели"
+                )
                 count += 1
             except Exception:
                 pass
