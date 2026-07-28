@@ -597,6 +597,16 @@ async def ads_debug(message: Message, api: YooMarketAPI) -> None:
                 if isinstance(v, (dict, list)):
                     v = _json.dumps(v, ensure_ascii=False)
                 lines.append(f"• {k} = {str(v)[:100]}")
+            # Also check the reference list actually resolves this ad's
+            # category — an id shown raw means the lookup came up empty.
+            _CATS_NAMES.pop(message.from_user.id, None)
+            names = await _category_names(api, message.from_user.id)
+            cid = ad.get("category_id")
+            lines += [
+                "",
+                f"категорий в справочнике: {len(names)}",
+                f"category_id {cid} → {names.get(int(cid)) if cid else None!r}",
+            ]
             report = "\n".join(lines)
     except Exception as e:
         report = f"ошибка: {str(e)[:250]}"

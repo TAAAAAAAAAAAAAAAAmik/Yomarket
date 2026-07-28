@@ -417,17 +417,26 @@ class YooMarketAPI:
         data = await self._get(f"/categories/{category_id}/filters")
         return data.get("data") or data.get("items") or []
 
-    async def get_categories(self) -> list[dict]:
-        """Fetch available categories."""
-        for path in ("/categories", "/ads/categories", "/catalog/categories"):
-            try:
-                data = await self._get(path)
-                return data.get("data") or data.get("items") or []
-            except RuntimeError as e:
-                if "404" in str(e) or "not found" in str(e).lower():
-                    continue
-                raise
-        return []
+    async def get_categories(self, max_pages: int = 40) -> list[dict]:
+        """Full category reference — GET /categories, following the cursor.
+
+        Lists use cursor pagination, and a marketplace this size has thousands
+        of categories: reading only the first page left deep ids (like 5221)
+        unresolved, so they showed as «Категория #5221».
+        """
+        out: list[dict] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            params = {"cursor": cursor} if cursor else None
+            data = await self._get("/categories", params=params)
+            rows = data.get("data") or data.get("items") or []
+            out.extend(r for r in rows if isinstance(r, dict))
+            meta = data.get("meta") or {}
+            cursor = meta.get("next_cursor") or meta.get("next")
+            if not cursor or not rows:
+                break
+        logger.info("categories loaded: %d", len(out))
+        return out
 
     async def update_price(self, ad_id: int | str, price: int,
                            discount: int | None = None) -> dict:
