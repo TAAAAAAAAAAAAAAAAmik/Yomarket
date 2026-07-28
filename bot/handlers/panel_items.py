@@ -70,7 +70,8 @@ async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
     try:
         data = await api.get_ads()
         ads = data.get("data") or data.get("items") or []
-        names = await _category_names(api, callback.from_user.id)
+        names = await _category_names(
+            api, callback.from_user.id, _wanted_cats(ads))
     except Exception as e:
         await callback.message.edit_text(
             f"❌ Не удалось загрузить объявления:\n<code>{str(e)[:200]}</code>",
@@ -142,7 +143,8 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
     try:
         data = await api.get_ads()
         ads = data.get("data") or data.get("items") or []
-        names = await _category_names(api, callback.from_user.id)
+        names = await _category_names(
+            api, callback.from_user.id, _wanted_cats(ads))
     except Exception as e:
         await callback.message.edit_text(
             f"❌ Ошибка загрузки:\n<code>{str(e)[:200]}</code>",
@@ -538,23 +540,48 @@ def _ad_price(ad: dict) -> int:
         return 0
 
 
-async def _category_names(api: YooMarketAPI, uid: int) -> dict[int, str]:
-    """category_id -> name. Ads only carry the id, so the reference list is
-    fetched once and cached — the spec says it changes rarely."""
-    cached = _CATS_NAMES.get(uid)
-    if cached:
-        return cached
-    names: dict[int, str] = {}
-    try:
-        for c in await api.get_categories():
-            cid = c.get("id")
-            label = c.get("name") or c.get("title")
-            if cid is not None and label:
-                names[int(cid)] = str(label)
-    except Exception as e:
-        logger.info("categories fetch failed: %s", e)
-    _CATS_NAMES[uid] = names
+async def _category_names(api: YooMarketAPI, uid: int,
+                          wanted: set[int] | None = None) -> dict[int, str]:
+    """category_id -> name, cached per user.
+
+    The flat reference only covers the top of the tree, so ids the ads actually
+    use are asked for individually rather than by walking every branch.
+    """
+    names = _CATS_NAMES.setdefault(uid, {})
+    if not names:
+        try:
+            for c in await api.get_categories():
+                cid = c.get("id")
+                label = c.get("name") or c.get("title")
+                if cid is not None and label:
+                    names[int(cid)] = str(label)
+        except Exception as e:
+            logger.info("categories fetch failed: %s", e)
+
+    for cid in sorted(wanted or ()):
+        if cid in names:
+            continue
+        try:
+            label = await api.resolve_category(cid)
+        except Exception as e:
+            logger.info("resolve_category(%s) failed: %s", cid, e)
+            label = ""
+        if label:
+            names[cid] = label
     return names
+
+
+def _wanted_cats(ads: list[dict]) -> set[int]:
+    """The category ids these ads actually use — only those need resolving."""
+    out: set[int] = set()
+    for ad in ads:
+        cid = ad.get("category_id")
+        try:
+            if cid not in (None, "", 0):
+                out.add(int(cid))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _ad_category(ad: dict, names: dict[int, str]) -> str:
@@ -600,13 +627,22 @@ async def ads_debug(message: Message, api: YooMarketAPI) -> None:
             # Also check the reference list actually resolves this ad's
             # category — an id shown raw means the lookup came up empty.
             _CATS_NAMES.pop(message.from_user.id, None)
-            names = await _category_names(api, message.from_user.id)
             cid = ad.get("category_id")
-            lines += [
-                "",
-                f"категорий в справочнике: {len(names)}",
-                f"category_id {cid} → {names.get(int(cid)) if cid else None!r}",
-            ]
+            names = await _category_names(
+                api, message.from_user.id, {int(cid)} if cid else set())
+            lines += ["", f"категорий в справочнике: {len(names)}",
+                      f"category_id {cid} → {names.get(int(cid)) if cid else None!r}"]
+            # Shape of the reference itself: is it a tree, is it paginated?
+            try:
+                raw = await api.categories_raw()
+                rows = raw.get("data") or raw.get("items") or []
+                lines.append(f"meta: {_json.dumps(raw.get('meta'), ensure_ascii=False)[:120]}")
+                lines.append(f"links: {_json.dumps(raw.get('links'), ensure_ascii=False)[:120]}")
+                if rows:
+                    lines.append(f"пример категории: "
+                                 f"{_json.dumps(rows[0], ensure_ascii=False)[:200]}")
+            except Exception as e:
+                lines.append(f"categories_raw: {str(e)[:120]}")
             report = "\n".join(lines)
     except Exception as e:
         report = f"ошибка: {str(e)[:250]}"

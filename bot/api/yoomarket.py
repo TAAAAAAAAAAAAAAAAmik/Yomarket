@@ -417,7 +417,31 @@ class YooMarketAPI:
         data = await self._get(f"/categories/{category_id}/filters")
         return data.get("data") or data.get("items") or []
 
-    async def get_categories(self, max_pages: int = 40) -> list[dict]:
+    async def categories_raw(self) -> dict:
+        """First page of /categories untouched — for diagnosing its shape."""
+        return await self._get("/categories")
+
+    async def resolve_category(self, category_id: int | str) -> str:
+        """Name of one category without walking the whole tree.
+
+        The flat reference returns only the top level, so a leaf id like 5221
+        is absent from it. The filters endpoint is scoped to a single category
+        and commonly echoes it back.
+        """
+        try:
+            data = await self._get(f"/categories/{category_id}/filters")
+        except RuntimeError as e:
+            logger.info("resolve_category(%s): %s", category_id, e)
+            return ""
+        for block in (data.get("category"), data.get("meta"), data.get("data"), data):
+            if isinstance(block, dict):
+                label = block.get("name") or block.get("title")
+                if label:
+                    return str(label)
+        return ""
+
+    async def get_categories(self, max_pages: int = 40,
+                             parent_id: int | str | None = None) -> list[dict]:
         """Full category reference — GET /categories, following the cursor.
 
         Lists use cursor pagination, and a marketplace this size has thousands
@@ -427,15 +451,20 @@ class YooMarketAPI:
         out: list[dict] = []
         cursor: str | None = None
         for _ in range(max_pages):
-            params = {"cursor": cursor} if cursor else None
-            data = await self._get("/categories", params=params)
+            params: dict = {}
+            if cursor:
+                params["cursor"] = cursor
+            if parent_id is not None:
+                params["parent_id"] = str(parent_id)
+            data = await self._get("/categories", params=params or None)
             rows = data.get("data") or data.get("items") or []
             out.extend(r for r in rows if isinstance(r, dict))
             meta = data.get("meta") or {}
-            cursor = meta.get("next_cursor") or meta.get("next")
+            cursor = (meta.get("next_cursor") or meta.get("next")
+                      or (data.get("links") or {}).get("next"))
             if not cursor or not rows:
                 break
-        logger.info("categories loaded: %d", len(out))
+        logger.info("categories loaded: %d (parent=%s)", len(out), parent_id)
         return out
 
     async def update_price(self, ad_id: int | str, price: int,
