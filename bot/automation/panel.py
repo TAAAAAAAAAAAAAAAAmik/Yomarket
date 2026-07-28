@@ -851,7 +851,161 @@ def panel_publish_item_sync(
     )
 
 
-def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
+# ---------------------------------------------------------------------------
+# Stock / остатки — a listing must have stock before it can go to moderation.
+# The panel stores stock as a separate Nova resource related to the item
+# (ad-values / ad-group-items / item-values …), so we discover it dynamically.
+# ---------------------------------------------------------------------------
+
+_STOCK_RESOURCES = ("ad-values", "ad-items", "item-values", "ad-group-items",
+                    "values", "item-stocks", "stocks", "goods-values")
+_STOCK_TEXT_KWS = ("value", "content", "data", "text", "login", "key", "code",
+                   "товар", "данн", "значен", "ключ")
+
+
+def panel_discover_stock_sync(cookie_string: str) -> tuple[bool, object]:
+    """
+    Blocking: find the Nova resource used for stock (остатки) and return its
+    creation form so we know exactly what to fill.
+    Returns (True, {"resource": str, "fields": [{attribute,label,required,
+    component,options}]}) or (False, diagnostic_text).
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    trace: list[str] = []
+
+    for res in _STOCK_RESOURCES:
+        try:
+            r = session.get(
+                f"{PANEL_URL}/nova-api/{res}/creation-fields"
+                f"?editing=true&editMode=create",
+                headers=hdrs, timeout=(6, 12), allow_redirects=False,
+            )
+        except Exception as e:
+            trace.append(f"{res}: {str(e)[:40]}")
+            continue
+        if r.status_code == 401:
+            return False, "401: сессия панели истекла — войдите снова"
+        if r.status_code != 200:
+            trace.append(f"{res}: {r.status_code}")
+            continue
+        try:
+            cf = r.json()
+        except Exception:
+            trace.append(f"{res}: bad JSON")
+            continue
+        if not isinstance(cf, dict):
+            continue
+        fields = _parse_nova_fields_payload(cf)
+        if not fields:
+            trace.append(f"{res}: пустые поля")
+            continue
+        out = []
+        for f in fields:
+            attr = f.get("attribute")
+            if not attr:
+                continue
+            out.append({
+                "attribute": attr,
+                "label": f.get("name") or attr,
+                "required": "required" in str(f.get("rules", [])),
+                "component": f.get("component", ""),
+                "options": _normalize_options(f),
+                "relationship": f.get("relationshipType")
+                or f.get("belongsToRelationship") or "",
+            })
+        return True, {"resource": res, "fields": out,
+                      "trace": "; ".join(trace)[:200]}
+
+    return False, ("не нашёл ресурс остатков.\n"
+                   f"Проверено: <code>{', '.join(_STOCK_RESOURCES)}</code>\n"
+                   f"Лог: <code>{'; '.join(trace)[:300]}</code>")
+
+
+def panel_add_stock_sync(
+    cookie_string: str, item_id: str, lines: list[str],
+    uid: int | None = None,
+) -> tuple[bool, str]:
+    """
+    Blocking: add stock rows (остатки) to an item. `lines` is the product data
+    the seller pasted — one row per line (keys/accounts/etc). Returns (ok, msg).
+    """
+    ok, form = panel_discover_stock_sync(cookie_string)
+    if not ok:
+        return False, str(form)
+    resource = form["resource"]
+    fields = form["fields"]
+
+    # the field that links a stock row to its item (belongsTo ad/item)
+    link_attr = next(
+        (f["attribute"] for f in fields
+         if f.get("relationship") or f["attribute"] in ("ad", "item", "ad_id", "item_id")),
+        None,
+    )
+    # the field that holds the actual product text
+    text_attr = next(
+        (f["attribute"] for f in fields
+         if any(k in f["attribute"].lower() or k in str(f["label"]).lower()
+                for k in _STOCK_TEXT_KWS)),
+        None,
+    )
+    if not text_attr:
+        attrs = [f["attribute"] for f in fields]
+        return False, (f"не понял, в какое поле писать товар.\n"
+                       f"Ресурс: <code>{resource}</code>\n"
+                       f"Поля: <code>{attrs}</code>")
+
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    added = 0
+    last_err = ""
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        payload = {text_attr: line}
+        if link_attr:
+            payload[link_attr] = str(item_id)
+        try:
+            r = session.post(
+                f"{PANEL_URL}/nova-api/{resource}?editing=true&editMode=create",
+                json=payload, headers=hdrs, timeout=(6, 15),
+            )
+        except Exception as e:
+            last_err = str(e)[:80]
+            continue
+        if r.status_code in (200, 201):
+            added += 1
+        elif r.status_code == 422:
+            last_err = f"422: {r.text[:200]}"
+            break  # same error will repeat for every row
+        else:
+            last_err = f"HTTP {r.status_code}: {r.text[:120]}"
+    _save_refreshed_cookies(uid, cookie_string, session)
+    if added:
+        msg = f"добавлено позиций: {added}"
+        if last_err:
+            msg += f" (часть с ошибкой: {last_err})"
+        return True, msg
+    return False, last_err or "ничего не добавлено"
+
+
+def panel_list_categories_sync(cookie_string: str) -> tuple[bool, object]:
+    """Blocking: seller's categories derived from their items.
+    Returns (True, [{"name": str, "count": int}]) or (False, error)."""
+    ok, items = panel_list_items_sync(cookie_string, with_category=True)
+    if not ok:
+        return False, items
+    counts: dict[str, int] = {}
+    for it in items:
+        cat = (it.get("category") or "").strip() or "Без категории"
+        counts[cat] = counts.get(cat, 0) + 1
+    cats = [{"name": k, "count": v} for k, v in counts.items()]
+    cats.sort(key=lambda c: (-c["count"], c["name"]))
+    return True, cats
+
+
+def panel_list_items_sync(cookie_string: str, with_category: bool = False) -> tuple[bool, object]:
     """Blocking: list items from the panel. Returns (True, [{id,title,price}])
     or (False, error)."""
     session = _make_panel_requests_session(cookie_string)
@@ -883,7 +1037,8 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
         raw_fields = res.get("fields")
         if isinstance(raw_fields, dict):
             raw_fields = list(raw_fields.values())
-        info = {"id": str(rid), "title": "", "price": "", "public": None}
+        info = {"id": str(rid), "title": "", "price": "", "public": None,
+                "category": "", "stock": None}
         _vis_kws = ("public", "visible", "active", "published", "status",
                     "hidden", "публич", "видим", "актив", "показ", "скрыт")
         for f in raw_fields or []:
@@ -895,6 +1050,23 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
                 info["title"] = str(f.get("value") or "")
             elif fa == "price":
                 info["price"] = str(f.get("value") or "")
+            elif fa in ("category", "subcategory") or "категор" in fn.lower():
+                # belongsTo → value may be an object/label
+                v = f.get("value")
+                label = ""
+                if isinstance(v, dict):
+                    label = str(v.get("title") or v.get("name") or v.get("display") or "")
+                elif v not in (None, ""):
+                    label = str(v)
+                if label and not info["category"]:
+                    info["category"] = label
+            elif any(k in fa.lower() or k in fn.lower()
+                     for k in ("count", "quantity", "stock", "остат", "количеств")):
+                v = f.get("value")
+                try:
+                    info["stock"] = int(float(str(v)))
+                except (TypeError, ValueError):
+                    pass
             elif info["public"] is None and any(
                     kw in fa.lower() or kw in fn.lower() for kw in _vis_kws):
                 val = f.get("value")

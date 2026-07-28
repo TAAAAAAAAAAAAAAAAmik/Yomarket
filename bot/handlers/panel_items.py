@@ -17,11 +17,13 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 40
+_CAT_CACHE: dict[int, list[str]] = {}
 
 
 class PanelItemState(StatesGroup):
     waiting_price = State()
     waiting_title = State()
+    waiting_stock = State()   # остатки перед отправкой на модерацию
 
 
 def _no_session_kb():
@@ -49,12 +51,72 @@ async def _run(uid: int, fn, *args):
         return None, f"Ошибка: {str(e)[:150]}"
 
 
+@router.callback_query(F.data == "pitems:cats")
+async def list_categories(callback: CallbackQuery) -> None:
+    """Show the seller's categories; picking one lists its items."""
+    from automation.panel import panel_list_categories_sync
+
+    await callback.message.edit_text("⏳ Загружаю категории...")
+    result, err = await _run(callback.from_user.id, panel_list_categories_sync)
+    if err == "no_session":
+        await callback.message.edit_text(
+            "❌ Нет сессии панели. Войдите через email.",
+            reply_markup=_no_session_kb())
+        await callback.answer()
+        return
+    if result is None or not result[0]:
+        detail = result[1] if result else err
+        await callback.message.edit_text(
+            f"❌ Не удалось получить категории:\n{detail}",
+            reply_markup=_no_session_kb())
+        await callback.answer()
+        return
+
+    cats = result[1]
+    _CAT_CACHE[callback.from_user.id] = [c["name"] for c in cats]
+    b = InlineKeyboardBuilder()
+    for i, c in enumerate(cats[:40]):
+        b.button(text=f"📂 {c['name'][:24]} ({c['count']})",
+                 callback_data=f"pcat:{i}")
+    b.adjust(1)
+    b.button(text="📋 Все товары", callback_data="pitems:list")
+    b.button(text="🔄 Обновить", callback_data="pitems:cats")
+    b.button(text="⬅️ Назад", callback_data="menu:ads")
+    b.adjust(2, 1)
+    await callback.message.edit_text(
+        f"📦 <b>Товары по категориям</b>\n\n"
+        f"Категорий: <b>{len(cats)}</b>\nВыберите категорию:",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pcat:"))
+async def list_category_items(callback: CallbackQuery) -> None:
+    """Items of one category."""
+    uid = callback.from_user.id
+    try:
+        idx = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    names = _CAT_CACHE.get(uid) or []
+    if idx >= len(names):
+        await callback.answer("Категория устарела, обновите список",
+                              show_alert=True)
+        return
+    await _render_items(callback, category=names[idx])
+
+
 @router.callback_query(F.data == "pitems:list")
 async def list_items(callback: CallbackQuery) -> None:
+    await _render_items(callback, category=None)
+
+
+async def _render_items(callback: CallbackQuery, category: str | None) -> None:
     from automation.panel import panel_list_items_sync
 
     await callback.message.edit_text("⏳ Загружаю товары из панели...")
-    result, err = await _run(callback.from_user.id, panel_list_items_sync)
+    result, err = await _run(callback.from_user.id, panel_list_items_sync, True)
     if err == "no_session":
         await callback.message.edit_text(
             "❌ Нет сессии панели. Войдите через email.",
@@ -76,12 +138,18 @@ async def list_items(callback: CallbackQuery) -> None:
         await callback.answer()
         return
 
+    if category:
+        items = [it for it in items
+                 if (it.get("category") or "Без категории") == category]
+
     hidden = [it for it in items if it.get("public") is False]
     b = InlineKeyboardBuilder()
     for it in items[:40]:
         pub = it.get("public")
         mark = "🌍 " if pub is True else ("🙈 " if pub is False else "")
-        label = f"{mark}{(it['title'] or ('Товар ' + it['id']))[:26]}"
+        stock = it.get("stock")
+        stock_mark = "⚠️" if stock == 0 else ""
+        label = f"{mark}{stock_mark}{(it['title'] or ('Товар ' + it['id']))[:24]}"
         if it.get("price"):
             label += f" — {it['price']} ₽"
         b.button(text=label, callback_data=f"pitem:{it['id']}")
@@ -89,15 +157,20 @@ async def list_items(callback: CallbackQuery) -> None:
     if hidden:
         b.button(text=f"🌍 Опубликовать все скрытые ({len(hidden)})",
                  callback_data="pitems:pubhidden")
+        b.adjust(1)
+    b.button(text="📂 По категориям", callback_data="pitems:cats")
     b.button(text="➕ Добавить товар", callback_data="create_ad:start")
-    b.button(text="🔄 Обновить", callback_data="pitems:list")
+    b.button(text="🔄 Обновить",
+             callback_data="pitems:list" if not category else "pitems:cats")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
-    b.adjust(1)
+    b.adjust(2, 2)
     status_hint = ""
     if any(it.get("public") is not None for it in items):
-        status_hint = "\n🌍 = виден в маркете, 🙈 = скрыт"
+        status_hint = "\n🌍 = виден, 🙈 = скрыт, ⚠️ = нет остатков"
+    head = (f"📂 <b>{category}</b>" if category
+            else "🛠 <b>Товары в панели</b>")
     await callback.message.edit_text(
-        f"🛠 <b>Товары в панели</b> (всего: {len(items)})"
+        f"{head} (всего: {len(items)})"
         f"{status_hint}\n\n"
         "Нажмите на товар для управления:",
         reply_markup=b.as_markup(),
@@ -107,13 +180,14 @@ async def list_items(callback: CallbackQuery) -> None:
 
 def _item_kb(item_id: str):
     b = InlineKeyboardBuilder()
+    b.button(text="📥 Остатки", callback_data=f"pitem_stock:{item_id}")
+    b.button(text="🌍 Опубликовать", callback_data=f"pitem_show:{item_id}")
     b.button(text="✏️ Цена", callback_data=f"pitem_price:{item_id}")
     b.button(text="✏️ Название", callback_data=f"pitem_title:{item_id}")
-    b.button(text="🌍 Показать", callback_data=f"pitem_show:{item_id}")
     b.button(text="🙈 Скрыть", callback_data=f"pitem_hide:{item_id}")
     b.button(text="🗑 Удалить", callback_data=f"pitem_del:{item_id}")
     b.button(text="⬅️ К товарам", callback_data="pitems:list")
-    b.adjust(2, 2, 1, 1)
+    b.adjust(2, 2, 2, 1)
     return b.as_markup()
 
 
@@ -321,3 +395,78 @@ async def item_delete_do(callback: CallbackQuery) -> None:
         detail = result[1] if result else err
         await callback.message.edit_text(
             f"❌ Не удалось удалить:\n{detail}", reply_markup=b.as_markup())
+
+
+# ── Остатки (нужны перед отправкой на модерацию) ────────────────────────────
+
+@router.callback_query(F.data.startswith("pitem_stock:"))
+async def stock_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Ask the seller for the product data that fills the item's stock."""
+    from automation.panel import panel_discover_stock_sync
+
+    item_id = callback.data.split(":", 1)[1]
+    uid = callback.from_user.id
+    await callback.answer("⏳ Смотрю форму остатков…")
+    await callback.message.edit_text("⏳ Определяю формат остатков в панели…")
+
+    result, err = await _run(uid, panel_discover_stock_sync)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data=f"pitem:{item_id}")
+
+    if not (result and result[0]):
+        detail = result[1] if result else err
+        await callback.message.edit_text(
+            f"❌ <b>Не нашёл, куда писать остатки</b>\n\n{detail}\n\n"
+            "Пришлите этот текст разработчику — подстрою под вашу панель.",
+            reply_markup=b.as_markup())
+        return
+
+    form = result[1]
+    fields = form.get("fields", [])
+    req = [f["label"] for f in fields if f.get("required")]
+    await state.set_state(PanelItemState.waiting_stock)
+    await state.update_data(stock_item_id=item_id)
+    hint = f"\n\n📋 Обязательные поля панели: <code>{req}</code>" if req else ""
+    await callback.message.edit_text(
+        f"📥 <b>Остатки товара #{item_id}</b>\n\n"
+        "Пришлите товар <b>одним сообщением</b> — каждая позиция с новой строки.\n\n"
+        "<i>Например:\nlogin1:pass1\nlogin2:pass2\nlogin3:pass3</i>\n\n"
+        "Сколько строк — столько позиций добавится в остатки."
+        f"{hint}",
+        reply_markup=b.as_markup())
+
+
+@router.message(PanelItemState.waiting_stock)
+async def stock_save(message: Message, state: FSMContext) -> None:
+    from automation.panel import panel_add_stock_sync
+
+    raw = message.text or ""
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    data = await state.get_data()
+    item_id = data.get("stock_item_id", "")
+    if not lines:
+        await message.answer("❌ Пусто. Пришлите позиции — каждая с новой строки.")
+        return
+    await state.clear()
+    uid = message.from_user.id
+
+    status = await message.answer(f"⏳ Добавляю {len(lines)} позиций в остатки…")
+    result, err = await _run(uid, panel_add_stock_sync, item_id, lines, uid)
+    b = InlineKeyboardBuilder()
+    if result and result[0]:
+        b.button(text="🌍 Опубликовать", callback_data=f"pitem_show:{item_id}")
+        b.button(text="📦 К товару", callback_data=f"pitem:{item_id}")
+        b.adjust(1)
+        await status.edit_text(
+            f"✅ <b>Остатки добавлены</b> ({result[1]})\n\n"
+            "Теперь можно отправить товар на модерацию — жмите "
+            "<b>🌍 Опубликовать</b>.",
+            reply_markup=b.as_markup())
+    else:
+        detail = result[1] if result else err
+        b.button(text="🔁 Повторить", callback_data=f"pitem_stock:{item_id}")
+        b.button(text="📦 К товару", callback_data=f"pitem:{item_id}")
+        b.adjust(1)
+        await status.edit_text(
+            f"❌ <b>Не удалось добавить остатки</b>\n\n{detail}",
+            reply_markup=b.as_markup())
