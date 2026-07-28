@@ -534,6 +534,62 @@ async def item_stock_save(message: Message, state: FSMContext,
         )
 
 
+def _ad_category(ad: dict) -> str:
+    """Category label of an ad, whatever the API calls it.
+
+    The panel's rows carry no category, so grouping comes from the API. Field
+    naming is not documented in the parts of the spec available here, so a few
+    shapes are accepted: a plain name, a nested object, or a bare id.
+    """
+    for key in ("category", "category_name", "category_title", "categoryName"):
+        v = ad.get(key)
+        if isinstance(v, dict):
+            label = v.get("name") or v.get("title") or v.get("label")
+            if label:
+                return str(label)
+        elif v not in (None, "", 0):
+            return str(v)
+    for key in ("category_id", "categoryId"):
+        if ad.get(key) not in (None, "", 0):
+            return f"Категория #{ad[key]}"
+    return "Без категории"
+
+
+@router.message(Command("ads_debug"))
+async def ads_debug(message: Message, api: YooMarketAPI) -> None:
+    """Show one ad exactly as the Integration API returns it.
+
+    The panel's item rows carry no category at all, so grouping has to come
+    from the API — this prints its field names instead of guessing them.
+    """
+    if not api:
+        await message.answer("⚠️ Не настроен API-токен")
+        return
+
+    import html as _html
+    import json as _json
+
+    status = await message.answer("⏳ Читаю объявление из API...")
+    try:
+        data = await api.get_ads()
+        rows = data.get("data") or data.get("items") or []
+        if not rows:
+            report = f"API вернул пусто: {_json.dumps(data, ensure_ascii=False)[:400]}"
+        else:
+            ad = rows[0]
+            lines = [f"всего объявлений: {len(rows)}",
+                     f"ключи: {list(ad.keys())}", ""]
+            for k, v in ad.items():
+                if isinstance(v, (dict, list)):
+                    v = _json.dumps(v, ensure_ascii=False)
+                lines.append(f"• {k} = {str(v)[:100]}")
+            report = "\n".join(lines)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:250]}"
+    await status.edit_text(
+        f"🔍 <b>Объявление в API</b>\n\n<code>{_html.escape(report)[:3500]}</code>")
+
+
 @router.message(Command("items_debug"))
 async def items_debug(message: Message) -> None:
     """Show how the panel actually describes an item.
