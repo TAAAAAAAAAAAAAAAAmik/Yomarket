@@ -258,6 +258,163 @@ class YooMarketAPI:
         payload.update(extra)
         return await self._post("/ads", json=payload)
 
+    async def create_and_publish(
+        self,
+        title: str,
+        price: int,
+        description: str,
+        category_id: int | str,
+        ad_type: str = "simple",
+        stock: int = 1,
+        items: list[str] | None = None,
+        value: dict | None = None,
+        photos: list[tuple[bytes, str]] | None = None,
+        publish: bool = True,
+        **extra,
+    ) -> tuple[str, str]:
+        """Create a listing, fill its stock, then put it on sale.
+
+        Stock has to exist before publishing, and how it is supplied depends on
+        the ad type:
+          auto-delivery -> `items`  (the texts buyers receive)
+          auto-value    -> `value`  (stock/min/max/step/label_id)
+          simple/unlimited -> the `stock` field on the ad itself
+
+        Photos are uploaded to the media buffer first: publishing an ad without
+        images is rejected with `empty_images`.
+        Returns (ad_id, human_message).
+        """
+        media_ids: list[str] = []
+        for content, filename in (photos or []):
+            media_ids.append(await self.upload_media(content, filename))
+
+        payload: dict = {
+            "title": title,
+            "price": price,
+            "description": description,
+            "category_id": category_id,
+            "type": ad_type,
+        }
+        if ad_type in ("simple", "auto-value"):
+            payload["stock"] = stock
+        if media_ids:
+            payload["media_ids"] = media_ids
+        payload.update(extra)
+
+        created = await self._post("/ads", json=payload)
+        inner = created.get("data") or created
+        ad_id = inner.get("id") or inner.get("ad_id")
+        if not ad_id:
+            raise RuntimeError(f"Товар создан, но в ответе нет id: {str(created)[:200]}")
+        ad_id = str(ad_id)
+
+        steps = ["создан"]
+        if ad_type == "auto-delivery" and items:
+            await self.add_ad_items(ad_id, items)
+            steps.append(f"позиций: {len(items)}")
+        elif ad_type == "auto-value" and value:
+            await self.update_ad_value(ad_id, **value)
+            steps.append("параметры авто-выбора заданы")
+
+        if publish:
+            try:
+                await self.publish_ad(ad_id)
+                steps.append("опубликован")
+            except RuntimeError as e:
+                # Keep the ad — it exists and can be published once fixed.
+                return ad_id, (f"⚠️ Товар создан (#{ad_id}), но не опубликован: "
+                               f"{str(e)[:200]}")
+        return ad_id, "✅ " + ", ".join(steps)
+
+    # ------------------------------------------------------------------
+    # Stock — must be filled BEFORE publishing, per ad type
+    # ------------------------------------------------------------------
+
+    async def get_ad_items(self, ad_id: int | str, cursor: str | None = None) -> dict:
+        """Auto-delivery positions of an ad (available / sold)."""
+        params = {"cursor": cursor} if cursor else None
+        return await self._get(f"/ads/{ad_id}/items", params=params)
+
+    async def add_ad_items(self, ad_id: int | str, items: list[str]) -> dict:
+        """Add auto-delivery positions — POST /ads/{ad_id}/items.
+
+        The API accepts up to 50 per request, so longer lists are sent in
+        batches. `items` are the texts handed to the buyer (keys, codes).
+        """
+        if not items:
+            raise RuntimeError("Список позиций пуст")
+        last: dict = {}
+        for i in range(0, len(items), 50):
+            batch = [str(x) for x in items[i:i + 50] if str(x).strip()]
+            if batch:
+                last = await self._post(f"/ads/{ad_id}/items",
+                                        json={"items": batch})
+        return last
+
+    async def delete_ad_item(self, ad_id: int | str, item_id: int | str) -> dict:
+        """Remove one unsold position."""
+        assert self.session is not None, "Call start() first"
+        url = f"{self.base_url}/ads/{ad_id}/items/{item_id}"
+        async with self.session.delete(url) as resp:
+            text = await resp.text()
+            logger.debug("DELETE %s → %s: %s", url, resp.status, text[:300])
+            if not resp.ok:
+                raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+            try:
+                return await resp.json(content_type=None)
+            except Exception:
+                return {}
+
+    async def get_ad_value(self, ad_id: int | str) -> dict:
+        """Auto-value parameters: stock, min/max, step, unit."""
+        return await self._get(f"/ads/{ad_id}/value")
+
+    async def update_ad_value(self, ad_id: int | str, **fields) -> dict:
+        """Set auto-value parameters (stock, min, max, step, label_id)."""
+        return await self._patch(f"/ads/{ad_id}/value", json=fields)
+
+    async def refill_ad_value(self, ad_id: int | str, amount: float) -> dict:
+        """Add to (or, with a negative amount, take from) the auto-value stock."""
+        return await self._post(f"/ads/{ad_id}/value/refill",
+                                json={"amount": amount})
+
+    async def get_value_labels(self) -> list[dict]:
+        """Units of measure available for auto-value ads."""
+        data = await self._get("/values/labels")
+        return data.get("data") or data.get("items") or []
+
+    async def upload_media(self, content: bytes, filename: str = "photo.jpg",
+                           content_type: str = "image/jpeg") -> str:
+        """Upload one image to the media buffer — POST /media → media_id.
+
+        Each media_id is single-use and expires in 24h if never attached.
+        """
+        assert self.session is not None, "Call start() first"
+        form = aiohttp.FormData()
+        form.add_field("file", content, filename=filename,
+                       content_type=content_type)
+        url = f"{self.base_url}/media"
+        async with self.session.post(url, data=form) as resp:
+            text = await resp.text()
+            logger.debug("POST /media → %s: %s", resp.status, text[:300])
+            if not resp.ok:
+                raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+            data = await resp.json(content_type=None)
+        inner = data.get("data") or data
+        media_id = inner.get("media_id") or inner.get("id")
+        if not media_id:
+            raise RuntimeError(f"В ответе нет media_id: {str(data)[:150]}")
+        return str(media_id)
+
+    async def publish_ad(self, ad_id: int | str) -> dict:
+        """Put an ad on sale. Fails with `empty_images` if it has no photos."""
+        return await self._post(f"/ads/{ad_id}/publish")
+
+    async def get_category_filters(self, category_id: int | str) -> list[dict]:
+        """Product parameters a category expects (with `required` flags)."""
+        data = await self._get(f"/categories/{category_id}/filters")
+        return data.get("data") or data.get("items") or []
+
     async def get_categories(self) -> list[dict]:
         """Fetch available categories."""
         for path in ("/categories", "/ads/categories", "/catalog/categories"):

@@ -11,6 +11,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from api.yoomarket import YooMarketAPI
 from storage import get_panel_creds
 
 router = Router()
@@ -22,6 +23,7 @@ _TIMEOUT = 40
 class PanelItemState(StatesGroup):
     waiting_price = State()
     waiting_title = State()
+    waiting_stock = State()
 
 
 def _no_session_kb():
@@ -109,11 +111,12 @@ def _item_kb(item_id: str):
     b = InlineKeyboardBuilder()
     b.button(text="✏️ Цена", callback_data=f"pitem_price:{item_id}")
     b.button(text="✏️ Название", callback_data=f"pitem_title:{item_id}")
+    b.button(text="📦 Остатки", callback_data=f"pitem_stock:{item_id}")
     b.button(text="🌍 Показать", callback_data=f"pitem_show:{item_id}")
     b.button(text="🙈 Скрыть", callback_data=f"pitem_hide:{item_id}")
     b.button(text="🗑 Удалить", callback_data=f"pitem_del:{item_id}")
     b.button(text="⬅️ К товарам", callback_data="pitems:list")
-    b.adjust(2, 2, 1, 1)
+    b.adjust(2, 2, 2, 1)
     return b.as_markup()
 
 
@@ -321,3 +324,75 @@ async def item_delete_do(callback: CallbackQuery) -> None:
         detail = result[1] if result else err
         await callback.message.edit_text(
             f"❌ Не удалось удалить:\n{detail}", reply_markup=b.as_markup())
+
+
+# ---------------------------------------------------------------------------
+# Stock — has to be filled before an ad can go on sale
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("pitem_stock:"))
+async def item_stock_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Ask for the stock to add. Goes through the Integration API, not the
+    panel: /ads/{id}/items and /ads/{id}/value are the documented routes."""
+    item_id = callback.data.split(":", 1)[1]
+    await state.update_data(item_id=item_id)
+    await state.set_state(PanelItemState.waiting_stock)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data=f"pitem:{item_id}")
+    await callback.message.edit_text(
+        "📦 <b>Добавить остатки</b>\n\n"
+        "<b>Авто-выдача</b> — пришлите позиции, <b>по одной в строке</b>:\n"
+        "<code>KEY-1111\nKEY-2222\nKEY-3333</code>\n\n"
+        "<b>Авто-выбор</b> — пришлите просто число, на сколько пополнить:\n"
+        "<code>500</code>\n\n"
+        "<i>Тип товара определю сам.</i>",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.message(PanelItemState.waiting_stock)
+async def item_stock_save(message: Message, state: FSMContext,
+                          api: YooMarketAPI) -> None:
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("❌ Пришлите позиции или число")
+        return
+    if not api:
+        await state.clear()
+        await message.answer("⚠️ Не настроен API-токен — остатки идут через него")
+        return
+
+    data = await state.get_data()
+    item_id = data.get("item_id", "")
+    await state.clear()
+    status = await message.answer("⏳ Добавляю остатки...")
+
+    try:
+        ad = await api.get_ad(item_id)
+        inner = ad.get("data") or ad
+        ad_type = str(inner.get("type") or "")
+
+        if ad_type == "auto-value" or (text.isdigit() and ad_type != "auto-delivery"):
+            await api.refill_ad_value(item_id, float(text))
+            done = f"остаток пополнен на {text}"
+        else:
+            items = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            await api.add_ad_items(item_id, items)
+            done = f"добавлено позиций: {len(items)}"
+
+        b = InlineKeyboardBuilder()
+        b.button(text="🌍 Опубликовать", callback_data=f"pitem_show:{item_id}")
+        b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
+        b.adjust(1)
+        await status.edit_text(
+            f"✅ <b>Готово</b> — {done}.\n\nТеперь товар можно публиковать.",
+            reply_markup=b.as_markup(),
+        )
+    except Exception as e:
+        b = InlineKeyboardBuilder()
+        b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
+        await status.edit_text(
+            f"❌ Не удалось добавить остатки:\n<code>{str(e)[:300]}</code>",
+            reply_markup=b.as_markup(),
+        )
