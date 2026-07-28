@@ -988,8 +988,13 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
         raw_fields = res.get("fields")
         if isinstance(raw_fields, dict):
             raw_fields = list(raw_fields.values())
-        info = {"id": str(rid), "title": "", "price": "", "public": None,
-                "category": "", "stock": None}
+        # Nova puts the row's display name on the resource itself; relying only
+        # on a field called "title" left every item labelled "Товар <id>".
+        row_title = res.get("title") or res.get("display") or ""
+        if isinstance(row_title, dict):
+            row_title = row_title.get("value") or ""
+        info = {"id": str(rid), "title": str(row_title or ""), "price": "",
+                "public": None, "category": "", "stock": None}
         cat_rank = 99  # lower = better source for the grouping label
         seen_attrs: list[str] = []
         _vis_kws = ("public", "visible", "active", "published", "status",
@@ -1001,10 +1006,21 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
             fn = str(f.get("name", ""))
             if fa:
                 seen_attrs.append(fa)
-            if fa == "title":
-                info["title"] = str(f.get("value") or "")
-            elif fa == "price":
-                info["price"] = str(f.get("value") or "")
+            if not info["title"] and (
+                    fa in ("title", "name", "naimenovanie")
+                    or "title" in fa.lower() or "name" in fa.lower()
+                    or "назван" in fn.lower() or "наимен" in fn.lower()):
+                v = f.get("value")
+                if isinstance(v, dict):
+                    v = v.get("title") or v.get("name") or v.get("display")
+                if v not in (None, ""):
+                    info["title"] = str(v)
+            elif not info["price"] and (
+                    "price" in fa.lower() or "цен" in fn.lower()
+                    or "стоим" in fn.lower()):
+                v = f.get("value")
+                if v not in (None, ""):
+                    info["price"] = str(v)
             elif (fa in _CAT_ATTRS or "категор" in fn.lower()
                   or f.get("belongsToRelationship") or f.get("belongsToId")):
                 # The grouping value is a belongsTo. On this panel an item
@@ -1041,9 +1057,10 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
                     info["public"] = (not on) if inverted else on
                 elif isinstance(val, (int, float)):
                     info["public"] = (not bool(val)) if inverted else bool(val)
-        if not info["category"]:
-            logger.info("no category for item %s; fields: %s",
-                        info["id"], seen_attrs[:15])
+        if not info["category"] or not info["title"]:
+            logger.info(
+                "item %s: title=%r category=%r; attrs=%s",
+                info["id"], info["title"], info["category"], seen_attrs[:20])
         if info["id"] and info["id"] != "None":
             items.append(info)
     return True, items

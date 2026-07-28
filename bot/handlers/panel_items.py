@@ -6,6 +6,7 @@ import asyncio
 import logging
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -531,3 +532,56 @@ async def item_stock_save(message: Message, state: FSMContext,
             f"❌ Не удалось добавить остатки:\n<code>{str(e)[:300]}</code>",
             reply_markup=b.as_markup(),
         )
+
+
+@router.message(Command("items_debug"))
+async def items_debug(message: Message) -> None:
+    """Show how the panel actually describes an item.
+
+    Field names differ per panel, and guessing them is what left items showing
+    as "Товар <id>" with no category. This prints the real ones.
+    """
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет сессии панели — войдите в «Панель продавца»")
+        return
+
+    import json as _json
+
+    from automation.panel import PANEL_URL, _make_panel_requests_session
+
+    def _fetch() -> str:
+        session = _make_panel_requests_session(creds["cookies"])
+        r = session.get(f"{PANEL_URL}/nova-api/items",
+                        params={"perPage": "1"}, timeout=(6, 12))
+        if r.status_code != 200:
+            return f"HTTP {r.status_code}: {r.text[:200]}"
+        rows = (r.json() or {}).get("resources") or []
+        if not rows:
+            return "Панель вернула пустой список"
+        row = rows[0]
+        out = [f"ключи записи: {list(row.keys())}",
+               f"title записи: {row.get('title')!r}"]
+        fields = row.get("fields")
+        if isinstance(fields, dict):
+            fields = list(fields.values())
+        for f in (fields or [])[:14]:
+            if not isinstance(f, dict):
+                continue
+            val = f.get("value")
+            if isinstance(val, (dict, list)):
+                val = _json.dumps(val, ensure_ascii=False)[:60]
+            out.append(f"• {f.get('attribute')} | {f.get('name')} = "
+                       f"{str(val)[:60]}")
+        return "\n".join(out)
+
+    status = await message.answer("⏳ Читаю структуру товара...")
+    try:
+        loop = asyncio.get_event_loop()
+        report = await asyncio.wait_for(loop.run_in_executor(None, _fetch),
+                                        timeout=40)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    import html as _html
+    await status.edit_text(
+        f"🔍 <b>Структура товара</b>\n\n<code>{_html.escape(report)[:3500]}</code>")
