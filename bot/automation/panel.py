@@ -935,6 +935,21 @@ def panel_bump_all_sync(
     return 0, f"⚠️ Не удалось поднять: {last}"
 
 
+def panel_list_categories_sync(cookie_string: str) -> tuple[bool, object]:
+    """Blocking: the seller's categories, derived from their own listings.
+    Returns (True, [{"name": str, "count": int}]) or (False, error)."""
+    ok, items = panel_list_items_sync(cookie_string)
+    if not ok:
+        return False, items
+    counts: dict[str, int] = {}
+    for it in items:
+        cat = (it.get("category") or "").strip() or "Без категории"
+        counts[cat] = counts.get(cat, 0) + 1
+    cats = [{"name": k, "count": v} for k, v in counts.items()]
+    cats.sort(key=lambda c: (-c["count"], c["name"]))
+    return True, cats
+
+
 def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
     """Blocking: list items from the panel. Returns (True, [{id,title,price}])
     or (False, error)."""
@@ -967,7 +982,8 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
         raw_fields = res.get("fields")
         if isinstance(raw_fields, dict):
             raw_fields = list(raw_fields.values())
-        info = {"id": str(rid), "title": "", "price": "", "public": None}
+        info = {"id": str(rid), "title": "", "price": "", "public": None,
+                "category": "", "stock": None}
         _vis_kws = ("public", "visible", "active", "published", "status",
                     "hidden", "публич", "видим", "актив", "показ", "скрыт")
         for f in raw_fields or []:
@@ -979,6 +995,23 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
                 info["title"] = str(f.get("value") or "")
             elif fa == "price":
                 info["price"] = str(f.get("value") or "")
+            elif fa in ("category", "subcategory") or "категор" in fn.lower():
+                # belongsTo → the value may be an object carrying the label
+                v = f.get("value")
+                label = ""
+                if isinstance(v, dict):
+                    label = str(v.get("title") or v.get("name")
+                                or v.get("display") or "")
+                elif v not in (None, ""):
+                    label = str(v)
+                if label and not info["category"]:
+                    info["category"] = label
+            elif any(k in fa.lower() or k in fn.lower()
+                     for k in ("count", "quantity", "stock", "остат", "количеств")):
+                try:
+                    info["stock"] = int(float(str(f.get("value"))))
+                except (TypeError, ValueError):
+                    pass
             elif info["public"] is None and any(
                     kw in fa.lower() or kw in fn.lower() for kw in _vis_kws):
                 val = f.get("value")

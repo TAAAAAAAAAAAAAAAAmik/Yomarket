@@ -18,6 +18,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 40
+_CAT_CACHE: dict[int, list[str]] = {}
 
 
 class PanelItemState(StatesGroup):
@@ -51,8 +52,67 @@ async def _run(uid: int, fn, *args):
         return None, f"Ошибка: {str(e)[:150]}"
 
 
+@router.callback_query(F.data == "pitems:cats")
+async def list_categories(callback: CallbackQuery) -> None:
+    """Seller's categories; picking one lists that category's items."""
+    from automation.panel import panel_list_categories_sync
+
+    await callback.message.edit_text("⏳ Загружаю категории...")
+    result, err = await _run(callback.from_user.id, panel_list_categories_sync)
+    if err == "no_session":
+        await callback.message.edit_text(
+            "❌ Нет сессии панели. Войдите через email.",
+            reply_markup=_no_session_kb())
+        await callback.answer()
+        return
+    if result is None or not result[0]:
+        detail = result[1] if result else err
+        await callback.message.edit_text(
+            f"❌ Не удалось получить категории:\n{detail}",
+            reply_markup=_no_session_kb())
+        await callback.answer()
+        return
+
+    cats = result[1]
+    _CAT_CACHE[callback.from_user.id] = [c["name"] for c in cats]
+    b = InlineKeyboardBuilder()
+    for i, c in enumerate(cats[:40]):
+        b.button(text=f"📂 {c['name'][:24]} ({c['count']})",
+                 callback_data=f"pcat:{i}")
+    b.adjust(1)
+    b.button(text="📋 Все товары", callback_data="pitems:list")
+    b.button(text="🔄 Обновить", callback_data="pitems:cats")
+    b.button(text="⬅️ Назад", callback_data="menu:ads")
+    b.adjust(2, 1)
+    await callback.message.edit_text(
+        f"📦 <b>Товары по категориям</b>\n\n"
+        f"Категорий: <b>{len(cats)}</b>\nВыберите категорию:",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pcat:"))
+async def list_category_items(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
+    try:
+        idx = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    names = _CAT_CACHE.get(uid) or []
+    if idx >= len(names):
+        await callback.answer("Список устарел — обновите категории",
+                              show_alert=True)
+        return
+    await _render_items(callback, category=names[idx])
+
+
 @router.callback_query(F.data == "pitems:list")
 async def list_items(callback: CallbackQuery) -> None:
+    await _render_items(callback, category=None)
+
+
+async def _render_items(callback: CallbackQuery, category: str | None) -> None:
     from automation.panel import panel_list_items_sync
 
     await callback.message.edit_text("⏳ Загружаю товары из панели...")
@@ -78,12 +138,17 @@ async def list_items(callback: CallbackQuery) -> None:
         await callback.answer()
         return
 
+    if category:
+        items = [it for it in items
+                 if (it.get("category") or "Без категории") == category]
+
     hidden = [it for it in items if it.get("public") is False]
     b = InlineKeyboardBuilder()
     for it in items[:40]:
         pub = it.get("public")
         mark = "🌍 " if pub is True else ("🙈 " if pub is False else "")
-        label = f"{mark}{(it['title'] or ('Товар ' + it['id']))[:26]}"
+        stock_mark = "⚠️" if it.get("stock") == 0 else ""
+        label = f"{mark}{stock_mark}{(it['title'] or ('Товар ' + it['id']))[:24]}"
         if it.get("price"):
             label += f" — {it['price']} ₽"
         b.button(text=label, callback_data=f"pitem:{it['id']}")
@@ -91,15 +156,19 @@ async def list_items(callback: CallbackQuery) -> None:
     if hidden:
         b.button(text=f"🌍 Опубликовать все скрытые ({len(hidden)})",
                  callback_data="pitems:pubhidden")
+        b.adjust(1)
+    b.button(text="📂 По категориям", callback_data="pitems:cats")
     b.button(text="➕ Добавить товар", callback_data="create_ad:start")
-    b.button(text="🔄 Обновить", callback_data="pitems:list")
+    b.button(text="🔄 Обновить",
+             callback_data="pitems:cats" if category else "pitems:list")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
-    b.adjust(1)
+    b.adjust(2, 2)
     status_hint = ""
     if any(it.get("public") is not None for it in items):
-        status_hint = "\n🌍 = виден в маркете, 🙈 = скрыт"
+        status_hint = "\n🌍 = виден, 🙈 = скрыт, ⚠️ = нет остатков"
+    head = f"📂 <b>{category}</b>" if category else "🛠 <b>Товары в панели</b>"
     await callback.message.edit_text(
-        f"🛠 <b>Товары в панели</b> (всего: {len(items)})"
+        f"{head} (всего: {len(items)})"
         f"{status_hint}\n\n"
         "Нажмите на товар для управления:",
         reply_markup=b.as_markup(),

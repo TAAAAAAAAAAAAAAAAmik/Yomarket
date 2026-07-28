@@ -59,7 +59,7 @@ def _ads_keyboard(ads: list[dict], next_cursor: str | None):
         n_list += 1
     # 2 columns: fixed actions
     b.button(text="➕ Добавить товар", callback_data="create_ad:start")
-    b.button(text="🌍 Публикация", callback_data="pitems:list")
+    b.button(text="📦 Товары", callback_data="pitems:cats")
     b.button(text="🛠 Управление", callback_data="pitems:list")
     b.button(text="📦 Паки", callback_data="packs:menu")
     b.button(text="💰 Все цены", callback_data="ads:bulk_price")
