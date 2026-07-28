@@ -7,7 +7,7 @@ import re
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from automation.panel import (
@@ -293,10 +293,18 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         ok = False
 
     if not ok:
+        # Grab the picture BEFORE closing the browser — a screenshot shows a
+        # form that never rendered, which no markup dump can.
+        shot = b""
+        try:
+            shot = await asyncio.wait_for(panel.screenshot(), timeout=20)
+        except Exception as e:
+            logger.warning("screenshot failed: %s", e)
         try:
             await panel.close()
         except Exception:
             pass
+
         await state.clear()
         seen = "\n".join(panel.captured[:15])
         pages = "\n".join(panel.page_debug[:3])
@@ -304,6 +312,14 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         if pages:
             extra += f"\n\n<b>Что на странице:</b>\n<code>{pages[:700]}</code>"
         await _safe_edit(status_msg, f"❌ {err or 'Не удалось отправить код'}{extra}")
+        if shot:
+            try:
+                await message.answer_photo(
+                    BufferedInputFile(shot, filename="login.png"),
+                    caption="📸 Что видит браузер на странице входа",
+                )
+            except Exception as e:
+                logger.warning("screenshot send failed: %s", e)
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")

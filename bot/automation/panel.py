@@ -2363,6 +2363,19 @@ class YooMarketPanel:
         # What each visited page offered when no email field was found —
         # makes a failed form hunt explainable instead of silent.
         self.page_debug: list[str] = []
+        # Kept so a failed login can send back a picture of what the browser
+        # actually saw — button lists cannot show a form that never rendered.
+        self._page = None
+
+    async def screenshot(self) -> bytes:
+        """PNG of the current page, or b"" if unavailable."""
+        if self._page is None:
+            return b""
+        try:
+            return await self._page.screenshot(full_page=False, type="png")
+        except Exception as e:
+            logger.warning("screenshot failed: %s", e)
+            return b""
 
     def _watch_requests(self, page) -> None:
         """Record the login requests the page fires."""
@@ -2464,6 +2477,7 @@ class YooMarketPanel:
             viewport={"width": 412, "height": 915},
         )
         page = await context.new_page()
+        self._page = page
         self._watch_requests(page)
 
         _EMAIL_SEL = ('input[type="email"], input[name="email"], '
@@ -2516,12 +2530,16 @@ class YooMarketPanel:
                     btn = await page.query_selector(sel)
                     if not btn or not await btn.is_visible():
                         continue
+                    logger.info("clicking opener %s", sel)
                     await btn.click()
-                    await asyncio.sleep(2)
                     await _dismiss_overlays()
-                    if await _find_email():
-                        logger.info("login form opened via %s", sel)
-                        return page, context
+                    # A modal animates in and Next.js hydrates lazily — poll
+                    # instead of checking once.
+                    for _ in range(8):
+                        await asyncio.sleep(1)
+                        if await _find_email():
+                            logger.info("login form opened via %s", sel)
+                            return page, context
                 except Exception:
                     continue
 
