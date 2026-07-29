@@ -845,6 +845,118 @@ def _option_price(label: str) -> int:
         return 0
 
 
+def _nova_rows_to_options(data) -> list[dict]:
+    """Turn a Nova index/associatable payload into [{label, value}]."""
+    if not isinstance(data, dict):
+        return []
+    rows = data.get("resources")
+    if not isinstance(rows, list):
+        return []
+    opts = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        val = row.get("value", row.get("id"))
+        if isinstance(val, dict):                # index rows nest {value: ...}
+            val = val.get("value", val.get("id"))
+        label = row.get("display") or row.get("title")
+        if not label:
+            # index rows carry their columns in `fields`
+            for fl in (row.get("fields") or []):
+                if isinstance(fl, dict) and fl.get("value") not in (None, ""):
+                    if str(fl.get("attribute")) not in ("id",):
+                        label = str(fl.get("value"))
+                        break
+        if val in (None, ""):
+            continue
+        opts.append({"label": str(label or val), "value": val})
+    return opts
+
+
+def panel_action_field_options_sync(
+    cookie_string: str, item_id: str, action_key: str, attr: str,
+    chosen: dict | None = None,
+) -> tuple[list[dict], str]:
+    """Blocking: hunt for the options of an action field Nova left empty.
+
+    «Оплата» arrives with neither options nor a required rule — the panel fills
+    it in the browser and validates it server-side. Rather than guess an id for
+    something that spends money, try the places Nova can legitimately serve it
+    from and report what each answered.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    trace: list[str] = []
+    base = {"resources": str(item_id), "editing": "true", "editMode": "update"}
+    base.update({k: str(v) for k, v in (chosen or {}).items()})
+    stem = attr[:-3] if attr.endswith("_id") else attr
+
+    # Dependent action fields: re-read the action with the current selection,
+    # which is what the panel's own form does when a choice is made.
+    def _from_actions(params: dict) -> list[dict]:
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/items/actions",
+                            params=params, headers=hdrs,
+                            timeout=(6, 10), allow_redirects=False)
+        except Exception as e:
+            trace.append(f"actions: {str(e)[:40]}")
+            return []
+        trace.append(f"actions+values: {r.status_code}")
+        if r.status_code != 200:
+            return []
+        try:
+            acts = (r.json() or {}).get("actions") or []
+        except Exception:
+            return []
+        for a in acts:
+            if not isinstance(a, dict) or a.get("uriKey") != action_key:
+                continue
+            for f in (a.get("fields") or []):
+                if isinstance(f, dict) and f.get("attribute") == attr:
+                    return _normalize_options(f)
+        return []
+
+    opts = _from_actions(base)
+    if opts:
+        return opts, "; ".join(trace)
+
+    # Endpoints Nova uses for relation and dependent fields, then the resource
+    # a payment system would live in.
+    candidates = [
+        (f"/nova-api/items/associatable/{attr}", base),
+        (f"/nova-api/items/associatable/{stem}", base),
+        (f"/nova-api/items/action-fields", {**base, "action": action_key,
+                                            "field": attr}),
+        (f"/nova-api/items/actions/{action_key}/fields", {**base, "field": attr}),
+        (f"/nova-api/{stem}s", {"perPage": "100"}),
+        ("/nova-api/payment-systems", {"perPage": "100"}),
+        ("/nova-api/payments", {"perPage": "100"}),
+    ]
+    for path, params in candidates:
+        try:
+            r = session.get(f"{PANEL_URL}{path}", params=params, headers=hdrs,
+                            timeout=(6, 10), allow_redirects=False)
+        except Exception as e:
+            trace.append(f"{path}: {str(e)[:30]}")
+            continue
+        trace.append(f"{path}: {r.status_code}")
+        if r.status_code != 200:
+            continue
+        try:
+            data = r.json()
+        except Exception:
+            continue
+        found = _nova_rows_to_options(data)
+        if not found and isinstance(data, dict):
+            for f in _parse_nova_fields_payload(data):
+                if f.get("attribute") == attr:
+                    found = _normalize_options(f)
+                    break
+        if found:
+            return found, "; ".join(trace)
+    return [], "; ".join(trace)[:300]
+
+
 def panel_promo_fields_sync(
     cookie_string: str, item_id: str,
 ) -> tuple[bool, object]:
@@ -887,29 +999,26 @@ def panel_promo_fields_sync(
         if not attr:
             continue
         opts = _normalize_options(f)
-        probe = ""
-        if not opts:
-            # A relation field carries no inline options; ask Nova for them.
-            opts, probe = panel_sync_field_options_sync(
-                cookie_string, "items", attr, {"resources": str(item_id)})
         for o in opts:
             o["price"] = _option_price(o["label"])
         out_fields.append({
             "attribute": attr,
             "label": f.get("name") or attr,
             "options": opts,
-            "required": "required" in str(f.get("rules", "")),
+            # «Оплата» carries no required rule — the panel only enforces it
+            # server-side — so an empty field cannot be treated as optional:
+            # skipping it is exactly what produced the 422.
+            "required": "required" in str(f.get("rules", "")) or not opts,
             "value": f.get("value"),
-            # Only for a field whose options stayed empty: what Nova calls it
-            # and what the lookup answered, so the gap can be diagnosed from
-            # the bot's message instead of another round of guessing.
-            "probe": "" if opts else (
-                f"component={f.get('component')} "
-                f"rel={f.get('relationshipType') or f.get('belongsToRelationship') or '—'} "
-                f"keys={sorted(f.keys())[:14]} | {probe}"[:400]),
+            # Fetched lazily, once earlier choices are known: a dependent field
+            # has no options until the selection it depends on is made.
+            "lookup": not opts,
+            "shape": (f"component={f.get('component')} "
+                      f"rel={f.get('relationshipType') or f.get('belongsToRelationship') or '—'} "
+                      f"keys={sorted(f.keys())[:14]}")[:250] if not opts else "",
         })
     return True, {"key": a.get("uriKey"), "name": a.get("name") or "Премиум",
-                  "fields": out_fields}
+                  "item_id": str(item_id), "fields": out_fields}
 
 
 def panel_bump_item_sync(
@@ -969,11 +1078,14 @@ def panel_bump_item_sync(
         # come from the tariff the seller picked; without them, say so.
         fields = [f for f in (a.get("fields") or []) if isinstance(f, dict)]
         chosen = {k: v for k, v in (params or {}).items() if v not in (None, "")}
+        # Not just the fields Nova marks required: «Оплата» carries no such
+        # rule yet is enforced server-side. Anything the action asks for and
+        # has no default of its own must come from the chosen tariff.
         missing = [
             f.get("name") or f.get("attribute")
             for f in fields
-            if "required" in str(f.get("rules", []))
-            and f.get("attribute") not in chosen
+            if f.get("attribute") not in chosen
+            and f.get("value") in (None, "")
         ]
         if missing:
             return False, (

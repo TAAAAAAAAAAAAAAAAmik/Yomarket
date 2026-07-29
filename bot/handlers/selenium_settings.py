@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 class SeleniumState(StatesGroup):
     waiting_bump_interval = State()
     waiting_withdraw_amount = State()
+    waiting_promo_value = State()
+
+
+def _esc(text) -> str:
+    return (str(text or "").replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
 
 
 def _st(on: bool) -> str:
@@ -153,13 +159,37 @@ def _promo_step_kb(spec: dict, step: int) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-async def _promo_step(callback: CallbackQuery, state: FSMContext,
+async def _promo_step(user_id: int, send, state: FSMContext,
                       spec: dict, step: int, picked: dict) -> None:
-    """Show the next field that still needs a choice, or save the tariff."""
+    """Show the next field that still needs a choice, or save the tariff.
+
+    `send(text, reply_markup=None)` delivers each step, so the same walk works
+    whether it was reached by a button or by a typed value.
+    """
+    import asyncio
+
+    from automation.panel import panel_action_field_options_sync
+    from storage import get_panel_creds
+
     fields = spec["fields"]
     while step < len(fields):
         f = fields[step]
         opts = f["options"]
+
+        if not opts and f.get("lookup"):
+            # A dependent field only gets its options once the choices it
+            # depends on are known, so this is asked for here, not up front.
+            creds = get_panel_creds(user_id) or {}
+            chosen = {k: v["value"] for k, v in picked.items()}
+            await send(f"⏳ Узнаю варианты для «{f['label']}»...")
+            opts, trace = await asyncio.get_event_loop().run_in_executor(
+                None, panel_action_field_options_sync, creds.get("cookies", ""),
+                str(spec.get("item_id") or ""), spec.get("key") or "",
+                f["attribute"], chosen)
+            f["options"] = opts
+            f["lookup"] = False
+            f["trace"] = trace
+
         if len(opts) == 1:
             # One possibility is not a choice — take it and move on
             picked[f["attribute"]] = {"value": opts[0]["value"],
@@ -167,43 +197,62 @@ async def _promo_step(callback: CallbackQuery, state: FSMContext,
                                       "price": opts[0].get("price", 0)}
             step += 1
             continue
-        if not opts:
-            if f["required"]:
-                probe = str(f.get("probe") or "").replace("<", "&lt;")
-                await callback.message.edit_text(
-                    f"⚠️ Панель не дала вариантов для поля "
-                    f"<b>{f['label']}</b> (<code>{f['attribute']}</code>).\n\n"
-                    f"Без него продвижение не запустится.\n\n"
-                    f"<code>{probe[:350]}</code>",
-                    reply_markup=_cancel_kb("selenium:bump:menu"))
-                return
-            step += 1
-            continue
+
         await state.update_data(promo_spec=spec, promo_picked=picked,
                                 promo_step=step)
-        await callback.message.edit_text(
+
+        if not opts:
+            # Never skip an option-less field: the panel validates it anyway,
+            # and skipping it is exactly what made promotion fail with 422.
+            await state.set_state(SeleniumState.waiting_promo_value)
+            info = _esc(f"{f.get('shape') or ''} | {f.get('trace') or ''}")
+            b = InlineKeyboardBuilder()
+            b.button(text="❌ Отмена", callback_data="selenium:bump:menu")
+            await send(
+                f"⚠️ Панель не отдала варианты для поля "
+                f"<b>{_esc(f['label'])}</b> (<code>{_esc(f['attribute'])}</code>).\n\n"
+                f"Пришлите значение сообщением — его видно в панели: откройте "
+                f"«Премиум» у объявления и посмотрите, что стоит в этом поле.\n\n"
+                f"<code>{info[:300]}</code>",
+                b.as_markup())
+            return
+
+        await state.set_state(None)
+        await send(
             f"⭐ <b>Премиум продвижение</b>\n\n"
-            f"Шаг {step + 1} из {len(fields)} — <b>{f['label']}</b>\n\n"
+            f"Шаг {step + 1} из {len(fields)} — <b>{_esc(f['label'])}</b>\n\n"
             f"<i>Выбор запоминается и применяется ко всем поднятиям.</i>",
-            reply_markup=_promo_step_kb(spec, step))
+            _promo_step_kb(spec, step))
         return
 
     # Everything chosen
     values = {k: v["value"] for k, v in picked.items()}
     price = max((v.get("price", 0) for v in picked.values()), default=0)
-    label = " · ".join(v["label"] for v in picked.values() if v.get("label"))
-    s = get_settings(callback.from_user.id)
+    label = " · ".join(str(v["label"]) for v in picked.values() if v.get("label"))
+    s = get_settings(user_id)
     s.setdefault("auto_bump", {})["promo"] = {
         "values": values, "label": label, "price": price,
         "action": spec.get("key"),
     }
-    save_settings(callback.from_user.id, s)
-    await state.update_data(promo_spec=None, promo_picked=None, promo_step=None)
-    await callback.message.edit_text(
-        f"✅ <b>Тариф сохранён</b>\n\n{label}"
+    save_settings(user_id, s)
+    await state.clear()
+    await send(
+        f"✅ <b>Тариф сохранён</b>\n\n{_esc(label)}"
         + (f"\n\nСтоимость: <b>{price} ₽</b> за объявление" if price else "")
         + "\n\n" + _bump_text(s),
-        reply_markup=_bump_kb(s))
+        _bump_kb(s))
+
+
+def _cb_send(callback: CallbackQuery):
+    async def send(text, reply_markup=None):
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    return send
+
+
+def _msg_send(message: Message):
+    async def send(text, reply_markup=None):
+        await message.answer(text, reply_markup=reply_markup)
+    return send
 
 
 @router.callback_query(F.data == "promo:setup")
@@ -216,7 +265,8 @@ async def promo_setup(callback: CallbackQuery, state: FSMContext) -> None:
             f"❌ Не удалось прочитать тарифы:\n{str(spec)[:300]}",
             reply_markup=_cancel_kb("selenium:bump:menu"))
         return
-    await _promo_step(callback, state, spec, 0, {})
+    await _promo_step(callback.from_user.id, _cb_send(callback), state,
+                      spec, 0, {})
 
 
 @router.callback_query(F.data.startswith("promo:pick:"))
@@ -237,12 +287,38 @@ async def promo_pick(callback: CallbackQuery, state: FSMContext) -> None:
     o = field["options"][idx]
     picked[field["attribute"]] = {"value": o["value"], "label": o["label"],
                                   "price": o.get("price", 0)}
-    await callback.answer(o["label"][:60])
-    await _promo_step(callback, state, spec, step + 1, picked)
+    await callback.answer(str(o["label"])[:60])
+    await _promo_step(callback.from_user.id, _cb_send(callback), state,
+                      spec, step + 1, picked)
+
+
+@router.message(SeleniumState.waiting_promo_value)
+async def promo_manual_value(message: Message, state: FSMContext) -> None:
+    """Take a value the seller read off the panel for a field Nova would not
+    describe, then carry on with the remaining steps."""
+    raw = (message.text or "").strip()
+    if not raw:
+        await message.answer("❌ Пришлите значение поля")
+        return
+    data = await state.get_data()
+    spec = data.get("promo_spec")
+    step = data.get("promo_step")
+    if not spec or step is None:
+        await state.clear()
+        await message.answer("Начните заново: «⚙️ Тариф»")
+        return
+    field = spec["fields"][step]
+    value = int(raw) if raw.isdigit() else raw
+    picked = data.get("promo_picked") or {}
+    picked[field["attribute"]] = {"value": value, "label": f"{field['label']}: {raw}",
+                                  "price": 0}
+    await _promo_step(message.from_user.id, _msg_send(message), state,
+                      spec, step + 1, picked)
 
 
 @router.callback_query(F.data == "selenium:bump:menu")
-async def bump_menu(callback: CallbackQuery) -> None:
+async def bump_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     s = get_settings(callback.from_user.id)
     await callback.message.edit_text(_bump_text(s), reply_markup=_bump_kb(s))
     await callback.answer()
