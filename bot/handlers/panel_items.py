@@ -909,12 +909,14 @@ async def items_debug(message: Message) -> None:
 
 
 @router.message(Command("scan"))
-async def scan_page(message: Message) -> None:
+async def scan_page(message: Message) -> None:  # noqa: C901
     """/scan /support — read a panel page and find the endpoints it calls.
 
     A page that shows messages must fetch them from somewhere; pointing this at
     the support chat gives that address without needing a browser.
     """
+    import re as _re_mod
+
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer(
@@ -922,6 +924,8 @@ async def scan_page(message: Message) -> None:
             "Адрес возьмите из строки браузера, когда открыт нужный чат.")
         return
     page_path = parts[1].strip()
+    # Accept a full URL pasted from the address bar, not just a path
+    page_path = _re_mod.sub(r"^https?://[^/]+", "", page_path)
     if not page_path.startswith("/"):
         page_path = "/" + page_path
 
@@ -968,6 +972,30 @@ async def scan_page(message: Message) -> None:
                 if len(m) < 60:
                     hits.add(m)
         out.append(f"в JS: {sorted(hits)[:20] or 'ничего'}")
+
+        # For a page like /chats/1076867 the messages come from a sibling
+        # address — probe the usual shapes directly.
+        m = _re.match(r"^/([a-z-]+)/(\d+)", page_path)
+        if m:
+            section, oid = m.group(1), m.group(2)
+            out.append("\n— проверка адресов сообщений —")
+            for cand in (
+                f"/api/{section}/{oid}/messages",
+                f"/{section}/{oid}/messages",
+                f"/api/{section}/{oid}",
+                f"/nova-api/{section}/{oid}",
+                f"/{section}/{oid}/list",
+                f"/api/{section}/{oid}/list",
+            ):
+                try:
+                    rr = session.get(PANEL_URL + cand, timeout=(5, 10),
+                                     allow_redirects=False)
+                except Exception:
+                    continue
+                if rr.status_code in (404, 405):
+                    continue
+                body = rr.text[:130].replace("\n", " ")
+                out.append(f"{cand} → {rr.status_code}: {body}")
         return "\n".join(out)
 
     status = await message.answer(f"⏳ Читаю {page_path}...")
