@@ -597,7 +597,9 @@ def _wanted_cats(ads: list[dict]) -> set[int]:
 # Stripping the number leaves that case ("Звезд"), which is not a category
 # name, so the common goods on this marketplace are mapped back to nominative.
 _GOODS_FORMS = {
-    "звезд": "Звезды", "звёзд": "Звезды", "stars": "Stars",
+    # English and Russian titles for the same goods share one group
+    "звезд": "Звезды", "звёзд": "Звезды", "звезды": "Звезды",
+    "звёзды": "Звезды", "stars": "Звезды", "star": "Звезды",
     "подписчиков": "Подписчики", "подписчика": "Подписчики",
     "просмотров": "Просмотры", "просмотра": "Просмотры",
     "лайков": "Лайки", "лайка": "Лайки",
@@ -613,25 +615,36 @@ _GOODS_FORMS = {
 def _label_from_title(title: str) -> str:
     """A category label derived from the ad's own title.
 
-    Used when the API gives no category name. "100 звезд" and
-    "500 звезд №219206" both come out as «Звезды», so a seller sees the goods,
-    not a quantity or an id.
+    Titles carry decoration and quantities — "💠100 ЗВЕЗД💠⚡МОМЕНТАЛЬНО⚡",
+    "100 звезд", "500 звезд №219206" — so symbols and numbers are dropped and
+    the goods word is looked for anywhere in what remains. All three land on
+    «Звезды» instead of each becoming its own category.
     """
-    text = re.sub(r"№\s*\d+", " ", str(title or ""))
-    text = re.sub(r"^[\d\s.,x×*+-]+", " ", text)
-    text = re.sub(r"\b\d+\s*(шт|штук|pcs)\b", " ", text, flags=re.I)
-    text = " ".join(text.split())
-    if not text:
+    # Strip emoji and punctuation, keeping letters and digits
+    text = re.sub(r"[^\w\s]", " ", str(title or ""), flags=re.UNICODE)
+    words = [w for w in text.split() if not w.isdigit()]
+    # Drop quantity prefixes glued to a word ("100зв" stays, "100" goes)
+    words = [re.sub(r"^\d+", "", w) for w in words]
+    words = [w for w in words if w]
+    if not words:
         return "Прочее"
 
-    words = text.split()
-    # Whole phrase first, then the leading word: "звезд telegram" -> Звезды
-    for candidate in (text.lower(), words[0].lower()):
-        form = _GOODS_FORMS.get(candidate)
+    lowered = [w.lower() for w in words]
+    for w in lowered:
+        form = _GOODS_FORMS.get(w)
+        if form:
+            return form
+    # Two-word goods names ("telegram stars")
+    for i in range(len(lowered) - 1):
+        form = _GOODS_FORMS.get(f"{lowered[i]} {lowered[i + 1]}")
         if form:
             return form
 
-    text = text[:30]
+    # Nothing recognised: keep the wording, minus the noise words
+    _NOISE = {"моментально", "быстро", "дешево", "новый", "акция", "хит",
+              "лучшая", "цена", "instant", "fast", "cheap"}
+    kept = [w for w in words if w.lower() not in _NOISE] or words
+    text = " ".join(kept)[:30]
     # capitalize() would lowercase the rest and turn "Telegram Stars" into
     # "Telegram stars"
     return text[0].upper() + text[1:]
