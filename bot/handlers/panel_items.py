@@ -379,7 +379,8 @@ async def edit_title_save(message: Message, state: FSMContext) -> None:
 
 # ── Показать / Скрыть ───────────────────────────────────────────────────────
 
-async def _stock_left(api: YooMarketAPI, item_id: str) -> tuple[bool, str]:
+async def _stock_left(api: YooMarketAPI, item_id: str,
+                      ad: dict | None = None) -> tuple[bool, str]:
     """How much stock an ad has. Returns (has_stock, human_note).
 
     Publishing is refused by the marketplace when an ad has nothing to sell, so
@@ -388,7 +389,8 @@ async def _stock_left(api: YooMarketAPI, item_id: str) -> tuple[bool, str]:
     On any error it returns True: a failed check must not block publishing.
     """
     try:
-        ad = await api.get_ad(item_id)
+        if ad is None:
+            ad = await api.get_ad(item_id)
         inner = ad.get("data") or ad
         ad_type = str(inner.get("type") or "")
 
@@ -421,9 +423,26 @@ async def _toggle(callback: CallbackQuery, public: bool,
     item_id = callback.data.split(":", 1)[1]
     uid = callback.from_user.id
 
-    # Refuse to publish an empty listing — offer to fill it instead.
     if public and api:
-        has_stock, note = await _stock_left(api, item_id)
+        # One fetch serves both checks below.
+        try:
+            ad = await api.get_ad(item_id)
+        except Exception as e:
+            logger.info("get_ad(%s) failed: %s", item_id, e)
+            ad = None
+
+        # Already queued or already live? Say so instead of submitting again.
+        status = str(((ad or {}).get("data") or ad or {}).get("status", "")).lower()
+        if status in ("moderate", "moderation", "pending", "review"):
+            await callback.answer(
+                "🕓 Товар уже отправлен на модерацию", show_alert=True)
+            return
+        if status in ("active", "published"):
+            await callback.answer("🟢 Товар уже опубликован", show_alert=True)
+            return
+
+        # Refuse to publish an empty listing — offer to fill it instead.
+        has_stock, note = await _stock_left(api, item_id, ad)
         if not has_stock:
             b = InlineKeyboardBuilder()
             b.button(text="📦 Добавить остатки",
@@ -603,7 +622,8 @@ async def item_stock_save(message: Message, state: FSMContext,
     status = await message.answer("⏳ Добавляю остатки...")
 
     try:
-        ad = await api.get_ad(item_id)
+        if ad is None:
+            ad = await api.get_ad(item_id)
         inner = ad.get("data") or ad
         ad_type = str(inner.get("type") or "")
 
