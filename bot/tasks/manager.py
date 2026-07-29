@@ -429,11 +429,69 @@ class TaskManager:
             settings["known_order_details"] = order_details
 
             await self._check_messages(user_id, api, settings)
+            await self._check_watched_chats(user_id, api, settings)
             await self._auto_confirm(user_id, api, settings)
 
             save_settings(user_id, settings)
         finally:
             await api.close()
+
+    async def _check_watched_chats(self, user_id: int, api: YooMarketAPI,
+                                   settings: dict) -> None:
+        """Poll chats that belong to no order — support, moderation.
+
+        The API cannot list chats, only read one by id, so these are the ids the
+        seller added by hand. Without this, support messages never reach the bot
+        at all: order polling has nothing to find them by.
+        """
+        watched: dict = settings.get("watched_chats") or {}
+        if not watched:
+            return
+
+        for chat_id, info in list(watched.items()):
+            try:
+                data = await api.get_messages(chat_id)
+                messages: list[dict] = data.get("data") or data.get("items") or []
+                if not messages:
+                    continue
+
+                newest_id = str(messages[-1].get("id", ""))
+                last_known = info.get("last_msg")
+                if last_known is None:
+                    info["last_msg"] = newest_id      # baseline, stay quiet
+                    continue
+                if not _is_newer(newest_id, last_known):
+                    continue
+
+                label = info.get("label") or f"Чат #{chat_id}"
+                for msg in messages:
+                    msg_id = str(msg.get("id", ""))
+                    if not _is_newer(msg_id, last_known):
+                        continue
+                    sender = msg.get("sender_type") or msg.get("sender") or ""
+                    if isinstance(sender, dict):
+                        sender = sender.get("type") or sender.get("role") or ""
+                    sender = str(sender).lower()
+                    if msg.get("is_mine") or msg.get("is_own") or sender in (
+                            "me", "self", "own", "shop", "seller"):
+                        continue
+
+                    text = (msg.get("text") or msg.get("message") or "")[:400]
+                    time_str = _fmt_time(msg.get("created_at") or msg.get("date"))
+                    await self._notify(
+                        user_id,
+                        _card(f"🛟 <b>{label.upper()}</b>",
+                              [f"🕐 {time_str}" if time_str else "",
+                               "",
+                               f"<blockquote>{text}</blockquote>"],
+                              f"💬 <code>#{chat_id}</code>"),
+                        reply_markup=_message_notify_kb(str(chat_id)),
+                    )
+                info["last_msg"] = newest_id
+            except Exception as e:
+                logger.warning("watched chat %s: %s", chat_id, e)
+
+        settings["watched_chats"] = watched
 
     async def _check_messages(self, user_id: int, api: YooMarketAPI, settings: dict) -> None:
         known_orders: dict = settings.get("known_orders", {})

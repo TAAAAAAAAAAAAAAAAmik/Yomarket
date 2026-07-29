@@ -8,7 +8,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
 from keyboards.main import ChatCallback, PaginationCallback, back_keyboard
-from storage import get_settings
+from aiogram.filters import Command
+from storage import get_settings, save_settings
 
 router = Router()
 
@@ -203,3 +204,80 @@ async def send_quick_reply(callback: CallbackQuery, api: YooMarketAPI) -> None:
         await callback.answer("✅ Отправлено!", show_alert=True)
     except Exception as e:
         await callback.answer(f"❌ {e}", show_alert=True)
+
+
+# ---------------------------------------------------------------------------
+# Chats outside orders — support, moderation
+# ---------------------------------------------------------------------------
+
+@router.message(Command("watch_chat"))
+async def watch_chat(message: Message, api: YooMarketAPI) -> None:
+    """/watch_chat 1076867 [название] — follow a chat that has no order.
+
+    Support and moderation conversations belong to no order, and the API has no
+    way to list chats, so their ids cannot be discovered — they are added here
+    and then polled like any other chat.
+    """
+    parts = (message.text or "").split(maxsplit=2)
+    settings = get_settings(message.from_user.id)
+    watched: dict = settings.setdefault("watched_chats", {})
+
+    if len(parts) < 2:
+        if watched:
+            lines = [f"• <code>{cid}</code> — {i.get('label') or 'без названия'}"
+                     for cid, i in watched.items()]
+            body = "\n".join(lines)
+        else:
+            body = "<i>пока ни одного</i>"
+        await message.answer(
+            f"🛟 <b>Отслеживаемые чаты</b>\n\n{body}\n\n"
+            f"Добавить: <code>/watch_chat 1076867 Поддержка</code>\n"
+            f"Убрать: <code>/unwatch_chat 1076867</code>\n\n"
+            f"<i>Номер возьмите из адреса чата в панели: "
+            f"panel.yoomarket.net/chats/<b>1076867</b></i>")
+        return
+
+    chat_id = parts[1].strip().strip("/")
+    # A pasted URL works too
+    if "/" in chat_id:
+        chat_id = chat_id.rstrip("/").split("/")[-1]
+    label = parts[2].strip() if len(parts) > 2 else "Поддержка"
+
+    if not api:
+        await message.answer("⚠️ Не настроен API-токен")
+        return
+
+    status = await message.answer(f"⏳ Проверяю чат #{chat_id}...")
+    try:
+        data = await api.get_messages(chat_id)
+        rows = data.get("data") or data.get("items") or []
+    except Exception as e:
+        await status.edit_text(
+            f"❌ Чат #{chat_id} не читается:\n<code>{str(e)[:250]}</code>\n\n"
+            f"<i>Возможно, этот чат недоступен по API-токену.</i>")
+        return
+
+    # Start from the newest message, so adding a chat does not replay history
+    last = str(rows[-1].get("id", "")) if rows else None
+    watched[str(chat_id)] = {"label": label, "last_msg": last}
+    save_settings(message.from_user.id, settings)
+    await status.edit_text(
+        f"✅ <b>{label}</b> добавлен\n\n"
+        f"💬 Чат <code>#{chat_id}</code> · сообщений сейчас: {len(rows)}\n\n"
+        f"Новые сообщения будут приходить уведомлениями.")
+
+
+@router.message(Command("unwatch_chat"))
+async def unwatch_chat(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Укажите номер: <code>/unwatch_chat 1076867</code>")
+        return
+    chat_id = parts[1].strip()
+    settings = get_settings(message.from_user.id)
+    watched: dict = settings.setdefault("watched_chats", {})
+    if watched.pop(chat_id, None) is None:
+        await message.answer(f"Чат #{chat_id} и так не отслеживается")
+        return
+    save_settings(message.from_user.id, settings)
+    await message.answer(f"✅ Чат #{chat_id} больше не отслеживается")

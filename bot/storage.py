@@ -74,6 +74,9 @@ _DEFAULT_SETTINGS = {
     "known_order_ids": [],
     "known_order_details": {},  # {order_id: {title, buyer, price, chat_id, seen_at}}
     "known_messages": {},  # {order_id: last_msg_id}
+    # Chats to watch that belong to no order — support, moderation. They cannot
+    # be discovered (the API has no chat list), so their ids are added by hand.
+    "watched_chats": {},   # {chat_id: {"label": str, "last_msg": str}}
     "blacklist": [],  # list of buyer names to suppress notifications for
     "reminders": {"enabled": False, "hours": 24},
     "reminded_orders": [],  # order IDs already reminded (reset on status change)
