@@ -14,6 +14,14 @@ from storage import get_settings, save_settings
 router = Router()
 
 
+def _esc(text) -> str:
+    """Text that came from outside — chat messages, labels, error bodies — goes
+    into HTML-parsed messages, where a stray '<' makes Telegram reject the whole
+    send and the reply silently never arrives."""
+    return (str(text or "").replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
 class ReplyState(StatesGroup):
     waiting_for_text = State()
     waiting_chat_id = State()
@@ -32,11 +40,12 @@ def _format_messages(messages: list[dict]) -> str:
             prefix = "⚙️ <i>Система</i>"
         else:
             prefix = "👤 <b>Покупатель</b>"
-        lines.append(f"{prefix}: {text}")
+        lines.append(f"{prefix}: {_esc(text)}")
     return "\n\n".join(lines)
 
 
-def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None) -> InlineKeyboardMarkup:
+def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None,
+                                watched: dict | None = None) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for order in orders:
         oid = str(order.get("id", ""))
@@ -47,8 +56,12 @@ def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None) -> 
     builder.adjust(1)
     if next_cursor:
         builder.button(text="Следующая →", callback_data=PaginationCallback(entity="chat_orders", cursor=next_cursor).pack())
-    # Support and moderation live outside orders, so they get their own entry
-    builder.button(text="🛟 Поддержка и модерация", callback_data="wchats:list")
+    # Support and moderation live outside orders, so they get their own entry.
+    # It must survive an empty order list — otherwise followed chats become
+    # unreachable exactly when they are the only chats there are.
+    n = len(watched or {})
+    builder.button(text=f"🛟 Поддержка и модерация{f' · {n}' if n else ''}",
+                   callback_data="wchats:list")
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
     return builder.as_markup()
 
@@ -56,19 +69,22 @@ def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None) -> 
 @router.callback_query(F.data == "menu:chats")
 async def show_chats(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.message.edit_text("⏳ Загружаю чаты...")
+    watched = get_settings(callback.from_user.id).get("watched_chats") or {}
     try:
         data = await api.get_orders()
         orders: list[dict] = data.get("data") or data.get("items") or []
         next_cursor: str | None = data.get("meta", {}).get("next_cursor")
-        if not orders:
-            await callback.message.edit_text("💬 Чатов не найдено.", reply_markup=back_keyboard())
-            await callback.answer()
-            return
-        text = "💬 <b>Чаты</b>\nВыберите заказ:"
-        keyboard = _build_chat_orders_keyboard(orders, next_cursor)
+        if orders:
+            text = "💬 <b>Чаты</b>\nВыберите заказ:"
+        else:
+            text = ("💬 <b>Чаты</b>\n\nПо заказам чатов пока нет."
+                    + (f"\nОтслеживаемых чатов вне заказов: <b>{len(watched)}</b>."
+                       if watched else ""))
+        keyboard = _build_chat_orders_keyboard(orders, next_cursor, watched)
     except Exception as e:
-        text = f"❌ Ошибка: {e}"
-        keyboard = back_keyboard()
+        # The order list failing must not hide chats that do not depend on it
+        text = f"❌ Заказы не загрузились: {e}"
+        keyboard = _build_chat_orders_keyboard([], None, watched)
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
@@ -85,7 +101,9 @@ async def paginate_chat_orders(
         orders: list[dict] = data.get("data") or data.get("items") or []
         next_cursor: str | None = data.get("meta", {}).get("next_cursor")
         text = "💬 <b>Чаты</b>\nВыберите заказ:"
-        keyboard = _build_chat_orders_keyboard(orders, next_cursor)
+        keyboard = _build_chat_orders_keyboard(
+            orders, next_cursor,
+            get_settings(callback.from_user.id).get("watched_chats") or {})
     except Exception as e:
         text = f"❌ Ошибка: {e}"
         keyboard = back_keyboard()
@@ -227,7 +245,7 @@ async def watch_chat(message: Message, api: YooMarketAPI) -> None:
 
     if len(parts) < 2:
         if watched:
-            lines = [f"• <code>{cid}</code> — {i.get('label') or 'без названия'}"
+            lines = [f"• <code>{_esc(cid)}</code> — {_esc(i.get('label') or 'без названия')}"
                      for cid, i in watched.items()]
             body = "\n".join(lines)
         else:
@@ -264,7 +282,7 @@ async def unwatch_chat(message: Message) -> None:
 def _wchats_text(watched: dict) -> str:
     if not watched:
         return "<i>пока ни одного</i>"
-    return "\n".join(f"• <b>{i.get('label') or 'Чат'}</b> — <code>#{c}</code>"
+    return "\n".join(f"• <b>{_esc(i.get('label') or 'Чат')}</b> — <code>#{_esc(c)}</code>"
                      for c, i in watched.items())
 
 
@@ -331,8 +349,8 @@ async def wchat_detail(callback: CallbackQuery) -> None:
     b.button(text="⬅️ Назад", callback_data="wchats:list")
     b.adjust(1, 2, 1)
     await callback.message.edit_text(
-        f"🛟 <b>{info.get('label') or 'Чат'}</b>\n\n"
-        f"💬 Номер: <code>#{cid}</code>",
+        f"🛟 <b>{_esc(info.get('label') or 'Чат')}</b>\n\n"
+        f"💬 Номер: <code>#{_esc(cid)}</code>",
         reply_markup=b.as_markup())
     await callback.answer()
 
@@ -363,14 +381,14 @@ async def wchat_history(callback: CallbackQuery, api: YooMarketAPI) -> None:
         data = await api.get_messages(cid)
         rows = data.get("data") or data.get("items") or []
     except Exception as e:
-        await callback.message.answer(f"❌ Не удалось: {str(e)[:200]}")
+        await callback.message.answer(f"❌ Не удалось: {_esc(str(e)[:200])}")
         return
     if not rows:
         await callback.message.answer("Здесь пока нет сообщений.")
         return
 
     info = (get_settings(callback.from_user.id).get("watched_chats") or {}).get(cid) or {}
-    label = info.get("label") or f"Чат #{cid}"
+    label = _esc(info.get("label") or f"Чат #{cid}")
     await callback.message.answer(
         f"📜 <b>{label}</b> — последние {min(len(rows), 15)} из {len(rows)}")
 
@@ -387,7 +405,7 @@ async def wchat_history(callback: CallbackQuery, api: YooMarketAPI) -> None:
         when = _fmt_msg_time(msg.get("created_at") or msg.get("date"))
         await callback.message.answer(
             f"{who}{('  •  🕐 ' + when) if when else ''}\n"
-            f"<blockquote>{text[:900]}</blockquote>")
+            f"<blockquote>{_esc(text[:900])}</blockquote>")
 
 
 def _fmt_msg_time(raw) -> str:
@@ -406,13 +424,21 @@ async def _add_watched(message: Message, api: YooMarketAPI,
     if not api:
         await message.answer("⚠️ Не настроен API-токен")
         return
+    # People paste the id however it appears — <963101>, #963101, a full url.
+    # Anything but the digits also lands in the error text below, where an
+    # angle bracket would break the message's HTML and silence the reply.
+    chat_id = "".join(ch for ch in str(chat_id) if ch.isdigit())
+    if not chat_id:
+        await message.answer("❌ В номере чата нет цифр. Пример: "
+                             "<code>/watch_chat 1076867 Поддержка</code>")
+        return
     status = await message.answer(f"⏳ Проверяю чат #{chat_id}...")
     try:
         data = await api.get_messages(chat_id)
         rows = data.get("data") or data.get("items") or []
     except Exception as e:
         await status.edit_text(
-            f"❌ Чат #{chat_id} не читается:\n<code>{str(e)[:250]}</code>")
+            f"❌ Чат #{chat_id} не читается:\n<code>{_esc(str(e)[:250])}</code>")
         return
     settings = get_settings(message.from_user.id)
     watched = settings.setdefault("watched_chats", {})
@@ -422,7 +448,7 @@ async def _add_watched(message: Message, api: YooMarketAPI,
     }
     save_settings(message.from_user.id, settings)
     await status.edit_text(
-        f"✅ <b>{label}</b> добавлен\n\n"
+        f"✅ <b>{_esc(label)}</b> добавлен\n\n"
         f"💬 <code>#{chat_id}</code> · сообщений: {len(rows)}\n\n"
         f"Новые сообщения придут уведомлениями. "
         f"Прошлые — кнопкой «📜 Показать историю».",

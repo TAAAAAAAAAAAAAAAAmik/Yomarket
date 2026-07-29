@@ -145,6 +145,14 @@ def _parse_star_qty(title: str, default: int) -> int:
 _RULE = "━━━━━━━━━━━━━━"
 
 
+def _esc(text) -> str:
+    """Notifications are sent with HTML parsing, so anything typed by a buyer or
+    by support — a '<' in a message, an angle bracket in a title — would make
+    Telegram reject the send and the notification would never arrive."""
+    return (str(text or "").replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
 def _money(value) -> str:
     """1234567 -> '1 234 567' — a thin space every three digits."""
     try:
@@ -317,12 +325,12 @@ class TaskManager:
                     if mark not in seen:
                         seen.append(mark)
                         settings["complaint_notify"] = cn
-                        who = f"{buyer}" + (f" ({username})" if username else "")
+                        who = _esc(f"{buyer}" + (f" ({username})" if username else ""))
                         await self._notify(
                             user_id,
                             _card("🚨 <b>СПОР ПО ЗАКАЗУ</b>",
-                                  [f"📦 <b>{title}</b>",
-                                   f"💰 <b>{_money(price)} ₽</b>   📊 {status}",
+                                  [f"📦 <b>{_esc(title)}</b>",
+                                   f"💰 <b>{_money(price)} ₽</b>   📊 {_esc(status)}",
                                    "",
                                    f"👤 {who}",
                                    f"🧾 <code>#{oid}</code>",
@@ -355,12 +363,12 @@ class TaskManager:
                         time_str = _fmt_time(time_raw)
                         cnt_today, rev_today = _today_stats(order_details, known)
                         qty_part = f"  ×{quantity}" if quantity else ""
-                        who_line = f"👤 <b>{buyer}</b>" + (
-                            f"  {username}" if username else "")
+                        who_line = f"👤 <b>{_esc(buyer)}</b>" + (
+                            f"  {_esc(username)}" if username else "")
                         body = [
-                            f"📦 <b>{title}</b>{qty_part}",
+                            f"📦 <b>{_esc(title)}</b>{qty_part}",
                             f"💰 <b>{_money(price)} ₽</b>"
-                            + (f"   🏷 {category}" if category else ""),
+                            + (f"   🏷 {_esc(category)}" if category else ""),
                             "",
                             who_line,
                             f"🕐 {time_str}   🧾 <code>#{oid}</code>"
@@ -388,11 +396,11 @@ class TaskManager:
                         msg = self._pick_message(title, ev.get("message", "Заказ подтверждён!"), rules, responders_map)
                         await self._send_chat(api, chat_id, msg)
                     cnt_today, rev_today = _today_stats(order_details, known)
-                    buyer_line = f"👤 {buyer}" + (f" ({username})" if username else "")
+                    buyer_line = _esc(f"👤 {buyer}" + (f" ({username})" if username else ""))
                     await self._notify(
                         user_id,
                         _card("✅ <b>ЗАКАЗ ВЫПОЛНЕН</b>",
-                              [f"📦 <b>{title}</b>",
+                              [f"📦 <b>{_esc(title)}</b>",
                                f"💰 <b>{_money(price)} ₽</b>",
                                "",
                                buyer_line,
@@ -407,15 +415,15 @@ class TaskManager:
                     if ev.get("enabled"):
                         msg = self._pick_message(title, ev.get("message", "Возврат оформлен."), rules, responders_map)
                         await self._send_chat(api, chat_id, msg)
-                    buyer_line = f"👤 {buyer}" + (f" ({username})" if username else "")
+                    buyer_line = _esc(f"👤 {buyer}" + (f" ({username})" if username else ""))
                     await self._notify(
                         user_id,
                         _card("↩️ <b>ВОЗВРАТ</b>",
-                              [f"📦 <b>{title}</b>",
+                              [f"📦 <b>{_esc(title)}</b>",
                                f"💰 <b>{_money(price)} ₽</b>",
                                "",
                                buyer_line,
-                               f"🧾 <code>#{oid}</code>   📊 {status}"]),
+                               f"🧾 <code>#{oid}</code>   📊 {_esc(status)}"]),
                         reply_markup=_order_notify_kb(oid, chat_id),
                     )
 
@@ -480,10 +488,10 @@ class TaskManager:
                     time_str = _fmt_time(msg.get("created_at") or msg.get("date"))
                     await self._notify(
                         user_id,
-                        _card(f"🛟 <b>{label.upper()}</b>",
+                        _card(f"🛟 <b>{_esc(label).upper()}</b>",
                               [f"🕐 {time_str}" if time_str else "",
                                "",
-                               f"<blockquote>{text}</blockquote>"],
+                               f"<blockquote>{_esc(text)}</blockquote>"],
                               f"💬 <code>#{chat_id}</code>"),
                         reply_markup=_message_notify_kb(str(chat_id)),
                     )
@@ -531,8 +539,8 @@ class TaskManager:
                 buyer_name = details.get("buyer", "Покупатель")
                 d_username = details.get("username", "")
                 d_price = details.get("price", "")
-                who = f"{buyer_name}" + (f" ({d_username})" if d_username else "")
-                order_line = f"📦 {title}" + (f"  •  💰 {d_price} ₽" if d_price and d_price != "—" else "")
+                who = _esc(f"{buyer_name}" + (f" ({d_username})" if d_username else ""))
+                order_line = _esc(f"📦 {title}" + (f"  •  💰 {d_price} ₽" if d_price and d_price != "—" else ""))
 
                 for msg in messages:
                     msg_id = str(msg.get("id", ""))
@@ -562,7 +570,9 @@ class TaskManager:
                     time_str = _fmt_time(msg.get("created_at") or msg.get("date"))
                     time_part = f"  •  🕐 {time_str}" if time_str else ""
                     raw_text = msg.get("text") or msg.get("message") or ""
-                    msg_text = raw_text[:200] or "—"
+                    # raw_text stays intact for the rules below; only the copy
+                    # that goes into an HTML message is escaped
+                    msg_text = _esc(raw_text[:200]) or "—"
 
                     # AutoStars: buyer replied with their @username → deliver
                     handled = await self._maybe_deliver_stars_reply(
@@ -639,15 +649,15 @@ class TaskManager:
             price = det.get("price", "—")
             chat_id = det.get("chat_id", oid)
             uname = det.get("username", "")
-            who = f"{buyer}" + (f" ({uname})" if uname else "")
+            who = _esc(f"{buyer}" + (f" ({uname})" if uname else ""))
 
             await self._notify(
                 user_id,
                 f"⏰ <b>Напоминание о заказе</b>\n\n"
                 f"🧾 Заказ <code>#{oid}</code>\n"
-                f"📦 {title}\n"
-                f"👤 {who}  •  💰 {price} ₽\n"
-                f"📊 Статус: {status}\n\n"
+                f"📦 {_esc(title)}\n"
+                f"👤 {who}  •  💰 {_esc(price)} ₽\n"
+                f"📊 Статус: {_esc(status)}\n\n"
                 f"⏳ Ждёт подтверждения уже <b>{hours_waiting} ч</b>",
                 reply_markup=_order_notify_kb(oid, chat_id),
             )
@@ -946,8 +956,16 @@ class TaskManager:
     async def _notify(self, user_id: int, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
         try:
             await self.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=reply_markup)
+            return
         except Exception as e:
             logger.warning("Notify failed (user %s): %s", user_id, e)
+        # A notification is worth more unformatted than not at all: if the HTML
+        # was rejected, strip the tags and send it as plain text.
+        try:
+            plain = re.sub(r"<[^>]+>", "", text)
+            await self.bot.send_message(user_id, plain, reply_markup=reply_markup)
+        except Exception as e:
+            logger.warning("Notify plain fallback failed (user %s): %s", user_id, e)
 
     # ------------------------------------------------------------------
     # Auto-features loop (separate from the orders loop)
