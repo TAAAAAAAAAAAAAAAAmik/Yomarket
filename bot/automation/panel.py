@@ -1058,24 +1058,73 @@ def panel_promo_fields_sync(
                   "item_id": str(item_id), "fields": out_fields}
 
 
+_URL_RE = re.compile(r"https?://[^\s\"'<>\\]{6,300}")
+
+
+def _find_url(node) -> str:
+    """First http(s) link anywhere in a decoded response.
+
+    The payment link was looked for under Nova's own keys (redirect,
+    openInNewTab, download) and was not there, so the shape of this panel's
+    answer is not Nova's default. Rather than guess the next key name, the
+    whole structure is searched.
+    """
+    if isinstance(node, str):
+        m = _URL_RE.search(node)
+        return m.group(0) if m else ""
+    if isinstance(node, dict):
+        # Keys that name a link win over one merely mentioned in prose
+        for k, v in node.items():
+            if isinstance(v, str) and any(
+                    t in str(k).lower() for t in
+                    ("url", "link", "redirect", "pay", "invoice", "href")):
+                m = _URL_RE.search(v)
+                if m:
+                    return m.group(0)
+        for v in node.values():
+            found = _find_url(v)
+            if found:
+                return found
+    if isinstance(node, list):
+        for v in node:
+            found = _find_url(v)
+            if found:
+                return found
+    return ""
+
+
 def _action_result(resp, fallback: str) -> str:
     """What a Nova action answered, in words.
 
     «Премиум» is paid through an external payment system, so a successful call
-    means an invoice was created — the answer usually carries a link to it, and
-    dropping that link would leave the purchase half-done and invisible.
+    means an invoice was created — the answer carries a link to it, and dropping
+    that link would leave the purchase half-done and invisible. When no link can
+    be found, the answer itself is shown: it is the only thing that can say what
+    the panel did instead.
     """
+    raw = (resp.text or "").strip()
     try:
-        data = _json.loads(resp.text or "{}")
+        data = _json.loads(raw or "{}")
     except Exception:
-        return fallback
-    if not isinstance(data, dict):
-        return fallback
-    url = data.get("redirect") or data.get("openInNewTab") or data.get("download")
-    text = data.get("message") or data.get("danger") or ""
+        data = None
+
+    url = _find_url(data) if data is not None else ""
+    if not url:
+        m = _URL_RE.search(raw)
+        url = m.group(0) if m else ""
+
+    text = ""
+    if isinstance(data, dict):
+        text = str(data.get("message") or data.get("danger") or "")
+
     if url:
         return f"{text or fallback}\n🔗 Оплата: {url}"
-    return str(text or fallback)
+    if text:
+        return text
+    # No link, no message: report what came back, otherwise a promotion that
+    # quietly did nothing looks identical to one that worked.
+    body = raw[:250] if raw else f"пустой ответ, код {resp.status_code}"
+    return f"{fallback}\nОтвет панели: {body}"
 
 
 def panel_bump_item_sync(
