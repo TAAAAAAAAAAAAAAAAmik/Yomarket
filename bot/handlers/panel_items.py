@@ -201,8 +201,11 @@ def _item_kb(item_id: str):
     b.button(text="🚀 На модерацию", callback_data=f"pitem_show:{item_id}")
     b.button(text="🙈 Скрыть", callback_data=f"pitem_hide:{item_id}")
     b.button(text="🗑 Удалить", callback_data=f"pitem_del:{item_id}")
+    # Promotion lived only in the other listing view, so a card opened from
+    # «📦 Товары» had no way to reach it
+    b.button(text="⭐ Премиум продвижение", callback_data=f"ad_bump:{item_id}")
     b.button(text="⬅️ К товарам", callback_data="pitems:list")
-    b.adjust(2, 2, 2, 1)
+    b.adjust(2, 2, 2, 1, 1)
     return b.as_markup()
 
 
