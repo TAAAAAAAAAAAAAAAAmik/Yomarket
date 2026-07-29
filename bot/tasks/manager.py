@@ -891,7 +891,8 @@ class TaskManager:
         except Exception as e:
             logger.warning("Auto chat send failed (chat %s): %s", chat_id, e)
 
-    async def _panel_bump(self, user_id: int) -> tuple[int, str]:
+    async def _panel_bump(self, user_id: int, api: YooMarketAPI | None = None,
+                          ) -> tuple[int, str]:
         """Promote all listings through the panel.
 
         Runs only from schedules the owner switched on themselves, so
@@ -901,7 +902,8 @@ class TaskManager:
         """
         from storage import get_panel_creds
         from automation.panel import panel_bump_all_sync
-        from handlers.selenium_settings import promo_limit, promo_params
+        from handlers.selenium_settings import (promo_afford, promo_limit,
+                                                promo_params, promo_price)
 
         creds = get_panel_creds(user_id)
         if not creds or not creds.get("cookies"):
@@ -913,16 +915,27 @@ class TaskManager:
             return 0, ("не выбран тариф «Премиум» — откройте "
                        "«Объявления» → «Премиум продвижение» → «Тариф»")
 
+        # Money runs out silently otherwise: the schedule would keep firing
+        # and each run would come back with a panel error nobody can read.
+        can_pay, covers, money = await promo_afford(api, settings)
+        if not can_pay:
+            return 0, f"💸 не хватает денег — {money}"
+
+        caps = [c for c in (promo_limit(settings), covers) if c]
         loop = asyncio.get_event_loop()
         try:
-            return await asyncio.wait_for(
+            count, msg = await asyncio.wait_for(
                 loop.run_in_executor(
                     None, panel_bump_all_sync, creds["cookies"], user_id, True,
-                    params, promo_limit(settings)),
+                    params, min(caps) if caps else 0),
                 timeout=180,
             )
         except asyncio.TimeoutError:
             return 0, "панель не ответила вовремя"
+        spent = count * promo_price(settings)
+        if spent:
+            msg += f" · потрачено {spent} ₽"
+        return count, msg
 
     async def _check_panel_session(self, user_id: int, settings: dict, now: float) -> None:
         """Warn once when the stored panel session stops working.
@@ -1019,7 +1032,7 @@ class TaskManager:
                     # the API has no such method, the panel exposes it as a
                     # Nova action.
                     logger.info("Auto-bump for user %s via panel", user_id)
-                    count, msg = await self._panel_bump(user_id)
+                    count, msg = await self._panel_bump(user_id, api)
                     settings["auto_bump"]["last_bump_run"] = now
                     messages.append(f"⬆️ Авто-поднятие: {msg}")
 
@@ -1175,7 +1188,7 @@ class TaskManager:
                             f"{ceiling:.0f} ₽/день (потрачено {spent_today:.0f} ₽)")
                         continue
                     try:
-                        count, msg = await self._panel_bump(user_id)
+                        count, msg = await self._panel_bump(user_id, api)
                         last_runs[last_run_key] = now_dt.isoformat()
                         bs["bumps_total"] = int(bs.get("bumps_total", 0)) + (count or 0)
                         if price_per_bump > 0 and count:

@@ -1109,13 +1109,20 @@ def panel_bump_item_sync(
             if resp.status_code in (200, 201, 204):
                 _save_refreshed_cookies(uid, cookie_string, session)
                 return True, str(a.get("name") or key)
-            if resp.status_code == 422:
-                # The action wants parameters. Describe them instead of
-                # inventing values — this one spends money.
+            if resp.status_code in (402, 422, 500):
                 try:
                     msg = (_json.loads(resp.text) or {}).get("message") or ""
                 except Exception:
                     msg = resp.text[:200]
+                # Running out of money is an ordinary outcome, not a fault:
+                # say so plainly instead of quoting a validation dump.
+                if any(k in msg.lower() for k in
+                       ("недостаточно", "не хватает", "средств", "баланс",
+                        "insufficient", "not enough")):
+                    return False, f"💸 не хватает денег на балансе: {msg[:150]}"
+            if resp.status_code == 422:
+                # The action wants parameters. Describe them instead of
+                # inventing values — this one spends money.
                 spec = []
                 for f in fields:
                     opts = _normalize_options(f)
@@ -1170,7 +1177,7 @@ def panel_bump_all_sync(
             # A missing action will be missing for every item — stop early
             # instead of repeating the same failure for the whole list.
             if any(k in msg for k in ("не найдено", "401", "подтвержд",
-                                      "требует", "тариф")):
+                                      "требует", "тариф", "не хватает")):
                 break
     if count:
         return count, f"✅ Поднято: {count}" + (f"\n{last}" if last else "")
