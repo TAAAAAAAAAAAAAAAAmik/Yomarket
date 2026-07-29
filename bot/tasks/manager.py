@@ -139,6 +139,29 @@ def _parse_star_qty(title: str, default: int) -> int:
     return default
 
 
+# Notifications share one layout: a title, a rule, the facts, a rule, context.
+# Scanning a phone screen is easier when every alert puts the same thing in the
+# same place.
+_RULE = "━━━━━━━━━━━━━━"
+
+
+def _money(value) -> str:
+    """1234567 -> '1 234 567' — a thin space every three digits."""
+    try:
+        return f"{int(float(str(value).replace(' ', '').replace(',', '.'))):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _card(title: str, body: list[str], footer: str = "") -> str:
+    # Empty strings are deliberate spacing, so only None is dropped — filtering
+    # on truthiness collapsed the blank lines that separate the blocks.
+    parts = [title, _RULE, *[b for b in body if b is not None]]
+    if footer:
+        parts += [_RULE, footer]
+    return "\n".join(parts)
+
+
 def _order_notify_kb(order_id: str, chat_id: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     # Quick actions straight from the notification (no need to open the order)
@@ -151,11 +174,18 @@ def _order_notify_kb(order_id: str, chat_id: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def _message_notify_kb(chat_id: str) -> InlineKeyboardMarkup:
+def _message_notify_kb(chat_id: str, order_id: str = "") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="✉️ Ответить", callback_data=f"reply_init:{chat_id}")
-    builder.button(text="📋 К сделке", callback_data=f"chat:{chat_id}:")
-    builder.adjust(2)
+    builder.button(text="💬 Открыть чат", callback_data=f"chat:{chat_id}:")
+    if order_id:
+        # Most replies are followed by acting on the order, so keep those here
+        builder.button(text="▶️ В работу", callback_data=f"order:{order_id}:work")
+        builder.button(text="✅ Подтвердить",
+                       callback_data=f"order:{order_id}:confirm")
+        builder.adjust(2, 2)
+    else:
+        builder.adjust(2)
     return builder.as_markup()
 
 
@@ -290,12 +320,14 @@ class TaskManager:
                         who = f"{buyer}" + (f" ({username})" if username else "")
                         await self._notify(
                             user_id,
-                            f"⚠️ <b>СПОР / ЖАЛОБА по заказу!</b>\n\n"
-                            f"🧾 Заказ <code>#{oid}</code>\n"
-                            f"📦 {title}\n"
-                            f"👤 {who}  •  💰 {price} ₽\n"
-                            f"📊 Статус: <b>{status}</b>\n\n"
-                            f"🔺 Требуется ваше вмешательство.",
+                            _card("🚨 <b>СПОР ПО ЗАКАЗУ</b>",
+                                  [f"📦 <b>{title}</b>",
+                                   f"💰 <b>{_money(price)} ₽</b>   📊 {status}",
+                                   "",
+                                   f"👤 {who}",
+                                   f"🧾 <code>#{oid}</code>",
+                                   "",
+                                   "🔺 <b>Требуется вмешательство</b>"]),
                             reply_markup=_order_notify_kb(oid, chat_id),
                         )
 
@@ -322,30 +354,25 @@ class TaskManager:
                     if not is_blacklisted:
                         time_str = _fmt_time(time_raw)
                         cnt_today, rev_today = _today_stats(order_details, known)
-                        lines = [
-                            "🛒 <b>Новая покупка!</b>",
-                            f"🧾 Заказ <code>#{oid}</code>",
+                        qty_part = f"  ×{quantity}" if quantity else ""
+                        who_line = f"👤 <b>{buyer}</b>" + (
+                            f"  {username}" if username else "")
+                        body = [
+                            f"📦 <b>{title}</b>{qty_part}",
+                            f"💰 <b>{_money(price)} ₽</b>"
+                            + (f"   🏷 {category}" if category else ""),
                             "",
-                            f"📦 Товар: <b>{title}</b>",
+                            who_line,
+                            f"🕐 {time_str}   🧾 <code>#{oid}</code>"
+                            if time_str else f"🧾 <code>#{oid}</code>",
                         ]
-                        if category:
-                            lines.append(f"🏷 Категория: {category}")
-                        if quantity:
-                            lines.append(f"🔢 Количество: <b>{quantity}</b>")
-                        lines.append(f"💰 Сумма: <b>{price} ₽</b>")
-                        buyer_line = f"👤 Покупатель: <b>{buyer}</b>"
-                        if username:
-                            buyer_line += f"  ({username})"
-                        lines.append(buyer_line)
-                        if time_str:
-                            lines.append(f"🕐 Время: {time_str}")
                         if accepted:
-                            lines.append("▶️ <i>Автоматически взят в работу</i>")
-                        lines.append("")
-                        lines.append(f"📊 Сегодня: <b>{cnt_today}</b> заказ(ов) на "
-                                     f"<b>{rev_today} ₽</b>")
+                            body.append("▶️ <i>взят в работу автоматически</i>")
                         await self._notify(
-                            user_id, "\n".join(lines),
+                            user_id,
+                            _card("🛒 <b>НОВАЯ ПОКУПКА</b>", body,
+                                  f"📊 Сегодня: <b>{cnt_today}</b> · "
+                                  f"<b>{_money(rev_today)} ₽</b>"),
                             reply_markup=_order_notify_kb(oid, chat_id),
                         )
                     if ar.get("enabled"):
@@ -364,12 +391,14 @@ class TaskManager:
                     buyer_line = f"👤 {buyer}" + (f" ({username})" if username else "")
                     await self._notify(
                         user_id,
-                        f"✅ <b>Заказ выполнен!</b>\n"
-                        f"🧾 <code>#{oid}</code>\n\n"
-                        f"📦 {title}\n"
-                        f"💰 <b>{price} ₽</b>\n"
-                        f"{buyer_line}\n\n"
-                        f"📊 Сегодня выполнено на <b>{rev_today} ₽</b>",
+                        _card("✅ <b>ЗАКАЗ ВЫПОЛНЕН</b>",
+                              [f"📦 <b>{title}</b>",
+                               f"💰 <b>{_money(price)} ₽</b>",
+                               "",
+                               buyer_line,
+                               f"🧾 <code>#{oid}</code>"],
+                              f"📊 Сегодня выполнено на "
+                              f"<b>{_money(rev_today)} ₽</b>"),
                         reply_markup=_order_notify_kb(oid, chat_id),
                     )
 
@@ -381,12 +410,12 @@ class TaskManager:
                     buyer_line = f"👤 {buyer}" + (f" ({username})" if username else "")
                     await self._notify(
                         user_id,
-                        f"↩️ <b>Возврат по заказу</b>\n"
-                        f"🧾 <code>#{oid}</code>\n\n"
-                        f"📦 {title}\n"
-                        f"💰 <b>{price} ₽</b>\n"
-                        f"{buyer_line}\n"
-                        f"📊 Статус: {status}",
+                        _card("↩️ <b>ВОЗВРАТ</b>",
+                              [f"📦 <b>{title}</b>",
+                               f"💰 <b>{_money(price)} ₽</b>",
+                               "",
+                               buyer_line,
+                               f"🧾 <code>#{oid}</code>   📊 {status}"]),
                         reply_markup=_order_notify_kb(oid, chat_id),
                     )
 
@@ -495,24 +524,25 @@ class TaskManager:
                             settings["complaint_notify"] = cn
                             await self._notify(
                                 user_id,
-                                f"⚠️ <b>ЖАЛОБА / ПРОБЛЕМА клиента!</b>\n\n"
-                                f"👤 <b>{who}</b>{time_part}\n"
-                                f"🧾 Заказ <code>#{order_id}</code>\n"
-                                f"{order_line}\n\n"
-                                f"<i>«{msg_text}»</i>\n\n"
-                                f"🔺 Ответьте как можно быстрее.",
-                                reply_markup=_message_notify_kb(chat_id),
+                                _card("🚨 <b>ЖАЛОБА КЛИЕНТА</b>",
+                                      [f"👤 <b>{who}</b>{time_part}",
+                                       "",
+                                       f"<blockquote>{msg_text}</blockquote>",
+                                       "",
+                                       "🔺 <b>Ответьте как можно быстрее</b>"],
+                                      f"{order_line}\n🧾 <code>#{order_id}</code>"),
+                                reply_markup=_message_notify_kb(chat_id, order_id),
                             )
                             continue
 
                     await self._notify(
                         user_id,
-                        f"💬 <b>Новое сообщение</b>\n\n"
-                        f"👤 <b>{who}</b>{time_part}\n"
-                        f"🧾 Заказ <code>#{order_id}</code>\n"
-                        f"{order_line}\n\n"
-                        f"<i>«{msg_text}»</i>",
-                        reply_markup=_message_notify_kb(chat_id),
+                        _card("💬 <b>СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ</b>",
+                              [f"👤 <b>{who}</b>{time_part}",
+                               "",
+                               f"<blockquote>{msg_text}</blockquote>"],
+                              f"{order_line}\n🧾 <code>#{order_id}</code>"),
+                        reply_markup=_message_notify_kb(chat_id, order_id),
                     )
 
                 known_messages[order_id] = newest_id
