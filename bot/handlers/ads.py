@@ -177,10 +177,27 @@ async def bump_ad_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
     from automation.panel import panel_bump_item_sync
     from storage import get_panel_creds
 
+    from handlers.selenium_settings import promo_params
+    from storage import get_settings
+
     ad_id = callback.data.split(":", 1)[1]
     creds = get_panel_creds(callback.from_user.id)
     if not creds or not creds.get("cookies"):
         await callback.answer("⚠️ Нужен вход в панель продавца", show_alert=True)
+        return
+
+    params = promo_params(get_settings(callback.from_user.id))
+    if not params:
+        b = InlineKeyboardBuilder()
+        b.button(text="⚙️ Выбрать тариф", callback_data="promo:setup")
+        b.button(text="⬅️ Назад", callback_data=f"ad:{ad_id}")
+        b.adjust(1)
+        await callback.message.edit_text(
+            "⚙️ <b>Сначала выберите тариф</b>\n\n"
+            "«Премиум» требует услугу, срок и способ оплаты — сроки стоят "
+            "по-разному, поэтому я не подставляю их сам.",
+            reply_markup=b.as_markup())
+        await callback.answer()
         return
 
     await callback.answer("⏳ Продвигаю...", show_alert=False)
@@ -189,7 +206,7 @@ async def bump_ad_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
         ok, msg = await asyncio.wait_for(
             loop.run_in_executor(
                 None, panel_bump_item_sync, creds["cookies"], ad_id,
-                callback.from_user.id, True),
+                callback.from_user.id, True, params),
             timeout=60,
         )
         await callback.message.edit_text(

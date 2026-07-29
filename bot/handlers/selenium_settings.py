@@ -47,6 +47,25 @@ def _cancel_kb(back: str) -> InlineKeyboardMarkup:
 # Auto-bump
 # ---------------------------------------------------------------------------
 
+def promo_params(s: dict) -> dict:
+    """The tariff the seller picked, as the payload the Nova action expects."""
+    return (s.get("auto_bump", {}).get("promo") or {}).get("values") or {}
+
+
+def promo_price(s: dict) -> int:
+    return int((s.get("auto_bump", {}).get("promo") or {}).get("price") or 0)
+
+
+def promo_limit(s: dict) -> int:
+    """How many listings the daily ceiling allows at the chosen tariff.
+    0 = no ceiling set, so no cap."""
+    ceiling = s.get("bump_stats", {}).get("daily_ceiling", 0)
+    price = promo_price(s)
+    if not ceiling or not price:
+        return 0
+    return max(0, int(ceiling // price))
+
+
 def _bump_text(s: dict, creds=None) -> str:
     ab = s.get("auto_bump", {})
     on = ab.get("enabled", False)
@@ -54,12 +73,24 @@ def _bump_text(s: dict, creds=None) -> str:
     last_run = _fmt_ts(ab.get("last_bump_run"))
     ceiling = s.get("bump_stats", {}).get("daily_ceiling", 0)
     limit = f"{ceiling:.0f} ₽/день" if ceiling else "не задан"
+    promo = ab.get("promo") or {}
+    if promo.get("values"):
+        tariff = promo.get("label") or "выбран"
+        price = promo_price(s)
+        tariff_line = f"Тариф: <b>{tariff}</b>" + (
+            f"  ·  {price} ₽ за объявление" if price else "")
+        cap = promo_limit(s)
+        if cap:
+            tariff_line += f"\nПотолок покрывает: <b>{cap}</b> объявлений за запуск"
+    else:
+        tariff_line = "Тариф: <b>не выбран</b> — продвижение не запустится"
     return "\n".join([
         "⭐ <b>Премиум продвижение</b>\n",
         f"Статус: {_st(on)}",
         f"Интервал: каждые {interval} ч",
         f"Последний запуск: {last_run}",
         f"Потолок трат: {limit}",
+        tariff_line,
         "",
         "⚠️ <b>Платно.</b> На Юмаркете поднятие — это «Премиум», деньги "
         "списываются с баланса магазина за каждое объявление.",
@@ -70,13 +101,144 @@ def _bump_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
     ab = s.get("auto_bump", {})
     on = ab.get("enabled", False)
     interval = ab.get("interval_hours", 24)
+    has_tariff = bool((ab.get("promo") or {}).get("values"))
     b = InlineKeyboardBuilder()
     b.button(text="▶️ Запустить сейчас", callback_data="selenium:run:bump")
     b.button(text=f"{'🔴 Выкл' if on else '🟢 Вкл'}", callback_data="selenium:bump:toggle")
+    b.button(text=f"⚙️ Тариф{'' if has_tariff else ' — выбрать'}",
+             callback_data="promo:setup")
     b.button(text=f"⏱ Интервал: {interval} ч", callback_data="selenium:bump:set_interval")
     b.button(text="⬅️ К объявлениям", callback_data="menu:ads")
-    b.adjust(2, 1, 1)
+    b.adjust(2, 1, 1, 1)
     return b.as_markup()
+
+
+# ---------------------------------------------------------------------------
+# Tariff picker for the paid «Премиум» action
+#
+# The action refuses to run without up_id (service), parameter_id (duration,
+# 19/49/89 ₽) and system_id (payment source). None of that can be guessed: each
+# combination spends a different amount of the shop's money, so the options are
+# read from the panel and chosen here once, then reused by every promotion.
+# ---------------------------------------------------------------------------
+
+async def _load_promo_spec(uid: int) -> tuple[bool, object]:
+    import asyncio
+
+    from automation.panel import panel_list_items_sync, panel_promo_fields_sync
+    from storage import get_panel_creds
+
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
+        return False, "Нужен вход в панель продавца"
+    cookies = creds["cookies"]
+    loop = asyncio.get_event_loop()
+    ok, items = await loop.run_in_executor(None, panel_list_items_sync, cookies)
+    if not ok:
+        return False, str(items)
+    ids = [i.get("id") for i in items if i.get("id")]
+    if not ids:
+        return False, "В панели нет объявлений — не с чего читать тарифы"
+    return await loop.run_in_executor(
+        None, panel_promo_fields_sync, cookies, str(ids[0]))
+
+
+def _promo_step_kb(spec: dict, step: int) -> InlineKeyboardMarkup:
+    field = spec["fields"][step]
+    b = InlineKeyboardBuilder()
+    for i, o in enumerate(field["options"][:12]):
+        b.button(text=o["label"][:60], callback_data=f"promo:pick:{step}:{i}")
+    b.button(text="❌ Отмена", callback_data="selenium:bump:menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+async def _promo_step(callback: CallbackQuery, state: FSMContext,
+                      spec: dict, step: int, picked: dict) -> None:
+    """Show the next field that still needs a choice, or save the tariff."""
+    fields = spec["fields"]
+    while step < len(fields):
+        f = fields[step]
+        opts = f["options"]
+        if len(opts) == 1:
+            # One possibility is not a choice — take it and move on
+            picked[f["attribute"]] = {"value": opts[0]["value"],
+                                      "label": opts[0]["label"],
+                                      "price": opts[0].get("price", 0)}
+            step += 1
+            continue
+        if not opts:
+            if f["required"]:
+                probe = str(f.get("probe") or "").replace("<", "&lt;")
+                await callback.message.edit_text(
+                    f"⚠️ Панель не дала вариантов для поля "
+                    f"<b>{f['label']}</b> (<code>{f['attribute']}</code>).\n\n"
+                    f"Без него продвижение не запустится.\n\n"
+                    f"<code>{probe[:350]}</code>",
+                    reply_markup=_cancel_kb("selenium:bump:menu"))
+                return
+            step += 1
+            continue
+        await state.update_data(promo_spec=spec, promo_picked=picked,
+                                promo_step=step)
+        await callback.message.edit_text(
+            f"⭐ <b>Премиум продвижение</b>\n\n"
+            f"Шаг {step + 1} из {len(fields)} — <b>{f['label']}</b>\n\n"
+            f"<i>Выбор запоминается и применяется ко всем поднятиям.</i>",
+            reply_markup=_promo_step_kb(spec, step))
+        return
+
+    # Everything chosen
+    values = {k: v["value"] for k, v in picked.items()}
+    price = max((v.get("price", 0) for v in picked.values()), default=0)
+    label = " · ".join(v["label"] for v in picked.values() if v.get("label"))
+    s = get_settings(callback.from_user.id)
+    s.setdefault("auto_bump", {})["promo"] = {
+        "values": values, "label": label, "price": price,
+        "action": spec.get("key"),
+    }
+    save_settings(callback.from_user.id, s)
+    await state.update_data(promo_spec=None, promo_picked=None, promo_step=None)
+    await callback.message.edit_text(
+        f"✅ <b>Тариф сохранён</b>\n\n{label}"
+        + (f"\n\nСтоимость: <b>{price} ₽</b> за объявление" if price else "")
+        + "\n\n" + _bump_text(s),
+        reply_markup=_bump_kb(s))
+
+
+@router.callback_query(F.data == "promo:setup")
+async def promo_setup(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer("⏳ Читаю тарифы из панели...")
+    await callback.message.edit_text("⏳ Читаю тарифы «Премиум» из панели...")
+    ok, spec = await _load_promo_spec(callback.from_user.id)
+    if not ok:
+        await callback.message.edit_text(
+            f"❌ Не удалось прочитать тарифы:\n{str(spec)[:300]}",
+            reply_markup=_cancel_kb("selenium:bump:menu"))
+        return
+    await _promo_step(callback, state, spec, 0, {})
+
+
+@router.callback_query(F.data.startswith("promo:pick:"))
+async def promo_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        _, _, step_s, idx_s = callback.data.split(":")
+        step, idx = int(step_s), int(idx_s)
+    except ValueError:
+        await callback.answer("❌ Ошибка выбора", show_alert=True)
+        return
+    data = await state.get_data()
+    spec = data.get("promo_spec")
+    if not spec:
+        await callback.answer("Начните заново: «⚙️ Тариф»", show_alert=True)
+        return
+    picked = data.get("promo_picked") or {}
+    field = spec["fields"][step]
+    o = field["options"][idx]
+    picked[field["attribute"]] = {"value": o["value"], "label": o["label"],
+                                  "price": o.get("price", 0)}
+    await callback.answer(o["label"][:60])
+    await _promo_step(callback, state, spec, step + 1, picked)
 
 
 @router.callback_query(F.data == "selenium:bump:menu")
@@ -126,15 +288,34 @@ async def bump_save_interval(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "selenium:run:bump")
 async def run_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
     """Ask first — promoting every listing spends money on each one."""
+    s = get_settings(callback.from_user.id)
+    if not promo_params(s):
+        b = InlineKeyboardBuilder()
+        b.button(text="⚙️ Выбрать тариф", callback_data="promo:setup")
+        b.button(text="⬅️ Назад", callback_data="selenium:bump:menu")
+        b.adjust(1)
+        await callback.message.edit_text(
+            "⚙️ <b>Сначала выберите тариф</b>\n\n"
+            "«Премиум» требует услугу, срок и способ оплаты. Каждый срок стоит "
+            "по-разному, поэтому я не подставляю их сам.",
+            reply_markup=b.as_markup())
+        await callback.answer()
+        return
+
+    price = promo_price(s)
+    cap = promo_limit(s)
+    label = (s.get("auto_bump", {}).get("promo") or {}).get("label") or "выбран"
     b = InlineKeyboardBuilder()
     b.button(text="✅ Да, продвинуть все", callback_data="selenium:run:bump_ok")
+    b.button(text="⚙️ Сменить тариф", callback_data="promo:setup")
     b.button(text="❌ Отмена", callback_data="selenium:bump:menu")
     b.adjust(1)
     await callback.message.edit_text(
         "⚠️ <b>Продвижение платное</b>\n\n"
-        "На Юмаркете поднятие — это «Премиум», деньги списываются "
-        "с баланса магазина <b>за каждое объявление</b>.\n\n"
-        "Продвинуть все объявления?",
+        f"Тариф: <b>{label}</b>\n"
+        + (f"Списывается <b>{price} ₽</b> за каждое объявление.\n" if price else "")
+        + (f"Потолок трат ограничит запуск {cap} объявлениями.\n" if cap else "")
+        + "\nПродвинуть все объявления?",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -160,10 +341,14 @@ async def run_bump_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None
         loop = asyncio.get_event_loop()
         count, msg = await asyncio.wait_for(
             loop.run_in_executor(
-                None, panel_bump_all_sync, creds["cookies"], uid, True),
+                None, panel_bump_all_sync, creds["cookies"], uid, True,
+                promo_params(s), promo_limit(s)),
             timeout=300,
         )
         s["auto_bump"]["last_bump_run"] = _time.time()
+        spent = count * promo_price(s)
+        if spent:
+            msg += f"\n💸 Потрачено: <b>{spent} ₽</b>"
         save_settings(uid, s)
         result_text = f"⬆️ <b>Продвижение завершено</b>\n\n{msg}"
     except asyncio.TimeoutError:

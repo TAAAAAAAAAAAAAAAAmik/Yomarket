@@ -814,9 +814,107 @@ def panel_publish_item_sync(
     )
 
 
+def _find_promo_action(actions: list[dict]) -> dict | None:
+    """The «Премиум» action among a resource's Nova actions."""
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        key = str(a.get("uriKey") or "")
+        if not key:
+            continue
+        blob = str(a.get("name") or "").lower() + " " + key.lower()
+        if any(kw in blob for kw in _DANGEROUS_KWS + _UNPUBLISH_KWS):
+            continue
+        if any(kw in blob for kw in _BUMP_KWS):
+            return a
+    return None
+
+
+_PRICE_RE = re.compile(r"(\d[\d\s ]*)\s*₽")
+
+
+def _option_price(label: str) -> int:
+    """'7 дней - 49 ₽' -> 49. The tariff labels carry the price, which is the
+    only place the cost of a promotion is stated before buying it."""
+    m = _PRICE_RE.search(str(label))
+    if not m:
+        return 0
+    try:
+        return int(m.group(1).replace(" ", "").replace(" ", ""))
+    except ValueError:
+        return 0
+
+
+def panel_promo_fields_sync(
+    cookie_string: str, item_id: str,
+) -> tuple[bool, object]:
+    """Blocking: describe the «Премиум» action so a tariff can be chosen.
+
+    Returns (True, {"key", "name", "fields": [{attribute, label, options,
+    required, price}]}) or (False, error). Options that Nova does not inline
+    («Оплата» is a relation, not a plain select) are fetched separately.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/items/actions",
+            params={"resources": str(item_id)},
+            headers=hdrs, timeout=(6, 10), allow_redirects=False,
+        )
+    except Exception as e:
+        return False, f"не получил список действий: {str(e)[:60]}"
+    if r.status_code == 401:
+        return False, "401: сессия панели истекла — войдите снова"
+    if r.status_code != 200:
+        return False, f"actions: {r.status_code}"
+    try:
+        actions = [a for a in ((r.json() or {}).get("actions") or [])
+                   if isinstance(a, dict)]
+    except Exception:
+        return False, "не разобрал ответ панели"
+
+    a = _find_promo_action(actions)
+    if not a:
+        names = [(x.get("name") or x.get("uriKey") or "?") for x in actions]
+        return False, f"действие продвижения не найдено. Доступные: {names}"
+
+    out_fields = []
+    for f in (a.get("fields") or []):
+        if not isinstance(f, dict):
+            continue
+        attr = f.get("attribute")
+        if not attr:
+            continue
+        opts = _normalize_options(f)
+        probe = ""
+        if not opts:
+            # A relation field carries no inline options; ask Nova for them.
+            opts, probe = panel_sync_field_options_sync(
+                cookie_string, "items", attr, {"resources": str(item_id)})
+        for o in opts:
+            o["price"] = _option_price(o["label"])
+        out_fields.append({
+            "attribute": attr,
+            "label": f.get("name") or attr,
+            "options": opts,
+            "required": "required" in str(f.get("rules", "")),
+            "value": f.get("value"),
+            # Only for a field whose options stayed empty: what Nova calls it
+            # and what the lookup answered, so the gap can be diagnosed from
+            # the bot's message instead of another round of guessing.
+            "probe": "" if opts else (
+                f"component={f.get('component')} "
+                f"rel={f.get('relationshipType') or f.get('belongsToRelationship') or '—'} "
+                f"keys={sorted(f.keys())[:14]} | {probe}"[:400]),
+        })
+    return True, {"key": a.get("uriKey"), "name": a.get("name") or "Премиум",
+                  "fields": out_fields}
+
+
 def panel_bump_item_sync(
     cookie_string: str, item_id: str, uid: int | None = None,
-    confirm: bool = False,
+    confirm: bool = False, params: dict | None = None,
 ) -> tuple[bool, str]:
     """Blocking: promote one listing via the panel's «Премиум» Nova action.
 
@@ -867,19 +965,20 @@ def panel_bump_item_sync(
                 f"Запуск только с подтверждением."
             )
 
-        # Report required parameters instead of inventing values for a
-        # purchase (duration, placement, budget, ...).
+        # Required parameters are never invented — this is a purchase. They
+        # come from the tariff the seller picked; without them, say so.
         fields = [f for f in (a.get("fields") or []) if isinstance(f, dict)]
-        required = [
+        chosen = {k: v for k, v in (params or {}).items() if v not in (None, "")}
+        missing = [
             f.get("name") or f.get("attribute")
             for f in fields
             if "required" in str(f.get("rules", []))
+            and f.get("attribute") not in chosen
         ]
-        if required:
+        if missing:
             return False, (
-                f"«{a.get('name') or key}» требует параметры: {required}. "
-                f"Запустите его в панели — я не подставляю значения для платной "
-                f"операции."
+                f"«{a.get('name') or key}»: не выбран тариф ({', '.join(map(str, missing))}). "
+                f"Откройте «⭐ Премиум продвижение» → «⚙️ Тариф»."
             )
 
         payload = {"resources": str(item_id)}
@@ -888,6 +987,7 @@ def panel_bump_item_sync(
             val = f.get("value")
             if attr and val not in (None, ""):
                 payload[attr] = val
+        payload.update(chosen)
         try:
             resp = session.post(
                 f"{PANEL_URL}/nova-api/items/action?action={key}",
@@ -927,8 +1027,13 @@ def panel_bump_item_sync(
 
 def panel_bump_all_sync(
     cookie_string: str, uid: int | None = None, confirm: bool = False,
+    params: dict | None = None, limit: int = 0,
 ) -> tuple[int, str]:
-    """Blocking: raise every listing the panel shows. Returns (count, message)."""
+    """Blocking: raise every listing the panel shows. Returns (count, message).
+
+    `limit` caps how many listings are promoted in one run — the caller works it
+    out from the daily spending ceiling, since every listing costs money.
+    """
     ok, items = panel_list_items_sync(cookie_string)
     if not ok:
         return 0, f"⚠️ {items}"
@@ -941,17 +1046,22 @@ def panel_bump_all_sync(
         item_id = it.get("id")
         if not item_id:
             continue
-        done, msg = panel_bump_item_sync(cookie_string, item_id, uid, confirm)
+        if limit and count >= limit:
+            last = f"остановился на {limit} — упёрся в потолок трат"
+            break
+        done, msg = panel_bump_item_sync(cookie_string, item_id, uid, confirm,
+                                         params)
         if done:
             count += 1
         else:
             last = msg
             # A missing action will be missing for every item — stop early
             # instead of repeating the same failure for the whole list.
-            if any(k in msg for k in ("не найдено", "401", "подтвержд", "требует")):
+            if any(k in msg for k in ("не найдено", "401", "подтвержд",
+                                      "требует", "тариф")):
                 break
     if count:
-        return count, f"✅ Поднято: {count}"
+        return count, f"✅ Поднято: {count}" + (f"\n{last}" if last else "")
     return 0, f"⚠️ Не удалось поднять: {last}"
 
 

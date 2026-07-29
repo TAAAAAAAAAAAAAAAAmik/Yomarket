@@ -895,21 +895,30 @@ class TaskManager:
         """Promote all listings through the panel.
 
         Runs only from schedules the owner switched on themselves, so
-        confirm=True is passed here; the daily spend ceiling still applies at
-        the call site.
+        confirm=True is passed here; the tariff they picked decides what is
+        bought, and the daily spend ceiling caps how many listings a run pays
+        for.
         """
         from storage import get_panel_creds
         from automation.panel import panel_bump_all_sync
+        from handlers.selenium_settings import promo_limit, promo_params
 
         creds = get_panel_creds(user_id)
         if not creds or not creds.get("cookies"):
             return 0, "нужен вход в панель — откройте «Панель продавца»"
 
+        settings = get_settings(user_id)
+        params = promo_params(settings)
+        if not params:
+            return 0, ("не выбран тариф «Премиум» — откройте "
+                       "«Объявления» → «Премиум продвижение» → «Тариф»")
+
         loop = asyncio.get_event_loop()
         try:
             return await asyncio.wait_for(
                 loop.run_in_executor(
-                    None, panel_bump_all_sync, creds["cookies"], user_id, True),
+                    None, panel_bump_all_sync, creds["cookies"], user_id, True,
+                    params, promo_limit(settings)),
                 timeout=180,
             )
         except asyncio.TimeoutError:
