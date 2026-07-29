@@ -800,7 +800,7 @@ async def publish_item(callback: CallbackQuery) -> None:
 
     b = InlineKeyboardBuilder()
     if not ok:
-        b.button(text="🌍 Опубликовать ещё раз", callback_data=f"cadpub:{item_id}")
+        b.button(text="🚀 Отправить на модерацию", callback_data=f"cadpub:{item_id}")
     b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
     b.button(text="📦 Мои товары", callback_data="menu:ads")
     b.adjust(1)
