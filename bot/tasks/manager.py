@@ -418,7 +418,14 @@ class TaskManager:
 
         for order_id in active:
             try:
-                data = await api.get_messages(order_id)
+                # Messages live under the ORDER'S CHAT, not the order:
+                # GET /chats/{chat_id}/messages. Querying by order id returned
+                # nothing whenever the two differ, so buyer messages never
+                # arrived. The id was already stored when the order was seen.
+                details = order_details.get(order_id, {})
+                chat_id = str(details.get("chat_id") or order_id)
+
+                data = await api.get_messages(chat_id)
                 messages: list[dict] = data.get("data") or data.get("items") or []
                 if not messages:
                     continue
@@ -433,10 +440,8 @@ class TaskManager:
                 if not _is_newer(newest_id, last_known_id):
                     continue
 
-                details = order_details.get(order_id, {})
                 title = details.get("title", f"Заказ #{order_id}")
                 buyer_name = details.get("buyer", "Покупатель")
-                chat_id = details.get("chat_id", order_id)
                 d_username = details.get("username", "")
                 d_price = details.get("price", "")
                 who = f"{buyer_name}" + (f" ({d_username})" if d_username else "")
@@ -446,9 +451,26 @@ class TaskManager:
                     msg_id = str(msg.get("id", ""))
                     if not _is_newer(msg_id, last_known_id):
                         continue
+                    # Skip what the shop itself sent; anything else counts as
+                    # the buyer. Requiring a known buyer value meant an
+                    # unfamiliar wording silently dropped every message.
                     sender = msg.get("sender_type") or msg.get("sender") or ""
-                    if sender not in ("buyer", "client", "customer", "user"):
+                    if isinstance(sender, dict):
+                        sender = (sender.get("type") or sender.get("role")
+                                  or sender.get("name") or "")
+                    sender = str(sender).lower()
+                    if msg.get("is_mine") or msg.get("is_own"):
                         continue
+                    # Substring match only for distinctive words: short ones
+                    # like "me" also occur inside "customer".
+                    _OWN_PARTS = ("shop", "seller", "store", "merchant",
+                                  "продав", "магаз", "support", "админ")
+                    _OWN_EXACT = {"me", "self", "own", "admin", "bot", "system"}
+                    if sender in _OWN_EXACT or any(k in sender for k in _OWN_PARTS):
+                        continue
+                    if sender and sender not in (
+                            "buyer", "client", "customer", "user"):
+                        logger.info("chat %s: unknown sender %r", chat_id, sender)
 
                     time_str = _fmt_time(msg.get("created_at") or msg.get("date"))
                     time_part = f"  •  🕐 {time_str}" if time_str else ""
