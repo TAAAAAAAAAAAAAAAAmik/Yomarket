@@ -906,3 +906,58 @@ async def items_debug(message: Message) -> None:
     import html as _html
     await status.edit_text(
         f"🔍 <b>Структура товара</b>\n\n<code>{_html.escape(report)[:3500]}</code>")
+
+
+@router.message(Command("panel_debug"))
+async def panel_debug(message: Message) -> None:
+    """List what the panel exposes, so support chats can be located.
+
+    Order chats come from the Integration API, which has no way to list chats —
+    only to read one by id. Anything outside an order (support, moderation)
+    therefore has to come from the panel, if it exposes it at all.
+    """
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет сессии панели — войдите в «Панель продавца»")
+        return
+
+    import html as _html
+    import re as _re
+
+    from automation.panel import PANEL_URL, _make_panel_requests_session
+
+    def _fetch() -> str:
+        session = _make_panel_requests_session(creds["cookies"])
+        out = []
+        for path in ("/nova-api/navigation", "/nova-api/resources"):
+            try:
+                r = session.get(PANEL_URL + path, timeout=(6, 12))
+                keys = sorted(set(_re.findall(r'"uriKey"\s*:\s*"([^"]+)"', r.text)))
+                out.append(f"{path} → {r.status_code}, ресурсов: {len(keys)}")
+                if keys:
+                    out.append(f"  {keys[:40]}")
+            except Exception as e:
+                out.append(f"{path}: {str(e)[:80]}")
+
+        # Anything chat-shaped is what we are after
+        for guess in ("chats", "messages", "dialogs", "tickets", "support"):
+            try:
+                r = session.get(f"{PANEL_URL}/nova-api/{guess}",
+                                params={"perPage": "1"}, timeout=(6, 10),
+                                allow_redirects=False)
+                if r.status_code != 404:
+                    out.append(f"/nova-api/{guess} → {r.status_code}: "
+                               f"{r.text[:120]}")
+            except Exception:
+                continue
+        return "\n".join(out) or "пусто"
+
+    status = await message.answer("⏳ Смотрю ресурсы панели...")
+    try:
+        loop = asyncio.get_event_loop()
+        report = await asyncio.wait_for(loop.run_in_executor(None, _fetch),
+                                        timeout=60)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    await status.edit_text(
+        f"🔍 <b>Ресурсы панели</b>\n\n<code>{_html.escape(report)[:3500]}</code>")
