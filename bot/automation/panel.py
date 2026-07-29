@@ -893,10 +893,30 @@ def panel_bump_item_sync(
                 f"{PANEL_URL}/nova-api/items/action?action={key}",
                 data=payload, headers=hdrs, timeout=(6, 15),
             )
-            trace.append(f"action {key}: {resp.status_code} {resp.text[:80]}")
+            trace.append(f"action {key}: {resp.status_code}")
             if resp.status_code in (200, 201, 204):
                 _save_refreshed_cookies(uid, cookie_string, session)
                 return True, str(a.get("name") or key)
+            if resp.status_code == 422:
+                # The action wants parameters. Describe them instead of
+                # inventing values — this one spends money.
+                try:
+                    msg = (_json.loads(resp.text) or {}).get("message") or ""
+                except Exception:
+                    msg = resp.text[:200]
+                spec = []
+                for f in fields:
+                    opts = _normalize_options(f)
+                    spec.append(
+                        f"{f.get('attribute')} | {f.get('name')}"
+                        + (f" | варианты: {[o['label'] for o in opts][:6]}"
+                           if opts else "")
+                        + (" | обязательное" if "required" in str(f.get("rules", ""))
+                           else ""))
+                return False, (
+                    f"«{a.get('name') or key}» требует данные.\n"
+                    f"Ответ: {msg[:200]}\n"
+                    f"Поля действия: {spec or 'не описаны'}")
         except Exception as e:
             trace.append(f"action {key}: {str(e)[:40]}")
 
