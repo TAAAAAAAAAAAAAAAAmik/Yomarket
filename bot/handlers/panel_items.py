@@ -908,6 +908,80 @@ async def items_debug(message: Message) -> None:
         f"🔍 <b>Структура товара</b>\n\n<code>{_html.escape(report)[:3500]}</code>")
 
 
+@router.message(Command("scan"))
+async def scan_page(message: Message) -> None:
+    """/scan /support — read a panel page and find the endpoints it calls.
+
+    A page that shows messages must fetch them from somewhere; pointing this at
+    the support chat gives that address without needing a browser.
+    """
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Укажите страницу панели, например:\n<code>/scan /support</code>\n\n"
+            "Адрес возьмите из строки браузера, когда открыт нужный чат.")
+        return
+    page_path = parts[1].strip()
+    if not page_path.startswith("/"):
+        page_path = "/" + page_path
+
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет сессии панели — войдите в «Панель продавца»")
+        return
+
+    import html as _html
+    import re as _re
+
+    from automation.panel import PANEL_URL, _make_panel_requests_session
+
+    def _fetch() -> str:
+        session = _make_panel_requests_session(creds["cookies"])
+        out = []
+        try:
+            r = session.get(PANEL_URL + page_path, timeout=(6, 15))
+        except Exception as e:
+            return f"не открылась: {str(e)[:120]}"
+        html = r.text
+        out.append(f"{page_path} → {r.status_code}, {len(html)}б")
+
+        # Endpoints named right in the page
+        inline = set(_re.findall(
+            r'["\'`](/[a-z0-9/_-]*(?:chat|support|message|ticket|dialog)[a-z0-9/_-]*)["\'`]',
+            html, _re.I))
+        if inline:
+            out.append(f"в HTML: {sorted(inline)[:12]}")
+
+        srcs = list(dict.fromkeys(
+            _re.findall(r'src="(/[^"]+\.js[^"]*)"', html)
+            + _re.findall(r'"(/[^"]+\.js)"', html)))[:6]
+        out.append(f"скриптов: {len(srcs)}")
+        hits = set()
+        for src in srcs:
+            try:
+                js = session.get(PANEL_URL + src, timeout=(6, 20)).text
+            except Exception:
+                continue
+            for m in _re.findall(
+                    r'["\'`](/[a-z0-9/_-]*(?:chat|support|message|ticket|dialog|notif)[a-z0-9/_-]*)["\'`]',
+                    js, _re.I):
+                if len(m) < 60:
+                    hits.add(m)
+        out.append(f"в JS: {sorted(hits)[:20] or 'ничего'}")
+        return "\n".join(out)
+
+    status = await message.answer(f"⏳ Читаю {page_path}...")
+    try:
+        loop = asyncio.get_event_loop()
+        report = await asyncio.wait_for(loop.run_in_executor(None, _fetch),
+                                        timeout=90)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    await status.edit_text(
+        f"🔍 <b>{_html.escape(page_path)}</b>\n\n"
+        f"<code>{_html.escape(report)[:3500]}</code>")
+
+
 @router.message(Command("panel_debug"))
 async def panel_debug(message: Message) -> None:
     """List what the panel exposes, so support chats can be located.
