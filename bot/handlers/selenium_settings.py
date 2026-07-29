@@ -73,29 +73,28 @@ def promo_limit(s: dict) -> int:
 
 
 async def promo_afford(api, s: dict) -> tuple[bool, int, str]:
-    """Can the shop pay for a promotion right now?
+    """What a promotion will cost, and what the shop balance is.
 
-    Returns (ok, how_many_listings_it_covers, human_text). Promotion is paid
-    from the shop's balance, so running out of money is a normal outcome that
-    deserves a plain answer instead of a panel error.
+    Returns (ok_to_run, listings_covered, human_text). Note what this does NOT
+    do: block the run when the balance is low. Yoomarket does not let «Премиум»
+    be paid from the shop balance — the panel's «Оплата» field offers only СБП,
+    cards, crypto and the like — so refusing on the balance would be refusing on
+    the wrong pot of money. The balance is shown because it is worth knowing;
+    whether the payment goes through is decided on the payment page.
     """
     price = promo_price(s)
     if not api:
         return True, 0, ""
     try:
-        balance, shown = await api.get_balance()
-    except Exception as e:
-        return True, 0, f"баланс не проверить ({str(e)[:60]})"
+        _balance, shown = await api.get_balance()
+    except Exception:
+        return True, 0, ""
     if shown == "—":
-        return True, 0, "баланс не проверить"
+        return True, 0, ""
     if not price:
-        return True, 0, f"на балансе {shown}"
-    covers = int(balance // price)
-    if covers < 1:
-        return False, 0, (
-            f"на балансе <b>{shown}</b>, а одно поднятие стоит "
-            f"<b>{price} ₽</b> — не хватает {price - balance:.0f} ₽")
-    return True, covers, f"на балансе <b>{shown}</b> — хватит на {covers} шт."
+        return True, 0, f"баланс магазина: {shown}"
+    return True, 0, (f"одно поднятие — <b>{price} ₽</b>, оплата отдельно "
+                     f"(баланс магазина {shown} для этого не используется)")
 
 
 def _bump_text(s: dict, creds=None) -> str:
@@ -124,8 +123,10 @@ def _bump_text(s: dict, creds=None) -> str:
         f"Потолок трат: {limit}",
         tariff_line,
         "",
-        "⚠️ <b>Платно.</b> На Юмаркете поднятие — это «Премиум», деньги "
-        "списываются с баланса магазина за каждое объявление.",
+        "⚠️ <b>Платно.</b> На Юмаркете поднятие — это «Премиум». Оплата "
+        "идёт не с баланса магазина, а выбранным способом (СБП, карта, "
+        "криптовалюта…) — бот пришлёт ссылку на оплату по каждому "
+        "объявлению.",
     ])
 
 
@@ -149,9 +150,10 @@ def _bump_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
 # Tariff picker for the paid «Премиум» action
 #
 # The action refuses to run without up_id (service), parameter_id (duration,
-# 19/49/89 ₽) and system_id (payment source). None of that can be guessed: each
-# combination spends a different amount of the shop's money, so the options are
-# read from the panel and chosen here once, then reused by every promotion.
+# 19/49/89 ₽) and system_id (payment method — СБП, cards, crypto, some with a
+# commission). None of that can be guessed: each combination costs a different
+# amount and charges a different account, so the options are read from the
+# panel and chosen here once, then reused by every promotion.
 # ---------------------------------------------------------------------------
 
 async def _load_promo_spec(uid: int) -> tuple[bool, object]:
@@ -348,9 +350,9 @@ async def bump_menu(callback: CallbackQuery, state: FSMContext,
                     api: YooMarketAPI) -> None:
     await state.clear()
     s = get_settings(callback.from_user.id)
-    # Whether there is money for this is the first thing worth knowing here
-    can_pay, _covers, money = await promo_afford(api, s)
-    tail = f"\n\n{'💸' if not can_pay else '💰'} {money[0].upper()}{money[1:]}." if money else ""
+    # What this will cost is the first thing worth knowing here
+    _can_pay, _covers, money = await promo_afford(api, s)
+    tail = f"\n\n💸 {money[0].upper()}{money[1:]}." if money else ""
     await callback.message.edit_text(_bump_text(s) + tail,
                                      reply_markup=_bump_kb(s))
     await callback.answer()
@@ -413,20 +415,7 @@ async def run_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
     price = promo_price(s)
     cap = promo_limit(s)
     label = (s.get("auto_bump", {}).get("promo") or {}).get("label") or "выбран"
-    can_pay, covers, money = await promo_afford(api, s)
-
-    if not can_pay:
-        b = InlineKeyboardBuilder()
-        b.button(text="⚙️ Сменить тариф", callback_data="promo:setup")
-        b.button(text="⬅️ Назад", callback_data="selenium:bump:menu")
-        b.adjust(1)
-        await callback.message.edit_text(
-            f"💸 <b>Не хватает денег на поднятие</b>\n\n{money}.\n\n"
-            f"Пополните баланс магазина или выберите тариф подешевле — "
-            f"день стоит меньше месяца.",
-            reply_markup=b.as_markup())
-        await callback.answer()
-        return
+    _can_pay, covers, money = await promo_afford(api, s)
 
     b = InlineKeyboardBuilder()
     b.button(text="✅ Да, продвинуть все", callback_data="selenium:run:bump_ok")
@@ -436,10 +425,10 @@ async def run_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.message.edit_text(
         "⚠️ <b>Продвижение платное</b>\n\n"
         f"Тариф: <b>{label}</b>\n"
-        + (f"Списывается <b>{price} ₽</b> за каждое объявление.\n" if price else "")
-        + (f"{money[0].upper()}{money[1:]}.\n" if money else "")
+        + (f"Стоимость: <b>{price} ₽</b> за каждое объявление.\n" if price else "")
         + (f"Потолок трат ограничит запуск {cap} объявлениями.\n" if cap else "")
-        + "\nПродвинуть все объявления?",
+        + "\nОплата пройдёт выбранным способом — на каждое объявление "
+          "придёт своя ссылка.\n\nПродвинуть все объявления?",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -459,15 +448,7 @@ async def run_bump_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None
         return
 
     s = get_settings(uid)
-    # Checked again here, not only on the confirmation screen: the balance can
-    # have been spent between seeing the warning and pressing the button.
-    can_pay, covers, money = await promo_afford(api, s)
-    if not can_pay:
-        await callback.answer("💸 Не хватает денег", show_alert=True)
-        await callback.message.edit_text(
-            f"💸 <b>Не хватает денег на поднятие</b>\n\n{money}.\n\n"
-            + _bump_text(s), reply_markup=_bump_kb(s))
-        return
+    _can_pay, covers, _money = await promo_afford(api, s)
 
     await callback.answer("⏳ Продвигаю объявления...", show_alert=False)
     await callback.message.edit_text("⏳ Продвигаю объявления через панель...")
@@ -485,12 +466,7 @@ async def run_bump_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None
         s["auto_bump"]["last_bump_run"] = _time.time()
         spent = count * promo_price(s)
         if spent:
-            msg += f"\n💸 Потрачено: <b>{spent} ₽</b>"
-            try:
-                _, left = await api.get_balance()
-                msg += f"   ·   Осталось: <b>{left}</b>"
-            except Exception:
-                pass
+            msg += f"\n\n💸 К оплате: <b>{spent} ₽</b> за {count} шт."
         save_settings(uid, s)
         result_text = f"⬆️ <b>Продвижение завершено</b>\n\n{msg}"
     except asyncio.TimeoutError:

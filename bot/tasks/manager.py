@@ -902,8 +902,8 @@ class TaskManager:
         """
         from storage import get_panel_creds
         from automation.panel import panel_bump_all_sync
-        from handlers.selenium_settings import (promo_afford, promo_limit,
-                                                promo_params, promo_price)
+        from handlers.selenium_settings import (promo_limit, promo_params,
+                                                promo_price)
 
         creds = get_panel_creds(user_id)
         if not creds or not creds.get("cookies"):
@@ -915,13 +915,9 @@ class TaskManager:
             return 0, ("не выбран тариф «Премиум» — откройте "
                        "«Объявления» → «Премиум продвижение» → «Тариф»")
 
-        # Money runs out silently otherwise: the schedule would keep firing
-        # and each run would come back with a panel error nobody can read.
-        can_pay, covers, money = await promo_afford(api, settings)
-        if not can_pay:
-            return 0, f"💸 не хватает денег — {money}"
-
-        caps = [c for c in (promo_limit(settings), covers) if c]
+        # Not gated on the shop balance: «Премиум» is paid by СБП/card/crypto,
+        # not from it, so the balance says nothing about whether this can run.
+        caps = [c for c in (promo_limit(settings),) if c]
         loop = asyncio.get_event_loop()
         try:
             count, msg = await asyncio.wait_for(
@@ -934,7 +930,7 @@ class TaskManager:
             return 0, "панель не ответила вовремя"
         spent = count * promo_price(settings)
         if spent:
-            msg += f" · потрачено {spent} ₽"
+            msg += f" · к оплате {spent} ₽"
         return count, msg
 
     async def _check_panel_session(self, user_id: int, settings: dict, now: float) -> None:

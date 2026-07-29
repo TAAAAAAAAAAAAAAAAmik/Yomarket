@@ -162,8 +162,9 @@ async def bump_ad(callback: CallbackQuery, api: YooMarketAPI) -> None:
     b.adjust(1)
     await callback.message.answer(
         "⚠️ <b>Продвижение платное</b>\n\n"
-        "На Юмаркете поднятие — это действие «Премиум», оно списывает деньги "
-        "с баланса магазина.\n\nПродвинуть этот товар?",
+        "На Юмаркете поднятие — это действие «Премиум». Оплата идёт не с "
+        "баланса магазина, а выбранным способом — придёт ссылка на "
+        "оплату.\n\nПродвинуть этот товар?",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -177,7 +178,7 @@ async def bump_ad_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
     from automation.panel import panel_bump_item_sync
     from storage import get_panel_creds
 
-    from handlers.selenium_settings import promo_afford, promo_params
+    from handlers.selenium_settings import promo_params
     from storage import get_settings
 
     ad_id = callback.data.split(":", 1)[1]
@@ -199,17 +200,6 @@ async def bump_ad_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
             "по-разному, поэтому я не подставляю их сам.",
             reply_markup=b.as_markup())
         await callback.answer()
-        return
-
-    can_pay, _covers, money = await promo_afford(api, s)
-    if not can_pay:
-        b = InlineKeyboardBuilder()
-        b.button(text="⬅️ К товару", callback_data=f"ad:{ad_id}")
-        await callback.message.edit_text(
-            f"💸 <b>Не хватает денег на поднятие</b>\n\n{money}.\n\n"
-            f"Пополните баланс магазина или выберите тариф подешевле.",
-            reply_markup=b.as_markup())
-        await callback.answer("💸 Не хватает денег", show_alert=True)
         return
 
     await callback.answer("⏳ Продвигаю...", show_alert=False)

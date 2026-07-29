@@ -928,16 +928,16 @@ def panel_action_field_options_sync(
                     return opts
         return _nova_rows_to_options(data)
 
+    # This panel resolves dependent action fields on the action list itself,
+    # once the values they depend on are passed — measured, not assumed. The
+    # dedicated sync routes 404/405 here, and are kept only as a fallback for
+    # a differently-versioned panel.
     routes = [
+        ("GET", "/nova-api/items/actions"),
         ("PATCH", f"/nova-api/items/action-fields/{action_key}"),
         ("PATCH", "/nova-api/items/action-fields"),
         ("PATCH", f"/nova-api/items/actions/{action_key}/fields"),
-        ("PATCH", "/nova-api/items/actions/fields"),
-        ("GET", f"/nova-api/items/action-fields/{action_key}"),
-        ("GET", "/nova-api/items/action-fields"),
         ("GET", f"/nova-api/items/actions/{action_key}/fields"),
-        # Falling back to the action list itself, now that the term is known
-        ("GET", "/nova-api/items/actions"),
     ]
     for method, path in routes:
         try:
@@ -1058,6 +1058,26 @@ def panel_promo_fields_sync(
                   "item_id": str(item_id), "fields": out_fields}
 
 
+def _action_result(resp, fallback: str) -> str:
+    """What a Nova action answered, in words.
+
+    «Премиум» is paid through an external payment system, so a successful call
+    means an invoice was created — the answer usually carries a link to it, and
+    dropping that link would leave the purchase half-done and invisible.
+    """
+    try:
+        data = _json.loads(resp.text or "{}")
+    except Exception:
+        return fallback
+    if not isinstance(data, dict):
+        return fallback
+    url = data.get("redirect") or data.get("openInNewTab") or data.get("download")
+    text = data.get("message") or data.get("danger") or ""
+    if url:
+        return f"{text or fallback}\n🔗 Оплата: {url}"
+    return str(text or fallback)
+
+
 def panel_bump_item_sync(
     cookie_string: str, item_id: str, uid: int | None = None,
     confirm: bool = False, params: dict | None = None,
@@ -1145,7 +1165,7 @@ def panel_bump_item_sync(
             trace.append(f"action {key}: {resp.status_code}")
             if resp.status_code in (200, 201, 204):
                 _save_refreshed_cookies(uid, cookie_string, session)
-                return True, str(a.get("name") or key)
+                return True, _action_result(resp, str(a.get("name") or key))
             if resp.status_code in (402, 422, 500):
                 try:
                     msg = (_json.loads(resp.text) or {}).get("message") or ""
@@ -1198,6 +1218,7 @@ def panel_bump_all_sync(
 
     count = 0
     last = ""
+    links: list[str] = []
     for it in items:
         item_id = it.get("id")
         if not item_id:
@@ -1209,6 +1230,10 @@ def panel_bump_all_sync(
                                          params)
         if done:
             count += 1
+            # Each promotion is paid separately, so every link matters
+            for line in str(msg).splitlines():
+                if "http" in line:
+                    links.append(f"{it.get('title') or item_id}: {line.strip()}")
         else:
             last = msg
             # A missing action will be missing for every item — stop early
@@ -1217,7 +1242,12 @@ def panel_bump_all_sync(
                                       "требует", "тариф", "не хватает")):
                 break
     if count:
-        return count, f"✅ Поднято: {count}" + (f"\n{last}" if last else "")
+        out = f"✅ Оформлено: {count}"
+        if last:
+            out += f"\n{last}"
+        if links:
+            out += "\n\n" + "\n".join(links[:10])
+        return count, out
     return 0, f"⚠️ Не удалось поднять: {last}"
 
 
