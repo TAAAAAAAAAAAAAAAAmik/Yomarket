@@ -875,86 +875,119 @@ def _nova_rows_to_options(data) -> list[dict]:
 
 def panel_action_field_options_sync(
     cookie_string: str, item_id: str, action_key: str, attr: str,
-    chosen: dict | None = None,
+    chosen: dict | None = None, component_key: str = "",
+    depends_on: dict | None = None,
 ) -> tuple[list[dict], str]:
-    """Blocking: hunt for the options of an action field Nova left empty.
+    """Blocking: resolve the options of a dependent action field.
 
-    «Оплата» arrives with neither options nor a required rule — the panel fills
-    it in the browser and validates it server-side. Rather than guess an id for
-    something that spends money, try the places Nova can legitimately serve it
-    from and report what each answered.
+    «Оплата» ships as `visible: false, options: [], dependsOn: {up_id,
+    parameter_id}` — it has nothing to offer until the term is chosen, and the
+    panel then asks the server to re-resolve it. That request is what is
+    reproduced here: PATCH, the dependency values as the body, and the field's
+    own `dependentComponentKey` as the `component` parameter, exactly as Nova's
+    form does. Several route shapes are tried because the action variant is not
+    the same across Nova versions; whatever each answered is reported.
     """
     session = _make_panel_requests_session(cookie_string)
-    hdrs = _panel_xsrf_headers(session, cookie_string)
+    hdrs = dict(_panel_xsrf_headers(session, cookie_string))
+    hdrs.setdefault("Accept", "application/json")
     trace: list[str] = []
-    base = {"resources": str(item_id), "editing": "true", "editMode": "update"}
-    base.update({k: str(v) for k, v in (chosen or {}).items()})
-    stem = attr[:-3] if attr.endswith("_id") else attr
 
-    # Dependent action fields: re-read the action with the current selection,
-    # which is what the panel's own form does when a choice is made.
-    def _from_actions(params: dict) -> list[dict]:
-        try:
-            r = session.get(f"{PANEL_URL}/nova-api/items/actions",
-                            params=params, headers=hdrs,
-                            timeout=(6, 10), allow_redirects=False)
-        except Exception as e:
-            trace.append(f"actions: {str(e)[:40]}")
-            return []
-        trace.append(f"actions+values: {r.status_code}")
-        if r.status_code != 200:
-            return []
-        try:
-            acts = (r.json() or {}).get("actions") or []
-        except Exception:
-            return []
-        for a in acts:
-            if not isinstance(a, dict) or a.get("uriKey") != action_key:
-                continue
-            for f in (a.get("fields") or []):
-                if isinstance(f, dict) and f.get("attribute") == attr:
-                    return _normalize_options(f)
-        return []
+    # The body carries the current state of every field the target depends on.
+    values: dict = {}
+    for k in (depends_on or {}):
+        values[k] = (depends_on or {}).get(k)
+    values.update({k: v for k, v in (chosen or {}).items()})
+    values = {k: ("" if v is None else v) for k, v in values.items()}
 
-    opts = _from_actions(base)
-    if opts:
-        return opts, "; ".join(trace)
+    params = {
+        "editing": "true", "editMode": "update",
+        "resources": str(item_id), "action": action_key,
+        "field": attr,
+    }
+    if component_key:
+        params["component"] = component_key
 
-    # Endpoints Nova uses for relation and dependent fields, then the resource
-    # a payment system would live in.
-    candidates = [
-        (f"/nova-api/items/associatable/{attr}", base),
-        (f"/nova-api/items/associatable/{stem}", base),
-        (f"/nova-api/items/action-fields", {**base, "action": action_key,
-                                            "field": attr}),
-        (f"/nova-api/items/actions/{action_key}/fields", {**base, "field": attr}),
-        (f"/nova-api/{stem}s", {"perPage": "100"}),
-        ("/nova-api/payment-systems", {"perPage": "100"}),
-        ("/nova-api/payments", {"perPage": "100"}),
+    def _field_options(data) -> list[dict]:
+        """Nova answers a sync with the single field, or with a field list."""
+        if not isinstance(data, dict):
+            return []
+        candidates = []
+        if data.get("attribute"):
+            candidates.append(data)
+        candidates.extend(_parse_nova_fields_payload(data))
+        for a in (data.get("actions") or []):
+            if isinstance(a, dict) and (not action_key
+                                        or a.get("uriKey") == action_key):
+                candidates.extend([f for f in (a.get("fields") or [])
+                                   if isinstance(f, dict)])
+        for f in candidates:
+            if isinstance(f, dict) and f.get("attribute") == attr:
+                opts = _normalize_options(f)
+                if opts:
+                    return opts
+        return _nova_rows_to_options(data)
+
+    routes = [
+        ("PATCH", f"/nova-api/items/action-fields/{action_key}"),
+        ("PATCH", "/nova-api/items/action-fields"),
+        ("PATCH", f"/nova-api/items/actions/{action_key}/fields"),
+        ("PATCH", "/nova-api/items/actions/fields"),
+        ("GET", f"/nova-api/items/action-fields/{action_key}"),
+        ("GET", "/nova-api/items/action-fields"),
+        ("GET", f"/nova-api/items/actions/{action_key}/fields"),
+        # Falling back to the action list itself, now that the term is known
+        ("GET", "/nova-api/items/actions"),
     ]
-    for path, params in candidates:
+    for method, path in routes:
         try:
-            r = session.get(f"{PANEL_URL}{path}", params=params, headers=hdrs,
-                            timeout=(6, 10), allow_redirects=False)
+            if method == "PATCH":
+                r = session.patch(f"{PANEL_URL}{path}", params=params,
+                                  json=values, headers=hdrs,
+                                  timeout=(6, 12), allow_redirects=False)
+            else:
+                r = session.get(f"{PANEL_URL}{path}",
+                                params={**params, **{k: str(v) for k, v
+                                                     in values.items()}},
+                                headers=hdrs, timeout=(6, 12),
+                                allow_redirects=False)
         except Exception as e:
-            trace.append(f"{path}: {str(e)[:30]}")
+            trace.append(f"{method} {path}: {str(e)[:30]}")
             continue
-        trace.append(f"{path}: {r.status_code}")
+        if r.status_code in (404, 405):
+            trace.append(f"{method} {path}: {r.status_code}")
+            continue
+        trace.append(f"{method} {path}: {r.status_code}")
         if r.status_code != 200:
+            trace.append(f"  {r.text[:80]}")
             continue
         try:
-            data = r.json()
+            found = _field_options(r.json())
         except Exception:
             continue
-        found = _nova_rows_to_options(data)
-        if not found and isinstance(data, dict):
-            for f in _parse_nova_fields_payload(data):
-                if f.get("attribute") == attr:
-                    found = _normalize_options(f)
-                    break
         if found:
             return found, "; ".join(trace)
-    return [], "; ".join(trace)[:300]
+
+    # Last resort: a resource the payment systems might live in as rows
+    stem = attr[:-3] if attr.endswith("_id") else attr
+    for guess in (f"{stem}s", "payment-systems", "payments", "wallets"):
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/{guess}",
+                            params={"perPage": "100"}, headers=hdrs,
+                            timeout=(5, 10), allow_redirects=False)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+        trace.append(f"/nova-api/{guess}: 200")
+        try:
+            found = _nova_rows_to_options(r.json())
+        except Exception:
+            continue
+        if found:
+            return found, "; ".join(trace)
+
+    return [], "; ".join(trace)[:400]
 
 
 def panel_promo_fields_sync(
@@ -1013,6 +1046,10 @@ def panel_promo_fields_sync(
             # Fetched lazily, once earlier choices are known: a dependent field
             # has no options until the selection it depends on is made.
             "lookup": not opts,
+            # What Nova needs in order to resolve this field later: which
+            # fields it watches, and the key its own form sends as `component`.
+            "depends_on": f.get("dependsOn") or {},
+            "component_key": f.get("dependentComponentKey") or "",
             "shape": (f"component={f.get('component')} "
                       f"rel={f.get('relationshipType') or f.get('belongsToRelationship') or '—'} "
                       f"keys={sorted(f.keys())[:14]}")[:250] if not opts else "",

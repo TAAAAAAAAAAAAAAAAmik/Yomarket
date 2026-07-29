@@ -211,7 +211,8 @@ async def _promo_step(user_id: int, send, state: FSMContext,
             opts, trace = await asyncio.get_event_loop().run_in_executor(
                 None, panel_action_field_options_sync, creds.get("cookies", ""),
                 str(spec.get("item_id") or ""), spec.get("key") or "",
-                f["attribute"], chosen)
+                f["attribute"], chosen, f.get("component_key") or "",
+                f.get("depends_on") or {})
             f["options"] = opts
             f["lookup"] = False
             f["trace"] = trace

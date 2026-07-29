@@ -1133,7 +1133,8 @@ async def promo_debug(message: Message) -> None:
 
     from automation.panel import (PANEL_URL, _find_promo_action,
                                   _make_panel_requests_session,
-                                  _panel_xsrf_headers, panel_list_items_sync)
+                                  _normalize_options, _panel_xsrf_headers,
+                                  panel_list_items_sync)
 
     def _fetch() -> str:
         ok, items = panel_list_items_sync(creds["cookies"])
@@ -1158,11 +1159,31 @@ async def promo_debug(message: Message) -> None:
             return f"действие не найдено среди {[x.get('name') for x in actions]}"
 
         out = [f"объявление #{item_id}", f"action: {a.get('uriKey')}"]
-        for f in (a.get("fields") or []):
-            if not isinstance(f, dict):
-                continue
+        fields = [f for f in (a.get("fields") or []) if isinstance(f, dict)]
+        for f in fields:
             out.append("\n— " + str(f.get("attribute")) + " —")
             out.append(_json.dumps(f, ensure_ascii=False)[:1400])
+
+        # A field with no options is dependent: show what asking the panel to
+        # resolve it actually returns, so the route can be seen rather than
+        # guessed at.
+        from automation.panel import panel_action_field_options_sync
+
+        picked = {}
+        for f in fields:
+            if _normalize_options(f) and f.get("value") not in (None, ""):
+                picked[f.get("attribute")] = f.get("value")
+        for f in fields:
+            if _normalize_options(f):
+                continue
+            opts, trace = panel_action_field_options_sync(
+                creds["cookies"], item_id, a.get("uriKey") or "",
+                f.get("attribute") or "", picked,
+                f.get("dependentComponentKey") or "", f.get("dependsOn") or {})
+            out.append(f"\n— синхронизация {f.get('attribute')} —")
+            out.append(f"значения: {picked}")
+            out.append(f"варианты: {opts or 'нет'}")
+            out.append(f"лог: {trace}")
         return "\n".join(out)
 
     status = await message.answer("⏳ Читаю действие «Премиум»...")
