@@ -16,6 +16,7 @@ router = Router()
 
 class ReplyState(StatesGroup):
     waiting_for_text = State()
+    waiting_chat_id = State()
 
 
 def _format_messages(messages: list[dict]) -> str:
@@ -46,6 +47,8 @@ def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None) -> 
     builder.adjust(1)
     if next_cursor:
         builder.button(text="Следующая →", callback_data=PaginationCallback(entity="chat_orders", cursor=next_cursor).pack())
+    # Support and moderation live outside orders, so they get their own entry
+    builder.button(text="🛟 Поддержка и модерация", callback_data="wchats:list")
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
     return builder.as_markup()
 
@@ -237,34 +240,9 @@ async def watch_chat(message: Message, api: YooMarketAPI) -> None:
             f"panel.yoomarket.net/chats/<b>1076867</b></i>")
         return
 
-    chat_id = parts[1].strip().strip("/")
-    # A pasted URL works too
-    if "/" in chat_id:
-        chat_id = chat_id.rstrip("/").split("/")[-1]
+    chat_id = parts[1].strip().rstrip("/").split("/")[-1]
     label = parts[2].strip() if len(parts) > 2 else "Поддержка"
-
-    if not api:
-        await message.answer("⚠️ Не настроен API-токен")
-        return
-
-    status = await message.answer(f"⏳ Проверяю чат #{chat_id}...")
-    try:
-        data = await api.get_messages(chat_id)
-        rows = data.get("data") or data.get("items") or []
-    except Exception as e:
-        await status.edit_text(
-            f"❌ Чат #{chat_id} не читается:\n<code>{str(e)[:250]}</code>\n\n"
-            f"<i>Возможно, этот чат недоступен по API-токену.</i>")
-        return
-
-    # Start from the newest message, so adding a chat does not replay history
-    last = str(rows[-1].get("id", "")) if rows else None
-    watched[str(chat_id)] = {"label": label, "last_msg": last}
-    save_settings(message.from_user.id, settings)
-    await status.edit_text(
-        f"✅ <b>{label}</b> добавлен\n\n"
-        f"💬 Чат <code>#{chat_id}</code> · сообщений сейчас: {len(rows)}\n\n"
-        f"Новые сообщения будут приходить уведомлениями.")
+    await _add_watched(message, api, chat_id, label)
 
 
 @router.message(Command("unwatch_chat"))
@@ -281,3 +259,171 @@ async def unwatch_chat(message: Message) -> None:
         return
     save_settings(message.from_user.id, settings)
     await message.answer(f"✅ Чат #{chat_id} больше не отслеживается")
+
+
+def _wchats_text(watched: dict) -> str:
+    if not watched:
+        return "<i>пока ни одного</i>"
+    return "\n".join(f"• <b>{i.get('label') or 'Чат'}</b> — <code>#{c}</code>"
+                     for c, i in watched.items())
+
+
+def _wchats_kb(watched: dict) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for cid, info in list(watched.items())[:20]:
+        b.button(text=f"🛟 {(info.get('label') or 'Чат')[:24]}",
+                 callback_data=f"wchat:{cid}")
+    b.adjust(1)
+    b.button(text="➕ Добавить чат", callback_data="wchats:add")
+    b.button(text="⬅️ Чаты", callback_data="menu:chats")
+    b.adjust(1, 2)
+    return b.as_markup()
+
+
+@router.callback_query(F.data == "wchats:list")
+async def wchats_list(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    watched = get_settings(callback.from_user.id).get("watched_chats") or {}
+    await callback.message.edit_text(
+        f"🛟 <b>Поддержка и модерация</b>\n\n{_wchats_text(watched)}\n\n"
+        f"<i>Чаты вне заказов — их номер берётся из адреса в панели:\n"
+        f"panel.yoomarket.net/chats/<b>1076867</b></i>",
+        reply_markup=_wchats_kb(watched))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "wchats:add")
+async def wchats_add(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(ReplyState.waiting_chat_id)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="wchats:list")
+    await callback.message.edit_text(
+        "➕ <b>Добавить чат</b>\n\n"
+        "Пришлите номер чата или ссылку на него, можно с названием:\n"
+        "<code>1076867 Поддержка</code>\n"
+        "<code>https://panel.yoomarket.net/chats/1076867</code>",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.message(ReplyState.waiting_chat_id)
+async def wchats_add_save(message: Message, state: FSMContext,
+                          api: YooMarketAPI) -> None:
+    await state.clear()
+    parts = (message.text or "").split(maxsplit=1)
+    if not parts:
+        await message.answer("❌ Пришлите номер чата")
+        return
+    chat_id = parts[0].strip().rstrip("/").split("/")[-1]
+    label = parts[1].strip() if len(parts) > 1 else "Поддержка"
+    await _add_watched(message, api, chat_id, label)
+
+
+@router.callback_query(F.data.startswith("wchat:"))
+async def wchat_detail(callback: CallbackQuery) -> None:
+    cid = callback.data.split(":", 1)[1]
+    watched = get_settings(callback.from_user.id).get("watched_chats") or {}
+    info = watched.get(cid) or {}
+    b = InlineKeyboardBuilder()
+    b.button(text="📜 Показать историю", callback_data=f"wchat_hist:{cid}")
+    b.button(text="✉️ Ответить", callback_data=f"reply_init:{cid}")
+    b.button(text="🗑 Убрать", callback_data=f"wchat_del:{cid}")
+    b.button(text="⬅️ Назад", callback_data="wchats:list")
+    b.adjust(1, 2, 1)
+    await callback.message.edit_text(
+        f"🛟 <b>{info.get('label') or 'Чат'}</b>\n\n"
+        f"💬 Номер: <code>#{cid}</code>",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("wchat_del:"))
+async def wchat_del(callback: CallbackQuery) -> None:
+    cid = callback.data.split(":", 1)[1]
+    settings = get_settings(callback.from_user.id)
+    watched = settings.setdefault("watched_chats", {})
+    watched.pop(cid, None)
+    save_settings(callback.from_user.id, settings)
+    await callback.answer("Убран", show_alert=True)
+    await callback.message.edit_text(
+        f"🛟 <b>Поддержка и модерация</b>\n\n{_wchats_text(watched)}",
+        reply_markup=_wchats_kb(watched))
+
+
+@router.callback_query(F.data.startswith("wchat_hist:"))
+async def wchat_history(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    """Send the messages already in the chat — following it only reports what
+    arrives afterwards, so past ones would otherwise stay unseen."""
+    cid = callback.data.split(":", 1)[1]
+    if not api:
+        await callback.answer("⚠️ Не настроен API-токен", show_alert=True)
+        return
+    await callback.answer("⏳ Загружаю историю...")
+    try:
+        data = await api.get_messages(cid)
+        rows = data.get("data") or data.get("items") or []
+    except Exception as e:
+        await callback.message.answer(f"❌ Не удалось: {str(e)[:200]}")
+        return
+    if not rows:
+        await callback.message.answer("Здесь пока нет сообщений.")
+        return
+
+    info = (get_settings(callback.from_user.id).get("watched_chats") or {}).get(cid) or {}
+    label = info.get("label") or f"Чат #{cid}"
+    await callback.message.answer(
+        f"📜 <b>{label}</b> — последние {min(len(rows), 15)} из {len(rows)}")
+
+    for msg in rows[-15:]:
+        text = (msg.get("text") or msg.get("message") or "").strip()
+        if not text:
+            continue
+        sender = msg.get("sender_type") or msg.get("sender") or ""
+        if isinstance(sender, dict):
+            sender = sender.get("type") or sender.get("role") or ""
+        mine = bool(msg.get("is_mine") or msg.get("is_own")) or str(sender).lower() in (
+            "me", "self", "own", "shop", "seller")
+        who = "🟢 Вы" if mine else f"🛟 {label}"
+        when = _fmt_msg_time(msg.get("created_at") or msg.get("date"))
+        await callback.message.answer(
+            f"{who}{('  •  🕐 ' + when) if when else ''}\n"
+            f"<blockquote>{text[:900]}</blockquote>")
+
+
+def _fmt_msg_time(raw) -> str:
+    if not raw:
+        return ""
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).strftime("%d.%m %H:%M")
+    except Exception:
+        return str(raw)[:16]
+
+
+async def _add_watched(message: Message, api: YooMarketAPI,
+                       chat_id: str, label: str) -> None:
+    """Verify a chat is readable, then follow it from its newest message."""
+    if not api:
+        await message.answer("⚠️ Не настроен API-токен")
+        return
+    status = await message.answer(f"⏳ Проверяю чат #{chat_id}...")
+    try:
+        data = await api.get_messages(chat_id)
+        rows = data.get("data") or data.get("items") or []
+    except Exception as e:
+        await status.edit_text(
+            f"❌ Чат #{chat_id} не читается:\n<code>{str(e)[:250]}</code>")
+        return
+    settings = get_settings(message.from_user.id)
+    watched = settings.setdefault("watched_chats", {})
+    watched[str(chat_id)] = {
+        "label": label,
+        "last_msg": str(rows[-1].get("id", "")) if rows else None,
+    }
+    save_settings(message.from_user.id, settings)
+    await status.edit_text(
+        f"✅ <b>{label}</b> добавлен\n\n"
+        f"💬 <code>#{chat_id}</code> · сообщений: {len(rows)}\n\n"
+        f"Новые сообщения придут уведомлениями. "
+        f"Прошлые — кнопкой «📜 Показать историю».",
+        reply_markup=_wchats_kb(watched))
