@@ -1113,3 +1113,68 @@ async def panel_debug(message: Message) -> None:
         report = f"ошибка: {str(e)[:200]}"
     await status.edit_text(
         f"🔍 <b>Ресурсы панели</b>\n\n<code>{_html.escape(report)[:3500]}</code>")
+
+
+@router.message(Command("promo_debug"))
+async def promo_debug(message: Message) -> None:
+    """Dump the «Премиум» action exactly as the panel describes it.
+
+    Every earlier attempt read a summary of these fields, and the summary drops
+    precisely the keys that would say what «Оплата» is. This prints the raw
+    JSON so the answer stops being a guess.
+    """
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет сессии панели — войдите в «Панель продавца»")
+        return
+
+    import html as _html
+    import json as _json
+
+    from automation.panel import (PANEL_URL, _find_promo_action,
+                                  _make_panel_requests_session,
+                                  _panel_xsrf_headers, panel_list_items_sync)
+
+    def _fetch() -> str:
+        ok, items = panel_list_items_sync(creds["cookies"])
+        if not ok:
+            return f"объявления не прочитались: {items}"
+        ids = [i.get("id") for i in items if i.get("id")]
+        if not ids:
+            return "в панели нет объявлений"
+        item_id = str(ids[0])
+
+        session = _make_panel_requests_session(creds["cookies"])
+        hdrs = _panel_xsrf_headers(session, creds["cookies"])
+        r = session.get(f"{PANEL_URL}/nova-api/items/actions",
+                        params={"resources": item_id}, headers=hdrs,
+                        timeout=(6, 12), allow_redirects=False)
+        if r.status_code != 200:
+            return f"actions → {r.status_code}: {r.text[:200]}"
+        actions = [a for a in ((r.json() or {}).get("actions") or [])
+                   if isinstance(a, dict)]
+        a = _find_promo_action(actions)
+        if not a:
+            return f"действие не найдено среди {[x.get('name') for x in actions]}"
+
+        out = [f"объявление #{item_id}", f"action: {a.get('uriKey')}"]
+        for f in (a.get("fields") or []):
+            if not isinstance(f, dict):
+                continue
+            out.append("\n— " + str(f.get("attribute")) + " —")
+            out.append(_json.dumps(f, ensure_ascii=False)[:1400])
+        return "\n".join(out)
+
+    status = await message.answer("⏳ Читаю действие «Премиум»...")
+    try:
+        loop = asyncio.get_event_loop()
+        report = await asyncio.wait_for(loop.run_in_executor(None, _fetch),
+                                        timeout=90)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+
+    # One field's JSON alone can exceed a Telegram message, so send in pieces
+    text = _html.escape(report)
+    for i in range(0, min(len(text), 12000), 3500):
+        await message.answer(f"<code>{text[i:i + 3500]}</code>")
+    await status.delete()
