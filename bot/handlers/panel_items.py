@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = 40
 _CAT_CACHE: dict[int, list[str]] = {}
+_CATS_NAMES: dict[int, dict[int, str]] = {}   # uid -> {category_id: name}
+# Ads deleted from the panel can still come back from GET /ads for a while, so
+# they are remembered and filtered out — otherwise a removed listing keeps its
+# button and stays in the count.
+_DELETED: dict[int, set[str]] = {}
 
 
 class PanelItemState(StatesGroup):
@@ -79,6 +84,10 @@ async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
             reply_markup=_no_session_kb())
         await callback.answer()
         return
+
+    gone = _DELETED.get(callback.from_user.id, set())
+    if gone:
+        ads = [a for a in ads if str(a.get("id")) not in gone]
 
     groups: dict[str, int] = {}
     for ad in ads:
@@ -153,6 +162,9 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
         await callback.answer()
         return
 
+    gone = _DELETED.get(callback.from_user.id, set())
+    if gone:
+        ads = [a for a in ads if str(a.get("id")) not in gone]
     if category:
         ads = [a for a in ads if _ad_category(a, names) == category]
 
@@ -524,22 +536,28 @@ async def item_delete_confirm(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("pitem_del2:"))
-async def item_delete_do(callback: CallbackQuery) -> None:
+async def item_delete_do(callback: CallbackQuery, api: YooMarketAPI) -> None:
     from automation.panel import panel_delete_item_sync
 
     item_id = callback.data.split(":", 1)[1]
     uid = callback.from_user.id
     await callback.answer("⏳ Удаляю...")
     result, err = await _run(uid, panel_delete_item_sync, item_id, uid)
+
+    if result and result[0]:
+        # Remember it: the API can keep returning a deleted ad briefly, which
+        # would put its button and its count straight back.
+        _DELETED.setdefault(uid, set()).add(str(item_id))
+        await callback.answer(f"✅ Товар #{item_id} удалён", show_alert=True)
+        # Straight back to the refreshed list, so the row is actually gone
+        await _render_ads(callback, api, category=None)
+        return
+
+    detail = result[1] if result else err
     b = InlineKeyboardBuilder()
     b.button(text="⬅️ К товарам", callback_data="pitems:list")
-    if result and result[0]:
-        await callback.message.edit_text(
-            f"✅ Товар #{item_id} удалён.", reply_markup=b.as_markup())
-    else:
-        detail = result[1] if result else err
-        await callback.message.edit_text(
-            f"❌ Не удалось удалить:\n{detail}", reply_markup=b.as_markup())
+    await callback.message.edit_text(
+        f"❌ Не удалось удалить:\n{detail}", reply_markup=b.as_markup())
 
 
 # ---------------------------------------------------------------------------
@@ -614,9 +632,6 @@ async def item_stock_save(message: Message, state: FSMContext,
             f"❌ Не удалось добавить остатки:\n<code>{str(e)[:300]}</code>",
             reply_markup=b.as_markup(),
         )
-
-
-_CATS_NAMES: dict[int, dict[int, str]] = {}   # uid -> {category_id: name}
 
 
 def _ad_price(ad: dict) -> int:
