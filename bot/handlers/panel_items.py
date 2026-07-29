@@ -968,6 +968,38 @@ async def panel_debug(message: Message) -> None:
                     out.append(f"  {r.text[:120]}")
             except Exception as e:
                 out.append(f"/nova-api/{guess}: {str(e)[:60]}")
+
+        # The support chat is not a Nova resource, so look for the panel's own
+        # endpoint — the same approach that found the login route.
+        out.append("\n— свои адреса панели —")
+        for path in ("/api/chats", "/api/support", "/chats", "/support",
+                     "/api/messages", "/api/tickets", "/api/chat/messages",
+                     "/nova-vendor/chat", "/api/notifications"):
+            try:
+                r = session.get(PANEL_URL + path, timeout=(5, 8),
+                                allow_redirects=False)
+                if r.status_code in (404, 405):
+                    continue
+                body = r.text[:100].replace("\n", " ")
+                out.append(f"{path} → {r.status_code}: {body}")
+            except Exception:
+                continue
+
+        # And what the panel's own scripts call
+        try:
+            html = session.get(PANEL_URL + "/", timeout=(6, 12)).text
+            srcs = _re.findall(r'src="(/[^"]+\.js[^"]*)"', html)[:4]
+            hits = set()
+            for src in srcs:
+                js = session.get(PANEL_URL + src, timeout=(6, 15)).text
+                for m in _re.findall(
+                        r'["\'`](/[a-z0-9/_-]*(?:chat|support|message|ticket)[a-z0-9/_-]*)["\'`]',
+                        js, _re.I):
+                    if len(m) < 60:
+                        hits.add(m)
+            out.append(f"в JS панели: {sorted(hits)[:15] or 'ничего'}")
+        except Exception as e:
+            out.append(f"JS: {str(e)[:60]}")
         return "\n".join(out) or "пусто"
 
     status = await message.answer("⏳ Смотрю ресурсы панели...")
