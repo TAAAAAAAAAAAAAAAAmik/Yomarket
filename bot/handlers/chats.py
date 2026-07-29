@@ -14,6 +14,23 @@ from storage import get_settings, save_settings
 router = Router()
 
 
+def _newest_id(rows: list[dict]) -> str:
+    """The largest message id present — not rows[-1], which is only the newest
+    if the API sorts oldest-first."""
+    best = ""
+    for m in rows:
+        mid = str(m.get("id", ""))
+        if not mid:
+            continue
+        try:
+            newer = int(mid) > int(best) if best else True
+        except (TypeError, ValueError):
+            newer = mid > best
+        if newer:
+            best = mid
+    return best
+
+
 def _esc(text) -> str:
     """Text that came from outside — chat messages, labels, error bodies — goes
     into HTML-parsed messages, where a stray '<' makes Telegram reject the whole
@@ -442,9 +459,12 @@ async def _add_watched(message: Message, api: YooMarketAPI,
         return
     settings = get_settings(message.from_user.id)
     watched = settings.setdefault("watched_chats", {})
+    # The largest id, not the last row: the baseline has to be the newest
+    # message however the API happens to sort them, or following the chat
+    # starts from the wrong point.
     watched[str(chat_id)] = {
         "label": label,
-        "last_msg": str(rows[-1].get("id", "")) if rows else None,
+        "last_msg": _newest_id(rows) or None,
     }
     save_settings(message.from_user.id, settings)
     await status.edit_text(
@@ -453,3 +473,39 @@ async def _add_watched(message: Message, api: YooMarketAPI,
         f"Новые сообщения придут уведомлениями. "
         f"Прошлые — кнопкой «📜 Показать историю».",
         reply_markup=_wchats_kb(watched))
+
+
+@router.message(Command("chats_debug"))
+async def chats_debug(message: Message, api: YooMarketAPI) -> None:
+    """What the follower sees right now, per watched chat.
+
+    Whether a support message would have produced a notification is otherwise
+    only answerable by waiting for one to arrive.
+    """
+    watched = get_settings(message.from_user.id).get("watched_chats") or {}
+    if not watched:
+        await message.answer("Отслеживаемых чатов нет.")
+        return
+    if not api:
+        await message.answer("⚠️ Не настроен API-токен")
+        return
+
+    out: list[str] = []
+    for cid, info in watched.items():
+        out.append(f"#{cid} — {info.get('label') or 'без названия'}")
+        out.append(f"  запомнено последнее: {info.get('last_msg')}")
+        try:
+            data = await api.get_messages(cid)
+        except Exception as e:
+            out.append(f"  чат не читается: {str(e)[:90]}")
+            continue
+        rows = data.get("data") or data.get("items") or []
+        out.append(f"  сообщений сейчас: {len(rows)}")
+        out.append(f"  самое новое: {_newest_id(rows) or '—'}")
+        for m in rows[-3:]:
+            sender = m.get("sender_type") or m.get("sender") or "—"
+            if isinstance(sender, dict):
+                sender = sender.get("type") or sender.get("role") or "—"
+            body = str(m.get("text") or m.get("message") or "")[:40]
+            out.append(f"  • id={m.get('id')} от={sender} «{body}»")
+    await message.answer(f"<code>{_esc(chr(10).join(out))[:3500]}</code>")

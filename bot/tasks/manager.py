@@ -49,6 +49,46 @@ def _is_newer(msg_id: str, last_id: str) -> bool:
         return msg_id > last_id
 
 
+def _msg_rows(data) -> list[dict]:
+    """The messages out of whatever envelope the API used.
+
+    A chat outside an order does not have to answer in the same shape as one
+    attached to an order, and a nested list arriving where a list was assumed
+    raised inside the poll loop, where the error was only logged — so nothing
+    ever arrived and nothing ever complained.
+    """
+    if isinstance(data, list):
+        return [m for m in data if isinstance(m, dict)]
+    if not isinstance(data, dict):
+        return []
+    for key in ("data", "items", "messages", "results"):
+        v = data.get(key)
+        if isinstance(v, list):
+            return [m for m in v if isinstance(m, dict)]
+        if isinstance(v, dict):
+            inner = _msg_rows(v)
+            if inner:
+                return inner
+    return []
+
+
+def _newest_id(rows: list[dict]) -> str:
+    """The largest message id present.
+
+    Taking rows[-1] assumed the API sorts oldest-first. If it sorts the other
+    way round, that is the OLDEST message, "is there anything newer" is false
+    forever, and no notification is ever sent.
+    """
+    best = ""
+    for m in rows:
+        mid = str(m.get("id", ""))
+        if not mid:
+            continue
+        if not best or _is_newer(mid, best):
+            best = mid
+    return best
+
+
 _USERNAME_RE = re.compile(r"@?([a-zA-Z][a-zA-Z0-9_]{3,31})")
 
 
@@ -459,11 +499,11 @@ class TaskManager:
         for chat_id, info in list(watched.items()):
             try:
                 data = await api.get_messages(chat_id)
-                messages: list[dict] = data.get("data") or data.get("items") or []
+                messages = _msg_rows(data)
                 if not messages:
                     continue
 
-                newest_id = str(messages[-1].get("id", ""))
+                newest_id = _newest_id(messages)
                 last_known = info.get("last_msg")
                 if last_known is None:
                     info["last_msg"] = newest_id      # baseline, stay quiet
@@ -521,11 +561,11 @@ class TaskManager:
                 chat_id = str(details.get("chat_id") or order_id)
 
                 data = await api.get_messages(chat_id)
-                messages: list[dict] = data.get("data") or data.get("items") or []
+                messages = _msg_rows(data)
                 if not messages:
                     continue
 
-                newest_id = str(messages[-1].get("id", ""))
+                newest_id = _newest_id(messages)
                 last_known_id = known_messages.get(order_id)
 
                 if last_known_id is None:
