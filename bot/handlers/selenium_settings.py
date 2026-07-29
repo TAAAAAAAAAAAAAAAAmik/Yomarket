@@ -22,6 +22,7 @@ class SeleniumState(StatesGroup):
     waiting_bump_interval = State()
     waiting_withdraw_amount = State()
     waiting_promo_value = State()
+    waiting_restore_interval = State()
 
 
 def _esc(text) -> str:
@@ -485,28 +486,57 @@ async def run_bump_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None
 def _restore_text(s: dict, creds=None) -> str:
     ar = s.get("auto_restore", {})
     on = ar.get("enabled", False)
+    interval = ar.get("interval_hours", 1)
     last_run = _fmt_ts(ar.get("last_restore_run"))
-    return "\n".join([
+    total = int(ar.get("restored_total", 0) or 0)
+    held = len([f for f in (ar.get("failures") or {}).values()
+                if float(f.get("until", 0) or 0) > _time.time()])
+    lines = [
         "🔄 <b>Авто-восстановление</b>\n",
         f"Статус: {_st(on)}",
+        f"Проверка: каждые {interval} ч",
         f"Последний запуск: {last_run}",
+        f"Требовать остатки: {'✅ да' if ar.get('require_stock', True) else '❌ нет'}",
+    ]
+    if ar.get("last_result"):
+        lines.append(f"Прошлый результат: {ar['last_result']}")
+    if total:
+        lines.append(f"Всего восстановлено: <b>{total}</b>")
+    if held:
+        lines.append(f"⏸ Отложено после отказов: {held}")
+    lines += [
         "",
-        "Переактивирует проданные или истёкшие объявления через API.",
-    ])
+        "Снятые с продажи объявления публикуются заново. "
+        "Распроданные пропускаются — публиковать их нечем.",
+        "<i>Публикация уходит на модерацию, а не сразу в продажу.</i>",
+    ]
+    return "\n".join(lines)
 
 
 def _restore_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
-    on = s.get("auto_restore", {}).get("enabled", False)
+    ar = s.get("auto_restore", {})
+    on = ar.get("enabled", False)
+    stock = ar.get("require_stock", True)
     b = InlineKeyboardBuilder()
     b.button(text="▶️ Запустить сейчас", callback_data="selenium:run:restore")
     b.button(text=f"{'🔴 Выкл' if on else '🟢 Вкл'}", callback_data="selenium:restore:toggle")
+    b.button(text="👁 Что будет восстановлено", callback_data="restore:preview")
+    b.button(text=f"⏱ Проверка: {ar.get('interval_hours', 1)} ч",
+             callback_data="restore:interval")
+    b.button(text=f"📦 Остатки: {'обязательны' if stock else 'не важны'}",
+             callback_data="restore:stock")
+    held = [f for f in (ar.get("failures") or {}).values()
+            if float(f.get("until", 0) or 0) > _time.time()]
+    if held:
+        b.button(text=f"⏸ Отложенные ({len(held)})", callback_data="restore:held")
     b.button(text="⬅️ К объявлениям", callback_data="menu:ads")
-    b.adjust(2, 1)
+    b.adjust(2, 1, 2, 1, 1)
     return b.as_markup()
 
 
 @router.callback_query(F.data == "selenium:restore:menu")
-async def restore_menu(callback: CallbackQuery) -> None:
+async def restore_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
     s = get_settings(callback.from_user.id)
     await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
     await callback.answer()
@@ -516,9 +546,145 @@ async def restore_menu(callback: CallbackQuery) -> None:
 async def restore_toggle(callback: CallbackQuery) -> None:
     s = get_settings(callback.from_user.id)
     s["auto_restore"]["enabled"] = not s["auto_restore"].get("enabled", False)
+    # Turning it on should act promptly, not wait out an interval that already
+    # elapsed while it was off
+    if s["auto_restore"]["enabled"]:
+        s["auto_restore"]["last_restore_run"] = 0
     save_settings(callback.from_user.id, s)
     await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
+    await callback.answer("Включено" if s["auto_restore"]["enabled"] else "Выключено")
+
+
+@router.callback_query(F.data == "restore:stock")
+async def restore_stock_toggle(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    ar = s.setdefault("auto_restore", {})
+    ar["require_stock"] = not ar.get("require_stock", True)
+    save_settings(callback.from_user.id, s)
+    await callback.answer(
+        "Распроданные будут пропускаться" if ar["require_stock"]
+        else "Публиковать буду и без остатков — маркетплейс может отказать",
+        show_alert=True)
+    await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
+
+
+@router.callback_query(F.data == "restore:interval")
+async def restore_interval(callback: CallbackQuery, state: FSMContext) -> None:
+    cur = get_settings(callback.from_user.id).get(
+        "auto_restore", {}).get("interval_hours", 1)
+    await state.set_state(SeleniumState.waiting_restore_interval)
+    await callback.message.edit_text(
+        f"⏱ <b>Как часто проверять</b>\n\nСейчас: {cur} ч\n\n"
+        f"Пришлите число часов (1, 3, 6, 12, 24). Можно дробное: 0.5 — "
+        f"каждые полчаса.",
+        reply_markup=_cancel_kb("selenium:restore:menu"))
     await callback.answer()
+
+
+@router.message(SeleniumState.waiting_restore_interval)
+async def restore_save_interval(message: Message, state: FSMContext) -> None:
+    try:
+        hours = float((message.text or "").replace(",", ".").strip())
+        if not 0.25 <= hours <= 168:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Нужно число от 0.25 до 168, например: 6")
+        return
+    s = get_settings(message.from_user.id)
+    s.setdefault("auto_restore", {})["interval_hours"] = hours
+    save_settings(message.from_user.id, s)
+    await state.clear()
+    await message.answer(_restore_text(s), reply_markup=_restore_kb(s))
+
+
+@router.callback_query(F.data == "restore:held")
+async def restore_held(callback: CallbackQuery) -> None:
+    """Ads put aside after the marketplace refused them, and why."""
+    s = get_settings(callback.from_user.id)
+    ar = s.get("auto_restore", {})
+    now = _time.time()
+    held = [(a, f) for a, f in (ar.get("failures") or {}).items()
+            if float(f.get("until", 0) or 0) > now]
+    b = InlineKeyboardBuilder()
+    b.button(text="🔁 Снять отсрочку со всех", callback_data="restore:unhold")
+    b.button(text="⬅️ Назад", callback_data="selenium:restore:menu")
+    b.adjust(1)
+    if not held:
+        await callback.message.edit_text("Отложенных объявлений нет.",
+                                         reply_markup=b.as_markup())
+        await callback.answer()
+        return
+    lines = []
+    for aid, f in held[:15]:
+        lines.append(
+            f"• <b>{_esc(f.get('title') or aid)[:34]}</b>\n"
+            f"   попыток: {f.get('tries')}, следующая: "
+            f"{_fmt_ts(f.get('until'))}\n"
+            f"   причина: {_esc(f.get('reason'))[:90]}")
+    await callback.message.edit_text(
+        "⏸ <b>Отложены после отказа</b>\n\n" + "\n\n".join(lines)[:3400],
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "restore:unhold")
+async def restore_unhold(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    s.setdefault("auto_restore", {})["failures"] = {}
+    save_settings(callback.from_user.id, s)
+    await callback.answer("Отсрочки сняты", show_alert=True)
+    await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
+
+
+@router.callback_query(F.data == "restore:preview")
+async def restore_preview(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    """Show what a run would touch, without touching anything.
+
+    Restoring publishes to a live marketplace, so being able to look before
+    acting is worth a button.
+    """
+    if not api:
+        await callback.answer("⚠️ API токен не настроен", show_alert=True)
+        return
+    await callback.answer("⏳ Смотрю...")
+    await callback.message.edit_text("⏳ Проверяю, что можно восстановить...")
+    s = get_settings(callback.from_user.id)
+    try:
+        rep = await api.restore_ads(
+            require_stock=bool(s.get("auto_restore", {}).get("require_stock", True)),
+            dry_run=True)
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ Не удалось посмотреть: {_esc(str(e)[:200])}",
+            reply_markup=_restore_kb(s))
+        return
+
+    body = [f"Всего объявлений: <b>{rep['total']}</b>",
+            f"Подходят под восстановление: <b>{rep['candidates']}</b>", ""]
+    if rep["restored"]:
+        body.append(f"✅ Будут опубликованы: <b>{len(rep['restored'])}</b>")
+        for row in rep["restored"][:12]:
+            body.append(f"   • {_esc(row['title'])[:38]} ({_esc(row['status'])})")
+    else:
+        body.append("Публиковать сейчас нечего.")
+    if rep["no_stock"]:
+        body.append("")
+        body.append(f"📦 Пропущу без остатков: <b>{len(rep['no_stock'])}</b>")
+        for row in rep["no_stock"][:8]:
+            body.append(f"   • {_esc(row['title'])[:32]} — {_esc(row.get('note'))}")
+    body.append("")
+    body.append(f"<i>Статусы в аккаунте: {_esc(', '.join(rep['statuses'][:10]))}</i>")
+
+    b = InlineKeyboardBuilder()
+    if rep["restored"]:
+        b.button(text=f"▶️ Восстановить ({len(rep['restored'])})",
+                 callback_data="selenium:run:restore")
+    b.button(text="🔄 Обновить", callback_data="restore:preview")
+    b.button(text="⬅️ Назад", callback_data="selenium:restore:menu")
+    b.adjust(1, 2)
+    await callback.message.edit_text(
+        "👁 <b>Предпросмотр восстановления</b>\n\n" + "\n".join(body)[:3500],
+        reply_markup=b.as_markup())
 
 
 @router.callback_query(F.data == "selenium:run:restore")
@@ -527,17 +693,51 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
         await callback.answer("⚠️ API токен не настроен", show_alert=True)
         return
     await callback.answer("⏳ Восстанавливаю объявления...", show_alert=False)
-    await callback.message.edit_text("⏳ Восстанавливаю объявления через API...")
-    s = get_settings(callback.from_user.id)
+    await callback.message.edit_text("⏳ Восстанавливаю объявления...")
+    uid = callback.from_user.id
+    s = get_settings(uid)
+    ar = s.setdefault("auto_restore", {})
     try:
-        count, msg = await api.restore_all_ads()
-        s["auto_restore"]["last_restore_run"] = _time.time()
-        save_settings(callback.from_user.id, s)
-        result_text = f"🔄 <b>Восстановление завершено</b>\n\n{msg}"
+        from handlers.panel_items import _DELETED
+        rep = await api.restore_ads(
+            require_stock=bool(ar.get("require_stock", True)),
+            skip_ids={str(i) for i in (_DELETED.get(uid) or set())})
+        ar["last_restore_run"] = _time.time()
+        ar["restored_total"] = int(ar.get("restored_total", 0) or 0) + len(rep["restored"])
+        # A manual run is a deliberate retry: clear the waits it just resolved
+        failures = ar.setdefault("failures", {})
+        for row in rep["restored"]:
+            failures.pop(str(row["id"]), None)
+        ar["last_result"] = (f"поднято {len(rep['restored'])}, "
+                             f"без остатков {len(rep['no_stock'])}, "
+                             f"отказов {len(rep['failed'])}")
+        save_settings(uid, s)
+
+        parts = [f"✅ Опубликовано заново: <b>{len(rep['restored'])}</b>"]
+        for row in rep["restored"][:10]:
+            parts.append(f"   • {_esc(row['title'])[:40]}")
+        if rep["restored"]:
+            parts.append("<i>Уходит на модерацию — статус сменится после проверки.</i>")
+        if rep["no_stock"]:
+            parts.append("")
+            parts.append(f"📦 Пропущено без остатков: <b>{len(rep['no_stock'])}</b>")
+            for row in rep["no_stock"][:6]:
+                parts.append(f"   • {_esc(row['title'])[:32]} — {_esc(row.get('note'))}")
+        if rep["failed"]:
+            parts.append("")
+            parts.append(f"⛔ Отказано: <b>{len(rep['failed'])}</b>")
+            for row in rep["failed"][:6]:
+                parts.append(f"   • {_esc(row['title'])[:30]}: {_esc(row['reason'])[:80]}")
+        if not rep["restored"] and not rep["no_stock"] and not rep["failed"]:
+            parts = ["Нечего восстанавливать — все объявления на месте.",
+                     f"<i>Статусы: {_esc(', '.join(rep['statuses'][:10]))}</i>"]
+        result_text = "🔄 <b>Восстановление завершено</b>\n\n" + "\n".join(parts)
     except Exception as e:
         logger.error("Manual restore error: %s", e)
-        result_text = f"❌ Ошибка: {e}"
-    await callback.message.edit_text(result_text + "\n\n" + _restore_text(s), reply_markup=_restore_kb(s))
+        result_text = f"❌ Ошибка: {_esc(str(e)[:200])}"
+    await callback.message.edit_text(
+        (result_text + "\n\n" + _restore_text(s))[:4000],
+        reply_markup=_restore_kb(s))
 
 
 # ---------------------------------------------------------------------------

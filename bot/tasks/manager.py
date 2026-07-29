@@ -973,6 +973,92 @@ class TaskManager:
             msg += f" · к оплате {spent} ₽"
         return count, msg
 
+    async def _auto_restore(self, user_id: int, api: YooMarketAPI,
+                            settings: dict, now: float) -> str:
+        """One scheduled restore pass. Returns a notification, or '' to stay quiet.
+
+        Quiet matters here: this runs on a timer, and "нечего восстанавливать"
+        every hour is noise that trains the seller to ignore the channel. Only
+        real events speak — ads that went back up, and refusals not already
+        reported.
+        """
+        ar = settings.setdefault("auto_restore", {})
+        failures: dict = ar.setdefault("failures", {})
+
+        # An ad the marketplace refused is not retried immediately: the reason
+        # rarely changes within the hour, and a schedule would otherwise repeat
+        # the same rejected call forever. The wait doubles, up to a day.
+        held = {aid for aid, f in failures.items()
+                if float(f.get("until", 0) or 0) > now}
+
+        from handlers.panel_items import _DELETED
+        skip = set(held) | {str(i) for i in (_DELETED.get(user_id) or set())}
+
+        try:
+            rep = await api.restore_ads(
+                require_stock=bool(ar.get("require_stock", True)),
+                skip_ids=skip)
+        except Exception as e:
+            logger.warning("Auto-restore for %s: %s", user_id, e)
+            return f"🔄 Авто-восстановление не отработало: {_esc(str(e)[:120])}"
+
+        ar["last_restore_run"] = now
+
+        for row in rep["restored"]:
+            failures.pop(str(row["id"]), None)      # it worked; forget the past
+        ar["restored_total"] = int(ar.get("restored_total", 0)) + len(rep["restored"])
+
+        fresh_failures = []
+        for row in rep["failed"]:
+            aid = str(row["id"])
+            prev = failures.get(aid) or {}
+            tries = int(prev.get("tries", 0)) + 1
+            # 1h, 2h, 4h ... capped at a day
+            wait = min(3600 * (2 ** (tries - 1)), 86400)
+            failures[aid] = {"tries": tries, "until": now + wait,
+                             "reason": row["reason"], "title": row["title"]}
+            if prev.get("reason") != row["reason"]:
+                fresh_failures.append(row)          # only new news is reported
+
+        # Keep the memory from growing without bound
+        for aid in [a for a, f in failures.items()
+                    if float(f.get("until", 0) or 0) < now - 7 * 86400]:
+            failures.pop(aid, None)
+        ar["failures"] = failures
+
+        summary = (f"поднято {len(rep['restored'])}, "
+                   f"без остатков {len(rep['no_stock'])}, "
+                   f"отказов {len(rep['failed'])}")
+        ar["last_result"] = summary
+
+        if not rep["restored"] and not fresh_failures:
+            return ""                                # nothing happened, say nothing
+
+        body: list[str] = []
+        if rep["restored"]:
+            body.append(f"✅ Снова в продаже: <b>{len(rep['restored'])}</b>")
+            for row in rep["restored"][:8]:
+                body.append(f"   • {_esc(row['title'])[:40]}")
+            body.append("")
+            body.append("<i>Опубликованное уходит на модерацию — "
+                        "статус сменится после проверки.</i>")
+        if rep["no_stock"]:
+            body.append("")
+            body.append(f"📦 Без остатков: <b>{len(rep['no_stock'])}</b> "
+                        f"— их публиковать нечем")
+            for row in rep["no_stock"][:5]:
+                body.append(f"   • {_esc(row['title'])[:34]} — {_esc(row.get('note'))}")
+        if fresh_failures:
+            body.append("")
+            body.append(f"⛔ Маркетплейс отказал: <b>{len(fresh_failures)}</b>")
+            for row in fresh_failures[:5]:
+                body.append(f"   • {_esc(row['title'])[:30]}: "
+                            f"{_esc(row['reason'])[:70]}")
+            body.append("<i>Повтор будет позже — с нарастающей паузой.</i>")
+
+        return _card("🔄 <b>АВТО-ВОССТАНОВЛЕНИЕ</b>", body,
+                     f"📦 Всего объявлений: {rep['total']}")
+
     async def _check_panel_session(self, user_id: int, settings: dict, now: float) -> None:
         """Warn once when the stored panel session stops working.
 
@@ -1075,10 +1161,12 @@ class TaskManager:
             # --- Auto-restore ---
             ar = settings.get("auto_restore", {})
             if ar.get("enabled"):
-                logger.info("Auto-restore for user %s via API", user_id)
-                count, msg = await api.restore_all_ads()
-                settings["auto_restore"]["last_restore_run"] = now
-                messages.append(f"🔄 Авто-восстановление: {msg}")
+                interval = float(ar.get("interval_hours", 1) or 1)
+                if (now - float(ar.get("last_restore_run", 0) or 0)) / 3600 >= interval:
+                    logger.info("Auto-restore for user %s via API", user_id)
+                    note = await self._auto_restore(user_id, api, settings, now)
+                    if note:
+                        messages.append(note)
 
             # --- Auto-withdraw ---
             aw = settings.get("auto_withdraw", {})

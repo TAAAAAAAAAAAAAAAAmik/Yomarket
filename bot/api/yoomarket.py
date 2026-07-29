@@ -101,48 +101,138 @@ class YooMarketAPI:
         """Take an ad off sale — POST /ads/{ad_id}/unpublish."""
         return await self._post(f"/ads/{ad_id}/unpublish")
 
-    async def restore_all_ads(self) -> tuple[int, str]:
-        """Restore all inactive/sold ads. Returns (count, message)."""
+    # Statuses that mean "was on sale, is not now" — the ones worth restoring.
+    # Deliberately excludes moderate/draft (on their way up already) and
+    # blocked/fraud (a republish would be refused and the block is not ours to
+    # undo).
+    _DOWN = ("inactive", "sold", "expired", "archived", "disabled", "closed",
+             "hidden", "not_active", "paused", "stopped", "cancelled",
+             "canceled", "finished", "ended")
+    _NEVER = ("blocked", "banned", "fraud", "moderate", "moderation", "draft",
+              "deleted", "removed", "active", "published")
+
+    @staticmethod
+    def _ad_state(ad: dict) -> str:
+        # First key that actually carries a value: get(k, fallback) returns
+        # None for a key that is present but empty, and the fallback never
+        # gets its turn — an ad described only by is_active read as "none".
+        raw = None
+        for key in ("status", "state", "is_active"):
+            if ad.get(key) is not None:
+                raw = ad[key]
+                break
+        if isinstance(raw, bool):
+            return "inactive" if not raw else "active"
+        if isinstance(raw, (int, float)):
+            return "inactive" if raw == 0 else "active"
+        return str(raw or "").lower()
+
+    async def ad_stock(self, ad_id: int | str,
+                       ad: dict | None = None) -> tuple[bool, str]:
+        """How much an ad has left to sell. Returns (has_stock, note).
+
+        Republishing something sold out is the one thing restore must not do:
+        the marketplace refuses it, and on a schedule that turns into the same
+        rejection every hour forever. On any error this answers True — a check
+        that cannot run must not block the action it was meant to inform.
+        """
+        try:
+            if ad is None:
+                ad = await self.get_ad(ad_id)
+            inner = ad.get("data") or ad
+            kind = str(inner.get("type") or "")
+
+            if kind == "auto-delivery":
+                data = await self.get_ad_items(ad_id)
+                rows = data.get("data") or data.get("items") or []
+                free = [r for r in rows
+                        if str((r or {}).get("status", "available")) == "available"]
+                return bool(free), f"позиций в наличии: {len(free)}"
+
+            if kind == "auto-value":
+                val = await self.get_ad_value(ad_id)
+                stock = (val.get("data") or val).get("stock")
+                return bool(stock), f"остаток: {stock}"
+
+            stock = inner.get("stock")
+            if stock is None:
+                return True, ""
+            return bool(stock), f"остаток: {stock}"
+        except Exception as e:
+            logger.info("stock check skipped for %s: %s", ad_id, e)
+            return True, ""
+
+    async def restore_ads(self, *, require_stock: bool = True,
+                          skip_ids=(), limit: int = 0,
+                          dry_run: bool = False) -> dict:
+        """Put ads that went down back on sale.
+
+        Returns a report rather than a count and a string, so the caller can
+        say which ads went back up, which had nothing to sell, and which the
+        marketplace refused — three outcomes that used to collapse into one
+        number and the last error message.
+        """
         data = await self.get_ads()
-        ads = data.get("data") or data.get("items") or []
-        # Deliberately excludes "moderate" and "draft": those are ads on their
-        # way to being published, not ones taken down.
-        _DEAD = ("inactive", "sold", "expired", "archived", "disabled",
-                 "closed", "hidden", "not_active", "paused", "stopped")
+        ads = [a for a in (data.get("data") or data.get("items") or [])
+               if isinstance(a, dict)]
+        skip = {str(i) for i in (skip_ids or ())}
 
-        def _is_dead(ad: dict) -> bool:
-            raw = ad.get("status", ad.get("state", ad.get("is_active")))
-            if isinstance(raw, bool):
-                return not raw          # is_active=False means it needs restoring
-            if isinstance(raw, (int, float)):
-                return raw == 0
-            return str(raw).lower() in _DEAD
+        report = {"restored": [], "no_stock": [], "failed": [], "skipped": 0,
+                  "statuses": sorted({self._ad_state(a) for a in ads}),
+                  "total": len(ads), "dry_run": dry_run}
 
-        inactive = [ad for ad in ads if _is_dead(ad)]
-        if not inactive:
-            # Report the statuses actually seen: the list above is a guess, and
-            # a silent "nothing to do" would hide an unrecognised value.
-            seen = sorted({
-                str(ad.get("status", ad.get("state", ad.get("is_active", "?"))))
-                for ad in ads
-            })
-            logger.info("restore_all_ads: no dead ads; statuses seen: %s", seen)
-            return 0, (f"ℹ️ Нет товаров для восстановления "
-                       f"(статусы объявлений: {', '.join(seen[:8])})")
-        count = 0
-        last_err = ""
-        for ad in inactive:
-            ad_id = ad.get("id")
-            if not ad_id:
+        candidates = []
+        for ad in ads:
+            aid = ad.get("id")
+            if not aid:
                 continue
+            if str(aid) in skip:
+                report["skipped"] += 1     # deleted in the panel, still listed
+                continue
+            state = self._ad_state(ad)
+            if state in self._NEVER or state not in self._DOWN:
+                continue
+            candidates.append(ad)
+
+        report["candidates"] = len(candidates)
+        if limit:
+            candidates = candidates[:limit]
+
+        for ad in candidates:
+            aid = ad.get("id")
+            title = str(ad.get("title") or ad.get("name") or f"#{aid}")
+            row = {"id": str(aid), "title": title,
+                   "status": self._ad_state(ad)}
+
+            if require_stock:
+                has, note = await self.ad_stock(aid, ad)
+                if not has:
+                    report["no_stock"].append({**row, "note": note})
+                    continue
+
+            if dry_run:
+                report["restored"].append(row)
+                continue
+
             try:
-                await self.restore_ad(ad_id)
-                count += 1
-            except RuntimeError as e:
-                last_err = str(e)
-        if count:
-            return count, f"✅ Восстановлено: {count}"
-        return 0, f"⚠️ API не поддерживает восстановление ({last_err})"
+                await self.restore_ad(aid)
+                report["restored"].append(row)
+            except Exception as e:
+                report["failed"].append({**row, "reason": str(e)[:160]})
+        return report
+
+    async def restore_all_ads(self) -> tuple[int, str]:
+        """Backwards-compatible wrapper around restore_ads()."""
+        rep = await self.restore_ads()
+        n = len(rep["restored"])
+        if n:
+            return n, f"✅ Восстановлено: {n}"
+        if rep["no_stock"]:
+            return 0, f"ℹ️ Нечего восстанавливать: {len(rep['no_stock'])} без остатков"
+        if rep["failed"]:
+            return 0, f"⚠️ Не удалось: {rep['failed'][0]['reason']}"
+        return 0, (f"ℹ️ Нет товаров для восстановления "
+                   f"(статусы: {', '.join(rep['statuses'][:8])})")
 
     async def get_balance(self) -> tuple[float, str]:
         """Get current balance. Returns (amount_float, formatted_string)."""

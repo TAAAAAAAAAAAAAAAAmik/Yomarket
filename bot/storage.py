@@ -66,7 +66,17 @@ _DEFAULT_SETTINGS = {
         "on_refunded": {"enabled": False, "message": "↩️ Возврат оформлен. Ожидайте 1-3 дня."},
     },
     "auto_rules": [],  # [{"keyword": "Roblox", "message": "🎮 Робуксы отправим в течение 15 минут!"}]
-    "auto_restore": {"enabled": False},
+    "auto_restore": {
+        "enabled": False,
+        "interval_hours": 1,     # раньше крутилось каждые 30 минут без паузы
+        "require_stock": True,   # не публиковать распроданное
+        "last_restore_run": 0,
+        "restored_total": 0,
+        # {ad_id: {"tries": n, "until": ts, "reason": str}} — объявление,
+        # которое маркетплейс отверг, не долбится каждый час
+        "failures": {},
+        "last_result": "",
+    },
     "auto_bump": {"enabled": False, "interval_hours": 24},
     "auto_withdraw": {"enabled": False, "min_amount": 500},
     "responders": {},  # {"GameName": "message text"} - keyed by ad title/name
