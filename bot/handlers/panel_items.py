@@ -181,15 +181,77 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
     await callback.answer()
 
 
+_TYPE_LABELS = {
+    "simple": "Ограниченная выдача",
+    "unlimited": "Безлимитная",
+    "auto-delivery": "Авто-выдача",
+    "auto-value": "Авто-выбор",
+}
+_STATUS_TEXT = {
+    "active": "🟢 активен", "published": "🟢 опубликован",
+    "moderate": "🕓 на модерации", "moderation": "🕓 на модерации",
+    "draft": "📝 черновик", "inactive": "🔴 неактивен",
+    "hidden": "🙈 скрыт", "sold": "💤 продан", "archived": "📦 в архиве",
+    "fraud": "⛔ заблокирован",
+}
+
+
 @router.callback_query(F.data.startswith("pitem:"))
-async def item_detail(callback: CallbackQuery, state: FSMContext) -> None:
+async def item_detail(callback: CallbackQuery, state: FSMContext,
+                      api: YooMarketAPI) -> None:
+    """Show the listing itself, not just its id.
+
+    Everything here comes from GET /ads/{id}; without it the screen was a bare
+    "Товар #219206" with buttons, which tells the seller nothing.
+    """
     await state.clear()  # "Отмена" из ввода цены/названия ведёт сюда
     item_id = callback.data.split(":", 1)[1]
-    await callback.message.edit_text(
-        f"🛠 <b>Товар #{item_id}</b>\n\nВыберите действие:",
-        reply_markup=_item_kb(item_id),
-    )
     await callback.answer()
+
+    text = f"🛠 <b>Товар #{item_id}</b>"
+    if api:
+        try:
+            ad = await api.get_ad(item_id)
+            ad = ad.get("data") or ad
+            title = str(ad.get("title") or f"Товар #{item_id}")
+            price = _ad_price(ad)
+            stock = ad.get("stock")
+            status = _STATUS_TEXT.get(str(ad.get("status", "")).lower(),
+                                      str(ad.get("status") or "—"))
+            kind = _TYPE_LABELS.get(str(ad.get("type", "")),
+                                    str(ad.get("type") or "—"))
+            lines = [
+                f"📦 <b>{title}</b>",
+                "",
+                f"💰 Цена: <b>{price} ₽</b>",
+                f"📊 Статус: {status}",
+                f"⚙️ Тип: {kind}",
+            ]
+            if stock is not None:
+                lines.append(f"📥 Остаток: <b>{stock}</b>")
+            if ad.get("views") is not None:
+                lines.append(f"👁 Просмотров: {ad['views']}")
+            lines.append(f"\n<code>#{item_id}</code>")
+            text = "\n".join(lines)
+        except Exception as e:
+            logger.info("get_ad(%s) failed: %s", item_id, e)
+            text = (f"🛠 <b>Товар #{item_id}</b>\n\n"
+                    f"<i>Детали не загрузились: {str(e)[:120]}</i>")
+
+    await _safe_edit_item(callback, text, _item_kb(item_id))
+
+
+async def _safe_edit_item(callback: CallbackQuery, text: str, markup) -> None:
+    """Edit, or send a fresh message when the old one cannot be edited
+    (a photo message, or identical text)."""
+    try:
+        await callback.message.edit_text(text, reply_markup=markup)
+    except Exception as e:
+        logger.info("item edit failed (%s), sending new", e)
+        try:
+            await callback.message.answer(text, reply_markup=markup)
+        except Exception:
+            logger.exception("item message could not be sent")
 
 
 # ── Цена / Название ─────────────────────────────────────────────────────────
