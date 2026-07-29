@@ -1093,14 +1093,21 @@ def _find_url(node) -> str:
     return ""
 
 
-def _action_result(resp, fallback: str) -> str:
-    """What a Nova action answered, in words.
+# Nova answers a refused action with HTTP 200 and the reason in the body, so
+# the status code says nothing about whether anything happened.
+_REFUSAL_KWS = (
+    "нет прав", "не авторизов", "запрещ", "недоступ", "не удалось",
+    "невозможно", "ошибк", "not authorized", "not allowed", "sorry",
+)
 
-    «Премиум» is paid through an external payment system, so a successful call
-    means an invoice was created — the answer carries a link to it, and dropping
-    that link would leave the purchase half-done and invisible. When no link can
-    be found, the answer itself is shown: it is the only thing that can say what
-    the panel did instead.
+
+def _action_result(resp, fallback: str) -> tuple[bool, str]:
+    """Whether a Nova action actually did anything, and what it said.
+
+    «Премиум» is paid through an external payment system, so a real success
+    means an invoice was created and the answer carries a link to it. A refusal
+    arrives as 200 too — under `danger`, or as a message that plainly says no —
+    and must not be reported as a promotion that went through.
     """
     raw = (resp.text or "").strip()
     try:
@@ -1113,18 +1120,25 @@ def _action_result(resp, fallback: str) -> str:
         m = _URL_RE.search(raw)
         url = m.group(0) if m else ""
 
-    text = ""
+    text, refused = "", False
     if isinstance(data, dict):
-        text = str(data.get("message") or data.get("danger") or "")
+        if data.get("danger"):
+            text, refused = str(data["danger"]), True
+        else:
+            text = str(data.get("message") or "")
+    if not refused and text and any(k in text.lower() for k in _REFUSAL_KWS):
+        refused = True
 
+    if refused:
+        return False, text
     if url:
-        return f"{text or fallback}\n🔗 Оплата: {url}"
+        return True, f"{text or fallback}\n🔗 Оплата: {url}"
     if text:
-        return text
+        return True, text
     # No link, no message: report what came back, otherwise a promotion that
     # quietly did nothing looks identical to one that worked.
     body = raw[:250] if raw else f"пустой ответ, код {resp.status_code}"
-    return f"{fallback}\nОтвет панели: {body}"
+    return False, f"панель ничего не вернула. Ответ: {body}"
 
 
 def panel_bump_item_sync(
@@ -1214,7 +1228,7 @@ def panel_bump_item_sync(
             trace.append(f"action {key}: {resp.status_code}")
             if resp.status_code in (200, 201, 204):
                 _save_refreshed_cookies(uid, cookie_string, session)
-                return True, _action_result(resp, str(a.get("name") or key))
+                return _action_result(resp, str(a.get("name") or key))
             if resp.status_code in (402, 422, 500):
                 try:
                     msg = (_json.loads(resp.text) or {}).get("message") or ""
@@ -1266,6 +1280,7 @@ def panel_bump_all_sync(
         return 0, "ℹ️ Нет объявлений"
 
     count = 0
+    refused = 0
     last = ""
     links: list[str] = []
     for it in items:
@@ -1285,18 +1300,28 @@ def panel_bump_all_sync(
                     links.append(f"{it.get('title') or item_id}: {line.strip()}")
         else:
             last = msg
-            # A missing action will be missing for every item — stop early
-            # instead of repeating the same failure for the whole list.
+            # Nova authorizes an action per record, so a refusal on one listing
+            # says nothing about the next — those are counted and skipped. Only
+            # a fault that will repeat for every item stops the run.
+            if "нет прав" in msg.lower() or "не авторизов" in msg.lower():
+                refused += 1
+                continue
             if any(k in msg for k in ("не найдено", "401", "подтвержд",
                                       "требует", "тариф", "не хватает")):
                 break
     if count:
         out = f"✅ Оформлено: {count}"
-        if last:
+        if refused:
+            out += f"\n⛔ Панель отказала по {refused} объявлениям"
+        if last and not refused:
             out += f"\n{last}"
         if links:
             out += "\n\n" + "\n".join(links[:10])
         return count, out
+    if refused:
+        return 0, (f"⛔ Панель отказала по всем {refused} объявлениям: {last}\n"
+                   f"Похоже, действие доступно не для любого состояния "
+                   f"объявления — проверьте на активном.")
     return 0, f"⚠️ Не удалось поднять: {last}"
 
 

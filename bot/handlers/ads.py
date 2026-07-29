@@ -211,8 +211,16 @@ async def bump_ad_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
                 callback.from_user.id, True, params),
             timeout=60,
         )
-        await callback.message.edit_text(
-            f"✅ Продвинуто: {msg}" if ok else f"❌ {msg[:300]}")
+        if ok:
+            await callback.message.edit_text(f"✅ {msg[:600]}")
+        else:
+            hint = ""
+            if "нет прав" in msg.lower():
+                # Nova authorizes per record, so this is about this listing
+                hint = ("\n\nПанель отказала именно для этого объявления. "
+                        "Продвижение может быть недоступно для его текущего "
+                        "состояния — попробуйте на активном.")
+            await callback.message.edit_text(f"⛔ {msg[:400]}{hint}")
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {str(e)[:200]}")
 
