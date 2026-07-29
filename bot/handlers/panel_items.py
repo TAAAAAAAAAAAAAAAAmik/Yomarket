@@ -181,6 +181,25 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
     await callback.answer()
 
 
+def _item_kb(item_id: str):
+    b = InlineKeyboardBuilder()
+    b.button(text="✏️ Цена", callback_data=f"pitem_price:{item_id}")
+    b.button(text="✏️ Название", callback_data=f"pitem_title:{item_id}")
+    b.button(text="📦 Остатки", callback_data=f"pitem_stock:{item_id}")
+    b.button(text="🌍 Показать", callback_data=f"pitem_show:{item_id}")
+    b.button(text="🙈 Скрыть", callback_data=f"pitem_hide:{item_id}")
+    b.button(text="🗑 Удалить", callback_data=f"pitem_del:{item_id}")
+    b.button(text="⬅️ К товарам", callback_data="pitems:list")
+    b.adjust(2, 2, 2, 1)
+    return b.as_markup()
+
+
+@router.callback_query(F.data == "pitems:list")
+async def list_items(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    """Flat list of every listing — same view as «Все товары»."""
+    await _render_ads(callback, api, category=None)
+
+
 _TYPE_LABELS = {
     "simple": "Ограниченная выдача",
     "unlimited": "Безлимитная",
