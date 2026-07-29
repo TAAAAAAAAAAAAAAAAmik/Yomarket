@@ -1048,6 +1048,12 @@ class TaskManager:
                         f"— их публиковать нечем")
             for row in rep["no_stock"][:5]:
                 body.append(f"   • {_esc(row['title'])[:34]} — {_esc(row.get('note'))}")
+        if rep.get("unknown"):
+            body.append("")
+            body.append(f"❔ Незнакомый статус у <b>{len(rep['unknown'])}</b> "
+                        f"— не трогал: "
+                        + ", ".join(sorted({_esc(r["status"])
+                                            for r in rep["unknown"]})[:6]))
         if fresh_failures:
             body.append("")
             body.append(f"⛔ Маркетплейс отказал: <b>{len(fresh_failures)}</b>")

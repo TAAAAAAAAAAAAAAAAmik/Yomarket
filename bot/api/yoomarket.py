@@ -105,9 +105,14 @@ class YooMarketAPI:
     # Deliberately excludes moderate/draft (on their way up already) and
     # blocked/fraud (a republish would be refused and the block is not ours to
     # undo).
-    _DOWN = ("inactive", "sold", "expired", "archived", "disabled", "closed",
-             "hidden", "not_active", "paused", "stopped", "cancelled",
-             "canceled", "finished", "ended")
+    # "unpublish" is what this marketplace actually reports for an ad taken off
+    # sale — it is the state POST /ads/{id}/unpublish leaves behind, and the one
+    # POST /ads/{id}/publish undoes. It was missing, so the very ads restore
+    # exists for were the ones it ignored.
+    _DOWN = ("unpublish", "unpublished", "unpublic", "inactive", "sold",
+             "expired", "archived", "disabled", "closed", "hidden",
+             "not_active", "paused", "stopped", "cancelled", "canceled",
+             "finished", "ended")
     _NEVER = ("blocked", "banned", "fraud", "moderate", "moderation", "draft",
               "deleted", "removed", "active", "published")
 
@@ -178,6 +183,7 @@ class YooMarketAPI:
         skip = {str(i) for i in (skip_ids or ())}
 
         report = {"restored": [], "no_stock": [], "failed": [], "skipped": 0,
+                  "unknown": [],
                   "statuses": sorted({self._ad_state(a) for a in ads}),
                   "total": len(ads), "dry_run": dry_run}
 
@@ -190,7 +196,16 @@ class YooMarketAPI:
                 report["skipped"] += 1     # deleted in the panel, still listed
                 continue
             state = self._ad_state(ad)
-            if state in self._NEVER or state not in self._DOWN:
+            if state in self._NEVER:
+                continue
+            if state not in self._DOWN:
+                # A status belonging to neither list is not silently dropped.
+                # That is exactly how «unpublish» went unnoticed: the run simply
+                # reported nothing to do and gave no reason.
+                report["unknown"].append(
+                    {"id": str(aid),
+                     "title": str(ad.get("title") or ad.get("name") or f"#{aid}"),
+                     "status": state})
                 continue
             candidates.append(ad)
 

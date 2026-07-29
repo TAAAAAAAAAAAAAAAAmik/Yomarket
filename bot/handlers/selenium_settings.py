@@ -672,6 +672,15 @@ async def restore_preview(callback: CallbackQuery, api: YooMarketAPI) -> None:
         body.append(f"📦 Пропущу без остатков: <b>{len(rep['no_stock'])}</b>")
         for row in rep["no_stock"][:8]:
             body.append(f"   • {_esc(row['title'])[:32]} — {_esc(row.get('note'))}")
+    if rep.get("unknown"):
+        body.append("")
+        body.append(f"❔ Незнакомый статус: <b>{len(rep['unknown'])}</b> "
+                    f"— не трогаю, пока не ясно, что он значит")
+        for row in rep["unknown"][:8]:
+            body.append(f"   • {_esc(row['title'])[:32]} — "
+                        f"<code>{_esc(row['status'])}</code>")
+        body.append("<i>Пришлите мне этот статус, если такие объявления "
+                    "должны восстанавливаться.</i>")
     body.append("")
     body.append(f"<i>Статусы в аккаунте: {_esc(', '.join(rep['statuses'][:10]))}</i>")
 
@@ -728,6 +737,13 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
             parts.append(f"⛔ Отказано: <b>{len(rep['failed'])}</b>")
             for row in rep["failed"][:6]:
                 parts.append(f"   • {_esc(row['title'])[:30]}: {_esc(row['reason'])[:80]}")
+        if rep.get("unknown"):
+            parts.append("")
+            parts.append(f"❔ Незнакомый статус, не трогал: "
+                         f"<b>{len(rep['unknown'])}</b>")
+            for row in rep["unknown"][:5]:
+                parts.append(f"   • {_esc(row['title'])[:30]} — "
+                             f"<code>{_esc(row['status'])}</code>")
         if not rep["restored"] and not rep["no_stock"] and not rep["failed"]:
             parts = ["Нечего восстанавливать — все объявления на месте.",
                      f"<i>Статусы: {_esc(', '.join(rep['statuses'][:10]))}</i>"]
