@@ -719,7 +719,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
             except Exception as e:
                 pub_ok, pub_msg = False, f"ошибка: {str(e)[:80]}"
             if pub_ok:
-                pub_note = f"\n🌍 Опубликован ({pub_msg})"
+                pub_note = f"\n🕓 Отправлен на модерацию ({pub_msg})"
             else:
                 # A fresh listing usually has nothing to sell yet, and the
                 # marketplace refuses to publish an empty one — say what to do
@@ -730,10 +730,10 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
                 )
 
         b = InlineKeyboardBuilder()
-        if item_id and "Опубликован" not in pub_note:
+        if item_id and "модерац" not in pub_note:
             b.button(text="📦 Добавить остатки",
                      callback_data=f"pitem_stock:{item_id}")
-            b.button(text="🌍 Опубликовать",
+            b.button(text="🚀 На модерацию",
                      callback_data=f"cadpub:{item_id}")
         b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
         b.button(text="📦 Мои товары", callback_data="menu:ads")
@@ -804,7 +804,8 @@ async def publish_item(callback: CallbackQuery) -> None:
     b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
     b.button(text="📦 Мои товары", callback_data="menu:ads")
     b.adjust(1)
-    result = (f"🌍 <b>Товар {item_id} опубликован</b> ({msg_text})" if ok
+    result = (f"🕓 <b>Товар {item_id} отправлен на модерацию</b> ({msg_text})"
+              f"\nПоявится в маркете после проверки." if ok
               else f"⚠️ <b>Не удалось опубликовать товар {item_id}</b>\n\n{msg_text}")
     try:
         await callback.message.edit_text(result, reply_markup=b.as_markup())

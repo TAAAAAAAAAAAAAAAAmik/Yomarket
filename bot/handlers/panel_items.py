@@ -186,7 +186,7 @@ def _item_kb(item_id: str):
     b.button(text="✏️ Цена", callback_data=f"pitem_price:{item_id}")
     b.button(text="✏️ Название", callback_data=f"pitem_title:{item_id}")
     b.button(text="📦 Остатки", callback_data=f"pitem_stock:{item_id}")
-    b.button(text="🌍 Показать", callback_data=f"pitem_show:{item_id}")
+    b.button(text="🚀 На модерацию", callback_data=f"pitem_show:{item_id}")
     b.button(text="🙈 Скрыть", callback_data=f"pitem_hide:{item_id}")
     b.button(text="🗑 Удалить", callback_data=f"pitem_del:{item_id}")
     b.button(text="⬅️ К товарам", callback_data="pitems:list")
@@ -429,9 +429,15 @@ async def _toggle(callback: CallbackQuery, public: bool,
 
     await callback.answer("⏳ Выполняю...")
     result, err = await _run(uid, panel_publish_item_sync, item_id, uid, public)
-    verb = "показан" if public else "скрыт"
     if result and result[0]:
-        text = f"✅ Товар #{item_id} {verb} ({result[1]})"
+        if public:
+            # Publishing does not put the ad on sale — it queues it for review,
+            # and it goes live only once that passes.
+            text = (f"✅ Товар #{item_id} отправлен на модерацию "
+                    f"({result[1]})\n\n"
+                    f"🕓 Появится в маркете после проверки.")
+        else:
+            text = f"✅ Товар #{item_id} скрыт ({result[1]})"
     else:
         detail = result[1] if result else err
         text = f"❌ Товар #{item_id}: не удалось.\n\n{detail}"
@@ -487,7 +493,9 @@ async def publish_all_hidden(callback: CallbackQuery, api: YooMarketAPI) -> None
     b.button(text="🔄 К товарам", callback_data="pitems:list")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
     b.adjust(2)
-    text = f"🌍 <b>Публикация завершена</b>\n\n✅ Опубликовано: <b>{ok}</b>"
+    text = (f"🌍 <b>Отправлено на модерацию</b>\n\n"
+            f"✅ Товаров: <b>{ok}</b>\n"
+            f"<i>Появятся в маркете после проверки.</i>")
     if empty:
         text += (f"\n📦 Пропущено без остатков: <b>{len(empty)}</b>"
                  f"\n<i>#{', #'.join(empty[:10])}</i>")
@@ -590,11 +598,13 @@ async def item_stock_save(message: Message, state: FSMContext,
             done = f"добавлено позиций: {len(items)}"
 
         b = InlineKeyboardBuilder()
-        b.button(text="🌍 Опубликовать", callback_data=f"pitem_show:{item_id}")
+        b.button(text="🚀 Отправить на модерацию",
+                 callback_data=f"pitem_show:{item_id}")
         b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
         b.adjust(1)
         await status.edit_text(
-            f"✅ <b>Готово</b> — {done}.\n\nТеперь товар можно публиковать.",
+            f"✅ <b>Готово</b> — {done}.\n\n"
+            f"Теперь товар можно отправить на модерацию.",
             reply_markup=b.as_markup(),
         )
     except Exception as e:
