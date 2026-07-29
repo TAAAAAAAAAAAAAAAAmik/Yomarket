@@ -935,21 +935,39 @@ async def panel_debug(message: Message) -> None:
                 keys = sorted(set(_re.findall(r'"uriKey"\s*:\s*"([^"]+)"', r.text)))
                 out.append(f"{path} → {r.status_code}, ресурсов: {len(keys)}")
                 if keys:
-                    out.append(f"  {keys[:40]}")
+                    out.append("  " + ", ".join(keys))
             except Exception as e:
                 out.append(f"{path}: {str(e)[:80]}")
 
         # Anything chat-shaped is what we are after
-        for guess in ("chats", "messages", "dialogs", "tickets", "support"):
+        # "notifies" is the likeliest home for support and moderation notices
+        for guess in ("notifies", "chats", "messages", "dialogs", "tickets",
+                      "support", "emails"):
             try:
                 r = session.get(f"{PANEL_URL}/nova-api/{guess}",
-                                params={"perPage": "1"}, timeout=(6, 10),
+                                params={"perPage": "2"}, timeout=(6, 10),
                                 allow_redirects=False)
-                if r.status_code != 404:
-                    out.append(f"/nova-api/{guess} → {r.status_code}: "
-                               f"{r.text[:120]}")
-            except Exception:
-                continue
+                if r.status_code == 404:
+                    continue
+                out.append(f"\n/nova-api/{guess} → {r.status_code}")
+                if r.status_code == 200:
+                    rows = (r.json() or {}).get("resources") or []
+                    out.append(f"  записей: {len(rows)}")
+                    if rows:
+                        row = rows[0]
+                        out.append(f"  title: {row.get('title')!r}")
+                        fields = row.get("fields")
+                        if isinstance(fields, dict):
+                            fields = list(fields.values())
+                        for f in (fields or [])[:8]:
+                            if isinstance(f, dict):
+                                val = str(f.get("value"))[:60]
+                                out.append(f"  • {f.get('attribute')} | "
+                                           f"{f.get('name')} = {val}")
+                else:
+                    out.append(f"  {r.text[:120]}")
+            except Exception as e:
+                out.append(f"/nova-api/{guess}: {str(e)[:60]}")
         return "\n".join(out) or "пусто"
 
     status = await message.answer("⏳ Смотрю ресурсы панели...")
