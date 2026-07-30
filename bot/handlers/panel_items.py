@@ -1244,12 +1244,14 @@ async def chat_debug(message: Message) -> None:
         return
     import html as _html
     from automation.panel import panel_chat_probe_sync
+    from storage import get_token
+    api_token = get_token(message.from_user.id) or ""
     status = await message.answer("⏳ Разбираю, как панель шлёт сообщения...")
     try:
         loop = asyncio.get_event_loop()
         _ok, report = await asyncio.wait_for(
             loop.run_in_executor(None, panel_chat_probe_sync,
-                                 creds["cookies"], chat_id),
+                                 creds["cookies"], chat_id, api_token),
             timeout=90)
     except Exception as e:
         report = f"ошибка: {str(e)[:200]}"

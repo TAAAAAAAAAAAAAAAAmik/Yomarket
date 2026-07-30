@@ -1693,12 +1693,16 @@ def _extract_bearer(html: str) -> str:
     return ""
 
 
-def panel_chat_probe_sync(cookie_string: str, chat_id: str) -> tuple[bool, str]:
+def panel_chat_probe_sync(cookie_string: str, chat_id: str,
+                          api_token: str = "") -> tuple[bool, str]:
     """Blocking, read-only: find how the panel sends a chat message.
 
     Sends nothing. Reads the chat page, digs out any Bearer token, tries the
     likely message endpoints with cookies (and with the token if cookies 401),
     and scans the page scripts for the POST route the reply goes to.
+    `api_token` is the Integration API bearer that already reads the chat — it
+    is tried against the panel chat API, since that is the token the SPA is
+    likely storing.
     """
     cid = "".join(ch for ch in str(chat_id) if ch.isdigit()) or str(chat_id)
     session = _make_panel_requests_session(cookie_string)
@@ -1759,6 +1763,31 @@ def panel_chat_probe_sync(cookie_string: str, chat_id: str) -> tuple[bool, str]:
         line = _get(p, stateful)
         if line:
             out.append(line)
+
+    # The Integration bearer that already reads this chat — the likeliest token
+    # the SPA keeps in localStorage. Try it against the panel API and against
+    # the marketplace API host directly.
+    if api_token:
+        out.append("\n— с интеграционным Bearer —")
+        bearer = {**stateful, "Authorization": f"Bearer {api_token}"}
+        for p in (f"/api/chats/{cid}/messages", f"/api/chats/{cid}"):
+            line = _get(p, bearer)
+            if line:
+                out.append(line)
+        import requests as _rq
+        for base in ("https://api.yoo.market", "https://api.yoo.market/v1",
+                     "https://api.yoo.market/app/v1"):
+            for p in (f"/chats/{cid}/messages", f"/chats/{cid}"):
+                try:
+                    rr = _rq.get(base + p, headers={
+                        "Authorization": f"Bearer {api_token}",
+                        "Accept": "application/json"},
+                        timeout=(5, 10), verify=False)
+                except Exception as e:
+                    continue
+                if rr.status_code == 404:
+                    continue
+                out.append(f"{base}{p} → {rr.status_code}: {rr.text[:80].strip()}")
 
     # Scan the main bundles for the chat endpoints and how auth is attached.
     out.append("\n— в JS —")
