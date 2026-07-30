@@ -20,6 +20,8 @@ class WithdrawState(StatesGroup):
     waiting_amount = State()
     waiting_threshold = State()
     waiting_auto_min = State()
+    waiting_req_value = State()      # a requisite field in the panel withdraw wizard
+    waiting_panel_amount = State()   # amount for a manual panel withdrawal
 
 
 def _pick(*sources_and_keys) -> object | None:
@@ -337,9 +339,8 @@ def _auto_text(s: dict) -> str:
     ]
     if method == "panel":
         vals = aw.get("panel_values") or {}
-        lines.append(f"Способ: <b>через панель</b>"
-                     + (f" ({aw.get('panel_resource')})" if aw.get("panel_resource") else ""))
-        lines.append("Настроено полей: " + (str(len(vals)) if vals else "нет"))
+        lines.append("Способ: <b>через панель</b>")
+        lines.append("Реквизиты: " + ("настроены" if vals else "не заданы"))
     else:
         lines.append("Способ: <b>через API</b>")
         lines.append("")
@@ -386,7 +387,9 @@ async def auto_toggle(callback: CallbackQuery) -> None:
             "Сначала настройте вывод через панель — через API Юмаркет вывод "
             "не поддерживает.", show_alert=True)
         return
-    if turning_on and not (aw.get("panel_resource") and aw.get("panel_values")):
+    if turning_on and not (aw.get("panel_balance_id")
+                           and aw.get("panel_action_key")
+                           and aw.get("panel_values")):
         await callback.answer("Сначала настройте способ вывода", show_alert=True)
         return
     aw["enabled"] = turning_on
@@ -428,27 +431,354 @@ async def auto_min_save(message: Message, state: FSMContext) -> None:
     await message.answer(_auto_text(s), reply_markup=_auto_kb(s))
 
 
-@router.callback_query(F.data == "balance:auto_setup")
-async def auto_setup(callback: CallbackQuery) -> None:
-    """Guide to capturing the real withdrawal request before wiring it.
+def _mask(value: str) -> str:
+    """Show requisites as •••• 1234 — enough to recognise, not to leak."""
+    v = str(value or "")
+    digits = "".join(ch for ch in v if ch.isdigit())
+    if len(digits) >= 4:
+        return "•••• " + digits[-4:]
+    return v[:2] + "…" if len(v) > 3 else v
 
-    Withdrawal moves money and its panel shape is unknown, so it is discovered
-    first (/withdraw_debug) rather than guessed. The wizard that fills the fields
-    is added once that structure is known — building it against an imagined form
-    would be building a broken money-mover.
-    """
+
+async def _run_panel(uid, fn, *args):
+    import asyncio
+    from storage import get_panel_creds
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
+        return None, "нужен вход в панель продавца"
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, fn, creds["cookies"], *args),
+            timeout=60), ""
+    except Exception as e:
+        return None, str(e)[:150]
+
+
+@router.callback_query(F.data == "balance:auto_setup")
+async def auto_setup(callback: CallbackQuery, state: FSMContext) -> None:
+    """Start the withdrawal wizard: pick a balance to withdraw from."""
+    from automation.panel import panel_balances_sync
+    await state.clear()
+    await callback.answer("⏳")
+    await callback.message.edit_text("⏳ Читаю счета из панели...")
+    res, err = await _run_panel(callback.from_user.id, panel_balances_sync)
+    ok = isinstance(res, list)
+    if not ok:
+        b = InlineKeyboardBuilder()
+        b.button(text="⬅️ Назад", callback_data="balance:auto")
+        await callback.message.edit_text(
+            f"❌ Не удалось прочитать счета: {_esc(err or res)}",
+            reply_markup=b.as_markup())
+        return
+    await state.update_data(wd_balances=res)
     b = InlineKeyboardBuilder()
+    for i, bl in enumerate(res):
+        cur = (bl.get("currency") or "").split("  ")[0][:28]
+        b.button(text=f"💳 {cur} · {bl.get('amount') or '—'}",
+                 callback_data=f"wd:bal:{i}")
     b.button(text="⬅️ Назад", callback_data="balance:auto")
+    b.adjust(1)
     await callback.message.edit_text(
         "⚙️ <b>Вывод через панель</b>\n\n"
-        "Вывод средств на Юмаркете — операция панели, а не API, и её точную "
-        "форму (сумма, способ, реквизиты) нельзя угадывать — это ваши деньги.\n\n"
-        "Отправьте команду <code>/withdraw_debug</code> — бот прочитает из "
-        "панели, где живёт вывод и какие у него поля, и пришлёт это сюда.\n\n"
-        "По ответу я подключу точный запрос вывода с выбором способа и "
-        "подтверждением — так же, как сделали продвижение.",
+        "С какого счёта выводить? Обычно это <b>Баланс Магазина</b> "
+        "(счёт для продаж).",
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("wd:bal:"))
+async def wd_pick_balance(callback: CallbackQuery, state: FSMContext) -> None:
+    from automation.panel import panel_withdraw_fields_sync
+    data = await state.get_data()
+    balances = data.get("wd_balances") or []
+    try:
+        bl = balances[int(callback.data.split(":")[-1])]
+    except (ValueError, IndexError):
+        await callback.answer("Список устарел, начните заново", show_alert=True)
+        return
+    await callback.answer("⏳")
+    await callback.message.edit_text("⏳ Читаю форму вывода...")
+    res, err = await _run_panel(callback.from_user.id,
+                                panel_withdraw_fields_sync, bl["id"])
+    if not isinstance(res, dict):
+        await callback.message.edit_text(
+            f"❌ {_esc(err or res)}",
+            reply_markup=_one_btn("⬅️ Назад", "balance:auto"))
+        return
+    sys_field = next((f for f in res["fields"] if f["attribute"] == "system"), None)
+    if not sys_field or not sys_field["options"]:
+        await callback.message.edit_text(
+            "❌ Панель не отдала список способов вывода. Возможно, вывод "
+            "закрыт, пока профиль не прошёл проверку.",
+            reply_markup=_one_btn("⬅️ Назад", "balance:auto"))
+        return
+    await state.update_data(wd_balance_id=bl["id"], wd_action=res["key"],
+                            wd_systems=sys_field["options"], wd_values={})
+    b = InlineKeyboardBuilder()
+    for i, o in enumerate(sys_field["options"][:20]):
+        b.button(text=str(o["label"])[:40], callback_data=f"wd:sys:{i}")
+    b.button(text="❌ Отмена", callback_data="balance:auto")
+    b.adjust(1)
+    await callback.message.edit_text(
+        "💸 <b>Способ вывода</b>\n\n"
+        "Выберите, куда выводить средства:",
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("wd:sys:"))
+async def wd_pick_system(callback: CallbackQuery, state: FSMContext) -> None:
+    from automation.panel import panel_withdraw_fields_sync
+    data = await state.get_data()
+    systems = data.get("wd_systems") or []
+    try:
+        sysopt = systems[int(callback.data.split(":")[-1])]
+    except (ValueError, IndexError):
+        await callback.answer("Начните заново", show_alert=True)
+        return
+    await callback.answer(str(sysopt["label"])[:60])
+    await callback.message.edit_text("⏳ Уточняю, какие нужны реквизиты...")
+    # Re-read the form with the system chosen — the panel then marks the
+    # requisites that method needs as visible.
+    res, err = await _run_panel(callback.from_user.id,
+                                panel_withdraw_fields_sync,
+                                data["wd_balance_id"], {"system": sysopt["value"]})
+    reqs = []
+    if isinstance(res, dict):
+        for f in res["fields"]:
+            if (f["visible"] and not f["skip"] and not f["is_amount"]
+                    and f["attribute"] != "system"):
+                reqs.append(f)
+    if not reqs:
+        # Fallback map if the re-read did not reshape visibility
+        reqs = _fallback_reqs(str(sysopt["label"]), res)
+    values = {"system": sysopt["value"]}
+    await state.update_data(wd_values=values, wd_system_label=str(sysopt["label"]),
+                            wd_queue=reqs, wd_qi=0)
+    await _wd_ask_next(callback.message, state)
+
+
+def _fallback_reqs(system_label: str, res) -> list:
+    """If Nova did not reshape the form, ask for the requisites the chosen
+    method obviously needs, by its own field labels."""
+    lab = system_label.lower()
+    fields = {f["attribute"]: f for f in (res.get("fields") if isinstance(res, dict) else [])}
+    want: list[str] = []
+    if "карт" in lab or "card" in lab:
+        want = ["card"]
+    elif "steam" in lab:
+        want = ["steam_wallet"]
+    elif "сбп" in lab or "sbp" in lab:
+        want = ["bank_id", "phone"]
+    elif any(t in lab for t in ("usdt", "trc", "крипт", "crypto")):
+        want = ["wallet"]
+    return [fields[a] for a in want if a in fields]
+
+
+async def _wd_ask_next(message, state: FSMContext) -> None:
+    data = await state.get_data()
+    queue = data.get("wd_queue") or []
+    qi = data.get("wd_qi", 0)
+    # Skip past any field already answered
+    while qi < len(queue) and queue[qi]["attribute"] in (data.get("wd_values") or {}):
+        qi += 1
+    if qi >= len(queue):
+        await _wd_finish(message, state)
+        return
+    f = queue[qi]
+    await state.update_data(wd_qi=qi)
+    label = _esc(f["label"])
+    hint = f"\n<i>{_esc(f['help'])}</i>" if f.get("help") else ""
+    if f["options"]:
+        b = InlineKeyboardBuilder()
+        for i, o in enumerate(f["options"][:30]):
+            b.button(text=str(o["label"])[:40], callback_data=f"wd:opt:{i}")
+        if not f["required"]:
+            b.button(text="⏭ Пропустить", callback_data="wd:skip")
+        b.button(text="❌ Отмена", callback_data="balance:auto")
+        b.adjust(1)
+        await message.edit_text(
+            f"💳 <b>{label}</b>{hint}\n\nВыберите:", reply_markup=b.as_markup())
+    else:
+        await state.set_state(WithdrawState.waiting_req_value)
+        b = InlineKeyboardBuilder()
+        if not f["required"]:
+            b.button(text="⏭ Пропустить", callback_data="wd:skip")
+        b.button(text="❌ Отмена", callback_data="balance:auto")
+        b.adjust(1)
+        ph = f.get("placeholder")
+        await message.edit_text(
+            f"✍️ <b>{label}</b>{hint}\n\n"
+            f"Пришлите значение{f' ({_esc(ph)})' if ph else ''}:",
+            reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("wd:opt:"))
+async def wd_pick_option(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    queue = data.get("wd_queue") or []
+    qi = data.get("wd_qi", 0)
+    if qi >= len(queue):
+        await callback.answer("Начните заново", show_alert=True)
+        return
+    f = queue[qi]
+    try:
+        o = f["options"][int(callback.data.split(":")[-1])]
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка выбора", show_alert=True)
+        return
+    values = dict(data.get("wd_values") or {})
+    values[f["attribute"]] = o["value"]
+    await callback.answer(str(o["label"])[:40])
+    await state.update_data(wd_values=values, wd_qi=qi + 1)
+    await _wd_ask_next(callback.message, state)
+
+
+@router.callback_query(F.data == "wd:skip")
+async def wd_skip(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.set_state(None)
+    await callback.answer("Пропущено")
+    await state.update_data(wd_qi=data.get("wd_qi", 0) + 1)
+    await _wd_ask_next(callback.message, state)
+
+
+@router.message(WithdrawState.waiting_req_value)
+async def wd_req_value(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    queue = data.get("wd_queue") or []
+    qi = data.get("wd_qi", 0)
+    if qi >= len(queue):
+        await state.clear()
+        await message.answer("Начните заново: «Настроить вывод».")
+        return
+    f = queue[qi]
+    raw = (message.text or "").strip()
+    if not raw:
+        await message.answer("❌ Пришлите значение или нажмите «Пропустить».")
+        return
+    # Number fields carry only digits; keep text ones as typed
+    if str(f.get("component", "")).startswith("number") or f.get("attribute") in (
+            "card", "phone", "link_id"):
+        cleaned = "".join(ch for ch in raw if ch.isdigit())
+        val = cleaned or raw
+    else:
+        val = raw
+    values = dict(data.get("wd_values") or {})
+    values[f["attribute"]] = val
+    await state.set_state(None)
+    await state.update_data(wd_values=values, wd_qi=qi + 1)
+    await _wd_ask_next(message, state)
+
+
+async def _wd_finish(message, state: FSMContext) -> None:
+    """Requisites gathered — save the method and show what was configured."""
+    data = await state.get_data()
+    uid = message.chat.id
+    s = get_settings(uid)
+    aw = s.setdefault("auto_withdraw", {})
+    aw["method"] = "panel"
+    aw["panel_balance_id"] = data.get("wd_balance_id", "")
+    aw["panel_action_key"] = data.get("wd_action", "")
+    aw["panel_values"] = data.get("wd_values", {})   # system + requisites, no amount
+    save_settings(uid, s)
+    await state.clear()
+
+    lines = ["✅ <b>Способ вывода сохранён</b>\n",
+             f"Способ: <b>{_esc(data.get('wd_system_label') or '—')}</b>"]
+    for k, v in (data.get("wd_values") or {}).items():
+        if k == "system":
+            continue
+        shown = _mask(v) if k in ("card", "wallet", "phone", "steam_wallet") else _esc(str(v))
+        lines.append(f"• {_esc(k)}: {shown}")
+    lines.append("\nТеперь можно вывести сумму вручную или включить автовывод.")
+    b = InlineKeyboardBuilder()
+    b.button(text="💸 Вывести сейчас", callback_data="wd:manual")
+    b.button(text="🤖 К автовыводу", callback_data="balance:auto")
+    b.button(text="💰 Баланс", callback_data="menu:balance")
+    b.adjust(1, 2)
+    await message.answer("\n".join(lines), reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "wd:manual")
+async def wd_manual_start(callback: CallbackQuery, state: FSMContext) -> None:
+    s = get_settings(callback.from_user.id)
+    aw = s.get("auto_withdraw", {})
+    if not (aw.get("panel_balance_id") and aw.get("panel_values")):
+        await callback.answer("Сначала настройте способ вывода", show_alert=True)
+        return
+    await state.set_state(WithdrawState.waiting_panel_amount)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="balance:auto")
+    await callback.message.edit_text(
+        "💸 <b>Сумма вывода</b>\n\nПришлите сумму в ₽:",
         reply_markup=b.as_markup())
     await callback.answer()
+
+
+@router.message(WithdrawState.waiting_panel_amount)
+async def wd_manual_amount(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        amount = int(float(raw))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите сумму числом, например: <b>500</b>")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    aw = s.get("auto_withdraw", {})
+    label = "выбранным способом"
+    vals = aw.get("panel_values") or {}
+    b = InlineKeyboardBuilder()
+    b.button(text=f"✅ Вывести {amount} ₽", callback_data=f"wd:go:{amount}")
+    b.button(text="❌ Отмена", callback_data="balance:auto")
+    b.adjust(1)
+    masked = ", ".join(
+        f"{k}={_mask(v) if k in ('card','wallet','phone','steam_wallet') else v}"
+        for k, v in vals.items() if k != "system")
+    await message.answer(
+        f"⚠️ <b>Подтвердите вывод</b>\n\n"
+        f"Сумма: <b>{amount} ₽</b>\n"
+        f"Реквизиты: {_esc(masked) or '—'}\n\n"
+        f"Деньги уйдут по авто-выплате. Проверьте реквизиты — ошибку не "
+        f"отменить.",
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("wd:go:"))
+async def wd_execute(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    from automation.panel import panel_withdraw_sync
+    try:
+        amount = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    uid = callback.from_user.id
+    s = get_settings(uid)
+    aw = s.get("auto_withdraw", {})
+    values = {**(aw.get("panel_values") or {}), "amount": amount}
+    await callback.answer("⏳ Оформляю вывод...")
+    await callback.message.edit_text("⏳ Отправляю заявку на вывод...")
+    res, err = await _run_panel(uid, panel_withdraw_sync,
+                                aw.get("panel_balance_id"),
+                                aw.get("panel_action_key"), values, uid, True)
+    ok = isinstance(res, tuple) and res[0]
+    msg = res[1] if isinstance(res, tuple) else (err or "не удалось")
+    _log_withdrawal(uid, float(amount), "manual", bool(ok))
+    b = InlineKeyboardBuilder()
+    b.button(text="📜 История", callback_data="balance:history")
+    b.button(text="💰 Баланс", callback_data="menu:balance")
+    b.adjust(2)
+    await callback.message.edit_text(
+        (f"✅ {_esc(msg)}" if ok else f"❌ {_esc(msg)}"),
+        reply_markup=b.as_markup())
+
+
+def _one_btn(text: str, cb: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text=text, callback_data=cb)
+    return b.as_markup()
 
 
 # ── Активные выводы ─────────────────────────────────────────────────────────

@@ -1415,21 +1415,28 @@ def panel_balances_sync(cookie_string: str) -> tuple[bool, object]:
 
 
 def panel_withdraw_fields_sync(
-    cookie_string: str, balance_id: str,
+    cookie_string: str, balance_id: str, chosen: dict | None = None,
 ) -> tuple[bool, object]:
     """Blocking: describe the «Вывести» action so a payout can be filled in.
 
     Returns (True, {"key", "name", "balance_id", "fields": [...]}) or
-    (False, error). Mirrors the promotion form: each field carries its options,
-    its dependencies and the key Nova needs to resolve a dependent select
-    (payment method / requisites) once earlier choices are made.
+    (False, error). `chosen` (e.g. {"system": 56}) is passed to Nova so the
+    form reshapes to that choice — after a payment system is picked, the
+    requisites it needs (card / wallet / phone / bank) turn visible and
+    required, and a dependent select like «Банк» gains its options. Reading the
+    form again with the choice made is how those become known, rather than
+    hardcoding which method needs what.
     """
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
+    params = {"resources": str(balance_id)}
+    for k, v in (chosen or {}).items():
+        if v not in (None, ""):
+            params[k] = v
     try:
         r = session.get(f"{PANEL_URL}/nova-api/{_BALANCE_RES}/actions",
-                        params={"resources": str(balance_id)},
-                        headers=hdrs, timeout=(6, 10), allow_redirects=False)
+                        params=params, headers=hdrs,
+                        timeout=(6, 10), allow_redirects=False)
     except Exception as e:
         return False, f"не получил действия баланса: {str(e)[:60]}"
     if r.status_code == 401:
@@ -1447,6 +1454,9 @@ def panel_withdraw_fields_sync(
         names = [(x.get("name") or x.get("uriKey") or "?") for x in actions]
         return False, f"действие вывода не найдено. Доступные: {names}"
 
+    # Never submit these: the amount is asked for at withdrawal time, «к
+    # получению» is computed and read-only.
+    _SKIP = ("amount", "к_получению", "к_получения", "to_receive")
     out_fields = []
     for f in (a.get("fields") or []):
         if not isinstance(f, dict):
@@ -1454,22 +1464,23 @@ def panel_withdraw_fields_sync(
         attr = f.get("attribute")
         if not attr:
             continue
-        opts = _normalize_options(f)
+        extra = f.get("extraAttributes") or {}
+        readonly = bool(f.get("readonly") or extra.get("readonly"))
         out_fields.append({
             "attribute": attr,
             "label": f.get("name") or attr,
             "component": f.get("component", ""),
-            "options": opts,
-            # As with «Оплата»: a select with no inline options is still
-            # required server-side, so an empty one is not treated as optional.
-            "required": "required" in str(f.get("rules", "")) or (
-                "select" in str(f.get("component", "")) and not opts),
+            "options": _normalize_options(f),
+            "required": bool(f.get("required")),
+            "visible": bool(f.get("visible")),
+            "readonly": readonly,
             "value": f.get("value"),
-            "lookup": not opts and "select" in str(f.get("component", "")),
+            "placeholder": f.get("placeholder") or "",
+            "help": _strip_html(f.get("helpText")),
+            "is_amount": attr == "amount",
+            "skip": attr in _SKIP or readonly,
             "depends_on": f.get("dependsOn") or {},
             "component_key": f.get("dependentComponentKey") or "",
-            "shape": (f"component={f.get('component')} "
-                      f"keys={sorted(f.keys())[:14]}")[:250],
         })
     return True, {"key": a.get("uriKey"), "name": a.get("name") or "Вывести",
                   "balance_id": str(balance_id), "fields": out_fields}

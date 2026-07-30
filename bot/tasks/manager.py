@@ -1055,11 +1055,9 @@ class TaskManager:
             creds = get_panel_creds(user_id)
             if not creds or not creds.get("cookies"):
                 return "💸 Авто-вывод: нужен вход в панель продавца."
-            # The amount field, whatever it is called, is set to the balance
-            values = {**values}
-            for k in list(values):
-                if values[k] == "__BALANCE__":
-                    values[k] = int(balance)
+            # The wizard stores the method and requisites without an amount —
+            # auto-withdraw takes the whole available balance.
+            values = {**values, "amount": int(balance)}
             loop = asyncio.get_event_loop()
             ok, msg = await asyncio.wait_for(
                 loop.run_in_executor(None, panel_withdraw_sync,
