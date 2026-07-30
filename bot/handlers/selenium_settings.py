@@ -23,6 +23,9 @@ class SeleniumState(StatesGroup):
     waiting_withdraw_amount = State()
     waiting_promo_value = State()
     waiting_restore_interval = State()
+    waiting_pos_url = State()
+    waiting_pos_threshold = State()
+    waiting_pos_interval = State()
 
 
 def _esc(text) -> str:
@@ -158,10 +161,252 @@ def _bump_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
     picked = promo_only_ids(s)
     b.button(text=f"🎯 Товары: {f'выбрано {len(picked)}' if picked else 'все'}",
              callback_data="promo:items")
+    pp = s.get("promo_position", {})
+    b.button(text=f"📍 По позиции: "
+                  f"{'не ниже ' + str(pp.get('max_position', 3)) if pp.get('enabled') else 'выкл'}",
+             callback_data="pos:menu")
     b.button(text=f"⏱ Интервал: {interval} ч", callback_data="selenium:bump:set_interval")
     b.button(text="⬅️ К объявлениям", callback_data="menu:ads")
-    b.adjust(2, 1, 1, 1, 1)
+    b.adjust(2, 1, 1, 1, 1, 1)
     return b.as_markup()
+
+
+# ---------------------------------------------------------------------------
+# Positional trigger: promote when the listing slips down the offers list
+#
+# Position is not in the seller API — it exists only on the public storefront,
+# so the page the buyer sees is read and our row located in it. Slipping below
+# the threshold only *promotes* when that is switched on explicitly: the trigger
+# spends money, so the default is to warn.
+# ---------------------------------------------------------------------------
+
+def _pos_text(s: dict) -> str:
+    pp = s.get("promo_position", {})
+    on = pp.get("enabled", False)
+    url = pp.get("url") or ""
+    lines = [
+        "📍 <b>Поднятие по позиции</b>\n",
+        f"Статус: {_st(on)}",
+        f"Порог: не ниже <b>{pp.get('max_position', 3)}</b>-го места",
+        f"Проверка: каждые {pp.get('interval_hours', 1)} ч",
+        f"Страница: {('<code>' + _esc(url[:60]) + '</code>') if url else '<b>не задана</b>'}",
+    ]
+    if pp.get("last_pos"):
+        lines.append(f"Последняя позиция: <b>{pp['last_pos']}</b>")
+    lines.append(f"Поднимать автоматически: "
+                 f"{'✅ да' if pp.get('auto_promote') else '❌ только предупреждать'}")
+    lines.append(f"Сообщать, если кто-то дешевле: "
+                 f"{'✅' if pp.get('undercut_notify', True) else '❌'}")
+    if pp.get("min_price"):
+        lines.append(f"Тревога, если цена ниже: <b>{pp['min_price']:.0f} ₽</b>")
+    lines.append("")
+    lines.append("<i>Позиции нет в API — бот читает публичную витрину и ищет "
+                 "ваш магазин в списке предложений.</i>")
+    if pp.get("auto_promote"):
+        lines.append("⚠️ <b>Поднятие платное</b> — сработает при падении ниже порога.")
+    return "\n".join(lines)
+
+
+def _pos_kb(s: dict) -> InlineKeyboardMarkup:
+    pp = s.get("promo_position", {})
+    on = pp.get("enabled", False)
+    b = InlineKeyboardBuilder()
+    b.button(text="🔴 Выключить" if on else "🟢 Включить", callback_data="pos:toggle")
+    b.button(text="🔗 Страница витрины", callback_data="pos:url")
+    b.button(text=f"🎯 Порог: {pp.get('max_position', 3)}", callback_data="pos:threshold")
+    b.button(text=f"⏱ Проверка: {pp.get('interval_hours', 1)} ч",
+             callback_data="pos:interval")
+    b.button(text=("⭐ Поднимать: авто" if pp.get("auto_promote")
+                   else "🔔 Поднимать: только сигнал"),
+             callback_data="pos:auto")
+    b.button(text=("💰 Дешевле: сообщать" if pp.get("undercut_notify", True)
+                   else "💰 Дешевле: молчать"), callback_data="pos:undercut")
+    b.button(text="🔍 Проверить сейчас", callback_data="pos:check")
+    b.button(text="⬅️ К продвижению", callback_data="selenium:bump:menu")
+    b.adjust(2, 2, 1, 1, 1, 1)
+    return b.as_markup()
+
+
+@router.callback_query(F.data == "pos:menu")
+async def pos_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    s = get_settings(callback.from_user.id)
+    await callback.message.edit_text(_pos_text(s), reply_markup=_pos_kb(s))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "pos:toggle")
+async def pos_toggle(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    pp = s.setdefault("promo_position", {})
+    turning_on = not pp.get("enabled", False)
+    if turning_on and not (pp.get("url") or "").strip():
+        await callback.answer("Сначала укажите страницу витрины", show_alert=True)
+        return
+    pp["enabled"] = turning_on
+    if turning_on:
+        pp["last_check"] = 0          # check on the next tick, not in an hour
+    save_settings(callback.from_user.id, s)
+    await callback.message.edit_text(_pos_text(s), reply_markup=_pos_kb(s))
+    await callback.answer("Включено" if turning_on else "Выключено")
+
+
+@router.callback_query(F.data == "pos:auto")
+async def pos_auto(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    pp = s.setdefault("promo_position", {})
+    pp["auto_promote"] = not pp.get("auto_promote", False)
+    save_settings(callback.from_user.id, s)
+    await callback.answer(
+        "Буду поднимать автоматически — это тратит деньги при каждом падении"
+        if pp["auto_promote"] else "Только предупреждаю, деньги не трачу",
+        show_alert=True)
+    await callback.message.edit_text(_pos_text(s), reply_markup=_pos_kb(s))
+
+
+@router.callback_query(F.data == "pos:undercut")
+async def pos_undercut(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    pp = s.setdefault("promo_position", {})
+    pp["undercut_notify"] = not pp.get("undercut_notify", True)
+    save_settings(callback.from_user.id, s)
+    await callback.message.edit_text(_pos_text(s), reply_markup=_pos_kb(s))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "pos:url")
+async def pos_url_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(SeleniumState.waiting_pos_url)
+    await callback.message.edit_text(
+        "🔗 <b>Страница витрины</b>\n\n"
+        "Откройте свой товар как покупатель — на странице, где виден "
+        "<b>список предложений</b> — и пришлите её адрес.\n\n"
+        "<i>Именно по этому списку считается позиция.</i>",
+        reply_markup=_cancel_kb("pos:menu"))
+    await callback.answer()
+
+
+@router.message(SeleniumState.waiting_pos_url)
+async def pos_url_save(message: Message, state: FSMContext) -> None:
+    url = (message.text or "").strip()
+    if not url.startswith("http"):
+        await message.answer("❌ Пришлите полный адрес, начиная с https://")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    s.setdefault("promo_position", {})["url"] = url
+    save_settings(message.from_user.id, s)
+    await message.answer(_pos_text(s), reply_markup=_pos_kb(s))
+
+
+@router.callback_query(F.data == "pos:threshold")
+async def pos_threshold_start(callback: CallbackQuery, state: FSMContext) -> None:
+    cur = get_settings(callback.from_user.id).get(
+        "promo_position", {}).get("max_position", 3)
+    await state.set_state(SeleniumState.waiting_pos_threshold)
+    await callback.message.edit_text(
+        f"🎯 <b>Порог позиции</b>\n\nСейчас: не ниже <b>{cur}</b>-го места\n\n"
+        f"Пришлите число: при падении ниже этого места бот сработает.",
+        reply_markup=_cancel_kb("pos:menu"))
+    await callback.answer()
+
+
+@router.message(SeleniumState.waiting_pos_threshold)
+async def pos_threshold_save(message: Message, state: FSMContext) -> None:
+    try:
+        n = int((message.text or "").strip())
+        if not 1 <= n <= 100:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Нужно число от 1 до 100")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    pp = s.setdefault("promo_position", {})
+    pp["max_position"] = n
+    pp["last_alert_pos"] = 0         # a new threshold re-arms the alert
+    save_settings(message.from_user.id, s)
+    await message.answer(_pos_text(s), reply_markup=_pos_kb(s))
+
+
+@router.callback_query(F.data == "pos:interval")
+async def pos_interval_start(callback: CallbackQuery, state: FSMContext) -> None:
+    cur = get_settings(callback.from_user.id).get(
+        "promo_position", {}).get("interval_hours", 1)
+    await state.set_state(SeleniumState.waiting_pos_interval)
+    await callback.message.edit_text(
+        f"⏱ <b>Как часто проверять позицию</b>\n\nСейчас: {cur} ч\n\n"
+        f"Пришлите число часов (можно дробное: 0.5 — каждые полчаса):",
+        reply_markup=_cancel_kb("pos:menu"))
+    await callback.answer()
+
+
+@router.message(SeleniumState.waiting_pos_interval)
+async def pos_interval_save(message: Message, state: FSMContext) -> None:
+    try:
+        h = float((message.text or "").replace(",", ".").strip())
+        if not 0.25 <= h <= 168:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Нужно число от 0.25 до 168")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    s.setdefault("promo_position", {})["interval_hours"] = h
+    save_settings(message.from_user.id, s)
+    await message.answer(_pos_text(s), reply_markup=_pos_kb(s))
+
+
+@router.callback_query(F.data == "pos:check")
+async def pos_check_now(callback: CallbackQuery) -> None:
+    """Read the storefront right now and show the standings — spends nothing."""
+    import asyncio
+
+    from automation.market import cheapest, fetch_offers_sync, find_position
+    from storage import get_shop_name
+
+    s = get_settings(callback.from_user.id)
+    pp = s.get("promo_position", {})
+    url = (pp.get("url") or "").strip()
+    if not url:
+        await callback.answer("Сначала укажите страницу витрины", show_alert=True)
+        return
+    await callback.answer("⏳ Смотрю витрину...")
+    await callback.message.edit_text("⏳ Читаю список предложений...")
+    try:
+        loop = asyncio.get_event_loop()
+        ok, res = await asyncio.wait_for(
+            loop.run_in_executor(None, fetch_offers_sync, url), timeout=60)
+    except Exception as e:
+        ok, res = False, str(e)[:200]
+    if not ok:
+        await callback.message.edit_text(
+            f"❌ {_esc(str(res))[:400]}", reply_markup=_pos_kb(s))
+        return
+
+    offers = res["offers"]
+    shop = get_shop_name(callback.from_user.id) or ""
+    mine = find_position(offers, seller=shop) if shop else None
+    low = cheapest(offers)
+    lines = [f"📍 <b>Позиция на витрине</b>\n",
+             f"Предложений на странице: <b>{len(offers)}</b>"]
+    if mine:
+        lines.append(f"Ваше место: <b>{mine['pos']}</b> из {len(offers)}")
+        if mine["price"]:
+            lines.append(f"Ваша цена: <b>{float(mine['price']):.0f} ₽</b>")
+    else:
+        lines.append(f"❔ Не нашёл магазин «{_esc(shop) or '—'}» в списке")
+    if low is not None:
+        lines.append(f"Минимальная цена: <b>{low:.0f} ₽</b>")
+    lines.append("")
+    lines.append("<b>Топ страницы:</b>")
+    for row in offers[:8]:
+        mark = "👉" if mine and row["pos"] == mine["pos"] else "  "
+        price = f"{float(row['price']):.0f} ₽" if row["price"] is not None else "—"
+        lines.append(f"{mark} {row['pos']}. {price} · "
+                     f"{_esc(row['seller'][:16] or row['title'][:20])}")
+    await callback.message.edit_text("\n".join(lines)[:3800],
+                                     reply_markup=_pos_kb(s))
 
 
 # ---------------------------------------------------------------------------

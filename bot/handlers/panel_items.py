@@ -1226,6 +1226,57 @@ async def promo_debug(message: Message) -> None:
     await status.delete()
 
 
+@router.message(Command("pos_debug"))
+async def pos_debug(message: Message) -> None:
+    """/pos_debug <ссылка> — прочитать список предложений и наши позиции.
+
+    Read-only. Position is not in the seller API — it exists only on the public
+    storefront — so the page the buyer sees is parsed and reported here before
+    anything is wired to it.
+    """
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Укажите страницу витрины, где виден список предложений:\n"
+            "<code>/pos_debug https://yoomarket.net/...</code>\n\n"
+            "<i>Откройте свой товар как покупатель и скопируйте адрес.</i>")
+        return
+    url = parts[1].strip()
+
+    import html as _html
+
+    from automation.market import cheapest, fetch_offers_sync, find_position
+    from storage import get_shop_name
+
+    shop = get_shop_name(message.from_user.id) or ""
+    status = await message.answer("⏳ Читаю список предложений...")
+    try:
+        loop = asyncio.get_event_loop()
+        ok, res = await asyncio.wait_for(
+            loop.run_in_executor(None, fetch_offers_sync, url), timeout=60)
+    except Exception as e:
+        ok, res = False, str(e)[:200]
+    if not ok:
+        await status.edit_text(f"❌ {_html.escape(str(res))[:600]}")
+        return
+
+    offers = res["offers"]
+    mine = find_position(offers, seller=shop) if shop else None
+    lines = [f"страница: {res['note']}", f"предложений: {len(offers)}",
+             f"магазин в боте: {shop or '—'}",
+             f"дешевле всех: {cheapest(offers)}", ""]
+    for row in offers[:15]:
+        mark = "👉" if mine and row["pos"] == mine["pos"] else "  "
+        lines.append(f"{mark}{row['pos']:>2}. {row['price']} ₽ | "
+                     f"{row['seller'][:18]} | {row['title'][:34]}")
+    lines.append("")
+    lines.append(f"наша позиция: {mine['pos'] if mine else 'не нашёл по магазину'}")
+    text = _html.escape("\n".join(lines))
+    for i in range(0, min(len(text), 7000), 3500):
+        await message.answer(f"<code>{text[i:i + 3500]}</code>")
+    await status.delete()
+
+
 @router.message(Command("chat_debug"))
 async def chat_debug(message: Message) -> None:
     """/chat_debug 1076867 — find how the panel sends a support message.

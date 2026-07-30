@@ -1045,6 +1045,90 @@ class TaskManager:
             msg += f" · к оплате {spent} ₽"
         return count, msg
 
+    async def _check_position(self, user_id: int, settings: dict, now: float,
+                              api: YooMarketAPI | None = None) -> str:
+        """Watch where the shop sits in the offers list; act when it slips.
+
+        Returns a notification, or '' to stay quiet. Promotion costs money, so
+        falling below the threshold only *promotes* when the seller switched
+        that on explicitly — otherwise it just says so, which is the safe
+        default for a trigger that spends.
+        """
+        pp = settings.setdefault("promo_position", {})
+        url = (pp.get("url") or "").strip()
+        if not url:
+            return ""
+        interval = float(pp.get("interval_hours", 1) or 1)
+        if (now - float(pp.get("last_check", 0) or 0)) / 3600 < interval:
+            return ""
+
+        from automation.market import cheapest, fetch_offers_sync, find_position
+        from storage import get_shop_name
+
+        loop = asyncio.get_event_loop()
+        try:
+            ok, res = await asyncio.wait_for(
+                loop.run_in_executor(None, fetch_offers_sync, url), timeout=60)
+        except Exception as e:
+            logger.warning("position check for %s: %s", user_id, e)
+            return ""
+        pp["last_check"] = now
+        if not ok:
+            return ""                       # page unreadable; stay quiet
+
+        offers = res["offers"]
+        shop = get_shop_name(user_id) or ""
+        mine = find_position(offers, seller=shop) if shop else None
+        if not mine:
+            return ""                       # cannot locate ourselves — no alarm
+
+        pos = int(mine["pos"])
+        prev = int(pp.get("last_pos", 0) or 0)
+        pp["last_pos"] = pos
+        threshold = int(pp.get("max_position", 3) or 3)
+
+        body: list[str] = []
+        slipped = pos > threshold
+        # Alert once per slip, and again only if it gets worse — a listing
+        # sitting at 7th place should not shout every hour.
+        alerted_at = int(pp.get("last_alert_pos", 0) or 0)
+        if slipped and (pos > alerted_at or alerted_at == 0):
+            pp["last_alert_pos"] = pos
+            body.append(f"📉 Опустились на <b>{pos}-е место</b>"
+                        + (f" (было {prev})" if prev and prev != pos else ""))
+            body.append(f"🎯 Порог: не ниже {threshold}-го")
+        elif not slipped and alerted_at:
+            pp["last_alert_pos"] = 0
+            body.append(f"📈 Вернулись на <b>{pos}-е место</b> — порог соблюдён")
+
+        # Undercutting: the cheapest offer on the page against ours
+        low = cheapest(offers)
+        if pp.get("undercut_notify", True) and low is not None and mine["price"]:
+            if low < float(mine["price"]):
+                body.append("")
+                body.append(f"💰 Дешевле всех: <b>{low:.0f} ₽</b>, "
+                            f"у вас {float(mine['price']):.0f} ₽")
+        floor = float(pp.get("min_price", 0) or 0)
+        if floor and low is not None and low < floor:
+            body.append(f"⚠️ Цена на витрине упала ниже {floor:.0f} ₽")
+
+        if not body:
+            return ""
+
+        promoted = ""
+        if slipped and pp.get("auto_promote"):
+            from handlers.selenium_settings import promo_params
+            if promo_params(settings):
+                count, msg = await self._panel_bump(user_id, api)
+                promoted = (f"\n⭐ Поднятие: {_esc(str(msg))[:120]}"
+                            if count or msg else "")
+            else:
+                promoted = "\n⚠️ Не поднял: не выбран тариф «Премиум»"
+
+        return _card("📍 <b>ПОЗИЦИЯ НА ВИТРИНЕ</b>", body,
+                     f"🏪 {_esc(shop)}   ·   предложений: {len(offers)}"
+                     + promoted)
+
     async def _auto_withdraw(self, user_id: int, api: YooMarketAPI,
                              settings: dict, now: float) -> str:
         """One scheduled withdrawal attempt. Returns a notification, or ''.
@@ -1344,6 +1428,12 @@ class TaskManager:
                     count, msg = await self._panel_bump(user_id, api)
                     settings["auto_bump"]["last_bump_run"] = now
                     messages.append(f"⬆️ Авто-поднятие: {msg}")
+
+            # --- Position watch ---
+            if settings.get("promo_position", {}).get("enabled"):
+                note = await self._check_position(user_id, settings, now, api)
+                if note:
+                    messages.append(note)
 
             # --- Auto-restore ---
             ar = settings.get("auto_restore", {})
