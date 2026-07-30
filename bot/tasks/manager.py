@@ -1043,9 +1043,10 @@ class TaskManager:
 
         method = aw.get("method", "api")
         if method == "panel":
-            resource = aw.get("panel_resource") or ""
+            balance_id = aw.get("panel_balance_id") or ""
+            action_key = aw.get("panel_action_key") or ""
             values = dict(aw.get("panel_values") or {})
-            if not resource or not values:
+            if not balance_id or not action_key or not values:
                 aw["enabled"] = False                   # misconfigured; stop
                 return ("💸 Авто-вывод выключен: не настроен способ вывода "
                         "через панель. Откройте «Баланс» → «Автовывод».")
@@ -1062,8 +1063,8 @@ class TaskManager:
             loop = asyncio.get_event_loop()
             ok, msg = await asyncio.wait_for(
                 loop.run_in_executor(None, panel_withdraw_sync,
-                                     creds["cookies"], resource, values,
-                                     user_id, True),
+                                     creds["cookies"], balance_id, action_key,
+                                     values, user_id, True),
                 timeout=60)
         else:
             ok, msg = await api.withdraw_balance(min_amount)

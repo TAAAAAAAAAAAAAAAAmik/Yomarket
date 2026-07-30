@@ -1344,6 +1344,135 @@ _FINANCE_RES = ("withdrawals", "withdrawal", "withdraws", "withdraw", "payouts",
                 "operations", "vyvod", "vyvody", "cashout", "cashouts")
 _WITHDRAW_KWS = ("вывод", "вывести", "withdraw", "payout", "cash", "вывода",
                  "снятие", "выплат")
+# Which balance resource / action the panel actually uses. Confirmed from the
+# panel itself via /withdraw_debug: withdrawal is the «Вывести» (uriKey
+# "вывести") Nova action on the `balances` resource — the same kind of action
+# «Премиум» is on `items`, not a resource you create.
+_BALANCE_RES = "balances"
+_WITHDRAW_ACTION_KWS = ("вывести", "вывод", "withdraw", "payout")
+_EXCHANGE_KWS = ("обмен", "обменять", "exchange", "convert")
+
+
+def _find_withdraw_action(actions: list[dict]) -> dict | None:
+    """The «Вывести» action, never the «Обменять» one next to it."""
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        key = str(a.get("uriKey") or "")
+        blob = str(a.get("name") or "").lower() + " " + key.lower()
+        if any(k in blob for k in _EXCHANGE_KWS):
+            continue
+        if any(k in blob for k in _WITHDRAW_ACTION_KWS):
+            return a
+    return None
+
+
+def panel_balances_sync(cookie_string: str) -> tuple[bool, object]:
+    """Blocking: the seller's balance rows — id, currency, amount.
+
+    Withdrawal is an action on one of these rows, so its id is needed to run it,
+    and the amounts say which row actually holds money.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    try:
+        r = session.get(f"{PANEL_URL}/nova-api/{_BALANCE_RES}",
+                        params={"perPage": "50"}, headers=hdrs,
+                        timeout=(6, 12), allow_redirects=False)
+    except Exception as e:
+        return False, str(e)[:80]
+    if r.status_code == 401:
+        return False, "401: сессия панели истекла — войдите снова"
+    if r.status_code != 200:
+        return False, f"balances → {r.status_code}"
+    try:
+        rows = (r.json() or {}).get("resources") or []
+    except Exception:
+        return False, "не разобрал ответ панели"
+
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rid = row.get("id")
+        if isinstance(rid, dict):
+            rid = rid.get("value", rid.get("id"))
+        currency = amount = ""
+        for f in (row.get("fields") or []):
+            if not isinstance(f, dict):
+                continue
+            fn = str(f.get("name") or "").lower()
+            fa = str(f.get("attribute") or "").lower()
+            val = _strip_html(f.get("value"))
+            if any(t in fn + fa for t in ("валют", "currency", "тип", "type")):
+                currency = currency or val
+            elif any(t in fn + fa for t in ("сумм", "amount", "баланс",
+                                            "balance", "остат", "value")):
+                amount = amount or val
+        out.append({"id": str(rid), "currency": currency, "amount": amount,
+                    "raw": row})
+    return True, out
+
+
+def panel_withdraw_fields_sync(
+    cookie_string: str, balance_id: str,
+) -> tuple[bool, object]:
+    """Blocking: describe the «Вывести» action so a payout can be filled in.
+
+    Returns (True, {"key", "name", "balance_id", "fields": [...]}) or
+    (False, error). Mirrors the promotion form: each field carries its options,
+    its dependencies and the key Nova needs to resolve a dependent select
+    (payment method / requisites) once earlier choices are made.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    try:
+        r = session.get(f"{PANEL_URL}/nova-api/{_BALANCE_RES}/actions",
+                        params={"resources": str(balance_id)},
+                        headers=hdrs, timeout=(6, 10), allow_redirects=False)
+    except Exception as e:
+        return False, f"не получил действия баланса: {str(e)[:60]}"
+    if r.status_code == 401:
+        return False, "401: сессия панели истекла — войдите снова"
+    if r.status_code != 200:
+        return False, f"actions: {r.status_code}"
+    try:
+        actions = [a for a in ((r.json() or {}).get("actions") or [])
+                   if isinstance(a, dict)]
+    except Exception:
+        return False, "не разобрал ответ панели"
+
+    a = _find_withdraw_action(actions)
+    if not a:
+        names = [(x.get("name") or x.get("uriKey") or "?") for x in actions]
+        return False, f"действие вывода не найдено. Доступные: {names}"
+
+    out_fields = []
+    for f in (a.get("fields") or []):
+        if not isinstance(f, dict):
+            continue
+        attr = f.get("attribute")
+        if not attr:
+            continue
+        opts = _normalize_options(f)
+        out_fields.append({
+            "attribute": attr,
+            "label": f.get("name") or attr,
+            "component": f.get("component", ""),
+            "options": opts,
+            # As with «Оплата»: a select with no inline options is still
+            # required server-side, so an empty one is not treated as optional.
+            "required": "required" in str(f.get("rules", "")) or (
+                "select" in str(f.get("component", "")) and not opts),
+            "value": f.get("value"),
+            "lookup": not opts and "select" in str(f.get("component", "")),
+            "depends_on": f.get("dependsOn") or {},
+            "component_key": f.get("dependentComponentKey") or "",
+            "shape": (f"component={f.get('component')} "
+                      f"keys={sorted(f.keys())[:14]}")[:250],
+        })
+    return True, {"key": a.get("uriKey"), "name": a.get("name") or "Вывести",
+                  "balance_id": str(balance_id), "fields": out_fields}
 
 
 def _finance_resource_names(session, hdrs) -> tuple[list[str], list[str]]:
@@ -1438,108 +1567,84 @@ def panel_finance_probe_sync(cookie_string: str) -> tuple[bool, str]:
 
     out.append(f"\nпроверено ресурсов: {seen or 'ничего не ответило'}")
 
-    # The panel's own scripts name the endpoints it calls — the same trick that
-    # found the login and chat routes.
-    try:
-        html = session.get(PANEL_URL + "/", timeout=(6, 12)).text
-        srcs = re.findall(r'src="(/[^"]+\.js[^"]*)"', html)[:4]
-        hits = set()
-        for src in srcs:
-            js = session.get(PANEL_URL + src, timeout=(6, 15)).text
-            for m in re.findall(
-                    r'["\'`](/[a-z0-9/_-]*(?:withdraw|payout|finance|wallet|'
-                    r'balance|vyvod|cash)[a-z0-9/_-]*)["\'`]', js, re.I):
-                if len(m) < 70:
-                    hits.add(m)
-        out.append(f"в JS панели: {sorted(hits)[:15] or 'ничего'}")
-    except Exception as e:
-        out.append(f"JS: {str(e)[:50]}")
+    # The «Вывести» action is the actual mechanism — dump its fields raw, the
+    # same way /promo_debug does for «Премиум», so the withdrawal form (amount,
+    # method, requisites) is seen exactly before anything is wired to it.
+    ok_b, balances = panel_balances_sync(cookie_string)
+    if ok_b and isinstance(balances, list) and balances:
+        out.append("\n=== БАЛАНСЫ ===")
+        for bl in balances:
+            out.append(f"  id={bl['id']} | {bl['currency']} | {bl['amount']}")
+        bid = None
+        for bl in balances:                     # prefer a row that holds money
+            try:
+                if float(str(bl["amount"]).replace(" ", "").replace(",", ".") or 0) > 0:
+                    bid = bl["id"]
+                    break
+            except ValueError:
+                continue
+        bid = bid or balances[0]["id"]
+        try:
+            ar = session.get(f"{PANEL_URL}/nova-api/{_BALANCE_RES}/actions",
+                             params={"resources": str(bid)}, headers=hdrs,
+                             timeout=(6, 10), allow_redirects=False)
+            out.append(f"\n=== действие «Вывести» (balance #{bid}) → "
+                       f"{ar.status_code} ===")
+            if ar.status_code == 200:
+                acts = [a for a in ((ar.json() or {}).get("actions") or [])
+                        if isinstance(a, dict)]
+                a = _find_withdraw_action(acts)
+                if not a:
+                    out.append(f"не нашёл среди {[x.get('uriKey') for x in acts]}")
+                else:
+                    out.append(f"uriKey: {a.get('uriKey')}")
+                    for f in (a.get("fields") or []):
+                        if isinstance(f, dict):
+                            out.append("• " + _json.dumps(f, ensure_ascii=False)[:900])
+        except Exception as e:
+            out.append(f"действие: {str(e)[:60]}")
 
     return True, "\n".join(out)
 
 
-def panel_withdraw_fields_sync(
-    cookie_string: str, resource: str,
-) -> tuple[bool, object]:
-    """Blocking: the create-withdrawal form of a Nova resource.
-
-    Returns (True, {"resource", "fields":[{attribute,label,options,required,
-    component}]}) or (False, error). Options a field does not carry inline are
-    fetched the same way the promotion form resolves its selects.
-    """
-    session = _make_panel_requests_session(cookie_string)
-    try:
-        r = session.get(f"{PANEL_URL}/nova-api/{resource}/creation-fields",
-                        params={"editing": "true", "editMode": "create"},
-                        timeout=(6, 10), allow_redirects=False)
-    except Exception as e:
-        return False, str(e)[:80]
-    if r.status_code == 401:
-        return False, "401: сессия панели истекла — войдите снова"
-    if r.status_code != 200:
-        return False, f"creation-fields → {r.status_code}"
-    try:
-        fields = _parse_nova_fields_payload(r.json())
-    except Exception:
-        return False, "не разобрал форму вывода"
-
-    out_fields = []
-    for f in fields:
-        attr = f.get("attribute")
-        if not attr:
-            continue
-        opts = _normalize_options(f)
-        if not opts and (f.get("belongsToRelationship")
-                         or "select" in str(f.get("component", ""))):
-            opts, _ = panel_sync_field_options_sync(
-                cookie_string, resource, attr, {})
-        out_fields.append({
-            "attribute": attr,
-            "label": f.get("name") or attr,
-            "component": f.get("component", ""),
-            "options": opts,
-            "required": "required" in str(f.get("rules", "")),
-            "value": f.get("value"),
-        })
-    return True, {"resource": resource, "fields": out_fields}
-
-
 def panel_withdraw_sync(
-    cookie_string: str, resource: str, values: dict,
+    cookie_string: str, balance_id: str, action_key: str, values: dict,
     uid: int | None = None, confirm: bool = False,
 ) -> tuple[bool, str]:
-    """Blocking: create a withdrawal in the panel — MOVES MONEY OUT.
+    """Blocking: run the «Вывести» action on a balance — MOVES MONEY OUT.
 
     Refuses without confirm=True, and submits only the field values it was
-    given: no money-moving field is ever invented. `values` is the form the
-    seller filled from panel_withdraw_fields_sync (amount, method, requisites).
+    given, plus the balance id the action runs on: no money-moving field is
+    ever invented. `values` is what the seller filled from
+    panel_withdraw_fields_sync (amount, method, requisites).
     """
     if not confirm:
         return False, "вывод не подтверждён"
     if not values:
         return False, "не заданы поля вывода — сначала настройте способ и сумму"
+    if not action_key:
+        return False, "не известен ключ действия вывода"
 
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
-    payload = {k: v for k, v in values.items() if v not in (None, "")}
+    payload = {"resources": str(balance_id)}
+    payload.update({k: v for k, v in values.items() if v not in (None, "")})
     try:
-        r = session.post(f"{PANEL_URL}/nova-api/{resource}",
-                         data=payload, headers=hdrs, timeout=(6, 20),
-                         allow_redirects=False)
+        r = session.post(
+            f"{PANEL_URL}/nova-api/{_BALANCE_RES}/action?action={action_key}",
+            data=payload, headers=hdrs, timeout=(6, 20), allow_redirects=False)
     except Exception as e:
         return False, f"запрос не прошёл: {str(e)[:80]}"
 
     if r.status_code == 401:
         return False, "401: сессия панели истекла — войдите снова"
     if r.status_code in (200, 201, 204):
-        _save_refreshed_cookies(uid, cookie_string, session)
-        # A created payout usually echoes an id / status
-        try:
-            data = r.json()
-            got = (data.get("resource") or data).get("id") if isinstance(data, dict) else ""
-        except Exception:
-            got = ""
-        return True, f"✅ Заявка на вывод создана{f' (#{got})' if got else ''}"
+        # A refused action also returns 200 with the reason in the body — the
+        # same trap «Премиум» had, so the answer is inspected, not the code.
+        ok, text = _action_result(r, "Заявка на вывод создана")
+        if ok:
+            _save_refreshed_cookies(uid, cookie_string, session)
+        return ok, text
     if r.status_code == 422:
         try:
             body = r.json()
