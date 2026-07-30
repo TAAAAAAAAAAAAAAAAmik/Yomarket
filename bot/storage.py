@@ -1,3 +1,5 @@
+import contextlib
+import contextvars
 import json
 import os
 import shutil
@@ -412,9 +414,52 @@ def _merge_defaults(settings: dict) -> dict:
     return result
 
 
+# When set (e.g. by a background loop dedicated to one shop), every
+# per-account storage read/write targets THIS account instead of the user's
+# currently-selected one. It's a ContextVar so each asyncio task can pin its
+# own account without touching the user's active selection.
+_account_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "account_override", default=None
+)
+
+
+def set_account_context(account_name: str | None) -> None:
+    """Pin the account used by per-account storage in the current context.
+
+    Used by the background TaskManager so one loop can monitor a non-active
+    shop. Pass None to fall back to the user's active account.
+    """
+    _account_override.set(account_name)
+
+
+@contextlib.contextmanager
+def account_context(account_name: str | None):
+    """Temporarily pin the per-account storage to `account_name`."""
+    token = _account_override.set(account_name)
+    try:
+        yield
+    finally:
+        _account_override.reset(token)
+
+
+def get_account_context() -> str | None:
+    """The account currently pinned in this context, if any."""
+    return _account_override.get()
+
+
+def get_account_token(user_id: int, account_name: str) -> str | None:
+    """Token of a specific named account (not necessarily the active one)."""
+    acc = get_accounts(user_id).get(account_name)
+    return acc.get("token") if acc else None
+
+
 def _account_key(user_id: int) -> str:
-    """Per-account storage key: '{uid}::{account}'. Falls back to plain uid."""
-    account = get_active_account(user_id)
+    """Per-account storage key: '{uid}::{account}'. Falls back to plain uid.
+
+    Honours a context override (set_account_context) so background loops can
+    read/write the settings of a shop that isn't the user's active one.
+    """
+    account = _account_override.get() or get_active_account(user_id)
     return f"{user_id}::{account}" if account else str(user_id)
 
 

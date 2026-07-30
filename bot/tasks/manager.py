@@ -13,7 +13,14 @@ from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
-from storage import get_token, get_settings, save_settings
+from storage import (
+    get_accounts,
+    get_account_token,
+    get_settings,
+    get_shop_name,
+    save_settings,
+    set_account_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -162,58 +169,76 @@ def _message_notify_kb(chat_id: str) -> InlineKeyboardMarkup:
 class TaskManager:
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
-        self._tasks: dict[int, asyncio.Task] = {}
-        self._selenium_tasks: dict[int, asyncio.Task] = {}
-        # Per-user lock: the orders loop (60s) and the auto-tasks loop (30min)
-        # both load→mutate→save the whole settings blob. Without serializing
-        # them, whichever saves last silently clobbers the other's changes
-        # (e.g. AutoStars pending / known_orders vs bump_schedule.last_runs).
-        self._locks: dict[int, asyncio.Lock] = {}
+        # Loops are keyed by (user_id, account_name): every shop a user has
+        # added gets its own orders loop and auto-tasks loop, so notifications
+        # and automation fire for ALL shops, not just the active one.
+        self._tasks: dict[tuple[int, str], asyncio.Task] = {}
+        self._selenium_tasks: dict[tuple[int, str], asyncio.Task] = {}
+        # Per-(user, account) lock: the orders loop (60s) and the auto-tasks
+        # loop (30min) both load→mutate→save the whole settings blob. Without
+        # serializing them, whichever saves last silently clobbers the other's
+        # changes (e.g. AutoStars pending / known_orders vs
+        # bump_schedule.last_runs).
+        self._locks: dict[tuple[int, str], asyncio.Lock] = {}
 
-    def _lock(self, user_id: int) -> asyncio.Lock:
-        lock = self._locks.get(user_id)
+    def _lock(self, user_id: int, account: str) -> asyncio.Lock:
+        key = (user_id, account)
+        lock = self._locks.get(key)
         if lock is None:
             lock = asyncio.Lock()
-            self._locks[user_id] = lock
+            self._locks[key] = lock
         return lock
 
     def start_for_user(self, user_id: int) -> None:
-        if user_id in self._tasks and not self._tasks[user_id].done():
-            self._tasks[user_id].cancel()
-        self._tasks[user_id] = asyncio.create_task(self._user_loop(user_id))
-        # Also start the selenium automation loop
-        if user_id in self._selenium_tasks and not self._selenium_tasks[user_id].done():
-            self._selenium_tasks[user_id].cancel()
-        self._selenium_tasks[user_id] = asyncio.create_task(self._selenium_loop(user_id))
+        """Reconcile this user's loops with their current account list:
+        start a loop for every account, stop loops for removed accounts."""
+        accounts = list(get_accounts(user_id).keys())
+        for account in accounts:
+            key = (user_id, account)
+            if key not in self._tasks or self._tasks[key].done():
+                self._tasks[key] = asyncio.create_task(self._user_loop(user_id, account))
+            if key not in self._selenium_tasks or self._selenium_tasks[key].done():
+                self._selenium_tasks[key] = asyncio.create_task(
+                    self._selenium_loop(user_id, account)
+                )
+        # Stop loops for accounts that no longer exist (e.g. after deletion).
+        for key in [k for k in self._tasks if k[0] == user_id and k[1] not in accounts]:
+            self.stop_for_account(*key)
+
+    def stop_for_account(self, user_id: int, account: str) -> None:
+        key = (user_id, account)
+        for store in (self._tasks, self._selenium_tasks):
+            task = store.pop(key, None)
+            if task:
+                task.cancel()
+        self._locks.pop(key, None)
 
     def stop_for_user(self, user_id: int) -> None:
-        if user_id in self._tasks:
-            self._tasks[user_id].cancel()
-            del self._tasks[user_id]
-        if user_id in self._selenium_tasks:
-            self._selenium_tasks[user_id].cancel()
-            del self._selenium_tasks[user_id]
+        for account in [k[1] for k in list(self._tasks) if k[0] == user_id]:
+            self.stop_for_account(user_id, account)
 
     async def start_all(self) -> None:
         from storage import get_all_users
         for uid in get_all_users():
             self.start_for_user(uid)
 
-    async def _user_loop(self, user_id: int) -> None:
+    async def _user_loop(self, user_id: int, account: str) -> None:
+        # Pin this task's per-account storage to `account` for its whole life.
+        set_account_context(account)
         while True:
             try:
-                await self._tick(user_id)
+                await self._tick(user_id, account)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Task error for user %s: %s", user_id, e)
+                logger.error("Task error for user %s/%s: %s", user_id, account, e)
             await asyncio.sleep(60)
 
-    async def _tick(self, user_id: int) -> None:
-        token = get_token(user_id)
+    async def _tick(self, user_id: int, account: str) -> None:
+        token = get_account_token(user_id, account)
         if not token:
             return
-        async with self._lock(user_id):
+        async with self._lock(user_id, account):
             settings = get_settings(user_id)
             await self._process_orders(user_id, token, settings)
             await self._check_reminders(user_id, settings)
@@ -771,9 +796,25 @@ class TaskManager:
         except Exception as e:
             logger.warning("Auto chat send failed (chat %s): %s", chat_id, e)
 
+    def _shop_prefix(self, user_id: int) -> str:
+        """When a user monitors several shops, tag each notification with the
+        shop it came from. The shop name resolves via the current account
+        context (set at loop start), so no extra plumbing is needed."""
+        try:
+            if len(get_accounts(user_id)) <= 1:
+                return ""
+            from storage import get_account_context
+            shop = get_shop_name(user_id) or get_account_context() or ""
+            return f"🏪 <b>{shop}</b>\n" if shop else ""
+        except Exception:
+            return ""
+
     async def _notify(self, user_id: int, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
         try:
-            await self.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=reply_markup)
+            await self.bot.send_message(
+                user_id, self._shop_prefix(user_id) + text,
+                parse_mode="HTML", reply_markup=reply_markup,
+            )
         except Exception as e:
             logger.warning("Notify failed (user %s): %s", user_id, e)
 
@@ -781,25 +822,27 @@ class TaskManager:
     # Selenium / Playwright automation loop (separate from orders loop)
     # ------------------------------------------------------------------
 
-    async def _selenium_loop(self, user_id: int) -> None:
+    async def _selenium_loop(self, user_id: int, account: str) -> None:
         """Background loop that runs browser automation tasks every 30 minutes."""
+        # Pin this task's per-account storage to `account` for its whole life.
+        set_account_context(account)
         # Initial delay so it doesn't run immediately on startup
         await asyncio.sleep(60)
         while True:
             try:
-                await self._tick_selenium(user_id)
+                await self._tick_selenium(user_id, account)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Selenium task error for user %s: %s", user_id, e)
+                logger.error("Selenium task error for user %s/%s: %s", user_id, account, e)
             await asyncio.sleep(_SELENIUM_LOOP_INTERVAL)
 
-    async def _tick_selenium(self, user_id: int) -> None:
+    async def _tick_selenium(self, user_id: int, account: str) -> None:
         """Run auto-bump / auto-restore / auto-withdraw via the Integration API."""
-        token = get_token(user_id)
+        token = get_account_token(user_id, account)
         if not token:
             return
-        async with self._lock(user_id):
+        async with self._lock(user_id, account):
             await self._tick_selenium_locked(user_id, token)
 
     async def _tick_selenium_locked(self, user_id: int, token: str) -> None:

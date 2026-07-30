@@ -175,10 +175,15 @@ async def delete_account_confirm(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "acc:del2")
-async def delete_account_do(callback: CallbackQuery) -> None:
+async def delete_account_do(callback: CallbackQuery, **data) -> None:
     uid = callback.from_user.id
     active = get_active_account(uid)
     if remove_account(uid, active):
+        # Stop this shop's background loops, keep the others running.
+        task_manager = data.get("task_manager")
+        if task_manager:
+            task_manager.stop_for_account(uid, active)
+            task_manager.start_for_user(uid)  # reconcile (new active account)
         await callback.answer(f"🗑 «{active}» удалён", show_alert=True)
     else:
         await callback.answer("Не удалось удалить", show_alert=True)

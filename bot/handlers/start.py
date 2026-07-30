@@ -158,7 +158,12 @@ async def back_to_main(callback: CallbackQuery) -> None:
 
 
 @router.message(Command("logout"))
-async def cmd_logout(message: Message, state: FSMContext) -> None:
+async def cmd_logout(message: Message, state: FSMContext, **data) -> None:
     await state.clear()
-    delete_token(message.from_user.id)
+    uid = message.from_user.id
+    delete_token(uid)
+    # Reconcile background loops: stop the logged-out shop, keep any others.
+    task_manager = data.get("task_manager")
+    if task_manager:
+        task_manager.start_for_user(uid)
     await message.answer("🚪 Вы вышли. Для входа — /start")
