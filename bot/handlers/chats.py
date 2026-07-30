@@ -39,6 +39,22 @@ def _esc(text) -> str:
             .replace("<", "&lt;").replace(">", "&gt;"))
 
 
+def _send_error(e: Exception) -> str:
+    """A readable reason a chat message could not be sent.
+
+    The Integration API only accepts a message while the chat has an ACTIVE
+    order — support and moderation chats have none, and a finished order's chat
+    stops accepting too. That comes back as no_active_orders_in_chat; showing
+    the raw JSON left the seller with no idea what it meant."""
+    s = str(e)
+    if "no_active" in s or "no active order" in s.lower():
+        return ("💬 В этом чате нет активного заказа, поэтому ответить через "
+                "бота нельзя — так устроено API Юмаркета.\n\n"
+                "Это чат поддержки/модерации или заказ уже закрыт. "
+                "Ответьте прямо в панели: panel.yoomarket.net")
+    return f"❌ Не отправилось: {_esc(s[:200])}"
+
+
 class ReplyState(StatesGroup):
     waiting_for_text = State()
     waiting_chat_id = State()
@@ -210,7 +226,7 @@ async def send_reply(message: Message, state: FSMContext, api: YooMarketAPI) -> 
         await api.send_message(chat_id, text_to_send)
         text = f"✅ Сообщение отправлено в чат #{chat_id}"
     except Exception as e:
-        text = f"❌ Ошибка: {e}"
+        text = _send_error(e)
 
     builder = InlineKeyboardBuilder()
     builder.button(text="💬 Вернуться в чат", callback_data=ChatCallback(chat_id=chat_id).pack())
@@ -241,7 +257,9 @@ async def send_quick_reply(callback: CallbackQuery, api: YooMarketAPI) -> None:
         await api.send_message(chat_id, text)
         await callback.answer("✅ Отправлено!", show_alert=True)
     except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
+        # Alerts are short and plain-text; strip the HTML the helper adds
+        msg = _send_error(e).replace("<b>", "").replace("</b>", "")
+        await callback.answer(msg[:200], show_alert=True)
 
 
 # ---------------------------------------------------------------------------
