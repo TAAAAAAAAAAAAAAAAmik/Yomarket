@@ -1703,7 +1703,17 @@ def panel_chat_probe_sync(cookie_string: str, chat_id: str) -> tuple[bool, str]:
     cid = "".join(ch for ch in str(chat_id) if ch.isdigit()) or str(chat_id)
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
+    # Sanctum only treats a cookie request as authenticated when it looks like
+    # it comes from the SPA — that means an Origin header, not just Referer.
+    stateful = {**hdrs, "Origin": PANEL_URL, "Referer": f"{PANEL_URL}/chats/{cid}"}
     out: list[str] = []
+
+    have = sorted({c.name for c in session.cookies})
+    out.append("куки: " + (", ".join(have) or "нет"))
+    out.append("есть laravel_session: "
+               + ("да" if any("session" in c.lower() for c in have) else "НЕТ"))
+    out.append("есть XSRF-TOKEN: "
+               + ("да" if any("xsrf" in c.lower() for c in have) else "НЕТ"))
 
     token = ""
     page_js: list[str] = []
@@ -1713,61 +1723,59 @@ def panel_chat_probe_sync(cookie_string: str, chat_id: str) -> tuple[bool, str]:
         except Exception as e:
             out.append(f"{page}: {str(e)[:50]}")
             continue
-        out.append(f"{page} → {r.status_code}, {len(r.text)}б")
         if not token:
             token = _extract_bearer(r.text)
         page_js += re.findall(r'src="(/[^"]+\.js[^"]*)"', r.text)
-    out.append(f"Bearer-токен на странице: {'найден' if token else 'нет'}")
+    out.append(f"Bearer на странице: {'найден' if token else 'нет'}")
 
-    def _try(method: str, path: str, use_token: bool):
-        h = dict(hdrs)
-        if use_token and token:
-            h["Authorization"] = f"Bearer {token}"
+    def _get(path, extra=None):
         try:
-            if method == "GET":
-                r = session.get(PANEL_URL + path, headers=h, timeout=(5, 10),
-                                allow_redirects=False)
-            else:
-                r = session.options(PANEL_URL + path, headers=h, timeout=(5, 10),
-                                     allow_redirects=False)
+            r = session.get(PANEL_URL + path, headers={**hdrs, **(extra or {})},
+                            timeout=(5, 10), allow_redirects=False)
         except Exception as e:
-            return f"{method} {path}: {str(e)[:40]}"
+            return f"{path}: {str(e)[:40]}"
         if r.status_code == 404:
             return ""
-        body = r.text[:90].replace("\n", " ")
-        return f"{method} {path} → {r.status_code}: {body}"
+        return f"{path} → {r.status_code}: {r.text[:80].strip()}"
 
-    out.append("\n— чтение сообщений (cookies) —")
-    read_paths = [f"/api/chats/{cid}/messages", f"/api/chats/{cid}",
-                  f"/chats/{cid}/messages", f"/api/support/{cid}/messages",
-                  f"/api/dialogs/{cid}/messages", f"/api/messages?chat_id={cid}"]
-    for p in read_paths:
-        line = _try("GET", p, use_token=False)
+    out.append("\n— чтение с куками —")
+    for p in (f"/api/chats/{cid}/messages", f"/api/chats/{cid}"):
+        line = _get(p)
         if line:
             out.append(line)
-            if "401" in line and token:
-                out.append("  " + _try("GET", p, use_token=True))
 
-    # The send route: scan the chat scripts for a POST to a chat/message path
-    out.append("\n— маршруты отправки в JS —")
-    sends = set()
-    for src in list(dict.fromkeys(page_js))[:6]:
+    # The decisive test: the same call, but marked as a stateful SPA request.
+    out.append("\n— то же, но с Origin (Sanctum stateful) —")
+    for p in (f"/api/chats/{cid}/messages", f"/api/chats/{cid}"):
+        line = _get(p, stateful)
+        if line:
+            out.append(line)
+
+    # Also try the Nova host and a web-guard route, in case the chat is not an
+    # /api/ resource at all.
+    out.append("\n— другие хосты/гварды —")
+    for p in (f"/nova-api/chats/{cid}", f"/nova-vendor/chat/{cid}/messages",
+              f"/chats/{cid}/messages"):
+        line = _get(p, stateful)
+        if line:
+            out.append(line)
+
+    # Scan the main bundles for the chat endpoints and how auth is attached.
+    out.append("\n— в JS —")
+    sends, auth = set(), set()
+    for src in list(dict.fromkeys(page_js))[:8]:
         try:
             js = session.get(PANEL_URL + src, timeout=(6, 20)).text
         except Exception:
             continue
-        for m in re.findall(
-                r'\.(?:post|put)\(\s*[`"\']([^`"\']*(?:chat|message|support|'
-                r'dialog|send)[^`"\']*)[`"\']', js, re.I):
-            if len(m) < 80:
+        for m in re.findall(r'[`"\']([^`"\']*chats?/[^`"\']*)[`"\']', js, re.I):
+            if 4 < len(m) < 70:
                 sends.add(m)
-        # A baseURL for the chat service, if it is a separate host
-        for m in re.findall(r'baseURL\s*[:=]\s*[`"\']([^`"\']+)[`"\']', js):
-            if len(m) < 80:
-                sends.add("baseURL=" + m)
-    out.append(f"{sorted(sends)[:20] or 'ничего не нашлось'}")
-    if token:
-        out.append(f"\n(токен: {token[:12]}…{token[-6:]})")
+        for m in re.findall(r'(Authorization|Bearer|sanctum|localStorage\.\w+'
+                            r'|withCredentials)', js, re.I):
+            auth.add(m.lower())
+    out.append(f"адреса с 'chat': {sorted(sends)[:15] or 'ничего'}")
+    out.append(f"признаки авторизации: {sorted(auth)[:10] or 'ничего'}")
     return True, "\n".join(out)
 
 
@@ -1785,6 +1793,10 @@ def panel_chat_send_sync(
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
     hdrs["Content-Type"] = "application/json"
+    # Mark the request as coming from the SPA so Sanctum accepts the session
+    # cookie for the /api/* guard — the Origin header is what it checks.
+    hdrs["Origin"] = PANEL_URL
+    hdrs["Referer"] = f"{PANEL_URL}/chats/{cid}"
 
     token = ""
     if use_token:
