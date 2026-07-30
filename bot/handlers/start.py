@@ -160,9 +160,13 @@ async def process_token(message: Message, state: FSMContext, **data) -> None:
     b.button(text="📧 Войти по email", callback_data="panel:sms_start")
     b.button(text="⏭ Позже", callback_data="menu:main")
     b.adjust(1)
+    # The shop name comes from the marketplace and goes into an HTML message —
+    # a '<' in it would make Telegram reject the whole send.
+    import html as _html
     await message.answer(
-        render_custom_text("token_ok", name=name, balance=balance),
-        reply_markup=b.as_markup())
+        render_custom_text("token_ok", name=_html.escape(name),
+                           balance=_html.escape(str(balance))),
+        reply_markup=b.as_markup(), disable_web_page_preview=True)
 
 
 @router.callback_query(F.data == "menu:main")
