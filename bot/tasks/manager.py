@@ -1013,8 +1013,8 @@ class TaskManager:
         """
         from storage import get_panel_creds
         from automation.panel import panel_bump_all_sync
-        from handlers.selenium_settings import (promo_limit, promo_params,
-                                                promo_price)
+        from handlers.selenium_settings import (promo_limit, promo_only_ids,
+                                                promo_params, promo_price)
 
         creds = get_panel_creds(user_id)
         if not creds or not creds.get("cookies"):
@@ -1034,7 +1034,8 @@ class TaskManager:
             count, msg = await asyncio.wait_for(
                 loop.run_in_executor(
                     None, panel_bump_all_sync, creds["cookies"], user_id, True,
-                    params, min(caps) if caps else 0),
+                    params, min(caps) if caps else 0,
+                    promo_only_ids(settings)),
                 timeout=180,
             )
         except asyncio.TimeoutError:

@@ -63,6 +63,11 @@ def promo_price(s: dict) -> int:
     return int((s.get("auto_bump", {}).get("promo") or {}).get("price") or 0)
 
 
+def promo_only_ids(s: dict) -> list:
+    """Listings the seller picked for promotion. Empty = every listing."""
+    return list((s.get("auto_bump", {}) or {}).get("only_items") or [])
+
+
 def promo_limit(s: dict) -> int:
     """How many listings the daily ceiling allows at the chosen tariff.
     0 = no ceiling set, so no cap."""
@@ -116,12 +121,21 @@ def _bump_text(s: dict, creds=None) -> str:
             tariff_line += f"\nПотолок покрывает: <b>{cap}</b> объявлений за запуск"
     else:
         tariff_line = "Тариф: <b>не выбран</b> — продвижение не запустится"
+    picked = promo_only_ids(s)
+    price = promo_price(s)
+    if picked:
+        scope = f"Товары: <b>выбрано {len(picked)}</b>"
+        if price:
+            scope += f"  ·  за прогон ≈ {len(picked) * price} ₽"
+    else:
+        scope = "Товары: <b>все</b> — платится за каждый"
     return "\n".join([
         "⭐ <b>Премиум продвижение</b>\n",
         f"Статус: {_st(on)}",
         f"Интервал: каждые {interval} ч",
         f"Последний запуск: {last_run}",
         f"Потолок трат: {limit}",
+        scope,
         tariff_line,
         "",
         "⚠️ <b>Платно.</b> На Юмаркете поднятие — это «Премиум». Оплата "
@@ -141,9 +155,12 @@ def _bump_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
     b.button(text=f"{'🔴 Выкл' if on else '🟢 Вкл'}", callback_data="selenium:bump:toggle")
     b.button(text=f"⚙️ Тариф{'' if has_tariff else ' — выбрать'}",
              callback_data="promo:setup")
+    picked = promo_only_ids(s)
+    b.button(text=f"🎯 Товары: {f'выбрано {len(picked)}' if picked else 'все'}",
+             callback_data="promo:items")
     b.button(text=f"⏱ Интервал: {interval} ч", callback_data="selenium:bump:set_interval")
     b.button(text="⬅️ К объявлениям", callback_data="menu:ads")
-    b.adjust(2, 1, 1, 1)
+    b.adjust(2, 1, 1, 1, 1)
     return b.as_markup()
 
 
@@ -283,6 +300,131 @@ def _msg_send(message: Message):
     async def send(text, reply_markup=None):
         await message.answer(text, reply_markup=reply_markup)
     return send
+
+
+# ---------------------------------------------------------------------------
+# Which listings to promote
+#
+# Promotion is charged per listing, so "promote everything" is the expensive
+# default. Picking positions is what makes a budget last.
+# ---------------------------------------------------------------------------
+
+_ITEMS_CACHE: dict[int, list] = {}
+
+
+async def _promo_items_screen(callback: CallbackQuery, reload: bool = False) -> None:
+    import asyncio
+
+    from automation.panel import panel_list_items_sync
+    from storage import get_panel_creds
+
+    uid = callback.from_user.id
+    items = _ITEMS_CACHE.get(uid)
+    if reload or not items:
+        creds = get_panel_creds(uid)
+        if not creds or not creds.get("cookies"):
+            await callback.answer("⚠️ Нужен вход в панель", show_alert=True)
+            return
+        await callback.message.edit_text("⏳ Загружаю товары из панели...")
+        loop = asyncio.get_event_loop()
+        ok, res = await loop.run_in_executor(
+            None, panel_list_items_sync, creds["cookies"])
+        if not ok:
+            await callback.message.edit_text(
+                f"❌ {_esc(str(res)[:200])}",
+                reply_markup=_cancel_kb("selenium:bump:menu"))
+            return
+        items = [{"id": str(i.get("id")), "title": str(i.get("title") or i.get("id"))}
+                 for i in res if i.get("id")]
+        _ITEMS_CACHE[uid] = items
+
+    s = get_settings(uid)
+    picked = set(promo_only_ids(s))
+    price = promo_price(s)
+
+    b = InlineKeyboardBuilder()
+    for i, it in enumerate(items[:40]):
+        mark = "✅" if it["id"] in picked else "▫️"
+        b.button(text=f"{mark} {it['title'][:34]}", callback_data=f"promo:it:{i}")
+    b.adjust(1)
+    b.button(text="☑️ Все", callback_data="promo:it_all")
+    b.button(text="✖️ Снять все", callback_data="promo:it_none")
+    b.button(text="🔄 Обновить список", callback_data="promo:items_reload")
+    b.button(text="⬅️ Готово", callback_data="selenium:bump:menu")
+    b.adjust(*([1] * len(items[:40])), 2, 1, 1)
+
+    n = len(picked)
+    cost = f"\n💸 За один прогон: <b>{n * price} ₽</b>" if (n and price) else ""
+    await callback.message.edit_text(
+        f"🎯 <b>Что продвигать</b>\n\n"
+        f"Выбрано: <b>{n}</b> из {len(items)}"
+        + (cost or "")
+        + "\n\n<i>Если не выбрано ничего — продвигаются все товары, и платится "
+          "за каждый. Отметьте только те позиции, которые нужно держать "
+          "наверху.</i>",
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "promo:items")
+async def promo_items(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await _promo_items_screen(callback)
+
+
+@router.callback_query(F.data == "promo:items_reload")
+async def promo_items_reload(callback: CallbackQuery) -> None:
+    await callback.answer("⏳ Обновляю...")
+    await _promo_items_screen(callback, reload=True)
+
+
+@router.callback_query(F.data.startswith("promo:it:"))
+async def promo_item_toggle(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
+    items = _ITEMS_CACHE.get(uid) or []
+    try:
+        it = items[int(callback.data.split(":")[-1])]
+    except (ValueError, IndexError):
+        await callback.answer("Список устарел — обновите", show_alert=True)
+        return
+    s = get_settings(uid)
+    ab = s.setdefault("auto_bump", {})
+    picked = list(ab.get("only_items") or [])
+    if it["id"] in picked:
+        picked.remove(it["id"])
+        note = "убрано"
+    else:
+        picked.append(it["id"])
+        note = "добавлено"
+    ab["only_items"] = picked
+    save_settings(uid, s)
+    await callback.answer(f"{note}: {it['title'][:40]}")
+    await _promo_items_screen(callback)
+
+
+@router.callback_query(F.data == "promo:it_all")
+async def promo_item_all(callback: CallbackQuery) -> None:
+    """Empty selection means everything — clearer than storing every id, and it
+    keeps working when new listings appear."""
+    uid = callback.from_user.id
+    s = get_settings(uid)
+    s.setdefault("auto_bump", {})["only_items"] = []
+    save_settings(uid, s)
+    await callback.answer("Продвигаются все товары")
+    await _promo_items_screen(callback)
+
+
+@router.callback_query(F.data == "promo:it_none")
+async def promo_item_none(callback: CallbackQuery) -> None:
+    """Deselect all: pick nothing, which is 'all' — so this offers the safer
+    reading, one item, rather than silently meaning the whole shop."""
+    uid = callback.from_user.id
+    items = _ITEMS_CACHE.get(uid) or []
+    s = get_settings(uid)
+    s.setdefault("auto_bump", {})["only_items"] = (
+        [items[0]["id"]] if items else [])
+    save_settings(uid, s)
+    await callback.answer("Оставил один товар — снимите и его, если нужно")
+    await _promo_items_screen(callback)
 
 
 @router.callback_query(F.data == "promo:setup")
@@ -461,7 +603,8 @@ async def run_bump_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None
         count, msg = await asyncio.wait_for(
             loop.run_in_executor(
                 None, panel_bump_all_sync, creds["cookies"], uid, True,
-                promo_params(s), min(caps) if caps else 0),
+                promo_params(s), min(caps) if caps else 0,
+                promo_only_ids(s)),
             timeout=300,
         )
         s["auto_bump"]["last_bump_run"] = _time.time()

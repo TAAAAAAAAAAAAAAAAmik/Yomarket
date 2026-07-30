@@ -1302,17 +1302,27 @@ def panel_bump_item_sync(
 def panel_bump_all_sync(
     cookie_string: str, uid: int | None = None, confirm: bool = False,
     params: dict | None = None, limit: int = 0,
+    only_ids: list | None = None,
 ) -> tuple[int, str]:
-    """Blocking: raise every listing the panel shows. Returns (count, message).
+    """Blocking: promote listings through the panel. Returns (count, message).
 
     `limit` caps how many listings are promoted in one run — the caller works it
     out from the daily spending ceiling, since every listing costs money.
+    `only_ids` restricts the run to chosen listings; empty means every listing.
+    Promoting selectively is the difference between paying for one position and
+    paying for the whole shop.
     """
     ok, items = panel_list_items_sync(cookie_string)
     if not ok:
         return 0, f"⚠️ {items}"
     if not items:
         return 0, "ℹ️ Нет объявлений"
+    if only_ids:
+        wanted = {str(i) for i in only_ids}
+        items = [it for it in items if str(it.get("id")) in wanted]
+        if not items:
+            return 0, ("ℹ️ Выбранных товаров нет в панели — обновите выбор "
+                       "в «Премиум продвижении»")
 
     count = 0
     refused = 0
