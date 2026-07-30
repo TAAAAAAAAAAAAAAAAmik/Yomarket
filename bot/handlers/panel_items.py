@@ -625,8 +625,7 @@ async def item_stock_save(message: Message, state: FSMContext,
     status = await message.answer("⏳ Добавляю остатки...")
 
     try:
-        if ad is None:
-            ad = await api.get_ad(item_id)
+        ad = await api.get_ad(item_id)
         inner = ad.get("data") or ad
         ad_type = str(inner.get("type") or "")
 
