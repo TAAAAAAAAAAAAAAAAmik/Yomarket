@@ -1202,3 +1202,36 @@ async def promo_debug(message: Message) -> None:
     for i in range(0, min(len(text), 12000), 3500):
         await message.answer(f"<code>{text[i:i + 3500]}</code>")
     await status.delete()
+
+
+@router.message(Command("withdraw_debug"))
+async def withdraw_debug(message: Message) -> None:
+    """Reveal what the panel exposes for withdrawal — a read-only probe.
+
+    The Integration API has no withdrawal endpoint, so a payout has to go
+    through the panel, and its exact shape is unknown. This shows the finance
+    resources and the create-withdrawal form so the real request is captured
+    instead of guessed. It moves no money.
+    """
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет сессии панели — войдите в «Панель продавца»")
+        return
+
+    import html as _html
+
+    from automation.panel import panel_finance_probe_sync
+
+    status = await message.answer("⏳ Ищу, где в панели вывод средств...")
+    try:
+        loop = asyncio.get_event_loop()
+        ok, report = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_finance_probe_sync, creds["cookies"]),
+            timeout=90)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+
+    text = _html.escape(str(report))
+    for i in range(0, min(len(text), 12000), 3500):
+        await message.answer(f"<code>{text[i:i + 3500]}</code>")
+    await status.delete()

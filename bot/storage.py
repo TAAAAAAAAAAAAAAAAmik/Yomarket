@@ -78,7 +78,18 @@ _DEFAULT_SETTINGS = {
         "last_result": "",
     },
     "auto_bump": {"enabled": False, "interval_hours": 24},
-    "auto_withdraw": {"enabled": False, "min_amount": 500},
+    "auto_withdraw": {
+        "enabled": False,
+        "min_amount": 500,
+        "interval_hours": 24,   # раньше пытался выводить каждый тик (30 мин)
+        "last_run": 0,
+        "method": "api",        # "api" | "panel"
+        # для вывода через панель: ресурс Nova и значения полей (сумма/способ/
+        # реквизиты), прочитанные из панели, а не угаданные
+        "panel_resource": "",
+        "panel_values": {},
+        "last_result": "",
+    },
     "responders": {},  # {"GameName": "message text"} - keyed by ad title/name
     "known_orders": {},  # {order_id: status}
     "known_order_ids": [],

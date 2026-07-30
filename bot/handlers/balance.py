@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 class WithdrawState(StatesGroup):
     waiting_amount = State()
     waiting_threshold = State()
+    waiting_auto_min = State()
 
 
 def _pick(*sources_and_keys) -> object | None:
@@ -118,6 +119,7 @@ def _kb() -> InlineKeyboardMarkup:
     b.button(text="📜 История выводов", callback_data="balance:history")
     b.button(text="📊 Статистика", callback_data="menu:stats")
     b.button(text="🔔 Порог уведомления", callback_data="balance:threshold")
+    b.button(text="🤖 Автовывод", callback_data="balance:auto")
     b.button(text="🔄 Обновить", callback_data="menu:balance")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     b.adjust(2, 2, 1, 2)
@@ -319,6 +321,134 @@ async def threshold_save(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ Уведомлю, когда баланс достигнет <b>{_RUB(amount)} ₽</b>.",
         reply_markup=b.as_markup())
+
+
+# ── Автовывод ────────────────────────────────────────────────────────────────
+
+def _auto_text(s: dict) -> str:
+    aw = s.get("auto_withdraw", {})
+    on = aw.get("enabled", False)
+    method = aw.get("method", "api")
+    lines = [
+        "🤖 <b>Автовывод</b>\n",
+        f"Статус: {'🟢 ВКЛ' if on else '🔴 ВЫКЛ'}",
+        f"Порог: от <b>{_RUB(float(aw.get('min_amount', 500) or 0))} ₽</b>",
+        f"Проверка: раз в {aw.get('interval_hours', 24)} ч",
+    ]
+    if method == "panel":
+        vals = aw.get("panel_values") or {}
+        lines.append(f"Способ: <b>через панель</b>"
+                     + (f" ({aw.get('panel_resource')})" if aw.get("panel_resource") else ""))
+        lines.append("Настроено полей: " + (str(len(vals)) if vals else "нет"))
+    else:
+        lines.append("Способ: <b>через API</b>")
+        lines.append("")
+        lines.append("⚠️ <b>Вывод через API у Юмаркета отсутствует.</b> "
+                     "Реальный вывод — только через панель. Настройте его "
+                     "кнопкой ниже.")
+    if aw.get("last_result"):
+        lines.append(f"\nПоследнее: {_esc(aw['last_result'])}")
+    return "\n".join(lines)
+
+
+def _esc(t) -> str:
+    return (str(t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _auto_kb(s: dict) -> InlineKeyboardMarkup:
+    aw = s.get("auto_withdraw", {})
+    on = aw.get("enabled", False)
+    b = InlineKeyboardBuilder()
+    b.button(text="🔴 Выключить" if on else "🟢 Включить",
+             callback_data="balance:auto_toggle")
+    b.button(text="🎯 Порог суммы", callback_data="balance:auto_min")
+    b.button(text="⚙️ Настроить вывод через панель", callback_data="balance:auto_setup")
+    b.button(text="⬅️ Баланс", callback_data="menu:balance")
+    b.adjust(2, 1, 1)
+    return b.as_markup()
+
+
+@router.callback_query(F.data == "balance:auto")
+async def auto_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    s = get_settings(callback.from_user.id)
+    await callback.message.edit_text(_auto_text(s), reply_markup=_auto_kb(s))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "balance:auto_toggle")
+async def auto_toggle(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    aw = s.setdefault("auto_withdraw", {})
+    turning_on = not aw.get("enabled", False)
+    if turning_on and aw.get("method", "api") != "panel":
+        await callback.answer(
+            "Сначала настройте вывод через панель — через API Юмаркет вывод "
+            "не поддерживает.", show_alert=True)
+        return
+    if turning_on and not (aw.get("panel_resource") and aw.get("panel_values")):
+        await callback.answer("Сначала настройте способ вывода", show_alert=True)
+        return
+    aw["enabled"] = turning_on
+    if turning_on:
+        aw["last_run"] = 0
+    save_settings(callback.from_user.id, s)
+    await callback.message.edit_text(_auto_text(s), reply_markup=_auto_kb(s))
+    await callback.answer("Включено" if turning_on else "Выключено")
+
+
+@router.callback_query(F.data == "balance:auto_min")
+async def auto_min_start(callback: CallbackQuery, state: FSMContext) -> None:
+    cur = get_settings(callback.from_user.id).get(
+        "auto_withdraw", {}).get("min_amount", 500)
+    await state.set_state(WithdrawState.waiting_auto_min)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="balance:auto")
+    await callback.message.edit_text(
+        f"🎯 <b>Порог автовывода</b>\n\nСейчас: {cur} ₽\n\n"
+        f"Выводить, когда баланс дорастёт до этой суммы. Пришлите число:",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.message(WithdrawState.waiting_auto_min)
+async def auto_min_save(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        amount = float(raw)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите сумму числом, например: <b>1000</b>")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    s.setdefault("auto_withdraw", {})["min_amount"] = amount
+    save_settings(message.from_user.id, s)
+    await message.answer(_auto_text(s), reply_markup=_auto_kb(s))
+
+
+@router.callback_query(F.data == "balance:auto_setup")
+async def auto_setup(callback: CallbackQuery) -> None:
+    """Guide to capturing the real withdrawal request before wiring it.
+
+    Withdrawal moves money and its panel shape is unknown, so it is discovered
+    first (/withdraw_debug) rather than guessed. The wizard that fills the fields
+    is added once that structure is known — building it against an imagined form
+    would be building a broken money-mover.
+    """
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="balance:auto")
+    await callback.message.edit_text(
+        "⚙️ <b>Вывод через панель</b>\n\n"
+        "Вывод средств на Юмаркете — операция панели, а не API, и её точную "
+        "форму (сумма, способ, реквизиты) нельзя угадывать — это ваши деньги.\n\n"
+        "Отправьте команду <code>/withdraw_debug</code> — бот прочитает из "
+        "панели, где живёт вывод и какие у него поля, и пришлёт это сюда.\n\n"
+        "По ответу я подключу точный запрос вывода с выбором способа и "
+        "подтверждением — так же, как сделали продвижение.",
+        reply_markup=b.as_markup())
+    await callback.answer()
 
 
 # ── Активные выводы ─────────────────────────────────────────────────────────

@@ -1019,6 +1019,73 @@ class TaskManager:
             msg += f" · к оплате {spent} ₽"
         return count, msg
 
+    async def _auto_withdraw(self, user_id: int, api: YooMarketAPI,
+                             settings: dict, now: float) -> str:
+        """One scheduled withdrawal attempt. Returns a notification, or ''.
+
+        Two routes: the Integration API (which has no withdrawal endpoint, so
+        this only works if one ever appears), and the panel (where withdrawal
+        actually lives). The panel route runs only with a method and values the
+        seller configured — this moves money out, so nothing is guessed.
+        """
+        aw = settings.setdefault("auto_withdraw", {})
+        min_amount = float(aw.get("min_amount", 500) or 0)
+
+        try:
+            balance, balance_str = await api.get_balance()
+        except Exception as e:
+            logger.warning("Auto-withdraw balance for %s: %s", user_id, e)
+            return ""
+        if balance_str == "—":
+            return ""                                   # unknown balance, skip
+        if balance < min_amount:
+            return ""                                   # below threshold, quiet
+
+        method = aw.get("method", "api")
+        if method == "panel":
+            resource = aw.get("panel_resource") or ""
+            values = dict(aw.get("panel_values") or {})
+            if not resource or not values:
+                aw["enabled"] = False                   # misconfigured; stop
+                return ("💸 Авто-вывод выключен: не настроен способ вывода "
+                        "через панель. Откройте «Баланс» → «Автовывод».")
+            from storage import get_panel_creds
+            from automation.panel import panel_withdraw_sync
+            creds = get_panel_creds(user_id)
+            if not creds or not creds.get("cookies"):
+                return "💸 Авто-вывод: нужен вход в панель продавца."
+            # The amount field, whatever it is called, is set to the balance
+            values = {**values}
+            for k in list(values):
+                if values[k] == "__BALANCE__":
+                    values[k] = int(balance)
+            loop = asyncio.get_event_loop()
+            ok, msg = await asyncio.wait_for(
+                loop.run_in_executor(None, panel_withdraw_sync,
+                                     creds["cookies"], resource, values,
+                                     user_id, True),
+                timeout=60)
+        else:
+            ok, msg = await api.withdraw_balance(min_amount)
+            if not ok and "не поддерживает" in msg:
+                # Do not repeat a doomed API attempt on every interval
+                aw["enabled"] = False
+                aw["last_run"] = now
+                aw["last_result"] = msg
+                return ("💸 Авто-вывод выключен: вывод через API недоступен. "
+                        "Настройте вывод через панель в «Баланс» → «Автовывод».")
+
+        aw["last_run"] = now
+        aw["last_result"] = msg
+        hist = settings.setdefault("withdrawal_history", [])
+        hist.insert(0, {"amount": float(int(balance)), "ts": now,
+                        "type": "auto",
+                        "status": "requested" if ok else "failed"})
+        del hist[100:]
+        return _card("💸 <b>АВТО-ВЫВОД</b>",
+                     [f"💰 Баланс был: <b>{balance_str}</b>", "",
+                      ("✅ " if ok else "⚠️ ") + _esc(msg)])
+
     async def _daily_report_text(self, api: YooMarketAPI, settings: dict) -> str:
         """The end-of-day summary, as today's numbers rather than lifetime ones.
 
@@ -1266,16 +1333,14 @@ class TaskManager:
             # --- Auto-withdraw ---
             aw = settings.get("auto_withdraw", {})
             if aw.get("enabled"):
-                min_amount = aw.get("min_amount", 500)
-                logger.info("Auto-withdraw for user %s via API", user_id)
-                success, msg = await api.withdraw_balance(min_amount)
-                # only log/notify when something actually happened (not "below threshold")
-                if success or "ниже порога" not in msg:
-                    hist = settings.setdefault("withdrawal_history", [])
-                    hist.insert(0, {"amount": 0.0, "ts": now, "type": "auto",
-                                    "status": "requested" if success else "failed"})
-                    del hist[100:]
-                    messages.append(f"💸 Авто-вывод: {msg}")
+                interval = float(aw.get("interval_hours", 24) or 24)
+                # A withdrawal must not fire on every 30-minute tick: without
+                # this guard a balance above the threshold was re-submitted
+                # every half hour.
+                if (now - float(aw.get("last_run", 0) or 0)) / 3600 >= interval:
+                    note = await self._auto_withdraw(user_id, api, settings, now)
+                    if note:
+                        messages.append(note)
 
             # --- Panel session health ---
             # Panel operations (product creation, item management) run on
