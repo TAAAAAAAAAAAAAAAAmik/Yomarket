@@ -707,10 +707,10 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
     s = get_settings(uid)
     ar = s.setdefault("auto_restore", {})
     try:
-        from handlers.panel_items import _DELETED
+        from handlers.panel_items import _deleted_ids
         rep = await api.restore_ads(
             require_stock=bool(ar.get("require_stock", True)),
-            skip_ids={str(i) for i in (_DELETED.get(uid) or set())})
+            skip_ids=_deleted_ids(uid))
         ar["last_restore_run"] = _time.time()
         ar["restored_total"] = int(ar.get("restored_total", 0) or 0) + len(rep["restored"])
         # A manual run is a deliberate retry: clear the waits it just resolved

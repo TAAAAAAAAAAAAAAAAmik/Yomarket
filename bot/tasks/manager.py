@@ -1146,8 +1146,8 @@ class TaskManager:
         held = {aid for aid, f in failures.items()
                 if float(f.get("until", 0) or 0) > now}
 
-        from handlers.panel_items import _DELETED
-        skip = set(held) | {str(i) for i in (_DELETED.get(user_id) or set())}
+        from handlers.panel_items import _deleted_ids
+        skip = set(held) | _deleted_ids(user_id)
 
         try:
             rep = await api.restore_ads(

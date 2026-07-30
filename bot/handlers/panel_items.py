@@ -14,7 +14,7 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
-from storage import get_panel_creds
+from storage import get_panel_creds, get_settings, save_settings
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -22,10 +22,32 @@ logger = logging.getLogger(__name__)
 _TIMEOUT = 40
 _CAT_CACHE: dict[int, list[str]] = {}
 _CATS_NAMES: dict[int, dict[int, str]] = {}   # uid -> {category_id: name}
+
 # Ads deleted from the panel can still come back from GET /ads for a while, so
-# they are remembered and filtered out — otherwise a removed listing keeps its
-# button and stays in the count.
-_DELETED: dict[int, set[str]] = {}
+# their ids are remembered and filtered out — otherwise a removed listing keeps
+# its button and stays in the count. This lives in settings, not memory: the
+# container is rebuilt on every deploy, and an in-memory set was wiped each
+# time, so every deleted item reappeared after the next update.
+# Statuses the marketplace itself uses for a removed listing — filtered even if
+# the id was never recorded, which covers items deleted straight from the site.
+_GONE_STATUSES = {"deleted", "removed", "trashed", "trash", "destroyed"}
+
+
+def _deleted_ids(uid: int) -> set[str]:
+    return {str(x) for x in (get_settings(uid).get("deleted_ads") or [])}
+
+
+def _mark_deleted(uid: int, item_id) -> None:
+    s = get_settings(uid)
+    lst = s.setdefault("deleted_ads", [])
+    if str(item_id) not in lst:
+        lst.append(str(item_id))
+        del lst[:-1000]          # keep the set bounded
+        save_settings(uid, s)
+
+
+def _is_gone(ad: dict) -> bool:
+    return str(ad.get("status", "")).lower() in _GONE_STATUSES
 
 
 class PanelItemState(StatesGroup):
@@ -85,9 +107,9 @@ async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
         await callback.answer()
         return
 
-    gone = _DELETED.get(callback.from_user.id, set())
-    if gone:
-        ads = [a for a in ads if str(a.get("id")) not in gone]
+    gone = _deleted_ids(callback.from_user.id)
+    ads = [a for a in ads
+           if str(a.get("id")) not in gone and not _is_gone(a)]
 
     groups: dict[str, int] = {}
     for ad in ads:
@@ -162,9 +184,9 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
         await callback.answer()
         return
 
-    gone = _DELETED.get(callback.from_user.id, set())
-    if gone:
-        ads = [a for a in ads if str(a.get("id")) not in gone]
+    gone = _deleted_ids(callback.from_user.id)
+    ads = [a for a in ads
+           if str(a.get("id")) not in gone and not _is_gone(a)]
     if category:
         ads = [a for a in ads if _ad_category(a, names) == category]
 
@@ -567,9 +589,10 @@ async def item_delete_do(callback: CallbackQuery, api: YooMarketAPI) -> None:
     result, err = await _run(uid, panel_delete_item_sync, item_id, uid)
 
     if result and result[0]:
-        # Remember it: the API can keep returning a deleted ad briefly, which
-        # would put its button and its count straight back.
-        _DELETED.setdefault(uid, set()).add(str(item_id))
+        # Remember it persistently: the API can keep returning a deleted ad
+        # briefly, and the container is rebuilt on every deploy — an in-memory
+        # note would be lost and the ad would come back.
+        _mark_deleted(uid, item_id)
         await callback.answer(f"✅ Товар #{item_id} удалён", show_alert=True)
         # Straight back to the refreshed list, so the row is actually gone
         await _render_ads(callback, api, category=None)
