@@ -105,10 +105,17 @@ async def _refresh_menu(callback: CallbackQuery) -> None:
 
 async def _finish_login(
     message: Message, status_msg: Message, uid: int, login: str, cookies: str,
+    chat_token: str = "",
 ) -> None:
     """Store the fresh panel session and confirm it works against the Nova API.
     Shared by both login flows (code and password)."""
-    save_panel_creds(uid, {"login": login, "cookies": cookies})
+    creds = {"login": login, "cookies": cookies}
+    # Keep any existing chat token unless the login produced a fresh one
+    if chat_token:
+        creds["chat_token"] = chat_token
+    elif (get_panel_creds(uid) or {}).get("chat_token"):
+        creds["chat_token"] = get_panel_creds(uid)["chat_token"]
+    save_panel_creds(uid, creds)
 
     from automation.panel import panel_check_session_sync
     loop = asyncio.get_event_loop()
@@ -344,12 +351,8 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
         await message.answer("Выберите действие:", reply_markup=b.as_markup())
         return
 
-    await _finish_login(message, status_msg, uid, email, result)
-    if seen:
-        await message.answer(
-            "🔎 <b>Запросы, которые сделал вход</b> — по ним сделаем "
-            f"версию без браузера:\n<code>{seen[:900]}</code>"
-        )
+    await _finish_login(message, status_msg, uid, email, result,
+                        getattr(http, "chat_token", ""))
 
 
 

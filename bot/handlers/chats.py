@@ -58,6 +58,7 @@ def _send_error(e: Exception) -> str:
 class ReplyState(StatesGroup):
     waiting_for_text = State()
     waiting_chat_id = State()
+    waiting_support_reply = State()   # reply to a support/moderation chat via the panel
 
 
 def _format_messages(messages: list[dict]) -> str:
@@ -380,20 +381,82 @@ async def wchat_detail(callback: CallbackQuery) -> None:
     digits = "".join(ch for ch in str(cid) if ch.isdigit())
     b = InlineKeyboardBuilder()
     b.button(text="📜 Показать историю", callback_data=f"wchat_hist:{cid}")
-    # No in-bot reply here: the API forbids sending to a chat without an active
-    # order (support has none), so this opens the panel where a reply works.
-    b.button(text="🌐 Ответить в панели",
+    # Reply in-bot via the panel chat API (support has no active order, so the
+    # marketplace API refuses it — the panel token is used instead).
+    b.button(text="✉️ Ответить", callback_data=f"sreply:{cid}")
+    b.button(text="🌐 Открыть в панели",
              url=f"https://panel.yoomarket.net/chats/{digits or cid}")
     b.button(text="🗑 Убрать", callback_data=f"wchat_del:{cid}")
     b.button(text="⬅️ Назад", callback_data="wchats:list")
-    b.adjust(1, 1, 2)
+    b.adjust(1, 2, 2)
     await callback.message.edit_text(
         f"🛟 <b>{_esc(info.get('label') or 'Чат')}</b>\n\n"
         f"💬 Номер: <code>#{_esc(cid)}</code>\n\n"
-        f"<i>Читать сообщения можно здесь, а отвечать — в панели: "
-        f"писать в чат без активного заказа через API Юмаркет не даёт.</i>",
+        f"<i>Читать и отвечать можно прямо здесь. Ответ уходит через панель — "
+        f"для этого нужен вход в панель по email.</i>",
         reply_markup=b.as_markup())
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("sreply:"))
+async def support_reply_init(callback: CallbackQuery, state: FSMContext) -> None:
+    cid = callback.data.split(":", 1)[1]
+    from storage import get_panel_creds
+    creds = get_panel_creds(callback.from_user.id) or {}
+    if not creds.get("chat_token"):
+        b = InlineKeyboardBuilder()
+        b.button(text="🌐 Войти в панель", callback_data="panel:sms_start")
+        b.button(text="⬅️ Назад", callback_data=f"wchat:{cid}")
+        b.adjust(1)
+        await callback.message.edit_text(
+            "🔑 <b>Нужен вход в панель</b>\n\n"
+            "Ответ в поддержку идёт через панель, а для этого боту нужен токен, "
+            "который выдаётся при входе по email. Войдите заново — токен "
+            "сохранится, и ответы заработают.",
+            reply_markup=b.as_markup())
+        await callback.answer()
+        return
+    await state.set_state(ReplyState.waiting_support_reply)
+    await state.update_data(support_chat_id=cid)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data=f"wchat:{cid}")
+    await callback.message.edit_text(
+        f"✉️ Напишите ответ в чат #{_esc(cid)}:", reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.message(ReplyState.waiting_support_reply)
+async def support_reply_send(message: Message, state: FSMContext) -> None:
+    import asyncio
+
+    from automation.panel import panel_chat_send_sync
+    from storage import get_panel_creds
+
+    data = await state.get_data()
+    cid = data.get("support_chat_id", "")
+    await state.clear()
+    text = (message.text or "").strip()
+    if not cid or not text:
+        await message.answer("❌ Пустой ответ.")
+        return
+    creds = get_panel_creds(message.from_user.id) or {}
+    status = await message.answer("⏳ Отправляю в поддержку...")
+    try:
+        loop = asyncio.get_event_loop()
+        ok, msg = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_chat_send_sync,
+                                 creds.get("cookies", ""), cid, text,
+                                 creds.get("chat_token", "")),
+            timeout=60)
+    except Exception as e:
+        ok, msg = False, str(e)[:150]
+    b = InlineKeyboardBuilder()
+    b.button(text="💬 К чату", callback_data=f"wchat:{cid}")
+    b.button(text="⬅️ Чаты", callback_data="menu:chats")
+    b.adjust(1)
+    await status.edit_text(
+        (f"✅ {_esc(msg)}" if ok else f"❌ {_esc(msg)}"),
+        reply_markup=b.as_markup())
 
 
 @router.callback_query(F.data.startswith("wchat_del:"))

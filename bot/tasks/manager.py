@@ -269,14 +269,16 @@ def _balance_notify_kb() -> InlineKeyboardMarkup:
 
 
 def _watched_notify_kb(chat_id: str) -> InlineKeyboardMarkup:
-    """For a support/moderation message: reply is not possible through the API
-    (no active order), so open the panel where it is, and read here."""
+    """For a support/moderation message: the marketplace API refuses a reply
+    (no active order), so answering goes through the panel chat token in-bot,
+    with a link to the panel as a fallback."""
     digits = "".join(ch for ch in str(chat_id) if ch.isdigit()) or str(chat_id)
     builder = InlineKeyboardBuilder()
-    builder.button(text="🌐 Ответить в панели",
-                   url=f"https://panel.yoomarket.net/chats/{digits}")
+    builder.button(text="✉️ Ответить", callback_data=f"sreply:{chat_id}")
     builder.button(text="📜 История", callback_data=f"wchat_hist:{chat_id}")
-    builder.adjust(1)
+    builder.button(text="🌐 В панели",
+                   url=f"https://panel.yoomarket.net/chats/{digits}")
+    builder.adjust(2, 1)
     return builder.as_markup()
 
 

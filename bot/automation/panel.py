@@ -135,6 +135,10 @@ class YooMarketPanelHTTP:
         self._verify_path: str = ""
         # Host that actually handles the login (the marketplace, normally).
         self._auth_host: str = MAIN_URL
+        # A Bearer token the login response may carry — the panel SPA stores it
+        # in localStorage and uses it for the chat API, which cookies cannot
+        # reach. Captured so support replies can be sent.
+        self.chat_token: str = ""
 
     async def start(self) -> None:
         connector = aiohttp.TCPConnector(ssl=False, limit=16)
@@ -300,6 +304,11 @@ class YooMarketPanelHTTP:
                     text = await resp.text()
                     logger.info("verify_code → %s: %s", resp.status, text[:200])
                     if resp.status in (200, 201, 204, 302):
+                        # Capture a Bearer token from the body regardless of
+                        # cookies — the chat API needs it, cookies do not reach
+                        # it. Look through nested objects too (token often sits
+                        # under "data"/"user").
+                        self.chat_token = _token_from_body(text)
                         cookies = _extract_all_cookies(self._session)
                         if cookies and await self._session_ok():
                             return True, cookies
@@ -352,6 +361,32 @@ class YooMarketPanelHTTP:
         except Exception:
             return False
 
+
+
+def _token_from_body(text: str) -> str:
+    """A Bearer token from a login response — top level or nested under the
+    usual keys. Returns '' when there is none."""
+    try:
+        data = _json.loads(text)
+    except Exception:
+        return ""
+
+    def _walk(node, depth=0):
+        if depth > 4 or not isinstance(node, dict):
+            return ""
+        for key in ("token", "access_token", "api_token", "bearer",
+                    "auth_token", "accessToken"):
+            v = node.get(key)
+            if isinstance(v, str) and len(v) >= 20:
+                return v
+        for v in node.values():
+            if isinstance(v, dict):
+                found = _walk(v, depth + 1)
+                if found:
+                    return found
+        return ""
+
+    return _walk(data)
 
 
 def _extract_all_cookies(session: aiohttp.ClientSession) -> str:
@@ -1810,57 +1845,61 @@ def panel_chat_probe_sync(cookie_string: str, chat_id: str,
 
 def panel_chat_send_sync(
     cookie_string: str, chat_id: str, text: str,
-    endpoint: str = "", use_token: bool = True,
+    chat_token: str = "", endpoint: str = "",
 ) -> tuple[bool, str]:
-    """Blocking: send a message to a support/moderation chat via the panel.
+    """Blocking: send a message to a support/moderation chat.
 
-    `endpoint` is the route discovered by panel_chat_probe_sync; when empty a
-    few known shapes are tried. If the chat wants the page's Bearer token
-    instead of cookies, it is picked up automatically.
+    The chat API authenticates by a Bearer token the panel stores in
+    localStorage at login (cookies 401 there). `chat_token` is that token,
+    captured during login and passed in from stored creds; without it, this
+    cannot authenticate and says so plainly instead of guessing.
     """
+    if not chat_token:
+        return False, ("нет токена чата — войдите в панель заново, чтобы бот "
+                       "получил его (кнопка «Войти по email»)")
+
+    import requests as _rq
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    _rq.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
     cid = "".join(ch for ch in str(chat_id) if ch.isdigit()) or str(chat_id)
-    session = _make_panel_requests_session(cookie_string)
-    hdrs = _panel_xsrf_headers(session, cookie_string)
-    hdrs["Content-Type"] = "application/json"
-    # Mark the request as coming from the SPA so Sanctum accepts the session
-    # cookie for the /api/* guard — the Origin header is what it checks.
-    hdrs["Origin"] = PANEL_URL
-    hdrs["Referer"] = f"{PANEL_URL}/chats/{cid}"
-
-    token = ""
-    if use_token:
-        try:
-            token = _extract_bearer(session.get(PANEL_URL + "/", timeout=(6, 12)).text)
-        except Exception:
-            token = ""
-    if token:
-        hdrs["Authorization"] = f"Bearer {token}"
-
-    paths = [endpoint] if endpoint else [
-        f"/api/chats/{cid}/messages", f"/api/chats/{cid}/send",
-        f"/chats/{cid}/messages", f"/api/support/{cid}/messages",
+    hdrs = {
+        "Authorization": f"Bearer {chat_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": PANEL_URL,
+        "Referer": f"{PANEL_URL}/chats/{cid}",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+    }
+    # Both hosts the chat API is served from, panel first.
+    targets = []
+    if endpoint:
+        targets.append(PANEL_URL + (endpoint if endpoint.startswith("/") else "/" + endpoint))
+    targets += [
+        f"{PANEL_URL}/api/chats/{cid}/messages",
+        f"{PANEL_URL}/api/chats/{cid}/send",
+        f"https://api.yoo.market/chats/{cid}/messages",
+        f"https://api.yoo.market/v1/chats/{cid}/messages",
     ]
     payloads = ({"text": text}, {"message": text}, {"body": text})
     last = ""
-    for path in [p for p in paths if p]:
-        if not path.startswith("/"):
-            path = "/" + path
+    for url in targets:
         for body in payloads:
             try:
-                r = session.post(PANEL_URL + path, json=body, headers=hdrs,
-                                 timeout=(6, 15), allow_redirects=False)
+                r = _rq.post(url, json=body, headers=hdrs,
+                             timeout=(6, 15), verify=False, allow_redirects=False)
             except Exception as e:
                 last = str(e)[:80]
                 continue
             if r.status_code in (200, 201, 204):
-                _save_refreshed_cookies(None, cookie_string, session)
-                return True, "✅ Отправлено в поддержку через панель"
+                return True, "✅ Отправлено в поддержку"
             if r.status_code == 404:
-                continue
-            last = f"{path} → {r.status_code}: {r.text[:100]}"
+                break                      # this url is wrong, next url
+            last = f"{r.status_code}: {r.text[:100]}"
             if r.status_code in (401, 403):
-                break     # auth problem repeats for every path/payload
-    return False, f"не удалось отправить: {last or 'все адреса 404'}"
+                return False, ("токен чата не подошёл (401). Войдите в панель "
+                               "заново, чтобы бот обновил токен.")
+    return False, f"не удалось отправить: {last or 'адрес не найден'}"
 
 
 def panel_list_categories_sync(cookie_string: str) -> tuple[bool, object]:
