@@ -441,6 +441,13 @@ def _mask(value: str) -> str:
 
 
 async def _run_panel(uid, fn, *args):
+    """Run a blocking panel function and unpack its (ok, payload) result.
+
+    The panel_* functions all return (ok, data). Returning that tuple verbatim
+    made callers test isinstance(res, list) against a tuple — the check failed
+    and the whole raw payload was dumped into a message that overflowed
+    Telegram's limit, so the "loading…" text never got replaced and looked hung.
+    """
     import asyncio
     from storage import get_panel_creds
     creds = get_panel_creds(uid)
@@ -448,11 +455,17 @@ async def _run_panel(uid, fn, *args):
         return None, "нужен вход в панель продавца"
     loop = asyncio.get_event_loop()
     try:
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, fn, creds["cookies"], *args),
-            timeout=60), ""
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, fn, creds["cookies"], *args), timeout=60)
+    except asyncio.TimeoutError:
+        return None, "панель не ответила за 60 секунд"
     except Exception as e:
-        return None, str(e)[:150]
+        return None, str(e)[:150] or type(e).__name__
+    if (isinstance(result, tuple) and len(result) == 2
+            and isinstance(result[0], bool)):
+        ok, payload = result
+        return (payload, "") if ok else (None, str(payload)[:250])
+    return result, ""
 
 
 @router.callback_query(F.data == "balance:auto_setup")
@@ -471,9 +484,13 @@ async def auto_setup(callback: CallbackQuery, state: FSMContext) -> None:
             f"❌ Не удалось прочитать счета: {_esc(err or res)}",
             reply_markup=b.as_markup())
         return
-    await state.update_data(wd_balances=res)
+    # Keep only what the next step needs — the full Nova rows in "raw" are large
+    # and would bloat the FSM state for no reason.
+    slim = [{"id": bl["id"], "currency": bl.get("currency", ""),
+             "amount": bl.get("amount", "")} for bl in res]
+    await state.update_data(wd_balances=slim)
     b = InlineKeyboardBuilder()
-    for i, bl in enumerate(res):
+    for i, bl in enumerate(slim):
         cur = (bl.get("currency") or "").split("  ")[0][:28]
         b.button(text=f"💳 {cur} · {bl.get('amount') or '—'}",
                  callback_data=f"wd:bal:{i}")
@@ -779,6 +796,19 @@ def _one_btn(text: str, cb: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text=text, callback_data=cb)
     return b.as_markup()
+
+
+async def _safe_edit(message, text: str, reply_markup=None) -> None:
+    """Edit a message, surviving both Telegram's 4096 limit and a rejected
+    edit — a message that fails to update is what makes the bot look hung."""
+    text = text[:4000]
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        try:
+            await message.answer(text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.warning("safe_edit failed: %s", e)
 
 
 # ── Активные выводы ─────────────────────────────────────────────────────────
