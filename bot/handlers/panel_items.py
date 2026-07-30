@@ -1226,6 +1226,39 @@ async def promo_debug(message: Message) -> None:
     await status.delete()
 
 
+@router.message(Command("chat_debug"))
+async def chat_debug(message: Message) -> None:
+    """/chat_debug 1076867 — find how the panel sends a support message.
+
+    Read-only: sends nothing. Reveals the token, the reachable endpoints and
+    the send route, so replying to support can be wired to the real request.
+    """
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Укажите номер чата: <code>/chat_debug 1076867</code>")
+        return
+    chat_id = parts[1].strip().rstrip("/").split("/")[-1]
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет сессии панели — войдите в «Панель продавца»")
+        return
+    import html as _html
+    from automation.panel import panel_chat_probe_sync
+    status = await message.answer("⏳ Разбираю, как панель шлёт сообщения...")
+    try:
+        loop = asyncio.get_event_loop()
+        _ok, report = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_chat_probe_sync,
+                                 creds["cookies"], chat_id),
+            timeout=90)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    text = _html.escape(str(report))
+    for i in range(0, min(len(text), 10000), 3500):
+        await message.answer(f"<code>{text[i:i + 3500]}</code>")
+    await status.delete()
+
+
 @router.message(Command("withdraw_debug"))
 async def withdraw_debug(message: Message) -> None:
     """Reveal what the panel exposes for withdrawal — a read-only probe.

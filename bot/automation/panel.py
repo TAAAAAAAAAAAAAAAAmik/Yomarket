@@ -1669,6 +1669,159 @@ def panel_withdraw_sync(
     return False, f"панель ответила {r.status_code}: {r.text[:150]}"
 
 
+# ---------------------------------------------------------------------------
+# Support / moderation chat — reply through the panel
+#
+# The Integration API refuses to send to a chat without an active order
+# (no_active_orders_in_chat), which is every support thread. Sending has to go
+# through the panel, and an earlier scan got 401 there — likely because the
+# chat wants a Bearer token embedded in the page, not the Laravel cookies. The
+# probe below finds that token and the real send route without sending
+# anything; panel_chat_send_sync then posts the reply.
+# ---------------------------------------------------------------------------
+
+def _extract_bearer(html: str) -> str:
+    """A chat API token embedded in the panel page, if there is one."""
+    for pat in (r'"api_token"\s*:\s*"([^"]{20,})"',
+                r'"access_token"\s*:\s*"([^"]{20,})"',
+                r'"bearer"\s*:\s*"([^"]{20,})"',
+                r'"token"\s*:\s*"([A-Za-z0-9._\-]{30,})"',
+                r'Bearer\s+([A-Za-z0-9._\-]{30,})'):
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def panel_chat_probe_sync(cookie_string: str, chat_id: str) -> tuple[bool, str]:
+    """Blocking, read-only: find how the panel sends a chat message.
+
+    Sends nothing. Reads the chat page, digs out any Bearer token, tries the
+    likely message endpoints with cookies (and with the token if cookies 401),
+    and scans the page scripts for the POST route the reply goes to.
+    """
+    cid = "".join(ch for ch in str(chat_id) if ch.isdigit()) or str(chat_id)
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    out: list[str] = []
+
+    token = ""
+    page_js: list[str] = []
+    for page in ("/", f"/chats/{cid}"):
+        try:
+            r = session.get(PANEL_URL + page, timeout=(6, 15))
+        except Exception as e:
+            out.append(f"{page}: {str(e)[:50]}")
+            continue
+        out.append(f"{page} → {r.status_code}, {len(r.text)}б")
+        if not token:
+            token = _extract_bearer(r.text)
+        page_js += re.findall(r'src="(/[^"]+\.js[^"]*)"', r.text)
+    out.append(f"Bearer-токен на странице: {'найден' if token else 'нет'}")
+
+    def _try(method: str, path: str, use_token: bool):
+        h = dict(hdrs)
+        if use_token and token:
+            h["Authorization"] = f"Bearer {token}"
+        try:
+            if method == "GET":
+                r = session.get(PANEL_URL + path, headers=h, timeout=(5, 10),
+                                allow_redirects=False)
+            else:
+                r = session.options(PANEL_URL + path, headers=h, timeout=(5, 10),
+                                     allow_redirects=False)
+        except Exception as e:
+            return f"{method} {path}: {str(e)[:40]}"
+        if r.status_code == 404:
+            return ""
+        body = r.text[:90].replace("\n", " ")
+        return f"{method} {path} → {r.status_code}: {body}"
+
+    out.append("\n— чтение сообщений (cookies) —")
+    read_paths = [f"/api/chats/{cid}/messages", f"/api/chats/{cid}",
+                  f"/chats/{cid}/messages", f"/api/support/{cid}/messages",
+                  f"/api/dialogs/{cid}/messages", f"/api/messages?chat_id={cid}"]
+    for p in read_paths:
+        line = _try("GET", p, use_token=False)
+        if line:
+            out.append(line)
+            if "401" in line and token:
+                out.append("  " + _try("GET", p, use_token=True))
+
+    # The send route: scan the chat scripts for a POST to a chat/message path
+    out.append("\n— маршруты отправки в JS —")
+    sends = set()
+    for src in list(dict.fromkeys(page_js))[:6]:
+        try:
+            js = session.get(PANEL_URL + src, timeout=(6, 20)).text
+        except Exception:
+            continue
+        for m in re.findall(
+                r'\.(?:post|put)\(\s*[`"\']([^`"\']*(?:chat|message|support|'
+                r'dialog|send)[^`"\']*)[`"\']', js, re.I):
+            if len(m) < 80:
+                sends.add(m)
+        # A baseURL for the chat service, if it is a separate host
+        for m in re.findall(r'baseURL\s*[:=]\s*[`"\']([^`"\']+)[`"\']', js):
+            if len(m) < 80:
+                sends.add("baseURL=" + m)
+    out.append(f"{sorted(sends)[:20] or 'ничего не нашлось'}")
+    if token:
+        out.append(f"\n(токен: {token[:12]}…{token[-6:]})")
+    return True, "\n".join(out)
+
+
+def panel_chat_send_sync(
+    cookie_string: str, chat_id: str, text: str,
+    endpoint: str = "", use_token: bool = True,
+) -> tuple[bool, str]:
+    """Blocking: send a message to a support/moderation chat via the panel.
+
+    `endpoint` is the route discovered by panel_chat_probe_sync; when empty a
+    few known shapes are tried. If the chat wants the page's Bearer token
+    instead of cookies, it is picked up automatically.
+    """
+    cid = "".join(ch for ch in str(chat_id) if ch.isdigit()) or str(chat_id)
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    hdrs["Content-Type"] = "application/json"
+
+    token = ""
+    if use_token:
+        try:
+            token = _extract_bearer(session.get(PANEL_URL + "/", timeout=(6, 12)).text)
+        except Exception:
+            token = ""
+    if token:
+        hdrs["Authorization"] = f"Bearer {token}"
+
+    paths = [endpoint] if endpoint else [
+        f"/api/chats/{cid}/messages", f"/api/chats/{cid}/send",
+        f"/chats/{cid}/messages", f"/api/support/{cid}/messages",
+    ]
+    payloads = ({"text": text}, {"message": text}, {"body": text})
+    last = ""
+    for path in [p for p in paths if p]:
+        if not path.startswith("/"):
+            path = "/" + path
+        for body in payloads:
+            try:
+                r = session.post(PANEL_URL + path, json=body, headers=hdrs,
+                                 timeout=(6, 15), allow_redirects=False)
+            except Exception as e:
+                last = str(e)[:80]
+                continue
+            if r.status_code in (200, 201, 204):
+                _save_refreshed_cookies(None, cookie_string, session)
+                return True, "✅ Отправлено в поддержку через панель"
+            if r.status_code == 404:
+                continue
+            last = f"{path} → {r.status_code}: {r.text[:100]}"
+            if r.status_code in (401, 403):
+                break     # auth problem repeats for every path/payload
+    return False, f"не удалось отправить: {last or 'все адреса 404'}"
+
+
 def panel_list_categories_sync(cookie_string: str) -> tuple[bool, object]:
     """Blocking: the seller's categories, derived from their own listings.
     Returns (True, [{"name": str, "count": int}]) or (False, error)."""
