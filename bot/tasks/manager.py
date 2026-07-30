@@ -268,6 +268,18 @@ def _balance_notify_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def _watched_notify_kb(chat_id: str) -> InlineKeyboardMarkup:
+    """For a support/moderation message: reply is not possible through the API
+    (no active order), so open the panel where it is, and read here."""
+    digits = "".join(ch for ch in str(chat_id) if ch.isdigit()) or str(chat_id)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🌐 Ответить в панели",
+                   url=f"https://panel.yoomarket.net/chats/{digits}")
+    builder.button(text="📜 История", callback_data=f"wchat_hist:{chat_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def _message_notify_kb(chat_id: str, order_id: str = "") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="✉️ Ответить", callback_data=f"reply_init:{chat_id}")
@@ -579,7 +591,7 @@ class TaskManager:
                                "",
                                f"<blockquote>{_esc(text)}</blockquote>"],
                               f"💬 <code>#{chat_id}</code>"),
-                        reply_markup=_message_notify_kb(str(chat_id)),
+                        reply_markup=_watched_notify_kb(str(chat_id)),
                     )
                 info["last_msg"] = newest_id
             except Exception as e:

@@ -377,15 +377,21 @@ async def wchat_detail(callback: CallbackQuery) -> None:
     cid = callback.data.split(":", 1)[1]
     watched = get_settings(callback.from_user.id).get("watched_chats") or {}
     info = watched.get(cid) or {}
+    digits = "".join(ch for ch in str(cid) if ch.isdigit())
     b = InlineKeyboardBuilder()
     b.button(text="📜 Показать историю", callback_data=f"wchat_hist:{cid}")
-    b.button(text="✉️ Ответить", callback_data=f"reply_init:{cid}")
+    # No in-bot reply here: the API forbids sending to a chat without an active
+    # order (support has none), so this opens the panel where a reply works.
+    b.button(text="🌐 Ответить в панели",
+             url=f"https://panel.yoomarket.net/chats/{digits or cid}")
     b.button(text="🗑 Убрать", callback_data=f"wchat_del:{cid}")
     b.button(text="⬅️ Назад", callback_data="wchats:list")
-    b.adjust(1, 2, 1)
+    b.adjust(1, 1, 2)
     await callback.message.edit_text(
         f"🛟 <b>{_esc(info.get('label') or 'Чат')}</b>\n\n"
-        f"💬 Номер: <code>#{_esc(cid)}</code>",
+        f"💬 Номер: <code>#{_esc(cid)}</code>\n\n"
+        f"<i>Читать сообщения можно здесь, а отвечать — в панели: "
+        f"писать в чат без активного заказа через API Юмаркет не даёт.</i>",
         reply_markup=b.as_markup())
     await callback.answer()
 
