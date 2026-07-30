@@ -3,6 +3,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
 from keyboards.main import main_menu_keyboard
@@ -63,7 +64,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
     from storage import render_custom_text
     await state.set_state(AuthState.waiting_for_token)
-    await message.answer(render_custom_text("welcome"))
+    # The greeting links to the panel; a link preview would bury the steps.
+    await message.answer(render_custom_text("welcome"),
+                         disable_web_page_preview=True)
 
 
 @router.message(Command("version"))
@@ -139,17 +142,27 @@ async def process_token(message: Message, state: FSMContext, **data) -> None:
     name, balance = _extract_shop(info)
     save_shop_name(message.from_user.id, name)
 
-    await message.answer(
-        f"✅ Авторизация успешна!\n\n"
-        f"🏪 <b>{name}</b>\n"
-        f"💰 Баланс: <b>{balance} ₽</b>"
-    )
-
     task_manager = data.get("task_manager")
     if task_manager:
         task_manager.start_for_user(message.from_user.id)
 
-    await _send_menu(message, message.from_user.id)
+    # Step 2 of onboarding: the panel login. Skipped for someone who is already
+    # logged in — no point walking them through a step that is done.
+    from storage import get_panel_creds, render_custom_text
+    if get_panel_creds(message.from_user.id):
+        await message.answer(
+            f"✅ <b>Токен обновлён</b>\n\n🏪 <b>{name}</b>\n"
+            f"💰 Баланс: <b>{balance} ₽</b>")
+        await _send_menu(message, message.from_user.id)
+        return
+
+    b = InlineKeyboardBuilder()
+    b.button(text="📧 Войти по email", callback_data="panel:sms_start")
+    b.button(text="⏭ Позже", callback_data="menu:main")
+    b.adjust(1)
+    await message.answer(
+        render_custom_text("token_ok", name=name, balance=balance),
+        reply_markup=b.as_markup())
 
 
 @router.callback_query(F.data == "menu:main")

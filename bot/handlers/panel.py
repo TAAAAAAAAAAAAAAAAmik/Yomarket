@@ -35,8 +35,10 @@ class PanelState(StatesGroup):
 
 def _status_text(creds: dict | None, has_token: bool = False) -> str:
     if not creds:
-        hint = "\n\n💡 У вас есть API-токен — попробуйте <b>автоматический вход</b>." if has_token else ""
-        return f"🔒 <b>Панель YooMarket</b>\n\nВы <b>не авторизованы</b> в панели продавца.{hint}"
+        return ("🔒 <b>Панель YooMarket</b>\n\n"
+                "Вы <b>не авторизованы</b> в панели продавца.\n\n"
+                "Вход по вашей почте: придёт код, введёте его здесь.\n"
+                "<i>Пароль не нужен.</i>")
     login = creds.get("login", "")
     login_part = f"\n👤 Логин: <b>{login}</b>" if login else ""
     return (
@@ -47,25 +49,24 @@ def _status_text(creds: dict | None, has_token: bool = False) -> str:
 
 
 def _menu_kb(creds: dict | None, has_token: bool = False):
+    """Email + code only.
+
+    The cookie-paste and token paths are gone on purpose: pasting cookies is
+    something no seller should be asked to do, and neither of those routes ever
+    yields the chat token the panel mints at email login — the one that makes
+    replying to support work. One way in, and it is the one that works fully.
+    """
     b = InlineKeyboardBuilder()
     if creds:
         b.button(text="🔄 Проверить", callback_data="panel:check")
         b.button(text="🚪 Выйти", callback_data="panel:logout")
-        b.button(text="📧 Вход по коду", callback_data="panel:sms_start")
-        b.button(text="🍪 Обновить cookies", callback_data="panel:cookies_start")
-        if has_token:
-            b.button(text="🎟 Через токен", callback_data="panel:token_login")
+        b.button(text="📧 Войти заново по email", callback_data="panel:sms_start")
+        b.button(text="⬅️ Настройки", callback_data="settings:menu")
+        b.adjust(2, 1, 1)
     else:
-        b.button(text="📧 Вход по коду", callback_data="panel:sms_start")
-        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
-        if has_token:
-            b.button(text="🎟 Через токен", callback_data="panel:token_login")
-    b.button(text="⬅️ Настройки", callback_data="settings:menu")
-    # 2 columns for actions, "⬅️ Настройки" on its own row at the bottom
-    if creds:
-        b.adjust(2, 2, 1, 1) if has_token else b.adjust(2, 2, 1)
-    else:
-        b.adjust(2, 1, 1) if has_token else b.adjust(2, 1)
+        b.button(text="📧 Войти по email", callback_data="panel:sms_start")
+        b.button(text="⬅️ Настройки", callback_data="settings:menu")
+        b.adjust(1)
     return b.as_markup()
 
 
@@ -193,7 +194,7 @@ async def panel_check(callback: CallbackQuery) -> None:
         await callback.message.answer("✅ Сессия <b>активна</b> — всё работает!")
     else:
         await callback.message.answer(
-            "⚠️ Сессия <b>истекла</b>.\n\nВойдите заново через email или вставьте новые cookies."
+            "⚠️ Сессия <b>истекла</b>.\n\nВойдите заново по email — придёт код."
         )
     await _refresh_menu(callback)
 
@@ -283,7 +284,6 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         await _safe_edit(status_msg, f"❌ {err or 'Не удалось отправить код'}")
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
-        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
         b.adjust(1)
         await message.answer("Выберите действие:", reply_markup=b.as_markup())
@@ -345,7 +345,6 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
         await _safe_edit(status_msg, f"❌ {result}")
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
-        b.button(text="🍪 Вставить cookies", callback_data="panel:cookies_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
         b.adjust(1)
         await message.answer("Выберите действие:", reply_markup=b.as_markup())

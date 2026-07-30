@@ -35,6 +35,12 @@ def _notif_text(s: dict) -> str:
     bl: list = s.get("blacklist", [])
 
     lines = ["🔔 <b>Уведомления</b>\n"]
+    lines.append(f"🛒 <b>Новый заказ</b> — "
+                 f"{_st(s.get('notify_orders', {}).get('enabled', True))}")
+    lines.append(f"💬 <b>Сообщения из чатов</b> — "
+                 f"{_st(s.get('notify_messages', {}).get('enabled', True))}")
+    lines.append("   <i>Заказы, поддержка и модерация</i>")
+    lines.append("")
     lines.append(f"⏰ <b>Напоминания о заказах</b> — {_st(rem_on)}")
     if rem_on:
         lines.append(f"   Через <b>{rem_h} ч</b>")
@@ -59,7 +65,14 @@ def _notif_kb(s: dict):
     dr = s.get("daily_report", {})
     dr_on = dr.get("enabled", False)
 
+    orders_on = s.get("notify_orders", {}).get("enabled", True)
+    msgs_on = s.get("notify_messages", {}).get("enabled", True)
+
     b = InlineKeyboardBuilder()
+    b.button(text=f"🛒 Новый заказ: {'🟢 вкл' if orders_on else '🔴 выкл'}",
+             callback_data="notif:toggle:orders")
+    b.button(text=f"💬 Сообщения из чатов: {'🟢 вкл' if msgs_on else '🔴 выкл'}",
+             callback_data="notif:toggle:messages")
     b.button(
         text=f"{'🔴 Выкл' if rem_on else '🟢 Вкл'} напоминания",
         callback_data="notif:toggle:reminders",
@@ -104,6 +117,34 @@ async def _refresh(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "notif:menu")
 async def notif_menu(callback: CallbackQuery) -> None:
+    await _refresh(callback)
+
+
+# ---------------------------------------------------------------------------
+# Orders / chat messages
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "notif:toggle:orders")
+async def toggle_order_notify(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    n = s.setdefault("notify_orders", {"enabled": True})
+    n["enabled"] = not n.get("enabled", True)
+    save_settings(callback.from_user.id, s)
+    await callback.answer("Новые заказы: "
+                          + ("вкл" if n["enabled"] else "выкл"))
+    await _refresh(callback)
+
+
+@router.callback_query(F.data == "notif:toggle:messages")
+async def toggle_message_notify(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    n = s.setdefault("notify_messages", {"enabled": True})
+    n["enabled"] = not n.get("enabled", True)
+    save_settings(callback.from_user.id, s)
+    await callback.answer(
+        "Сообщения из чатов: " + ("вкл" if n["enabled"] else "выкл")
+        + ("" if n["enabled"] else " · жалобы всё равно придут"),
+        show_alert=not n["enabled"])
     await _refresh(callback)
 
 

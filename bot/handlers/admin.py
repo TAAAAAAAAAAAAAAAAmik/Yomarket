@@ -216,13 +216,35 @@ async def _do_grant(msg, state: FSMContext, days: int, admin_id: int, bot: Bot) 
             await msg.answer(text, reply_markup=b.as_markup())
     else:
         await msg.answer(text, reply_markup=b.as_markup())
-    # notify the client
+    # Greet the client and put them straight into the onboarding step. Setting
+    # the token-waiting state matters: the greeting asks for the API token, and
+    # without the state their reply would land nowhere.
     try:
-        from storage import render_custom_text
+        from storage import get_token, render_custom_text
         await bot.send_message(
-            target, render_custom_text("sub_granted", days=days, left=left))
-    except Exception:
-        pass
+            target, render_custom_text("sub_granted", days=days, left=left),
+            disable_web_page_preview=True)
+        if not get_token(target):
+            await _arm_token_state(state, target, bot)
+    except Exception as e:
+        logger.warning("sub_granted notify %s: %s", target, e)
+
+
+async def _arm_token_state(state: FSMContext, target: int, bot: Bot) -> None:
+    """Put another user's FSM into "waiting for API token".
+
+    The greeting is sent to them, not to the admin running the command, so the
+    state has to be written against that user's own storage key.
+    """
+    from aiogram.fsm.storage.base import StorageKey
+
+    from handlers.start import AuthState
+
+    storage = getattr(state, "storage", None)
+    if storage is None:
+        return
+    key = StorageKey(bot_id=bot.id, chat_id=int(target), user_id=int(target))
+    await storage.set_state(key, AuthState.waiting_for_token)
 
 
 # ── Чёрный список ───────────────────────────────────────────────────────────

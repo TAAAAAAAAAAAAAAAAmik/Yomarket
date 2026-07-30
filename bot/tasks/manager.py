@@ -459,7 +459,8 @@ class TaskManager:
                             accepted = True
                         except Exception as e:
                             logger.warning("Auto-accept order %s: %s", oid, e)
-                    if not is_blacklisted:
+                    if not is_blacklisted and settings.get(
+                            "notify_orders", {}).get("enabled", True):
                         time_str = _fmt_time(time_raw)
                         cnt_today, rev_today = _today_stats(order_details, known)
                         qty_part = f"  ×{quantity}" if quantity else ""
@@ -555,6 +556,10 @@ class TaskManager:
         watched: dict = settings.get("watched_chats") or {}
         if not watched:
             return
+        # Support and moderation are chat traffic too — the same switch covers
+        # them, but their position is still tracked so nothing is re-sent when
+        # notifications are turned back on.
+        announce = settings.get("notify_messages", {}).get("enabled", True)
 
         for chat_id, info in list(watched.items()):
             try:
@@ -584,6 +589,8 @@ class TaskManager:
                             "me", "self", "own", "shop", "seller"):
                         continue
 
+                    if not announce:
+                        continue
                     text = (msg.get("text") or msg.get("message") or "")[:400]
                     time_str = _fmt_time(msg.get("created_at") or msg.get("date"))
                     await self._notify(
@@ -703,15 +710,19 @@ class TaskManager:
                             )
                             continue
 
-                    await self._notify(
-                        user_id,
-                        _card("💬 <b>СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ</b>",
-                              [f"👤 <b>{who}</b>{time_part}",
-                               "",
-                               f"<blockquote>{msg_text}</blockquote>"],
-                              f"{order_line}\n🧾 <code>#{order_id}</code>"),
-                        reply_markup=_message_notify_kb(chat_id, order_id),
-                    )
+                    # A complaint is an alert, not chat traffic, and is sent
+                    # above regardless — this switch only silences ordinary
+                    # buyer messages.
+                    if settings.get("notify_messages", {}).get("enabled", True):
+                        await self._notify(
+                            user_id,
+                            _card("💬 <b>СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ</b>",
+                                  [f"👤 <b>{who}</b>{time_part}",
+                                   "",
+                                   f"<blockquote>{msg_text}</blockquote>"],
+                                  f"{order_line}\n🧾 <code>#{order_id}</code>"),
+                            reply_markup=_message_notify_kb(chat_id, order_id),
+                        )
 
                 known_messages[order_id] = newest_id
 
