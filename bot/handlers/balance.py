@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 class WithdrawState(StatesGroup):
     waiting_amount = State()
+    waiting_threshold = State()
 
 
 def _pick(*sources_and_keys) -> object | None:
@@ -53,14 +54,73 @@ def _parse_check(data: dict) -> tuple[str, str, str | None]:
     return str(name), bal_str, pend_str
 
 
+_DONE = ("confirmed", "completed", "done")
+_RUB = lambda v: f"{int(round(v)):,}".replace(",", " ")   # 1234 → "1 234"
+
+
+def _earned(details: dict, known: dict, since: float) -> tuple[int, int]:
+    """(completed sales, revenue ₽) over orders first seen at/after `since`.
+
+    Reads what the order poller already stores, so the balance screen can show
+    what came in today and this week without another round-trip to the API.
+    """
+    sales = revenue = 0
+    for oid, det in details.items():
+        seen = det.get("seen_at", 0)
+        if not seen or seen < since:
+            continue
+        st = str(known.get(oid) or known.get(str(oid)) or "")
+        if st not in _DONE:
+            continue
+        sales += 1
+        try:
+            revenue += int(float(str(det.get("price", 0))))
+        except (ValueError, TypeError):
+            pass
+    return sales, revenue
+
+
+def _bump_spent(s: dict, since: float) -> float:
+    """Promotion spend to subtract from revenue. Only today's is tracked
+    precisely; for the week it is the best figure available."""
+    bs = s.get("bump_schedule", {})
+    if bs.get("spent_day") == datetime.now().strftime("%Y-%m-%d"):
+        return float(bs.get("spent_today", 0) or 0)
+    return 0.0
+
+
+def _activity_block(uid: int) -> str:
+    s = get_settings(uid)
+    details = s.get("known_order_details", {})
+    known = s.get("known_orders", {})
+    now = time.time()
+    day_start = now - (now % 86400)
+    week_start = now - 7 * 86400
+
+    d_sales, d_rev = _earned(details, known, day_start)
+    w_sales, w_rev = _earned(details, known, week_start)
+    d_spent = _bump_spent(s, day_start)
+
+    lines = ["", "📊 <b>Продажи</b>"]
+    net = d_rev - d_spent
+    today = f"├ Сегодня: <b>{_RUB(d_rev)} ₽</b> ({d_sales})"
+    if d_spent:
+        today += f"  ·  чистыми {_RUB(net)} ₽"
+    lines.append(today)
+    lines.append(f"└ 7 дней: <b>{_RUB(w_rev)} ₽</b> ({w_sales})")
+    return "\n".join(lines)
+
+
 def _kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="💸 Вывести средства", callback_data="balance:withdraw")
     b.button(text="📋 Активные выводы", callback_data="balance:active")
     b.button(text="📜 История выводов", callback_data="balance:history")
+    b.button(text="📊 Статистика", callback_data="menu:stats")
+    b.button(text="🔔 Порог уведомления", callback_data="balance:threshold")
     b.button(text="🔄 Обновить", callback_data="menu:balance")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
-    b.adjust(2, 1, 2)
+    b.adjust(2, 2, 1, 2)
     return b.as_markup()
 
 
@@ -103,7 +163,14 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
         )
         if pending:
             text += f"⏳ В ожидании: <b>{pending} ₽</b>\n"
-        text += "✅ Статус: Активен"
+        # Tie the number to what produced it — a balance with no sales context
+        # is just a figure
+        text += _activity_block(callback.from_user.id)
+        threshold = get_settings(callback.from_user.id).get(
+            "balance_notify", {})
+        if threshold.get("enabled"):
+            text += (f"\n\n🔔 Уведомлю при достижении "
+                     f"<b>{_RUB(float(threshold.get('threshold', 0) or 0))} ₽</b>")
         kb = _kb()
     else:
         # Nothing usable — show diagnostics so the real response shape is visible
@@ -193,6 +260,65 @@ async def withdraw_amount(message: Message, state: FSMContext, api: YooMarketAPI
         return
     await state.clear()
     await _do_withdraw(message, message.from_user.id, api, amount)
+
+
+# ── Порог уведомления о балансе ──────────────────────────────────────────────
+
+@router.callback_query(F.data == "balance:threshold")
+async def threshold_start(callback: CallbackQuery, state: FSMContext) -> None:
+    s = get_settings(callback.from_user.id)
+    bn = s.get("balance_notify", {})
+    cur = bn.get("threshold", 1000)
+    on = bn.get("enabled", False)
+    await state.set_state(WithdrawState.waiting_threshold)
+    b = InlineKeyboardBuilder()
+    if on:
+        b.button(text="🔕 Выключить уведомление", callback_data="balance:threshold_off")
+    b.button(text="❌ Отмена", callback_data="menu:balance")
+    b.adjust(1)
+    await callback.message.edit_text(
+        f"🔔 <b>Порог уведомления о балансе</b>\n\n"
+        f"Сейчас: {'включено, ' + str(cur) + ' ₽' if on else 'выключено'}\n\n"
+        f"Пришлите сумму — бот напишет, когда баланс её достигнет, "
+        f"чтобы вовремя вывести средства.",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "balance:threshold_off")
+async def threshold_off(callback: CallbackQuery, state: FSMContext, api: YooMarketAPI) -> None:
+    await state.clear()
+    s = get_settings(callback.from_user.id)
+    s.setdefault("balance_notify", {})["enabled"] = False
+    save_settings(callback.from_user.id, s)
+    await callback.answer("Уведомление выключено", show_alert=True)
+    await show_balance(callback, api)
+
+
+@router.message(WithdrawState.waiting_threshold)
+async def threshold_save(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        amount = float(raw)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите сумму числом, например: <b>1000</b>")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    bn = s.setdefault("balance_notify", {})
+    bn["threshold"] = amount
+    bn["enabled"] = True
+    # Reset the arm so an already-high balance still triggers once next tick,
+    # instead of being treated as "already notified".
+    bn["last_notified_balance"] = 0.0
+    save_settings(message.from_user.id, s)
+    b = InlineKeyboardBuilder()
+    b.button(text="💰 К балансу", callback_data="menu:balance")
+    await message.answer(
+        f"✅ Уведомлю, когда баланс достигнет <b>{_RUB(amount)} ₽</b>.",
+        reply_markup=b.as_markup())
 
 
 # ── Активные выводы ─────────────────────────────────────────────────────────

@@ -148,8 +148,45 @@ def _order_username(order: dict) -> str:
     return u if u.startswith("@") else f"@{u}"
 
 
+_DONE_STATUSES = ("confirmed", "completed", "done")
+_BACK_STATUSES = ("refunded", "cancelled", "returned")
+
+
+def _window_stats(order_details: dict, known_orders: dict,
+                  since_ts: float) -> dict:
+    """Order figures for everything first seen at/after since_ts.
+
+    Revenue counts completed orders only — an order that came in and was
+    refunded is not money earned — so «выручка» in a report means what it says.
+    Orders are dated by when the bot first saw them (seen_at): the only per-order
+    timestamp kept locally, and good enough for "today" once the bot is running.
+    """
+    orders = completed = refunded = revenue = 0
+    for oid, det in order_details.items():
+        seen = det.get("seen_at", 0)
+        if not seen or seen < since_ts:
+            continue
+        orders += 1
+        st = str(known_orders.get(oid) or known_orders.get(str(oid)) or "")
+        try:
+            price = int(float(str(det.get("price", 0))))
+        except (ValueError, TypeError):
+            price = 0
+        if st in _DONE_STATUSES:
+            completed += 1
+            revenue += price
+        elif st in _BACK_STATUSES:
+            refunded += 1
+    return {"orders": orders, "completed": completed,
+            "refunded": refunded, "revenue": revenue}
+
+
 def _today_stats(order_details: dict, known_orders: dict) -> tuple[int, int]:
-    """(orders today, revenue today ₽) from locally tracked order details."""
+    """(orders today, revenue today ₽) from locally tracked order details.
+
+    Kept for the new-purchase notification's running tally, which counts every
+    order taken today, not only completed ones.
+    """
     now = time.time()
     day_start = now - (now % 86400)
     cnt = 0
@@ -219,6 +256,15 @@ def _order_notify_kb(order_id: str, chat_id: str) -> InlineKeyboardMarkup:
     builder.button(text="💬 Чат", callback_data=f"chat:{chat_id}:")
     builder.button(text="🔍 Детали", callback_data=f"order:{order_id}:view")
     builder.adjust(3, 2)
+    return builder.as_markup()
+
+
+def _balance_notify_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💸 Вывести средства", callback_data="balance:withdraw")
+    builder.button(text="💰 Баланс", callback_data="menu:balance")
+    builder.button(text="📊 Статистика", callback_data="menu:stats")
+    builder.adjust(1, 2)
     return builder.as_markup()
 
 
@@ -973,6 +1019,49 @@ class TaskManager:
             msg += f" · к оплате {spent} ₽"
         return count, msg
 
+    async def _daily_report_text(self, api: YooMarketAPI, settings: dict) -> str:
+        """The end-of-day summary, as today's numbers rather than lifetime ones.
+
+        The old report showed the all-time completed count under a «за сегодня»
+        heading; here every figure is the day's own, with revenue net of what
+        promotion cost, so the line the seller reads is the money that actually
+        moved.
+        """
+        details = settings.get("known_order_details", {})
+        known = settings.get("known_orders", {})
+        day_start = time.time() - (time.time() % 86400)
+        st = _window_stats(details, known, day_start)
+
+        bs = settings.get("bump_schedule", {})
+        spent_today = 0.0
+        if bs.get("spent_day") == datetime.now().strftime("%Y-%m-%d"):
+            spent_today = float(bs.get("spent_today", 0) or 0)
+
+        try:
+            _bal, balance_str = await api.get_balance()
+        except Exception:
+            balance_str = "—"
+
+        net = st["revenue"] - spent_today
+        body = [
+            f"🛒 Заказов за день: <b>{st['orders']}</b>",
+            f"✅ Выполнено: <b>{st['completed']}</b>"
+            + (f"   ↩️ Возвраты: {st['refunded']}" if st['refunded'] else ""),
+            "",
+            f"💵 Выручка: <b>{_money(st['revenue'])} ₽</b>",
+        ]
+        if spent_today:
+            body.append(f"⬆️ Продвижение: −{_money(spent_today)} ₽")
+            body.append(f"🟰 Чистыми: <b>{_money(net)} ₽</b>")
+        body.append("")
+        body.append(f"💰 Баланс сейчас: <b>{balance_str}</b>")
+        if not st["orders"]:
+            body.append("")
+            body.append("<i>Сегодня заказов не было.</i>")
+
+        return _card("📊 <b>ИТОГИ ДНЯ</b>", body,
+                     f"🗓 {datetime.now().strftime('%d.%m.%Y')}")
+
     async def _auto_restore(self, user_id: int, api: YooMarketAPI,
                             settings: dict, now: float) -> str:
         """One scheduled restore pass. Returns a notification, or '' to stay quiet.
@@ -1200,17 +1289,27 @@ class TaskManager:
             # --- Balance notify ---
             bn = settings.get("balance_notify", {})
             if bn.get("enabled"):
-                threshold = bn.get("threshold", 1000)
-                last_bal = bn.get("last_notified_balance", 0.0)
+                threshold = float(bn.get("threshold", 1000) or 0)
+                last_bal = float(bn.get("last_notified_balance", 0.0) or 0)
                 try:
                     balance, balance_str = await api.get_balance()
-                    settings["balance_notify"]["last_notified_balance"] = balance
-                    if balance >= threshold > last_bal:
-                        await self._notify(
-                            user_id,
-                            f"🔔 <b>Уведомление о балансе</b>\n\n"
-                            f"Баланс достиг порога: <b>{balance_str}</b> ≥ {threshold:.0f} ₽",
-                        )
+                    # An unreadable balance must not be recorded as 0: that would
+                    # re-arm the alert and fire a false "crossed the threshold"
+                    # the moment a real number came back.
+                    if balance_str != "—":
+                        settings["balance_notify"]["last_notified_balance"] = balance
+                        # Edge-triggered: fire once as the balance crosses up to
+                        # the threshold, re-arm only after it drops back below.
+                        if balance >= threshold > last_bal:
+                            await self._notify(
+                                user_id,
+                                _card("🔔 <b>БАЛАНС ДОСТИГ ПОРОГА</b>",
+                                      [f"💰 На счету: <b>{balance_str}</b>",
+                                       f"🎯 Порог: {_money(threshold)} ₽",
+                                       "",
+                                       "Можно выводить средства."]),
+                                reply_markup=_balance_notify_kb(),
+                            )
                 except Exception as e:
                     logger.warning("Balance notify error for user %s: %s", user_id, e)
 
@@ -1223,20 +1322,10 @@ class TaskManager:
                 if last_day != today_str and datetime.now().hour >= report_hour:
                     settings["daily_report"]["last_report_day"] = today_str
                     try:
-                        known_orders = get_settings(user_id).get("known_orders", {})
-                        completed_today = sum(
-                            1 for s in known_orders.values()
-                            if s in ("confirmed", "completed", "done")
-                        )
-                        total = len(known_orders)
-                        balance, balance_str = await api.get_balance()
                         await self._notify(
                             user_id,
-                            f"📊 <b>Ежедневный отчёт</b>\n\n"
-                            f"📦 Всего заказов: <b>{total}</b>\n"
-                            f"✅ Выполнено: <b>{completed_today}</b>\n"
-                            f"💰 Баланс: <b>{balance_str}</b>",
-                        )
+                            await self._daily_report_text(api, settings),
+                            reply_markup=_balance_notify_kb())
                     except Exception as e:
                         logger.warning("Daily report error for user %s: %s", user_id, e)
 

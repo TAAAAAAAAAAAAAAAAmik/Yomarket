@@ -13,7 +13,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from api.yoomarket import YooMarketAPI
 from keyboards.main import back_keyboard
 from storage import get_settings
-from handlers.balance import _parse_check
+from handlers.balance import _parse_check, _earned, _bump_spent, _RUB
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -32,13 +32,20 @@ def _back_to_stats_keyboard():
 async def show_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.message.edit_text("⏳ Загружаю статистику...")
 
+    import time as _t
     settings = get_settings(callback.from_user.id)
     known_orders: dict = settings.get("known_orders", {})
+    details: dict = settings.get("known_order_details", {})
 
     completed = sum(1 for s in known_orders.values() if s in COMPLETED_STATUSES)
     refunded = sum(1 for s in known_orders.values() if s in ("refunded", "cancelled", "returned"))
     active = len(known_orders) - completed - refunded
     total = len(known_orders)
+
+    now = _t.time()
+    d_sales, d_rev = _earned(details, known_orders, now - (now % 86400))
+    w_sales, w_rev = _earned(details, known_orders, now - 7 * 86400)
+    d_net = d_rev - _bump_spent(settings, now - (now % 86400))
 
     balance_str = "—"
     shop_name = "—"
@@ -62,11 +69,16 @@ async def show_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
         except Exception as e:
             logger.warning("Stats ads error: %s", e)
 
+    money_line = f"💵 Сегодня: <b>{_RUB(d_rev)} ₽</b> ({d_sales})"
+    if d_net != d_rev:
+        money_line += f"  ·  чистыми {_RUB(d_net)} ₽"
     text = (
         f"📊 <b>Статистика</b>\n"
         f"🏪 {shop_name}\n\n"
         f"💰 Баланс: <b>{balance_str}</b>\n"
         f"🚀 Объявлений: <b>{ads_total}</b>\n\n"
+        f"{money_line}\n"
+        f"📆 7 дней: <b>{_RUB(w_rev)} ₽</b> ({w_sales})\n\n"
         f"🛒 <b>Заказы (за всё время)</b>\n"
         f"├ Всего: <b>{total}</b>\n"
         f"├ ✅ Выполнено: <b>{completed}</b>\n"
@@ -138,16 +150,33 @@ async def show_revenue(callback: CallbackQuery) -> None:
         by_title[title][0] += 1
         by_title[title][1] += price
 
+    # Promotion spend for the same window, so the seller sees revenue and the
+    # cost of chasing it side by side. Only today's spend is tracked precisely;
+    # for longer windows it is the lifetime total, labelled so it is not
+    # mistaken for the period's.
+    bs = settings.get("bump_schedule", {})
+    if days == 1 and bs.get("spent_day") == datetime.now().strftime("%Y-%m-%d"):
+        spent = float(bs.get("spent_today", 0) or 0)
+        spent_exact = True
+    else:
+        spent = float(bs.get("spent_total", 0) or 0)
+        spent_exact = (days == 0)
+
     period = _PERIODS.get(days, f"{days} дней")
     lines = [f"💰 <b>Выручка — {period}</b>\n"]
     lines.append(f"📦 Продаж: <b>{count}</b>")
-    lines.append(f"💵 Выручка: <b>{revenue} ₽</b>")
+    lines.append(f"💵 Выручка: <b>{_RUB(revenue)} ₽</b>")
     if count:
-        lines.append(f"🧾 Средний чек: <b>{revenue // count} ₽</b>")
+        lines.append(f"🧾 Средний чек: <b>{_RUB(revenue // count)} ₽</b>")
+    if spent:
+        tag = "" if spent_exact else " <i>(всего)</i>"
+        lines.append(f"⬆️ Продвижение: <b>−{_RUB(spent)} ₽</b>{tag}")
+        lines.append(f"🟰 Чистыми: <b>{_RUB(revenue - spent)} ₽</b>")
+    if count:
         top = sorted(by_title.items(), key=lambda kv: kv[1][1], reverse=True)[:5]
         lines.append("\n🏆 <b>Топ по выручке:</b>")
         for i, (title, (cnt, total)) in enumerate(top, 1):
-            lines.append(f"{i}. {title} — {cnt} шт., <b>{total} ₽</b>")
+            lines.append(f"{i}. {title} — {cnt} шт., <b>{_RUB(total)} ₽</b>")
     else:
         lines.append("\nНет выполненных заказов за период.")
 
