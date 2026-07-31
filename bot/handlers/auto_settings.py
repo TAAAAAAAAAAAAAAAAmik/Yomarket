@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import logging
+from datetime import datetime, timedelta
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from api.yoomarket import YooMarketAPI
 from storage import get_settings, save_settings
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 
 class AutoState(StatesGroup):
@@ -26,6 +31,70 @@ class AutoState(StatesGroup):
 
 def _st(on: bool) -> str:
     return "🟢 ВКЛ" if on else "🔴 ВЫКЛ"
+
+
+def _parse_slot(slot: str) -> tuple[int, int] | None:
+    """'09:30' → (9, 30). None if the slot isn't a valid time."""
+    try:
+        h, m = map(int, str(slot).strip().split(":"))
+    except (ValueError, AttributeError):
+        return None
+    return (h, m) if 0 <= h <= 23 and 0 <= m <= 59 else None
+
+
+def _next_slot(times: list[str], now: datetime | None = None) -> str:
+    """Next scheduled slot as '09:30 (через 2 ч 15 мин)'."""
+    now = now or datetime.now()
+    best: tuple[datetime, str] | None = None
+    for slot in times:
+        parsed = _parse_slot(slot)
+        if not parsed:
+            continue
+        h, m = parsed
+        when = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if when <= now:  # already passed today → tomorrow
+            when += timedelta(days=1)
+        if best is None or when < best[0]:
+            best = (when, f"{h:02d}:{m:02d}")
+    if not best:
+        return ""
+    left = int((best[0] - now).total_seconds() // 60)
+    hrs, mins = divmod(left, 60)
+    eta = f"{hrs} ч {mins} мин" if hrs else f"{mins} мин"
+    return f"{best[1]} (через {eta})"
+
+
+def _fmt_last_bump(raw: str | None) -> str:
+    """ISO timestamp → 'сегодня в 09:30' / '28.07 09:30'."""
+    if not raw:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(raw))
+    except (ValueError, TypeError):
+        return ""
+    if dt.date() == datetime.now().date():
+        return f"сегодня в {dt.strftime('%H:%M')}"
+    return dt.strftime("%d.%m %H:%M")
+
+
+def _baseline_past_slots(bs: dict) -> None:
+    """Mark today's already-past slots as done.
+
+    The scheduler catches up on slots it missed while the bot was down. Without
+    a baseline, configuring (or enabling) the schedule at 10:00 with a 09:00
+    slot would fire a bump immediately — surprising, and it costs money on paid
+    bumps. Only slots that come due AFTER the change should fire.
+    """
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    last_runs = bs.setdefault("last_runs", {})
+    for slot in bs.get("times", []):
+        parsed = _parse_slot(slot)
+        if not parsed:
+            continue
+        h, m = parsed
+        if now.replace(hour=h, minute=m, second=0, microsecond=0) <= now:
+            last_runs.setdefault(f"{today}_{slot}", now.isoformat())
 
 
 def _auto_text(s: dict) -> str:
@@ -63,8 +132,21 @@ def _auto_text(s: dict) -> str:
     lines.append(f"\n⏰ <b>Планировщик поднятия</b> — {_st(bs_on)}")
     if bs_on and bs_times:
         lines.append(f"   Время: <b>{', '.join(bs_times)}</b>")
+        nxt = _next_slot(bs_times)
+        if nxt:
+            lines.append(f"   Следующее: <b>{nxt}</b>")
+        last = _fmt_last_bump(bs.get("last_bump_at"))
+        if last:
+            lines.append(f"   Последнее: {last}")
+        ceil = float(bs.get("daily_ceiling", 0) or 0)
+        if ceil > 0:
+            spent = float(bs.get("spent_today", 0) or 0)
+            lines.append(f"   Потрачено сегодня: <b>{spent:.0f}/{ceil:.0f} ₽</b>")
+        total = int(bs.get("bumps_total", 0) or 0)
+        if total:
+            lines.append(f"   Всего поднятий: {total}")
     elif bs_on:
-        lines.append("   Время не задано")
+        lines.append("   ⚠️ Время не задано — поднятия не идут")
 
     return "\n".join(lines)
 
@@ -122,6 +204,8 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
         builder.button(text=f"💵 Цена поднятия: {ppb} ₽", callback_data="auto:set:bump_price")
         ceil_str = f"{ceil} ₽/день" if ceil else "без лимита"
         builder.button(text=f"⛔ Потолок трат: {ceil_str}", callback_data="auto:set:bump_ceiling")
+        if bs_times:
+            builder.button(text="▶️ Поднять сейчас", callback_data="auto:run:bump_now")
 
     builder.button(text="⬅️ Настройки", callback_data="settings:menu")
     builder.adjust(1)
@@ -399,6 +483,9 @@ async def toggle_bump_schedule(callback: CallbackQuery) -> None:
     s = get_settings(callback.from_user.id)
     bs = s.setdefault("bump_schedule", {"enabled": False, "times": [], "last_runs": {}})
     bs["enabled"] = not bs.get("enabled", False)
+    if bs["enabled"]:
+        # Don't retroactively fire slots that already passed today.
+        _baseline_past_slots(bs)
     save_settings(callback.from_user.id, s)
     await _refresh(callback)
 
@@ -431,12 +518,20 @@ async def save_bump_times(message: Message, state: FSMContext) -> None:
     if not valid:
         await message.answer("❌ Введите время в формате ЧЧ:ММ, например: <code>09:00, 21:00</code>")
         return
+    valid = sorted(set(valid))  # drop duplicates, keep chronological order
     await state.clear()
     s = get_settings(message.from_user.id)
-    s.setdefault("bump_schedule", {})["times"] = valid
-    s["bump_schedule"]["last_runs"] = {}
+    bs = s.setdefault("bump_schedule", {})
+    bs["times"] = valid
+    bs["last_runs"] = {}
+    # Slots that already passed today shouldn't fire the moment they're saved.
+    _baseline_past_slots(bs)
     save_settings(message.from_user.id, s)
-    await message.answer(f"✅ Время поднятия: <b>{', '.join(valid)}</b>")
+    nxt = _next_slot(valid)
+    await message.answer(
+        f"✅ Время поднятия: <b>{', '.join(valid)}</b>"
+        + (f"\n⏭ Следующее: <b>{nxt}</b>" if nxt else "")
+    )
     await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
 
 
@@ -498,5 +593,56 @@ async def save_bump_ceiling(message: Message, state: FSMContext) -> None:
     save_settings(message.from_user.id, s)
     await message.answer(f"✅ Потолок: <b>{ceil:g} ₽/день</b>" if ceil else "✅ Лимит снят")
     await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
+
+
+@router.callback_query(F.data == "auto:run:bump_now")
+async def run_bump_now(callback: CallbackQuery, api: YooMarketAPI | None) -> None:
+    """Bump right now, from the scheduler menu — same accounting as a slot."""
+    if api is None:
+        await callback.answer("❌ Нет токена. Отправьте /start", show_alert=True)
+        return
+    await callback.answer("⏳ Поднимаю…")
+    s = get_settings(callback.from_user.id)
+    bs = s.setdefault("bump_schedule", {})
+
+    price_per_bump = float(bs.get("price_per_bump", 0) or 0)
+    ceiling = float(bs.get("daily_ceiling", 0) or 0)
+    today = datetime.now().strftime("%Y-%m-%d")
+    if bs.get("spent_day") != today:
+        bs["spent_day"] = today
+        bs["spent_today"] = 0.0
+    spent_today = float(bs.get("spent_today", 0) or 0)
+
+    if ceiling > 0 and price_per_bump > 0 and spent_today >= ceiling:
+        save_settings(callback.from_user.id, s)
+        await callback.message.edit_text(
+            f"⛔ Достигнут потолок {ceiling:.0f} ₽/день "
+            f"(потрачено {spent_today:.0f} ₽).\n\n" + _auto_text(s),
+            reply_markup=_auto_keyboard(s),
+        )
+        return
+
+    try:
+        count, msg = await api.bump_all_ads()
+    except Exception as e:
+        logger.error("Manual scheduler bump error: %s", e)
+        await callback.message.edit_text(
+            f"❌ Ошибка поднятия: {e}\n\n" + _auto_text(s),
+            reply_markup=_auto_keyboard(s),
+        )
+        return
+
+    bs["bumps_total"] = int(bs.get("bumps_total", 0) or 0) + (count or 0)
+    bs["last_bump_at"] = datetime.now().isoformat()
+    if price_per_bump > 0 and count:
+        spent_today += count * price_per_bump
+        bs["spent_today"] = spent_today
+        bs["spent_total"] = float(bs.get("spent_total", 0) or 0) + count * price_per_bump
+        msg += f" (потрачено {spent_today:.0f}"
+        msg += f"/{ceiling:.0f} ₽)" if ceiling > 0 else " ₽)"
+    save_settings(callback.from_user.id, s)
+    await callback.message.edit_text(
+        f"⬆️ {msg}\n\n" + _auto_text(s), reply_markup=_auto_keyboard(s)
+    )
 
 

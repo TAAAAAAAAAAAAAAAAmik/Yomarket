@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 # Selenium loop interval in seconds (check every 30 minutes)
 _SELENIUM_LOOP_INTERVAL = 30 * 60
 
+# Scheduled bumps are evaluated in the fast 60s loop, so a slot normally fires
+# within a minute of its time. This catch-up window lets a slot still fire if
+# the bot was briefly down at that minute, without replaying long-stale slots
+# (e.g. after the bot was off all morning) on the next start.
+_BUMP_CATCHUP_SECONDS = 2 * 3600
+
 
 def _fmt_time(raw) -> str:
     if not raw:
@@ -242,6 +248,105 @@ class TaskManager:
             settings = get_settings(user_id)
             await self._process_orders(user_id, token, settings)
             await self._check_reminders(user_id, settings)
+            await self._maybe_bump_schedule(user_id, token, settings)
+
+    async def _maybe_bump_schedule(self, user_id: int, token: str, settings: dict) -> None:
+        """Fire scheduled bumps at their configured times.
+
+        Runs in the fast (60s) loop, so a slot fires within a minute of its
+        time instead of drifting by up to 30 minutes in the automation loop —
+        and it can never be skipped by that loop's coarse timing. A catch-up
+        window covers brief downtime. Respects the optional daily cost ceiling.
+        """
+        bs = settings.get("bump_schedule", {})
+        if not (bs.get("enabled") and bs.get("times")):
+            return
+
+        now_dt = datetime.now()
+        today_str = now_dt.strftime("%Y-%m-%d")
+        last_runs: dict = bs.setdefault("last_runs", {})
+        dirty = False
+
+        # Reset the daily spend counter when the day changes.
+        if bs.get("spent_day") != today_str:
+            bs["spent_day"] = today_str
+            bs["spent_today"] = 0.0
+            dirty = True
+
+        # Drop run-markers from previous days — keys are "{date}_{slot}" and
+        # would otherwise grow without bound in the settings blob.
+        stale = [k for k in last_runs if not k.startswith(f"{today_str}_")]
+        if stale:
+            for k in stale:
+                last_runs.pop(k, None)
+            dirty = True
+
+        # Slots that are due now: past their time today, not yet run, and within
+        # the catch-up window (so a slot isn't lost to a brief restart).
+        due: list[str] = []
+        for slot in bs["times"]:
+            try:
+                sh, sm = map(int, str(slot).split(":"))
+                slot_dt = now_dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
+            except (ValueError, AttributeError):
+                continue
+            if last_runs.get(f"{today_str}_{slot}"):
+                continue
+            due_secs = (now_dt - slot_dt).total_seconds()
+            if 0 <= due_secs <= _BUMP_CATCHUP_SECONDS:
+                due.append(slot)
+
+        if not due:
+            if dirty:
+                save_settings(user_id, settings)
+            return
+
+        price_per_bump = float(bs.get("price_per_bump", 0) or 0)
+        ceiling = float(bs.get("daily_ceiling", 0) or 0)
+        spent_today = float(bs.get("spent_today", 0) or 0)
+
+        # Cost ceiling reached: mark the due slots handled (so we stop checking
+        # them every minute) and skip the API call entirely.
+        if ceiling > 0 and price_per_bump > 0 and spent_today >= ceiling:
+            for slot in due:
+                last_runs[f"{today_str}_{slot}"] = now_dt.isoformat()
+            save_settings(user_id, settings)
+            await self._notify(
+                user_id,
+                f"⛔ Поднятие ({', '.join(due)}) пропущено: достигнут потолок "
+                f"{ceiling:.0f} ₽/день (потрачено {spent_today:.0f} ₽)",
+            )
+            return
+
+        # One bump lifts every ad, so several slots that came due together
+        # (e.g. after downtime) collapse into a single pass — no double bumping.
+        api = YooMarketAPI(token)
+        await api.start()
+        try:
+            count, msg = await api.bump_all_ads()
+        except Exception as e:
+            logger.warning("Scheduled bump error for user %s: %s", user_id, e)
+            return  # leave slots unmarked so the next tick retries
+        finally:
+            await api.close()
+
+        for slot in due:
+            last_runs[f"{today_str}_{slot}"] = now_dt.isoformat()
+        bs["bumps_total"] = int(bs.get("bumps_total", 0)) + (count or 0)
+        bs["last_bump_at"] = now_dt.isoformat()
+        slot_label = ", ".join(due)
+        if price_per_bump > 0 and count:
+            spent_today += count * price_per_bump
+            bs["spent_today"] = spent_today
+            bs["spent_total"] = float(bs.get("spent_total", 0)) + count * price_per_bump
+            cap = f" (потрачено {spent_today:.0f}"
+            cap += f"/{ceiling:.0f} ₽)" if ceiling > 0 else " ₽)"
+            text = f"⬆️ Поднятие ({slot_label}): {msg}{cap}"
+        else:
+            text = f"⬆️ Поднятие ({slot_label}): {msg}"
+        settings["bump_schedule"] = bs
+        save_settings(user_id, settings)
+        await self._notify(user_id, text)
 
     async def _process_orders(self, user_id: int, token: str, settings: dict) -> None:
         api = YooMarketAPI(token)
@@ -973,55 +1078,9 @@ class TaskManager:
                 except Exception as e:
                     logger.warning("Price schedule error for user %s: %s", user_id, e)
 
-            # --- Bump scheduler (with optional paid-bump cost ceiling) ---
-            bs = settings.get("bump_schedule", {})
-            if bs.get("enabled") and bs.get("times"):
-                now_dt = datetime.now()
-                current_mins = now_dt.hour * 60 + now_dt.minute
-                last_runs: dict = bs.get("last_runs", {})
-                today_str = now_dt.strftime("%Y-%m-%d")
-                price_per_bump = float(bs.get("price_per_bump", 0) or 0)
-                ceiling = float(bs.get("daily_ceiling", 0) or 0)
-                # reset the daily spend counter when the day changes
-                if bs.get("spent_day") != today_str:
-                    bs["spent_day"] = today_str
-                    bs["spent_today"] = 0.0
-                spent_today = float(bs.get("spent_today", 0) or 0)
-                for slot in bs["times"]:
-                    try:
-                        sh, sm = map(int, slot.split(":"))
-                    except (ValueError, AttributeError):
-                        continue
-                    slot_mins = sh * 60 + sm
-                    # Within 35-minute window of the slot
-                    if not (0 <= current_mins - slot_mins < 35):
-                        continue
-                    last_run_key = f"{today_str}_{slot}"
-                    if last_runs.get(last_run_key):
-                        continue
-                    # Cost ceiling: skip if we've already hit the daily cap
-                    if ceiling > 0 and price_per_bump > 0 and spent_today >= ceiling:
-                        last_runs[last_run_key] = now_dt.isoformat()
-                        messages.append(
-                            f"⛔ Поднятие ({slot}) пропущено: достигнут потолок "
-                            f"{ceiling:.0f} ₽/день (потрачено {spent_today:.0f} ₽)")
-                        continue
-                    try:
-                        count, msg = await api.bump_all_ads()
-                        last_runs[last_run_key] = now_dt.isoformat()
-                        bs["bumps_total"] = int(bs.get("bumps_total", 0)) + (count or 0)
-                        if price_per_bump > 0 and count:
-                            spent_today += count * price_per_bump
-                            bs["spent_today"] = spent_today
-                            bs["spent_total"] = float(bs.get("spent_total", 0)) + count * price_per_bump
-                            cap = f" (потрачено {spent_today:.0f}"
-                            cap += f"/{ceiling:.0f} ₽)" if ceiling > 0 else " ₽)"
-                            messages.append(f"⬆️ Поднятие ({slot}): {msg}{cap}")
-                        else:
-                            messages.append(f"⬆️ Поднятие ({slot}): {msg}")
-                        settings["bump_schedule"] = bs
-                    except Exception as e:
-                        logger.warning("Bump scheduler error for user %s slot %s: %s", user_id, slot, e)
+            # --- Bump scheduler ---
+            # Moved to the fast 60s loop (_maybe_bump_schedule) so slots fire at
+            # their exact time instead of drifting with this 30-min loop.
 
         except Exception as e:
             logger.error("Auto-tasks error for user %s: %s", user_id, e)
