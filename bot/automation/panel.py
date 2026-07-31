@@ -3057,3 +3057,34 @@ class PanelSession:
                 return not any(k in final_url for k in ("/login", "/auth", "/signin"))
         except Exception:
             return False
+
+
+def panel_item_actions_sync(cookie_string: str, item_id: str) -> str:
+    """Read-only: the Nova actions the panel offers for one listing.
+
+    Used by /restore_debug to establish two things the Integration API cannot
+    answer: whether the panel knows this id at all (the API's ad ids and the
+    panel's item ids need not be the same space), and which action publishes
+    it. Runs no action — it only lists them.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/items/actions",
+            params={"resources": str(item_id)},
+            headers=hdrs, timeout=(6, 10), allow_redirects=False,
+        )
+    except Exception as e:
+        return f"запрос не удался: {str(e)[:80]}"
+    if r.status_code != 200:
+        return f"HTTP {r.status_code} — панель не отдала действия"
+    try:
+        actions = (r.json() or {}).get("actions") or []
+    except Exception:
+        return "ответ не разобран"
+    if not actions:
+        return "действий нет (id не знаком панели?)"
+    names = [f"{a.get('name') or '?'}[{a.get('uriKey') or '?'}]"
+             for a in actions if isinstance(a, dict)]
+    return ", ".join(names)[:400]

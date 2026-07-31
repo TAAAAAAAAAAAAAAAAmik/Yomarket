@@ -1298,6 +1298,27 @@ async def run_withdraw(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.message.edit_text(result_text + "\n\n" + _withdraw_text(s), reply_markup=_withdraw_kb(s))
 
 
+async def _panel_actions_for(uid: int, item_id) -> str:
+    """Read-only: which Nova actions the panel offers for this listing."""
+    import asyncio
+    from storage import get_panel_creds
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
+        return "нет входа в панель"
+    try:
+        from automation.panel import panel_item_actions_sync
+    except ImportError:
+        return "проба недоступна"
+    try:
+        loop = asyncio.get_event_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, panel_item_actions_sync,
+                                 creds["cookies"], str(item_id)),
+            timeout=30)
+    except Exception as e:
+        return f"ошибка: {str(e)[:90]}"
+
+
 @router.message(Command("restore_debug"))
 async def restore_debug(message: Message, api: YooMarketAPI) -> None:
     """Print, for the listings restore wants to fix, exactly what the API says.
@@ -1356,6 +1377,9 @@ async def restore_debug(message: Message, api: YooMarketAPI) -> None:
                 lines.append(f"ОСТАТКИ: has={has} {note}")
             except Exception as e:
                 lines.append(f"ОСТАТКИ: ошибка {str(e)[:90]}")
+            # Does the panel know this id, and what can it do with it? This is
+            # what decides whether the panel fallback can work at all.
+            lines.append(f"ПАНЕЛЬ: {await _panel_actions_for(message.from_user.id, aid)}")
         report = "\n".join(lines)
     except Exception as e:
         report = f"ошибка: {str(e)[:250]}"

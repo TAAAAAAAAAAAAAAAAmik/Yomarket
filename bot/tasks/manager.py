@@ -1379,6 +1379,45 @@ class TaskManager:
         return _card("📊 <b>ИТОГИ ДНЯ</b>", body,
                      f"🗓 {datetime.now().strftime('%d.%m.%Y')}")
 
+    async def _panel_republish(self, user_id: int, rows: list[dict]
+                               ) -> tuple[list[dict], list[dict]]:
+        """Retry refused publishes through the panel. Returns (done, still_failed).
+
+        The Integration API answers incorrect_status for listings sitting in
+        «unpublish» — the state it is supposed to undo — so publishing over it
+        is a dead end for them. The panel runs the same Nova action a human
+        clicks, which is already how promotion and withdrawal work here, so the
+        same route is used as the fallback rather than inventing an endpoint.
+
+        Only listings the API refused with incorrect_status come here: a
+        network failure or a real validation error should not silently drive a
+        second attempt by another road.
+        """
+        from storage import get_panel_creds
+        creds = get_panel_creds(user_id)
+        if not creds or not creds.get("cookies"):
+            return [], rows
+
+        from automation.panel import panel_publish_item_sync
+        loop = asyncio.get_event_loop()
+        done, failed = [], []
+        for row in rows:
+            try:
+                ok, msg = await asyncio.wait_for(
+                    loop.run_in_executor(None, panel_publish_item_sync,
+                                         creds["cookies"], str(row["id"]),
+                                         user_id, True),
+                    timeout=60)
+            except Exception as e:
+                ok, msg = False, str(e)[:120]
+            if ok:
+                done.append(row)
+            else:
+                # Keep the panel's own trace: it names the actions it saw, which
+                # is what tells us whether the id is even known to the panel.
+                failed.append({**row, "reason": f"{row['reason']} · панель: {msg[:120]}"})
+        return done, failed
+
     async def _restore_after_sale(self, user_id: int, api: YooMarketAPI,
                                   settings: dict, sold_ads: set, sold_now: bool
                                   ) -> None:
@@ -1418,8 +1457,19 @@ class TaskManager:
                     has, _note = await api.ad_stock(aid, inner)
                     if not has:
                         continue                   # sold out — nothing to sell
-                await api.restore_ad(aid)
-                back.append(str(inner.get("title") or inner.get("name") or f"#{aid}"))
+                title = str(inner.get("title") or inner.get("name") or f"#{aid}")
+                try:
+                    await api.restore_ad(aid)
+                except Exception as e:
+                    # Same dead end as the scheduled pass: the API won't publish
+                    # out of «unpublish». Take the panel route instead.
+                    if "incorrect_status" not in str(e):
+                        raise
+                    done, _still = await self._panel_republish(
+                        user_id, [{"id": str(aid), "title": title, "reason": str(e)}])
+                    if not done:
+                        continue
+                back.append(title)
             except Exception as e:
                 logger.info("Instant restore of %s: %s", aid, e)
 
@@ -1476,6 +1526,18 @@ class TaskManager:
             return f"🔄 Авто-восстановление не отработало: {_esc(str(e)[:120])}"
 
         ar["last_restore_run"] = now
+
+        # Anything the API refused because of the listing's state gets a second
+        # try through the panel, which can make that transition when the API
+        # cannot. Recovered listings move into `restored` and are reported as
+        # normal successes — the route taken is an implementation detail.
+        via_panel: list[dict] = []
+        retryable = [r for r in rep["failed"]
+                     if "incorrect_status" in str(r.get("reason", ""))]
+        if retryable:
+            via_panel, still = await self._panel_republish(user_id, retryable)
+            rep["restored"] += via_panel
+            rep["failed"] = [r for r in rep["failed"] if r not in retryable] + still
 
         for row in rep["restored"]:
             failures.pop(str(row["id"]), None)      # it worked; forget the past
@@ -1542,6 +1604,8 @@ class TaskManager:
             body.append(f"✅ Снова в продаже: <b>{len(rep['restored'])}</b>")
             for row in rep["restored"][:8]:
                 body.append(f"   • {_esc(row['title'])[:40]}")
+            if via_panel:
+                body.append(f"   <i>из них через панель: {len(via_panel)}</i>")
             body.append("")
             body.append("<i>Опубликованное уходит на модерацию — "
                         "статус сменится после проверки.</i>")
