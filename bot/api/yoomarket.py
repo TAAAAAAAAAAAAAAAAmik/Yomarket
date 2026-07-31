@@ -316,7 +316,32 @@ class YooMarketAPI:
                 await self.restore_ad(aid)
                 report["restored"].append(row)
             except Exception as e:
-                report["failed"].append({**row, "reason": str(e)[:160]})
+                reason = str(e)[:160]
+                # A refusal blamed on the state is the one case where the list
+                # row cannot be trusted: it is what said the ad was publishable.
+                # Fetch the record that decides, and attach what it says, so the
+                # failure carries its own diagnosis instead of needing a second
+                # command to explain it.
+                if "incorrect_status" in reason:
+                    try:
+                        full = await self.get_ad(aid)
+                        inner = full.get("data") or full
+                        real = self._ad_state(inner)
+                        kind = str(inner.get("type") or "?")
+                        _has, note = await self.ad_stock(aid, inner)
+                        row["status"] = real or row["status"]
+                        reason += f" · карточка: {real or '?'}/{kind}"
+                        if note:
+                            reason += f", {note}"
+                        for key in ("moderation_status", "moderation", "reason",
+                                    "reject_reason", "comment"):
+                            extra = inner.get(key)
+                            if extra:
+                                reason += f", {key}={str(extra)[:60]}"
+                                break
+                    except Exception as probe:
+                        reason += f" · карточка не прочиталась: {str(probe)[:60]}"
+                report["failed"].append({**row, "reason": reason})
         return report
 
     async def restore_all_ads(self) -> tuple[int, str]:
