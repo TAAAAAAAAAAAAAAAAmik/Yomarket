@@ -6,6 +6,7 @@ import time as _time
 from datetime import datetime
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
@@ -1295,3 +1296,70 @@ async def run_withdraw(callback: CallbackQuery, api: YooMarketAPI) -> None:
         result_text = f"❌ Ошибка: {e}"
     s = get_settings(callback.from_user.id)
     await callback.message.edit_text(result_text + "\n\n" + _withdraw_text(s), reply_markup=_withdraw_kb(s))
+
+
+@router.message(Command("restore_debug"))
+async def restore_debug(message: Message, api: YooMarketAPI) -> None:
+    """Print, for the listings restore wants to fix, exactly what the API says.
+
+    A live run refused every candidate with incorrect_status while reporting
+    their status as «unpublish» — the state restore was built around. Rather
+    than guess what that state really means, this prints the raw list row, the
+    raw detail record and the stock verdict for each one, so the classification
+    can be corrected from the marketplace's own answer. Read-only: it publishes
+    nothing.
+    """
+    if not api:
+        await message.answer("⚠️ Не настроен API-токен")
+        return
+
+    import html as _html
+    import json as _json
+
+    status = await message.answer("⏳ Читаю объявления...")
+    try:
+        data = await api.get_ads()
+        rows = [a for a in (data.get("data") or data.get("items") or [])
+                if isinstance(a, dict)]
+        by_state: dict[str, int] = {}
+        for a in rows:
+            by_state[api._ad_state(a)] = by_state.get(api._ad_state(a), 0) + 1
+
+        lines = [f"всего объявлений: {len(rows)}",
+                 f"статусы: {_json.dumps(by_state, ensure_ascii=False)}",
+                 f"_DOWN (пробуем публиковать): {list(api._DOWN)}",
+                 f"_NEVER (не трогаем): {list(api._NEVER)}", ""]
+
+        targets = [a for a in rows if api._ad_state(a) in api._DOWN][:3]
+        if not targets:
+            lines.append("Кандидатов на восстановление нет.")
+        for a in targets:
+            aid = a.get("id")
+            lines.append("─" * 30)
+            lines.append(f"СТРОКА СПИСКА (id={aid}):")
+            for k, v in a.items():
+                if isinstance(v, (dict, list)):
+                    v = _json.dumps(v, ensure_ascii=False)
+                lines.append(f"  • {k} = {str(v)[:90]}")
+            try:
+                full = await api.get_ad(aid)
+                inner = full.get("data") or full
+                lines.append("КАРТОЧКА ТОВАРА:")
+                for k, v in inner.items():
+                    if isinstance(v, (dict, list)):
+                        v = _json.dumps(v, ensure_ascii=False)
+                    lines.append(f"  • {k} = {str(v)[:90]}")
+            except Exception as e:
+                lines.append(f"  карточка недоступна: {str(e)[:120]}")
+            try:
+                has, note = await api.ad_stock(aid)
+                lines.append(f"ОСТАТКИ: has={has} {note}")
+            except Exception as e:
+                lines.append(f"ОСТАТКИ: ошибка {str(e)[:90]}")
+        report = "\n".join(lines)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:250]}"
+
+    await status.edit_text(
+        f"🔍 <b>Диагностика восстановления</b>\n\n"
+        f"<code>{_html.escape(report)[:3500]}</code>")
