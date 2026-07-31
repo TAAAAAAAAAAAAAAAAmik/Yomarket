@@ -202,7 +202,7 @@ AUTOMATIONS: list[dict] = [
     },
     # --- деньги ---
     {
-        "key": "withdraw", "group": "💰 Деньги",
+        "key": "withdraw", "group": "💰 Баланс",
         "title": "Выводить баланс",
         "short": "Вывод денег",
         "path": ("auto_withdraw", "enabled"),
@@ -215,6 +215,37 @@ AUTOMATIONS: list[dict] = [
 ]
 
 _BY_KEY = {a["key"]: a for a in AUTOMATIONS}
+
+# Sections of the main screen. Seventeen toggles in one list is a wall on a
+# phone; the main screen now shows sections with an "on / total" count and the
+# toggles live one tap in. Keys are stable strings, not positions, so a
+# keyboard still open in a client can't send a tap to the wrong section.
+GROUP_KEYS = {
+    "💬 Общение с покупателем": "chat",
+    "📦 Заказы": "orders",
+    "🛒 Товары": "goods",
+    "🔔 Уведомления": "notify",
+    "💰 Баланс": "money",
+}
+# Button labels: the full titles read well in the text block but get chopped
+# in a half-width button.
+GROUP_SHORT = {
+    "chat": "💬 Общение", "orders": "📦 Заказы", "goods": "🛒 Товары",
+    "notify": "🔔 Уведомления", "money": "💰 Баланс",
+}
+GROUPS: list[tuple[str, str]] = []          # [(key, title)] in registry order
+for _a in AUTOMATIONS:
+    _pair = (GROUP_KEYS[_a["group"]], _a["group"])
+    if _pair not in GROUPS:
+        GROUPS.append(_pair)
+
+
+def group_items(gkey: str) -> list[dict]:
+    return [a for a in AUTOMATIONS if GROUP_KEYS[a["group"]] == gkey]
+
+
+def group_title(gkey: str) -> str:
+    return next((t for k, t in GROUPS if k == gkey), "")
 
 # "Рекомендуемое" deliberately leaves out everything that spends money — a
 # client shouldn't discover paid «Премиум» promotion by tapping a preset.
@@ -332,26 +363,17 @@ def _autopilot_text(s: dict) -> str:
             "и не потратит ни рубля.",
         ]
     else:
-        # One line per group, items inline: seventeen separate bullet lines is
-        # a lot of scrolling on a phone, and the grouping is what carries the
-        # meaning anyway. The note in brackets is the detail worth checking.
+        # One line per section: what's on, and what it's set to. The toggles
+        # themselves are a tap in, so this stays a summary.
         lines.append("")
-        group = None
-        parts: list[str] = []
-
-        def flush() -> None:
-            if group and parts:
-                lines.append(f"{group.split()[0]} " + " · ".join(parts))
-
-        for a in AUTOMATIONS:
-            if not is_on(s, a):
+        for gkey, title in GROUPS:
+            items = group_items(gkey)
+            on = [a for a in items if is_on(s, a)]
+            if not on:
+                lines.append(f"{title} — <i>выключено</i>")
                 continue
-            if a["group"] != group:
-                flush()
-                group, parts = a["group"], []
-            note = a.get("note")
-            parts.append(a["short"] + (f" ({note(s)})" if note else ""))
-        flush()
+            names = ", ".join(a["short"] for a in on)
+            lines.append(f"{title} — <b>{len(on)}/{len(items)}</b>: {names}")
 
     blocked = _blocked(s)
     if blocked:
@@ -394,18 +416,15 @@ def _autopilot_kb(s: dict) -> InlineKeyboardMarkup:
             b.button(text=f"⚠️ {a['short']} — {msg}", callback_data=target)
             rows.append(1)
 
-    # Two columns, grouped order — the text above carries the group headings,
-    # so no separator rows are needed (they were dead taps anyway).
-    toggles = 0
-    for a in AUTOMATIONS:
-        mark = "🟢" if is_on(s, a) else "🔴"
-        warn = a.get("warn")
-        if is_on(s, a) and warn and warn(s)[0]:
-            mark = "⚠️"
-        money = "💵" if a.get("costs") else ""
-        b.button(text=f"{mark} {a['short']}{money}", callback_data=f"ap:t:{a['key']}")
-        toggles += 1
-    rows.extend([2] * (toggles // 2) + ([1] if toggles % 2 else []))
+    # Sections, two per row, each showing how much of it is on.
+    n = 0
+    for gkey, title in GROUPS:
+        items = group_items(gkey)
+        on = sum(1 for a in items if is_on(s, a))
+        b.button(text=f"{GROUP_SHORT.get(gkey, title)}  {on}/{len(items)}",
+                 callback_data=f"ap:g:{gkey}")
+        n += 1
+    rows.extend([2] * (n // 2) + ([1] if n % 2 else []))
 
     b.button(text="🛠 Тонкая настройка", callback_data="auto:menu")
     b.button(text="⬅️ Настройки", callback_data="settings:menu")
@@ -413,6 +432,89 @@ def _autopilot_kb(s: dict) -> InlineKeyboardMarkup:
 
     b.adjust(*rows)
     return b.as_markup()
+
+
+# ---------------------------------------------------------------------------
+# One section
+# ---------------------------------------------------------------------------
+
+def _group_text(s: dict, gkey: str) -> str:
+    items = group_items(gkey)
+    on = [a for a in items if is_on(s, a)]
+    lines = [f"{group_title(gkey)} — включено <b>{len(on)}</b> из {len(items)}"]
+
+    if on:
+        lines.append("")
+        for a in on:
+            note = a.get("note")
+            lines.append(f"🟢 {a['title']}" + (f" — <i>{note(s)}</i>" if note else ""))
+
+    off = [a for a in items if not is_on(s, a)]
+    if off:
+        lines.append("")
+        lines.append("<i>Выключено: " + ", ".join(a["short"] for a in off) + "</i>")
+
+    blocked = [(a, m, f) for a, m, f in _blocked(s) if a in items]
+    if blocked:
+        lines.append("")
+        lines.append("⚠️ <b>Не заработает, пока не настроить:</b>")
+        for a, msg, _fix in blocked:
+            lines.append(f"· <b>{a['title']}</b> — {msg}")
+
+    if any(a.get("costs") for a in items):
+        lines.append("")
+        lines.append("💵 — тратит деньги.")
+    return "\n".join(lines)
+
+
+def _group_kb(s: dict, gkey: str) -> InlineKeyboardMarkup:
+    items = group_items(gkey)
+    b = InlineKeyboardBuilder()
+    rows: list[int] = []
+
+    for a, msg, fix in [(a, m, f) for a, m, f in _blocked(s) if a in items][:3]:
+        target = fix or a.get("tune")
+        if target:
+            b.button(text=f"⚠️ {a['short']} — {msg}", callback_data=target)
+            rows.append(1)
+
+    n = 0
+    for a in items:
+        mark = "🟢" if is_on(s, a) else "🔴"
+        warn = a.get("warn")
+        if is_on(s, a) and warn and warn(s)[0]:
+            mark = "⚠️"
+        money = "💵" if a.get("costs") else ""
+        b.button(text=f"{mark} {a['short']}{money}",
+                 callback_data=f"ap:x:{gkey}:{a['key']}")
+        n += 1
+    rows.extend([2] * (n // 2) + ([1] if n % 2 else []))
+
+    # Bulk-on is offered only where nothing in the section spends money —
+    # switching on paid promotion in one tap is not something to stumble into.
+    if not any(a.get("costs") for a in items):
+        b.button(text="✅ Включить всё", callback_data=f"ap:ga:{gkey}")
+        rows.append(1)
+    if any(is_on(s, a) for a in items):
+        b.button(text="🔴 Выключить раздел", callback_data=f"ap:gn:{gkey}")
+        rows.append(1)
+
+    b.button(text="⬅️ Автопилот", callback_data="ap:menu")
+    rows.append(1)
+    b.adjust(*rows)
+    return b.as_markup()
+
+
+def _toggle_alert(s: dict, auto: dict, now_on: bool) -> str:
+    """Popup text after flipping a switch: confirm, or name what's still needed."""
+    if not now_on:
+        return f"🔴 {auto['title']} — выключено"
+    warn = auto.get("warn")
+    blocked = (warn(s) if warn else ("", ""))[0]
+    if blocked:
+        return f"⚠️ {auto['title']}: {blocked}"
+    note = auto.get("note")
+    return f"🟢 {auto['title']}" + (f" ({note(s)})" if note else "")
 
 
 async def _refresh(callback: CallbackQuery, alert: str | None = None) -> None:
@@ -451,17 +553,69 @@ async def autopilot_toggle(callback: CallbackQuery) -> None:
     set_automation(s, auto, now_on)
     save_settings(callback.from_user.id, s)
 
-    if not now_on:
-        alert = f"🔴 {auto['title']} — выключено"
-    else:
-        warn = auto.get("warn")
-        blocked = (warn(s) if warn else ("", ""))[0]
-        if blocked:
-            alert = f"⚠️ {auto['title']}: {blocked}"
-        else:
-            note = auto.get("note")
-            alert = f"🟢 {auto['title']}" + (f" ({note(s)})" if note else "")
-    await _refresh(callback, alert)
+    await _refresh(callback, _toggle_alert(s, auto, now_on))
+
+
+async def _refresh_group(callback: CallbackQuery, gkey: str,
+                         alert: str | None = None) -> None:
+    s = get_settings(callback.from_user.id)
+    try:
+        await callback.message.edit_text(_group_text(s, gkey),
+                                         reply_markup=_group_kb(s, gkey))
+    except Exception:
+        pass
+    await callback.answer(alert or "")
+
+
+@router.callback_query(F.data.startswith("ap:g:"))
+async def autopilot_group(callback: CallbackQuery) -> None:
+    gkey = callback.data.split(":")[-1]
+    if not group_items(gkey):
+        await callback.answer("Раздел не найден", show_alert=True)
+        return
+    await _refresh_group(callback, gkey)
+
+
+@router.callback_query(F.data.startswith("ap:x:"))
+async def autopilot_group_toggle(callback: CallbackQuery) -> None:
+    _, _, gkey, key = callback.data.split(":", 3)
+    auto = _BY_KEY.get(key)
+    if not auto:
+        await callback.answer("Не найдено", show_alert=True)
+        return
+    s = get_settings(callback.from_user.id)
+    now_on = not is_on(s, auto)
+    set_automation(s, auto, now_on)
+    save_settings(callback.from_user.id, s)
+    await _refresh_group(callback, gkey, _toggle_alert(s, auto, now_on))
+
+
+@router.callback_query(F.data.startswith("ap:ga:"))
+async def autopilot_group_all(callback: CallbackQuery) -> None:
+    gkey = callback.data.split(":")[-1]
+    items = group_items(gkey)
+    if not items:
+        await callback.answer("Раздел не найден", show_alert=True)
+        return
+    s = get_settings(callback.from_user.id)
+    for a in items:
+        set_automation(s, a, True)
+    save_settings(callback.from_user.id, s)
+    await _refresh_group(callback, gkey, f"🟢 Включено: {len(items)}")
+
+
+@router.callback_query(F.data.startswith("ap:gn:"))
+async def autopilot_group_none(callback: CallbackQuery) -> None:
+    gkey = callback.data.split(":")[-1]
+    items = group_items(gkey)
+    if not items:
+        await callback.answer("Раздел не найден", show_alert=True)
+        return
+    s = get_settings(callback.from_user.id)
+    for a in items:
+        set_automation(s, a, False)
+    save_settings(callback.from_user.id, s)
+    await _refresh_group(callback, gkey, "🔴 Раздел выключен")
 
 
 @router.callback_query(F.data.startswith("ap:p:"))
