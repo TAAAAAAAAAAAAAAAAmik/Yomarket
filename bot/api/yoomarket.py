@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
+
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -28,44 +31,74 @@ class YooMarketAPI:
             await self.session.close()
             self.session = None
 
-    async def _get(self, path: str, params: dict | None = None) -> dict:
+    # A gateway hiccup on the marketplace side is not an error worth showing:
+    # 502/503/504 mean their proxy could not reach the app, and a second try a
+    # moment later usually succeeds. Anything else is answered straight away.
+    _RETRY_STATUSES = (502, 503, 504)
+    _RETRIES = 2
+
+    @staticmethod
+    def _clean_error(status: int, text: str) -> str:
+        """A short reason from a response body that may be an HTML error page.
+
+        A 502 answers with a full DOCTYPE page; dumping it into a chat message
+        told the seller nothing and buried the one useful fact — the code.
+        """
+        body = (text or "").strip()
+        if body[:1] == "<" or "<html" in body[:200].lower():
+            body = ""                       # an HTML error page says nothing
+        else:
+            body = re.sub(r"\s+", " ", body)[:150]
+        if status in (502, 503, 504):
+            return f"HTTP {status}: сервер Юмаркета недоступен"
+        return f"HTTP {status}" + (f": {body}" if body else "")
+
+    async def _request(self, method: str, path: str, *,
+                       params: dict | None = None,
+                       json: dict | None = None) -> dict:
         assert self.session is not None, "Call start() first"
-        async with self.session.get(f"{self.base_url}{path}", params=params) as resp:
-            text = await resp.text()
-            logger.debug("GET %s → %s: %s", path, resp.status, text[:500])
+        last = ""
+        for attempt in range(self._RETRIES + 1):
             try:
-                data = await resp.json(content_type=None)
-            except Exception:
-                raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
-            if not resp.ok:
-                raise RuntimeError(data.get("message") or data.get("error") or f"HTTP {resp.status}")
-            return data
+                async with self.session.request(
+                    method, f"{self.base_url}{path}",
+                    params=params, json=json,
+                ) as resp:
+                    text = await resp.text()
+                    logger.debug("%s %s → %s: %s", method, path, resp.status,
+                                 text[:500])
+                    if resp.status in self._RETRY_STATUSES and attempt < self._RETRIES:
+                        last = self._clean_error(resp.status, text)
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        raise RuntimeError(self._clean_error(resp.status, text))
+                    if not resp.ok:
+                        msg = ""
+                        if isinstance(data, dict):
+                            msg = str(data.get("message") or data.get("error") or "")
+                        raise RuntimeError(
+                            msg or self._clean_error(resp.status, text))
+                    return data
+            except asyncio.TimeoutError:
+                # A timeout is worth one more try for the same reason a 502 is
+                if attempt < self._RETRIES:
+                    last = "timeout"
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                raise RuntimeError("timeout: Юмаркет не ответил вовремя")
+        raise RuntimeError(last or "запрос не удался")
+
+    async def _get(self, path: str, params: dict | None = None) -> dict:
+        return await self._request("GET", path, params=params)
 
     async def _post(self, path: str, json: dict | None = None) -> dict:
-        assert self.session is not None, "Call start() first"
-        async with self.session.post(f"{self.base_url}{path}", json=json or {}) as resp:
-            text = await resp.text()
-            logger.debug("POST %s → %s: %s", path, resp.status, text[:500])
-            try:
-                data = await resp.json(content_type=None)
-            except Exception:
-                raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
-            if not resp.ok:
-                raise RuntimeError(data.get("message") or data.get("error") or f"HTTP {resp.status}")
-            return data
+        return await self._request("POST", path, json=json or {})
 
     async def _patch(self, path: str, json: dict | None = None) -> dict:
-        assert self.session is not None, "Call start() first"
-        async with self.session.patch(f"{self.base_url}{path}", json=json or {}) as resp:
-            text = await resp.text()
-            logger.debug("PATCH %s → %s: %s", path, resp.status, text[:500])
-            try:
-                data = await resp.json(content_type=None)
-            except Exception:
-                raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
-            if not resp.ok:
-                raise RuntimeError(data.get("message") or data.get("error") or f"HTTP {resp.status}")
-            return data
+        return await self._request("PATCH", path, json=json or {})
 
     async def check(self) -> dict:
         return await self._get("/check")
