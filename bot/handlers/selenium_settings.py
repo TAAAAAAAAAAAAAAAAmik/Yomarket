@@ -1151,6 +1151,20 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
             require_stock=bool(ar.get("require_stock", True)),
             skip_ids=_deleted_ids(uid),
             skip_statuses=[])
+
+        # The same panel fallback the schedule uses. Without it, pressing
+        # «Запустить сейчас» reported incorrect_status and stopped there, while
+        # the automatic pass quietly recovered the very same listings — the
+        # manual button looked broken next to the feature that worked.
+        retryable = [r for r in rep["failed"]
+                     if "incorrect_status" in str(r.get("reason", ""))]
+        if retryable:
+            from tasks.manager import panel_republish
+            done, still = await panel_republish(uid, retryable)
+            rep["restored"] += done
+            rep["failed"] = [r for r in rep["failed"]
+                             if r not in retryable] + still
+
         for row in rep["failed"]:
             if "incorrect_status" in str(row.get("reason", "")):
                 st = str(row.get("status") or "").lower()

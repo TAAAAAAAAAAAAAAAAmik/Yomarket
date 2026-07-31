@@ -330,6 +330,51 @@ def _message_notify_kb(chat_id: str, order_id: str = "") -> InlineKeyboardMarkup
     return builder.as_markup()
 
 
+async def panel_republish(user_id: int, rows: list[dict]
+                          ) -> tuple[list[dict], list[dict]]:
+    """Retry refused publishes through the panel. Returns (done, still_failed).
+
+    The Integration API answers incorrect_status for listings sitting in
+    «unpublish» — the state it is supposed to undo — so publishing over it is a
+    dead end for them. The panel runs the same Nova action a human clicks,
+    which is already how promotion and withdrawal work here, so the same route
+    is the fallback rather than an invented endpoint.
+
+    Only listings the API refused with incorrect_status come here: a network
+    failure or a real validation error should not silently drive a second
+    attempt by another road.
+
+    Module level, not a method: the manual «Запустить сейчас» button needs it
+    too, and it uses nothing from the task manager.
+    """
+    from storage import get_panel_creds
+    creds = get_panel_creds(user_id)
+    if not creds or not creds.get("cookies"):
+        return [], [{**r, "reason": f"{r.get('reason', '')} · нет входа в панель"}
+                    for r in rows]
+
+    from automation.panel import panel_publish_item_sync
+    loop = asyncio.get_event_loop()
+    done, failed = [], []
+    for row in rows:
+        try:
+            ok, msg = await asyncio.wait_for(
+                loop.run_in_executor(None, panel_publish_item_sync,
+                                     creds["cookies"], str(row["id"]),
+                                     user_id, True),
+                timeout=60)
+        except Exception as e:
+            ok, msg = False, str(e)[:120]
+        if ok:
+            done.append(row)
+        else:
+            # Keep the panel's own trace: it names the actions it saw, which is
+            # what tells us whether the id is even known to the panel.
+            failed.append({**row,
+                           "reason": f"{row.get('reason', '')} · панель: {msg[:120]}"})
+    return done, failed
+
+
 class TaskManager:
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
@@ -1381,42 +1426,7 @@ class TaskManager:
 
     async def _panel_republish(self, user_id: int, rows: list[dict]
                                ) -> tuple[list[dict], list[dict]]:
-        """Retry refused publishes through the panel. Returns (done, still_failed).
-
-        The Integration API answers incorrect_status for listings sitting in
-        «unpublish» — the state it is supposed to undo — so publishing over it
-        is a dead end for them. The panel runs the same Nova action a human
-        clicks, which is already how promotion and withdrawal work here, so the
-        same route is used as the fallback rather than inventing an endpoint.
-
-        Only listings the API refused with incorrect_status come here: a
-        network failure or a real validation error should not silently drive a
-        second attempt by another road.
-        """
-        from storage import get_panel_creds
-        creds = get_panel_creds(user_id)
-        if not creds or not creds.get("cookies"):
-            return [], rows
-
-        from automation.panel import panel_publish_item_sync
-        loop = asyncio.get_event_loop()
-        done, failed = [], []
-        for row in rows:
-            try:
-                ok, msg = await asyncio.wait_for(
-                    loop.run_in_executor(None, panel_publish_item_sync,
-                                         creds["cookies"], str(row["id"]),
-                                         user_id, True),
-                    timeout=60)
-            except Exception as e:
-                ok, msg = False, str(e)[:120]
-            if ok:
-                done.append(row)
-            else:
-                # Keep the panel's own trace: it names the actions it saw, which
-                # is what tells us whether the id is even known to the panel.
-                failed.append({**row, "reason": f"{row['reason']} · панель: {msg[:120]}"})
-        return done, failed
+        return await panel_republish(user_id, rows)
 
     async def _restore_after_sale(self, user_id: int, api: YooMarketAPI,
                                   settings: dict, sold_ads: set, sold_now: bool
