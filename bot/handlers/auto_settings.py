@@ -74,6 +74,7 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     ae = s.get("auto_events", {})
     builder = InlineKeyboardBuilder()
 
+    builder.button(text="⚡ Автопилот (всё сразу)", callback_data="ap:menu")
     builder.button(text="📩 Автоответчики", callback_data="resp:cats")
 
     ar_on = ar.get("enabled", False)
