@@ -1262,7 +1262,8 @@ class TaskManager:
         try:
             rep = await api.restore_ads(
                 require_stock=bool(ar.get("require_stock", True)),
-                skip_ids=skip)
+                skip_ids=skip,
+                skip_statuses=ar.get("barred_statuses") or [])
         except Exception as e:
             logger.warning("Auto-restore for %s: %s", user_id, e)
             return f"🔄 Авто-восстановление не отработало: {_esc(str(e)[:120])}"
@@ -1272,6 +1273,17 @@ class TaskManager:
         for row in rep["restored"]:
             failures.pop(str(row["id"]), None)      # it worked; forget the past
         ar["restored_total"] = int(ar.get("restored_total", 0)) + len(rep["restored"])
+
+        # Learn which statuses the marketplace itself refuses to publish, so
+        # the next pass skips them instead of re-asking every hour. This is the
+        # answer coming from the marketplace, not a guess about its states.
+        barred = list(ar.get("barred_statuses") or [])
+        for row in rep["failed"]:
+            if "incorrect_status" in str(row.get("reason", "")):
+                st = str(row.get("status") or "").lower()
+                if st and st not in barred:
+                    barred.append(st)
+        ar["barred_statuses"] = barred
 
         fresh_failures = []
         for row in rep["failed"]:
@@ -1323,8 +1335,8 @@ class TaskManager:
             body.append("")
             body.append(f"⛔ Маркетплейс отказал: <b>{len(fresh_failures)}</b>")
             for row in fresh_failures[:5]:
-                body.append(f"   • {_esc(row['title'])[:30]}: "
-                            f"{_esc(row['reason'])[:70]}")
+                body.append(f"   • {_esc(row['title'])[:26]}\n"
+                            f"     {_esc(row['reason'])[:150]}")
             body.append("<i>Повтор будет позже — с нарастающей паузой.</i>")
 
         return _card("🔄 <b>АВТО-ВОССТАНОВЛЕНИЕ</b>", body,

@@ -111,10 +111,15 @@ class YooMarketAPI:
     # exists for were the ones it ignored.
     _DOWN = ("unpublish", "unpublished", "unpublic", "inactive", "sold",
              "expired", "archived", "disabled", "closed", "hidden",
-             "not_active", "paused", "stopped", "cancelled", "canceled",
-             "finished", "ended")
+             "not_active", "paused", "stopped")
+    # "publish" is this marketplace's word for a live ad — without it 12 live
+    # listings read as an unknown status. Cancelled/rejected ads are terminal,
+    # not merely taken down: publishing one answers incorrect_status, so they
+    # belong here rather than in _DOWN.
     _NEVER = ("blocked", "banned", "fraud", "moderate", "moderation", "draft",
-              "deleted", "removed", "active", "published")
+              "deleted", "removed", "active", "publish", "published",
+              "cancelled", "canceled", "rejected", "declined",
+              "finished", "ended", "completed")
 
     @staticmethod
     def _ad_state(ad: dict) -> str:
@@ -169,7 +174,8 @@ class YooMarketAPI:
 
     async def restore_ads(self, *, require_stock: bool = True,
                           skip_ids=(), limit: int = 0,
-                          dry_run: bool = False) -> dict:
+                          dry_run: bool = False,
+                          skip_statuses=()) -> dict:
         """Put ads that went down back on sale.
 
         Returns a report rather than a count and a string, so the caller can
@@ -181,6 +187,11 @@ class YooMarketAPI:
         ads = [a for a in (data.get("data") or data.get("items") or [])
                if isinstance(a, dict)]
         skip = {str(i) for i in (skip_ids or ())}
+        # Statuses the marketplace has already refused to publish. Learned from
+        # its own incorrect_status answers rather than guessed by me — a state
+        # that cannot be published once will not become publishable by retrying
+        # every ad in it.
+        barred = {str(x).lower() for x in (skip_statuses or ())}
 
         report = {"restored": [], "no_stock": [], "failed": [], "skipped": 0,
                   "unknown": [],
@@ -196,7 +207,7 @@ class YooMarketAPI:
                 report["skipped"] += 1     # deleted in the panel, still listed
                 continue
             state = self._ad_state(ad)
-            if state in self._NEVER:
+            if state in self._NEVER or state in barred:
                 continue
             if state not in self._DOWN:
                 # A status belonging to neither list is not silently dropped.

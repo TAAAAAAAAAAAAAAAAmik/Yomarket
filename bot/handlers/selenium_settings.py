@@ -1040,7 +1040,8 @@ async def restore_preview(callback: CallbackQuery, api: YooMarketAPI) -> None:
     try:
         rep = await api.restore_ads(
             require_stock=bool(s.get("auto_restore", {}).get("require_stock", True)),
-            dry_run=True)
+            dry_run=True,
+            skip_statuses=s.get("auto_restore", {}).get("barred_statuses") or [])
     except Exception as e:
         await callback.message.edit_text(
             f"❌ Не удалось посмотреть: {_esc(str(e)[:200])}",
@@ -1098,7 +1099,15 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
         from handlers.panel_items import _deleted_ids
         rep = await api.restore_ads(
             require_stock=bool(ar.get("require_stock", True)),
-            skip_ids=_deleted_ids(uid))
+            skip_ids=_deleted_ids(uid),
+            skip_statuses=ar.get("barred_statuses") or [])
+        barred = list(ar.get("barred_statuses") or [])
+        for row in rep["failed"]:
+            if "incorrect_status" in str(row.get("reason", "")):
+                st = str(row.get("status") or "").lower()
+                if st and st not in barred:
+                    barred.append(st)
+        ar["barred_statuses"] = barred
         ar["last_restore_run"] = _time.time()
         ar["restored_total"] = int(ar.get("restored_total", 0) or 0) + len(rep["restored"])
         # A manual run is a deliberate retry: clear the waits it just resolved
@@ -1124,7 +1133,7 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
             parts.append("")
             parts.append(f"⛔ Отказано: <b>{len(rep['failed'])}</b>")
             for row in rep["failed"][:6]:
-                parts.append(f"   • {_esc(row['title'])[:30]}: {_esc(row['reason'])[:80]}")
+                parts.append(f"   • {_esc(row['title'])[:26]}\n     {_esc(row['reason'])[:150]}")
         if rep.get("unknown"):
             parts.append("")
             parts.append(f"❔ Незнакомый статус, не трогал: "
