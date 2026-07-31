@@ -747,6 +747,7 @@ MENU_BUTTONS = [
     ("balance",  "💰 Баланс",     "menu:balance"),
     ("stats",    "📊 Статистика", "menu:stats"),
     ("plugins",  "🧩 Плагины",    "plugins:menu"),
+    ("autopilot", "⚡ Автопилот",  "ap:menu"),
     ("settings", "⚙️ Настройки",  "settings:menu"),
 ]
 

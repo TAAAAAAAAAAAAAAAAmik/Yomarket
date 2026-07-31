@@ -10,6 +10,7 @@ router = Router()
 @router.callback_query(F.data == "settings:menu")
 async def settings_menu(callback: CallbackQuery) -> None:
     b = InlineKeyboardBuilder()
+    b.button(text="⚡ Автопилот", callback_data="ap:menu")
     b.button(text="🔔 Уведомления", callback_data="notif:menu")
     b.button(text="⚙️ Авто-функции", callback_data="auto:menu")
     b.button(text="🕐 Расписание цен", callback_data="pricesched:menu")
@@ -17,9 +18,11 @@ async def settings_menu(callback: CallbackQuery) -> None:
     b.button(text="🛠 Инструменты", callback_data="tools:menu")
     b.button(text="🌐 Панель продавца", callback_data="panel:menu")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
-    b.adjust(2, 2, 2, 1)
+    b.adjust(1, 2, 2, 2, 1)
     await callback.message.edit_text(
-        "⚙️ <b>Настройки</b>\n\nВыберите раздел:",
+        "⚙️ <b>Настройки</b>\n\n"
+        "⚡ <b>Автопилот</b> — включить все автоматизации в один тап.\n"
+        "Остальные разделы — для тонкой настройки.",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
