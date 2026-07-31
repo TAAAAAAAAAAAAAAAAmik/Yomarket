@@ -105,6 +105,16 @@ AUTOMATIONS: list[dict] = [
         "tune": "selenium:restore:menu",
     },
     {
+        "key": "restore_instant", "group": "🛒 Товары",
+        "title": "Возвращать сразу после продажи",
+        "short": "Сразу в продажу",
+        "path": ("auto_restore", "instant"),
+        "warn": lambda s: (("", "") if s.get("auto_restore", {}).get("enabled")
+                           else ("нужно включить восстановление",
+                                 "selenium:restore:menu")),
+        "tune": "selenium:restore:menu",
+    },
+    {
         "key": "promo_sched", "group": "🛒 Товары",
         "title": "Премиум по расписанию",
         "short": "Премиум: время",
@@ -250,6 +260,7 @@ def group_title(gkey: str) -> str:
 # "Рекомендуемое" deliberately leaves out everything that spends money — a
 # client shouldn't discover paid «Премиум» promotion by tapping a preset.
 _SAFE = ["reply", "refunded", "accept", "confirm", "reminders", "restore",
+         "restore_instant",
          "notify_orders", "notify_messages", "complaints", "reviews",
          "balance", "daily"]
 # "Максимум" adds the promotion schedule and position watch. Position watch

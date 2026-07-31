@@ -69,6 +69,10 @@ _DEFAULT_SETTINGS = {
     "auto_restore": {
         "enabled": False,
         "interval_hours": 1,     # раньше крутилось каждые 30 минут без паузы
+        # Вернуть товар в продажу сразу после покупки, не дожидаясь
+        # планового прохода: продажа — это и есть момент, когда товар мог уйти
+        # с витрины.
+        "instant": True,
         "require_stock": True,   # не публиковать распроданное
         "last_restore_run": 0,
         "restored_total": 0,

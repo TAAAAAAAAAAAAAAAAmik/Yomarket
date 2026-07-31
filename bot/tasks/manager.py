@@ -503,6 +503,10 @@ class TaskManager:
             # appear AFTER initialization trigger alerts/auto-actions.
             initialized = settings.get("orders_initialized", False)
 
+            # Listings that just sold, for the instant put-back-on-sale below.
+            sold_now = False
+            sold_ads: set[str] = set()
+
             for order in orders:
                 oid = str(order.get("id", ""))
                 if not oid:
@@ -571,6 +575,16 @@ class TaskManager:
                     continue
 
                 if prev_status is None:
+                    # A sale is the moment the listing may have gone off sale —
+                    # note it so it can be put back up right now instead of
+                    # waiting out the restore interval.
+                    sold_now = True
+                    sold_ad = _order_field(order, "ad_id", "product_id",
+                                           "item_id", "listing_id",
+                                           "ad.id", "product.id", "item.id")
+                    if sold_ad:
+                        sold_ads.add(str(sold_ad))
+
                     # Auto-accept: press "начать заказ" immediately so orders
                     # don't sit unaccepted (buyer can't force a refund).
                     accepted = False
@@ -664,6 +678,9 @@ class TaskManager:
             await self._check_messages(user_id, api, settings)
             await self._check_watched_chats(user_id, api, settings)
             await self._auto_confirm(user_id, api, settings)
+            if sold_ads or sold_now:
+                await self._restore_after_sale(user_id, api, settings,
+                                               sold_ads, sold_now)
 
             save_settings(user_id, settings)
         finally:
@@ -1361,6 +1378,66 @@ class TaskManager:
 
         return _card("📊 <b>ИТОГИ ДНЯ</b>", body,
                      f"🗓 {datetime.now().strftime('%d.%m.%Y')}")
+
+    async def _restore_after_sale(self, user_id: int, api: YooMarketAPI,
+                                  settings: dict, sold_ads: set, sold_now: bool
+                                  ) -> None:
+        """Put a listing back on sale the moment it sells.
+
+        The scheduled pass runs on an interval — an hour by default — so a
+        listing that sold out sat off-sale for up to that long. A sale is the
+        one event that reliably means "this may have gone down", so it drives
+        the restore directly, in the 60s orders loop.
+
+        Two paths. When the order says which listing it was, that listing alone
+        is republished: one detail fetch and one publish, no full sweep, and no
+        throttle needed. When the order carries no listing id, a normal restore
+        pass is used instead — that costs a full listing fetch, so it is capped
+        to once every few minutes rather than running every time an order lands
+        during a rush.
+        """
+        ar = settings.setdefault("auto_restore", {})
+        if not (ar.get("enabled") and ar.get("instant", True)):
+            return
+
+        now = time.time()
+        from handlers.panel_items import _deleted_ids
+        skip = _deleted_ids(user_id) | {
+            aid for aid, f in (ar.get("failures") or {}).items()
+            if float(f.get("until", 0) or 0) > now}
+
+        back: list[str] = []
+        for aid in sorted(sold_ads - set(skip)):
+            try:
+                ad = await api.get_ad(aid)
+                inner = ad.get("data") or ad
+                state = api._ad_state(inner)
+                if state not in api._DOWN:
+                    continue                       # still live, nothing to do
+                if ar.get("require_stock", True):
+                    has, _note = await api.ad_stock(aid, inner)
+                    if not has:
+                        continue                   # sold out — nothing to sell
+                await api.restore_ad(aid)
+                back.append(str(inner.get("title") or inner.get("name") or f"#{aid}"))
+            except Exception as e:
+                logger.info("Instant restore of %s: %s", aid, e)
+
+        if back:
+            ar["restored_total"] = int(ar.get("restored_total", 0) or 0) + len(back)
+            await self._notify(
+                user_id,
+                _card("♻️ <b>СНОВА В ПРОДАЖЕ</b>",
+                      [f"• {_esc(t)[:44]}" for t in back[:8]]
+                      + ["", "<i>Вернул сразу после продажи.</i>"]))
+            return
+
+        # No listing id in the order — fall back to a normal pass, rate-limited.
+        if sold_now and now - float(ar.get("last_instant_run", 0) or 0) >= 300:
+            ar["last_instant_run"] = now
+            note = await self._auto_restore(user_id, api, settings, now)
+            if note:
+                await self._notify(user_id, note)
 
     async def _auto_restore(self, user_id: int, api: YooMarketAPI,
                             settings: dict, now: float) -> str:

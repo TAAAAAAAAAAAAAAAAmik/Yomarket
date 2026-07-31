@@ -885,6 +885,7 @@ def _restore_text(s: dict, creds=None) -> str:
         f"Проверка: каждые {interval} ч",
         f"Последний запуск: {last_run}",
         f"Требовать остатки: {'✅ да' if ar.get('require_stock', True) else '❌ нет'}",
+        f"Сразу после продажи: {'✅ да' if ar.get('instant', True) else '❌ нет'}",
     ]
     if ar.get("last_result"):
         lines.append(f"Прошлый результат: {ar['last_result']}")
@@ -896,6 +897,8 @@ def _restore_text(s: dict, creds=None) -> str:
         "",
         "Снятые с продажи объявления публикуются заново. "
         "Распроданные пропускаются — публиковать их нечем.",
+        "⚡ С включённым «сразу после продажи» товар возвращается "
+        "в момент покупки, а не ждёт следующей проверки.",
         "<i>Публикация уходит на модерацию, а не сразу в продажу.</i>",
     ]
     return "\n".join(lines)
@@ -913,12 +916,15 @@ def _restore_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
              callback_data="restore:interval")
     b.button(text=f"📦 Остатки: {'обязательны' if stock else 'не важны'}",
              callback_data="restore:stock")
+    b.button(text=f"⚡ Сразу после продажи: "
+                  f"{'вкл' if ar.get('instant', True) else 'выкл'}",
+             callback_data="restore:instant")
     held = [f for f in (ar.get("failures") or {}).values()
             if float(f.get("until", 0) or 0) > _time.time()]
     if held:
         b.button(text=f"⏸ Отложенные ({len(held)})", callback_data="restore:held")
     b.button(text="⬅️ К объявлениям", callback_data="menu:ads")
-    b.adjust(2, 1, 2, 1, 1)
+    b.adjust(2, 1, 2, 1, 1, 1)
     return b.as_markup()
 
 
@@ -952,6 +958,20 @@ async def restore_stock_toggle(callback: CallbackQuery) -> None:
     await callback.answer(
         "Распроданные будут пропускаться" if ar["require_stock"]
         else "Публиковать буду и без остатков — маркетплейс может отказать",
+        show_alert=True)
+    await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
+
+
+@router.callback_query(F.data == "restore:instant")
+async def restore_instant_toggle(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    ar = s.setdefault("auto_restore", {})
+    ar["instant"] = not ar.get("instant", True)
+    save_settings(callback.from_user.id, s)
+    await callback.answer(
+        "Товар вернётся в продажу сразу после покупки"
+        if ar["instant"] else
+        "Возврат только по расписанию — до часа ожидания",
         show_alert=True)
     await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
 
