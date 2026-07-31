@@ -26,6 +26,33 @@ _AUTO_LOOP_INTERVAL = 30 * 60
 # (e.g. after the bot was off all morning) on the next start.
 _BUMP_CATCHUP_SECONDS = 2 * 3600
 
+# How many listings one restore pass will act on. Each candidate costs a stock
+# check plus a publish, run one after another while the per-user lock is held —
+# and the 60s orders loop needs that same lock. A shop with a few hundred ads
+# down would otherwise stall order notifications for minutes. A backlog is
+# drained over consecutive passes instead.
+_RESTORE_MAX_PER_PASS = 40
+
+# A status the marketplace refused with incorrect_status is skipped, but not
+# forever: the ban is inferred from one ad's answer and applied to every ad in
+# that state, so it is re-tested after a week in case it was transient or the
+# marketplace changed its mind.
+_RESTORE_BARRED_TTL = 7 * 86400
+
+
+def _barred_map(ar: dict) -> dict:
+    """{status: expiry} of statuses restore should skip.
+
+    Accepts the older plain-list form, which carried no expiry, and dates it
+    from now so an existing install starts re-testing instead of skipping those
+    statuses forever.
+    """
+    raw = ar.get("barred_until")
+    if isinstance(raw, dict):
+        return {str(k).lower(): float(v or 0) for k, v in raw.items()}
+    legacy = ar.get("barred_statuses") or []
+    return {str(st).lower(): time.time() + _RESTORE_BARRED_TTL for st in legacy}
+
 
 def _fmt_time(raw) -> str:
     if not raw:
@@ -1356,11 +1383,17 @@ class TaskManager:
         from handlers.panel_items import _deleted_ids
         skip = set(held) | _deleted_ids(user_id)
 
+        # Statuses barred by a past incorrect_status, minus the ones whose ban
+        # has aged out and is due for a re-test.
+        barred_until: dict = _barred_map(ar)
+        active_barred = [st for st, until in barred_until.items() if until > now]
+
         try:
             rep = await api.restore_ads(
                 require_stock=bool(ar.get("require_stock", True)),
                 skip_ids=skip,
-                skip_statuses=ar.get("barred_statuses") or [])
+                limit=_RESTORE_MAX_PER_PASS,
+                skip_statuses=active_barred)
         except Exception as e:
             logger.warning("Auto-restore for %s: %s", user_id, e)
             return f"🔄 Авто-восстановление не отработало: {_esc(str(e)[:120])}"
@@ -1374,13 +1407,15 @@ class TaskManager:
         # Learn which statuses the marketplace itself refuses to publish, so
         # the next pass skips them instead of re-asking every hour. This is the
         # answer coming from the marketplace, not a guess about its states.
-        barred = list(ar.get("barred_statuses") or [])
+        # Each ban carries an expiry: it is inferred from a single ad and
+        # applied to every ad in that state, so it must be able to heal.
         for row in rep["failed"]:
             if "incorrect_status" in str(row.get("reason", "")):
                 st = str(row.get("status") or "").lower()
-                if st and st not in barred:
-                    barred.append(st)
-        ar["barred_statuses"] = barred
+                if st:
+                    barred_until[st] = now + _RESTORE_BARRED_TTL
+        ar["barred_until"] = barred_until
+        ar.pop("barred_statuses", None)          # superseded by the dated form
 
         fresh_failures = []
         for row in rep["failed"]:
@@ -1400,12 +1435,29 @@ class TaskManager:
             failures.pop(aid, None)
         ar["failures"] = failures
 
+        # A status in neither list is the signal that the marketplace has a
+        # state this code doesn't know about — exactly how «unpublish» hid for
+        # so long. Reporting it only when something *else* happened defeats the
+        # purpose, so a status not seen before counts as news in its own right.
+        # Each distinct status is announced once, not every hour.
+        seen_unknown = set(ar.get("seen_unknown") or [])
+        new_unknown = sorted({str(r["status"]) for r in rep.get("unknown") or []}
+                             - seen_unknown)
+        if new_unknown:
+            ar["seen_unknown"] = sorted(seen_unknown | set(new_unknown))
+
+        # Listings left over because the pass is capped; picked up next round
+        # rather than after another full interval.
+        backlog = max(0, int(rep.get("candidates", 0)) - _RESTORE_MAX_PER_PASS)
+        if backlog:
+            ar["last_restore_run"] = 0
+
         summary = (f"поднято {len(rep['restored'])}, "
                    f"без остатков {len(rep['no_stock'])}, "
                    f"отказов {len(rep['failed'])}")
         ar["last_result"] = summary
 
-        if not rep["restored"] and not fresh_failures:
+        if not rep["restored"] and not fresh_failures and not new_unknown:
             return ""                                # nothing happened, say nothing
 
         body: list[str] = []
@@ -1422,12 +1474,15 @@ class TaskManager:
                         f"— их публиковать нечем")
             for row in rep["no_stock"][:5]:
                 body.append(f"   • {_esc(row['title'])[:34]} — {_esc(row.get('note'))}")
-        if rep.get("unknown"):
+        if new_unknown:
+            affected = [r for r in rep["unknown"] if str(r["status"]) in new_unknown]
             body.append("")
-            body.append(f"❔ Незнакомый статус у <b>{len(rep['unknown'])}</b> "
-                        f"— не трогал: "
-                        + ", ".join(sorted({_esc(r["status"])
-                                            for r in rep["unknown"]})[:6]))
+            body.append("❔ <b>Незнакомый статус</b> — не трогал: "
+                        + ", ".join(_esc(x) for x in new_unknown[:6]))
+            for row in affected[:4]:
+                body.append(f"   • {_esc(row['title'])[:38]}")
+            body.append("<i>Напишите нам этот статус, если такие товары "
+                        "должны возвращаться в продажу.</i>")
         if fresh_failures:
             body.append("")
             body.append(f"⛔ Маркетплейс отказал: <b>{len(fresh_failures)}</b>")
@@ -1435,6 +1490,11 @@ class TaskManager:
                 body.append(f"   • {_esc(row['title'])[:26]}\n"
                             f"     {_esc(row['reason'])[:150]}")
             body.append("<i>Повтор будет позже — с нарастающей паузой.</i>")
+
+        if backlog:
+            body.append("")
+            body.append(f"⏳ Ещё <b>{backlog}</b> в очереди — продолжу "
+                        f"в следующий заход.")
 
         return _card("🔄 <b>АВТО-ВОССТАНОВЛЕНИЕ</b>", body,
                      f"📦 Всего объявлений: {rep['total']}")

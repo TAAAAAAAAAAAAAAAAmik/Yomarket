@@ -993,13 +993,28 @@ async def restore_held(callback: CallbackQuery) -> None:
     now = _time.time()
     held = [(a, f) for a, f in (ar.get("failures") or {}).items()
             if float(f.get("until", 0) or 0) > now]
+    from tasks.manager import _barred_map
+    barred = [(st, u) for st, u in _barred_map(ar).items() if u > now]
+
     b = InlineKeyboardBuilder()
     b.button(text="🔁 Снять отсрочку со всех", callback_data="restore:unhold")
     b.button(text="⬅️ Назад", callback_data="selenium:restore:menu")
     b.adjust(1)
+
+    # A barred status quietly skips every ad in it, so it has to be visible —
+    # otherwise a seller sees listings that never come back and no reason why.
+    barred_block = ""
+    if barred:
+        barred_block = ("\n\n🚫 <b>Статусы, которые маркетплейс отказался "
+                        "публиковать</b>\n"
+                        + "\n".join(f"• <code>{_esc(st)}</code> — повторю "
+                                   f"{_fmt_ts(u)}" for st, u in sorted(barred))
+                        + "\n<i>Объявления в этих статусах пропускаются.</i>")
+
     if not held:
-        await callback.message.edit_text("Отложенных объявлений нет.",
-                                         reply_markup=b.as_markup())
+        await callback.message.edit_text(
+            ("Отложенных объявлений нет." + barred_block) or "—",
+            reply_markup=b.as_markup())
         await callback.answer()
         return
     lines = []
@@ -1010,7 +1025,8 @@ async def restore_held(callback: CallbackQuery) -> None:
             f"{_fmt_ts(f.get('until'))}\n"
             f"   причина: {_esc(f.get('reason'))[:90]}")
     await callback.message.edit_text(
-        "⏸ <b>Отложены после отказа</b>\n\n" + "\n\n".join(lines)[:3400],
+        ("⏸ <b>Отложены после отказа</b>\n\n"
+         + "\n\n".join(lines)[:3000] + barred_block),
         reply_markup=b.as_markup())
     await callback.answer()
 
@@ -1018,7 +1034,12 @@ async def restore_held(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "restore:unhold")
 async def restore_unhold(callback: CallbackQuery) -> None:
     s = get_settings(callback.from_user.id)
-    s.setdefault("auto_restore", {})["failures"] = {}
+    ar = s.setdefault("auto_restore", {})
+    ar["failures"] = {}
+    # Barred statuses are the broader half of the same hold, so clearing one
+    # without the other leaves the seller wondering why nothing changed.
+    ar["barred_until"] = {}
+    ar.pop("barred_statuses", None)
     save_settings(callback.from_user.id, s)
     await callback.answer("Отсрочки сняты", show_alert=True)
     await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
@@ -1037,11 +1058,14 @@ async def restore_preview(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.answer("⏳ Смотрю...")
     await callback.message.edit_text("⏳ Проверяю, что можно восстановить...")
     s = get_settings(callback.from_user.id)
+    from tasks.manager import _barred_map
     try:
         rep = await api.restore_ads(
             require_stock=bool(s.get("auto_restore", {}).get("require_stock", True)),
             dry_run=True,
-            skip_statuses=s.get("auto_restore", {}).get("barred_statuses") or [])
+            skip_statuses=[st for st, u in
+                           _barred_map(s.get("auto_restore", {})).items()
+                           if u > _time.time()])
     except Exception as e:
         await callback.message.edit_text(
             f"❌ Не удалось посмотреть: {_esc(str(e)[:200])}",
@@ -1097,17 +1121,22 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
     ar = s.setdefault("auto_restore", {})
     try:
         from handlers.panel_items import _deleted_ids
+        from tasks.manager import _barred_map, _RESTORE_BARRED_TTL
+        now = _time.time()
+        # A manual run is a deliberate retry, so a status barred earlier is
+        # given another chance here rather than skipped again.
+        barred_until = _barred_map(ar)
         rep = await api.restore_ads(
             require_stock=bool(ar.get("require_stock", True)),
             skip_ids=_deleted_ids(uid),
-            skip_statuses=ar.get("barred_statuses") or [])
-        barred = list(ar.get("barred_statuses") or [])
+            skip_statuses=[])
         for row in rep["failed"]:
             if "incorrect_status" in str(row.get("reason", "")):
                 st = str(row.get("status") or "").lower()
-                if st and st not in barred:
-                    barred.append(st)
-        ar["barred_statuses"] = barred
+                if st:
+                    barred_until[st] = now + _RESTORE_BARRED_TTL
+        ar["barred_until"] = barred_until
+        ar.pop("barred_statuses", None)
         ar["last_restore_run"] = _time.time()
         ar["restored_total"] = int(ar.get("restored_total", 0) or 0) + len(rep["restored"])
         # A manual run is a deliberate retry: clear the waits it just resolved
