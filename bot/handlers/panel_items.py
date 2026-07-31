@@ -101,9 +101,12 @@ async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
         names = await _category_names(
             api, callback.from_user.id, _wanted_cats(ads))
     except Exception as e:
-        await callback.message.edit_text(
-            f"❌ Не удалось загрузить объявления:\n<code>{str(e)[:200]}</code>",
-            reply_markup=_no_session_kb())
+        from handlers.ads import _load_error
+        b = InlineKeyboardBuilder()
+        b.button(text="🔄 Повторить", callback_data="pitems:cats")
+        b.button(text="⬅️ Назад", callback_data="menu:ads")
+        b.adjust(1)
+        await callback.message.edit_text(_load_error(e), reply_markup=b.as_markup())
         await callback.answer()
         return
 
@@ -178,9 +181,12 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
         names = await _category_names(
             api, callback.from_user.id, _wanted_cats(ads))
     except Exception as e:
-        await callback.message.edit_text(
-            f"❌ Ошибка загрузки:\n<code>{str(e)[:200]}</code>",
-            reply_markup=_no_session_kb())
+        from handlers.ads import _load_error
+        b = InlineKeyboardBuilder()
+        b.button(text="🔄 Повторить", callback_data="pitems:cats")
+        b.button(text="⬅️ Назад", callback_data="menu:ads")
+        b.adjust(1)
+        await callback.message.edit_text(_load_error(e), reply_markup=b.as_markup())
         await callback.answer()
         return
 

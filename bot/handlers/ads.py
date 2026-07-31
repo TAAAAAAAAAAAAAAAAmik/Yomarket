@@ -29,6 +29,32 @@ def _status(raw: str) -> str:
     return STATUS_EMOJI.get(raw, f"⚪ {raw}")
 
 
+def _load_error(e: Exception) -> str:
+    """Say what actually went wrong loading listings.
+
+    An empty or opaque error here is the difference between "the bot is broken"
+    and "your token expired" — the seller can act on the second one.
+    """
+    s = str(e) or type(e).__name__
+    low = s.lower()
+    if "timeout" in low or "timed out" in low:
+        return ("⏱ <b>Юмаркет не ответил вовремя</b>\n\n"
+                "Маркетплейс сейчас медленный или недоступен. Попробуйте ещё раз.")
+    if "401" in s or "unauthenticated" in low or "unauthorized" in low:
+        return ("🔑 <b>Токен не принят</b>\n\n"
+                "Похоже, API-токен отозван или истёк. Создайте новый в панели "
+                "(Мой магазин → Интеграции) и пришлите его командой /start.")
+    if "429" in s or "too many" in low:
+        return ("🚦 <b>Слишком много запросов</b>\n\n"
+                "Юмаркет ограничил частоту. Подождите минуту и повторите.")
+    if any(k in low for k in ("cannot connect", "dns", "network", "unreachable",
+                              "connection")):
+        return ("🌐 <b>Нет связи с Юмаркетом</b>\n\n"
+                "Сервер маркетплейса недоступен. Это пройдёт само — повторите позже.")
+    return (f"❌ <b>Не удалось загрузить объявления</b>\n\n"
+            f"<code>{str(s)[:250]}</code>")
+
+
 def _fmt_list(ads: list[dict], total: int | None) -> str:
     """Summary only. The listings are browsed under «📦 Товары», so repeating
     them here just makes the menu scroll."""
@@ -76,12 +102,13 @@ async def ads_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
         text = _fmt_list(ads, total)
         keyboard = _ads_keyboard(ads, next_cursor)
     except Exception as e:
-        text = f"❌ Ошибка загрузки: {e}\n\n💡 Попробуйте управление через панель."
+        text = _load_error(e)
         b = InlineKeyboardBuilder()
+        b.button(text="🔄 Повторить", callback_data="ads_load")
         b.button(text="🛠 Управление (панель)", callback_data="pitems:list")
         b.button(text="➕ Добавить товар", callback_data="create_ad:start")
         b.button(text="⬅️ Главное меню", callback_data="menu:main")
-        b.adjust(2, 1)
+        b.adjust(2, 1, 1)
         keyboard = b.as_markup()
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()

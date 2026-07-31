@@ -14,9 +14,13 @@ class YooMarketAPI:
 
     async def start(self) -> None:
         connector = aiohttp.TCPConnector(ssl=False)
+        # aiohttp's default is a five-minute total timeout, so a stalled request
+        # left "⏳ Загружаю..." on screen for five minutes — indistinguishable
+        # from the bot being broken. Fail fast and say so instead.
         self.session = aiohttp.ClientSession(
             headers={"Authorization": f"Bearer {self.token}"},
             connector=connector,
+            timeout=aiohttp.ClientTimeout(total=25, connect=10, sock_read=20),
         )
 
     async def close(self) -> None:
