@@ -1182,7 +1182,9 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
             parts.append("")
             parts.append(f"⛔ Отказано: <b>{len(rep['failed'])}</b>")
             for row in rep["failed"][:6]:
-                parts.append(f"   • {_esc(row['title'])[:26]}\n     {_esc(row['reason'])[:150]}")
+                st = _esc(str(row.get("status") or "?"))
+                parts.append(f"   • {_esc(row['title'])[:26]}  <code>{st}</code>"
+                             f"\n     {_esc(row['reason'])[:150]}")
         if rep.get("unknown"):
             parts.append("")
             parts.append(f"❔ Незнакомый статус, не трогал: "

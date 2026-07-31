@@ -1564,7 +1564,10 @@ class TaskManager:
             body.append("")
             body.append(f"⛔ Маркетплейс отказал: <b>{len(fresh_failures)}</b>")
             for row in fresh_failures[:5]:
-                body.append(f"   • {_esc(row['title'])[:26]}\n"
+                # The status is the whole point of an incorrect_status refusal
+                # — without it the seller can't tell what to change.
+                st = _esc(str(row.get("status") or "?"))
+                body.append(f"   • {_esc(row['title'])[:26]}  <code>{st}</code>\n"
                             f"     {_esc(row['reason'])[:150]}")
             body.append("<i>Повтор будет позже — с нарастающей паузой.</i>")
 

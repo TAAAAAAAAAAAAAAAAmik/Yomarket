@@ -53,6 +53,36 @@ class YooMarketAPI:
             return f"HTTP {status}: сервер Юмаркета недоступен"
         return f"HTTP {status}" + (f": {body}" if body else "")
 
+    @staticmethod
+    def _error_message(data) -> str:
+        """Readable text out of an error body, with the machine code kept.
+
+        The marketplace nests the failure — {"error": {"code": ...,
+        "message": ...}} — and str() on that dict is what used to reach the
+        seller verbatim. The code is deliberately preserved in the string:
+        auto-restore decides what to stop retrying by looking for
+        `incorrect_status` in the reason.
+        """
+        node = data
+        for _ in range(3):
+            if not isinstance(node, dict):
+                break
+            inner = node.get("error") or node.get("errors")
+            if isinstance(inner, dict) and (inner.get("message") or inner.get("code")):
+                node = inner
+                continue
+            break
+        if not isinstance(node, dict):
+            return str(node or "")[:150]
+        # `error` is sometimes the text itself rather than a nested object
+        msg = str(node.get("message") or "").strip()
+        if not msg and isinstance(node.get("error"), str):
+            msg = node["error"].strip()
+        code = str(node.get("code") or "").strip()
+        if msg and code and code not in msg:
+            return f"{msg} ({code})"[:200]
+        return (msg or code)[:200]
+
     async def _request(self, method: str, path: str, *,
                        params: dict | None = None,
                        json: dict | None = None) -> dict:
@@ -76,11 +106,9 @@ class YooMarketAPI:
                     except Exception:
                         raise RuntimeError(self._clean_error(resp.status, text))
                     if not resp.ok:
-                        msg = ""
-                        if isinstance(data, dict):
-                            msg = str(data.get("message") or data.get("error") or "")
                         raise RuntimeError(
-                            msg or self._clean_error(resp.status, text))
+                            self._error_message(data)
+                            or self._clean_error(resp.status, text))
                     return data
             except asyncio.TimeoutError:
                 # A timeout is worth one more try for the same reason a 502 is
@@ -184,9 +212,16 @@ class YooMarketAPI:
         that cannot run must not block the action it was meant to inform.
         """
         try:
-            if ad is None:
-                ad = await self.get_ad(ad_id)
-            inner = ad.get("data") or ad
+            inner = (ad.get("data") or ad) if ad else None
+            # A row from the /ads list usually carries neither `type` nor
+            # `stock`. Judging from it fell through to "stock is None → assume
+            # there is some", which passed every listing — including sold-out
+            # АВТОВЫДАЧА ones, whose publish the marketplace then refused with
+            # incorrect_status. When the row can't answer, fetch the record
+            # that can instead of assuming.
+            if not inner or (not inner.get("type") and inner.get("stock") is None):
+                full = await self.get_ad(ad_id)
+                inner = full.get("data") or full
             kind = str(inner.get("type") or "")
 
             if kind == "auto-delivery":
