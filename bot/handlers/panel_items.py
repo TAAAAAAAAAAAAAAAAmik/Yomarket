@@ -46,6 +46,11 @@ def _mark_deleted(uid: int, item_id) -> None:
         save_settings(uid, s)
 
 
+def _esc(text) -> str:
+    return (str(text or "").replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
 def _is_gone(ad: dict) -> bool:
     return str(ad.get("status", "")).lower() in _GONE_STATUSES
 
@@ -94,7 +99,9 @@ async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
         await callback.answer()
         return
 
-    await callback.message.edit_text("⏳ Загружаю категории...")
+    from handlers.ads import _safe_edit
+    await callback.answer()
+    await _safe_edit(callback.message, "⏳ Загружаю категории...")
     try:
         data = await api.get_ads()
         ads = data.get("data") or data.get("items") or []
@@ -106,8 +113,7 @@ async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
         b.button(text="🔄 Повторить", callback_data="pitems:cats")
         b.button(text="⬅️ Назад", callback_data="menu:ads")
         b.adjust(1)
-        await callback.message.edit_text(_load_error(e), reply_markup=b.as_markup())
-        await callback.answer()
+        await _safe_edit(callback.message, _load_error(e), b.as_markup())
         return
 
     gone = _deleted_ids(callback.from_user.id)
@@ -174,7 +180,9 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
     if not api:
         await callback.answer("⚠️ Не настроен API-токен", show_alert=True)
         return
-    await callback.message.edit_text("⏳ Загружаю товары...")
+    from handlers.ads import _safe_edit
+    await callback.answer()
+    await _safe_edit(callback.message, "⏳ Загружаю товары...")
     try:
         data = await api.get_ads()
         ads = data.get("data") or data.get("items") or []
@@ -186,8 +194,7 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
         b.button(text="🔄 Повторить", callback_data="pitems:cats")
         b.button(text="⬅️ Назад", callback_data="menu:ads")
         b.adjust(1)
-        await callback.message.edit_text(_load_error(e), reply_markup=b.as_markup())
-        await callback.answer()
+        await _safe_edit(callback.message, _load_error(e), b.as_markup())
         return
 
     gone = _deleted_ids(callback.from_user.id)
@@ -203,8 +210,10 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
         title = str(ad.get("title") or f"Товар {ad.get('id')}")
         price = _ad_price(ad)
         stock = ad.get("stock")
+        # Titles come from the marketplace; an unescaped '<' would make the
+        # edit fail and freeze the "⏳ Загружаю товары..." placeholder.
         lines.append(
-            f"{mark} <b>{title}</b> — {price} ₽"
+            f"{mark} <b>{_esc(title)}</b> — {price} ₽"
             + (f" · остаток {stock}" if stock is not None else ""))
         b.button(text=f"{mark} {title[:26]} — {price} ₽",
                  callback_data=f"pitem:{ad.get('id')}")
@@ -213,12 +222,12 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
     b.button(text="⬅️ Назад", callback_data="menu:ads")
     b.adjust(2)
 
-    header = f"📂 <b>{category}</b>" if category else "📋 <b>Все товары</b>"
+    header = f"📂 <b>{_esc(category)}</b>" if category else "📋 <b>Все товары</b>"
     body = "\n".join(lines) if lines else "Здесь пока пусто."
-    await callback.message.edit_text(
+    await _safe_edit(
+        callback.message,
         f"{header}\n\nТоваров: <b>{len(ads)}</b>\n\n{body[:3000]}",
-        reply_markup=b.as_markup())
-    await callback.answer()
+        b.as_markup())
 
 
 def _item_kb(item_id: str):

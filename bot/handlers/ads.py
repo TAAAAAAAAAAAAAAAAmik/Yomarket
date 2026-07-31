@@ -51,8 +51,34 @@ def _load_error(e: Exception) -> str:
                               "connection")):
         return ("🌐 <b>Нет связи с Юмаркетом</b>\n\n"
                 "Сервер маркетплейса недоступен. Это пройдёт само — повторите позже.")
+    # Escaped: the raw error can carry '<', which makes Telegram reject the
+    # whole edit — leaving the "⏳ Загружаю..." text on screen forever, i.e.
+    # the exact hang this message exists to explain.
+    import html as _html
     return (f"❌ <b>Не удалось загрузить объявления</b>\n\n"
-            f"<code>{str(s)[:250]}</code>")
+            f"<code>{_html.escape(str(s)[:250])}</code>")
+
+
+async def _safe_edit(message, text: str, reply_markup=None) -> None:
+    """Replace a message's text, or say something rather than nothing.
+
+    A rejected edit is worse than a wrong one here: the message being replaced
+    is the "⏳ Загружаю..." placeholder, so a failure freezes it.
+    """
+    try:
+        await message.edit_text(text[:4000], reply_markup=reply_markup)
+        return
+    except Exception:
+        pass
+    try:
+        import re as _re
+        plain = _re.sub(r"<[^>]+>", "", text)[:4000]
+        await message.edit_text(plain, parse_mode=None, reply_markup=reply_markup)
+    except Exception:
+        try:
+            await message.answer(text[:4000], reply_markup=reply_markup)
+        except Exception:
+            pass
 
 
 def _fmt_list(ads: list[dict], total: int | None) -> str:
@@ -92,7 +118,10 @@ def _ads_keyboard(ads: list[dict], next_cursor: str | None):
 
 @router.callback_query(F.data.in_({"menu:ads", "ads_load"}))
 async def ads_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    await callback.message.edit_text("⏳ Загружаю объявления...")
+    # Answer the callback first: Telegram spins the button for a few seconds and
+    # then reports a timeout on its own if it is left unanswered.
+    await callback.answer()
+    await _safe_edit(callback.message, "⏳ Загружаю объявления...")
     try:
         data = await api.get_ads()
         ads: list[dict] = data.get("data") or data.get("items") or []
@@ -110,8 +139,7 @@ async def ads_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
         b.button(text="⬅️ Главное меню", callback_data="menu:main")
         b.adjust(2, 1, 1)
         keyboard = b.as_markup()
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
+    await _safe_edit(callback.message, text, keyboard)
 
 
 @router.callback_query(PaginationCallback.filter(F.entity == "ads"))
