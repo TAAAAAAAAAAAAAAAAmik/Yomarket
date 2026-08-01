@@ -783,24 +783,48 @@ def _row_title(res: dict) -> str:
     return ""
 
 
+def _row_haystack(res: dict) -> str:
+    """Everything textual in a Nova row, for matching a listing by name.
+
+    The row's display title is not always the ad's own name — this panel titles
+    a row by its parent product, keeping the ad name in a field — so the whole
+    row is searched rather than one attribute.
+    """
+    parts = [_row_title(res)]
+    fields = res.get("fields")
+    if isinstance(fields, dict):
+        fields = list(fields.values())
+    for f in (fields or []):
+        if not isinstance(f, dict):
+            continue
+        v = f.get("value")
+        if isinstance(v, dict):
+            v = v.get("title") or v.get("name") or v.get("display") or ""
+        if isinstance(v, str) and v:
+            parts.append(_strip_html(v))
+    return " ".join(str(p) for p in parts if p)
+
+
 def panel_find_listing_sync(
     cookie_string: str, titles: list, resources: tuple = _ITEM_RESOURCES,
 ) -> tuple[dict, str]:
-    """Blocking: locate listings by title across the panel's own resources.
+    """Blocking: locate listings by name across the panel's own resources.
 
     Returns ({title_key: (resource, id)}, trace). The Integration API and the
-    panel number the same listing differently, and not every listing sits in
-    `items` — so the panel's own lists are searched, by the one field both
-    sides share.
+    panel number the same listing differently, and the panel does not
+    necessarily title a row by the ad's name, so every text in the row is
+    searched — matched on letters and digits only, since the two sides decorate
+    and truncate differently.
     """
     import re as _re
 
     def key(t) -> str:
         return _re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", "", str(t or "")).lower()
 
-    wanted = {key(t): t for t in titles if key(t)}
+    wanted = {key(t) for t in titles if len(key(t)) >= 8}
     found: dict = {}
     trace: list[str] = []
+    samples: list[str] = []
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
 
@@ -837,21 +861,23 @@ def panel_find_listing_sync(
             rid = row.get("id")
             if isinstance(rid, dict):
                 rid = rid.get("value")
-            k = key(_row_title(row))
-            if not k or not rid:
+            if not rid:
                 continue
-            if k in wanted and k not in found:
-                found[k] = (res_name, str(rid))
-                continue
-            # Titles are truncated differently on each side, so a prefix match
-            # is what actually pairs them.
+            hay = key(_row_haystack(row))
+            if len(samples) < 6:
+                samples.append(_row_title(row)[:28] or f"#{rid}")
             for wk in wanted:
                 if wk in found:
                     continue
-                if k.startswith(wk[:24]) or wk.startswith(k[:24]):
+                # Containment both ways: the panel may hold the fuller name or
+                # the shorter one. The 8-character floor above keeps a short
+                # name from matching half the catalogue.
+                if wk in hay or (len(hay) >= 8 and hay[:24] in wk):
                     found[wk] = (res_name, str(rid))
                     break
-    return found, "; ".join(trace)[:300]
+    if len(found) < len(wanted) and samples:
+        trace.append("названия в панели: " + ", ".join(samples))
+    return found, "; ".join(trace)[:400]
 
 
 def panel_publish_item_sync(
