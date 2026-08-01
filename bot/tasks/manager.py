@@ -1617,14 +1617,30 @@ class TaskManager:
         # normal case the panel fallback exists to handle — barring it would
         # switch off restore for the one state it is built around, and every
         # later pass would skip in silence.
+        # Bans learned while the panel could not be reached are meaningless —
+        # they were never a verdict on the status. Drop them as soon as that is
+        # what the failures say, so a fixed configuration is not held back by
+        # week-old noise.
+        if any(k in str(r.get("reason", "")) for r in rep["failed"]
+               for k in ("разные магазины", "нет входа в панель")):
+            barred_until.clear()
         recovered = {str(r.get("status") or "").lower() for r in via_panel}
         for st in recovered:
             barred_until.pop(st, None)
         for row in rep["failed"]:
-            if "incorrect_status" in str(row.get("reason", "")):
-                st = str(row.get("status") or "").lower()
-                if st and st not in recovered:
-                    barred_until[st] = now + _RESTORE_BARRED_TTL
+            reason = str(row.get("reason", ""))
+            if "incorrect_status" not in reason:
+                continue
+            # A refusal that never reached the panel says nothing about the
+            # status: the fallback stopped at a different shop or a missing
+            # login. Barring on that would blame the state for a configuration
+            # problem — and silence restore for a week once it is fixed.
+            if any(k in reason for k in ("разные магазины", "нет входа в панель",
+                                         "не отдала список")):
+                continue
+            st = str(row.get("status") or "").lower()
+            if st and st not in recovered:
+                barred_until[st] = now + _RESTORE_BARRED_TTL
         ar["barred_until"] = barred_until
         ar.pop("barred_statuses", None)          # superseded by the dated form
 
