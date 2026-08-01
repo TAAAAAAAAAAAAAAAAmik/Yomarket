@@ -27,6 +27,8 @@ class SeleniumState(StatesGroup):
     waiting_pos_url = State()
     waiting_pos_threshold = State()
     waiting_pos_interval = State()
+    waiting_sched_times = State()
+    waiting_sched_ceiling = State()
 
 
 def _esc(text) -> str:
@@ -162,14 +164,206 @@ def _bump_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
     picked = promo_only_ids(s)
     b.button(text=f"🎯 Товары: {f'выбрано {len(picked)}' if picked else 'все'}",
              callback_data="promo:items")
+    bs = s.get("bump_schedule", {})
+    times = bs.get("times") or []
+    b.button(text=f"🕐 Авто-продвижение: "
+                  f"{('по времени · ' + ', '.join(times[:3])) if (bs.get('enabled') and times) else 'выкл'}",
+             callback_data="sched:menu")
     pp = s.get("promo_position", {})
     b.button(text=f"📍 По позиции: "
                   f"{'не ниже ' + str(pp.get('max_position', 3)) if pp.get('enabled') else 'выкл'}",
              callback_data="pos:menu")
     b.button(text=f"⏱ Интервал: {interval} ч", callback_data="selenium:bump:set_interval")
     b.button(text="⬅️ К объявлениям", callback_data="menu:ads")
-    b.adjust(2, 1, 1, 1, 1, 1)
+    b.adjust(2, 1, 1, 1, 1, 1, 1)
     return b.as_markup()
+
+
+# ---------------------------------------------------------------------------
+# Scheduled promotion — the same slots every day
+#
+# The scheduler already fires `bump_schedule` from the fast loop; this is the
+# screen that sets it, next to the promotion it drives rather than in a
+# different menu.
+# ---------------------------------------------------------------------------
+
+def _sched_text(s: dict) -> str:
+    bs = s.get("bump_schedule", {})
+    times = bs.get("times") or []
+    price = promo_price(s) or float(bs.get("price_per_bump", 0) or 0)
+    ceiling = float(bs.get("daily_ceiling", 0) or 0)
+    spent = float(bs.get("spent_today", 0) or 0) if (
+        bs.get("spent_day") == datetime.now().strftime("%Y-%m-%d")) else 0.0
+    lines = [
+        "🕐 <b>Авто-продвижение по времени</b>\n",
+        f"Статус: {_st(bs.get('enabled', False))}",
+        f"Время запуска: <b>{', '.join(times) if times else 'не задано'}</b>",
+    ]
+    picked = promo_only_ids(s)
+    lines.append(f"Товары: <b>{f'выбрано {len(picked)}' if picked else 'все'}</b>")
+    if price and times:
+        per_run = (len(picked) or 0) * price
+        lines.append(f"Цена поднятия: <b>{price:g} ₽</b>"
+                     + (f"  ·  за прогон ≈ {per_run:g} ₽" if per_run else ""))
+    lines.append(f"Потолок в день: "
+                 f"<b>{f'{ceiling:.0f} ₽' if ceiling else 'не задан'}</b>"
+                 + (f"  ·  сегодня {spent:.0f} ₽" if spent else ""))
+    if bs.get("bumps_total"):
+        lines.append(f"Всего поднятий: <b>{bs['bumps_total']}</b>  ·  "
+                     f"потрачено {float(bs.get('spent_total', 0) or 0):.0f} ₽")
+    lines += [
+        "",
+        "Запускает продвижение каждый день в указанные часы — без вашего "
+        "участия.",
+        "<i>Время по серверу. Слот отрабатывает один раз в сутки; если бот был "
+        "выключен дольше 35 минут после слота, он пропускается, а не "
+        "срабатывает задним числом.</i>",
+    ]
+    if bs.get("enabled") and not promo_params(s):
+        lines.append("⚠️ <b>Не выбран тариф</b> — расписание не сможет поднять.")
+    return "\n".join(lines)
+
+
+def _sched_kb(s: dict) -> InlineKeyboardMarkup:
+    bs = s.get("bump_schedule", {})
+    on = bs.get("enabled", False)
+    b = InlineKeyboardBuilder()
+    b.button(text="🔴 Выключить" if on else "🟢 Включить",
+             callback_data="sched:toggle")
+    b.button(text="🕐 Задать время", callback_data="sched:times")
+    b.button(text="💰 Потолок в день", callback_data="sched:ceiling")
+    if bs.get("times"):
+        b.button(text="🧹 Убрать расписание", callback_data="sched:clear")
+    b.button(text="⬅️ К продвижению", callback_data="selenium:bump:menu")
+    b.adjust(2, 1, 1, 1)
+    return b.as_markup()
+
+
+@router.callback_query(F.data == "sched:menu")
+async def sched_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    s = get_settings(callback.from_user.id)
+    await callback.message.edit_text(_sched_text(s), reply_markup=_sched_kb(s))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "sched:toggle")
+async def sched_toggle(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    bs = s.setdefault("bump_schedule", {"enabled": False, "times": [],
+                                        "last_runs": {}})
+    turning_on = not bs.get("enabled", False)
+    if turning_on and not (bs.get("times") or []):
+        await callback.answer("Сначала задайте время", show_alert=True)
+        return
+    if turning_on and not promo_params(s):
+        await callback.answer(
+            "Сначала выберите тариф «Премиум» — иначе поднять не получится",
+            show_alert=True)
+        return
+    bs["enabled"] = turning_on
+    save_settings(callback.from_user.id, s)
+    await callback.message.edit_text(_sched_text(s), reply_markup=_sched_kb(s))
+    await callback.answer("Включено" if turning_on else "Выключено")
+
+
+@router.callback_query(F.data == "sched:times")
+async def sched_times_start(callback: CallbackQuery, state: FSMContext) -> None:
+    cur = ", ".join(get_settings(callback.from_user.id)
+                    .get("bump_schedule", {}).get("times") or [])
+    await state.set_state(SeleniumState.waiting_sched_times)
+    await callback.message.edit_text(
+        f"🕐 <b>Время авто-продвижения</b>\n\n"
+        f"Сейчас: {cur or 'не задано'}\n\n"
+        f"Пришлите время через запятую, например:\n"
+        f"<code>09:00, 15:00, 21:00</code>\n\n"
+        f"<i>Каждый день в эти часы бот поднимет выбранные товары.</i>",
+        reply_markup=_cancel_kb("sched:menu"))
+    await callback.answer()
+
+
+@router.message(SeleniumState.waiting_sched_times)
+async def sched_times_save(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").replace(";", ",")
+    valid, bad = [], []
+    for part in raw.split(","):
+        t = part.strip()
+        if not t:
+            continue
+        # Accept 9:00 and 09.00 alike, then store one canonical HH:MM — the
+        # scheduler compares slots as strings.
+        t = t.replace(".", ":")
+        try:
+            hh, mm = t.split(":")
+            h, m = int(hh), int(mm)
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError
+            valid.append(f"{h:02d}:{m:02d}")
+        except ValueError:
+            bad.append(t)
+    if not valid:
+        await message.answer("❌ Не разобрал время. Пример: <code>09:00, 21:00</code>")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    bs = s.setdefault("bump_schedule", {})
+    bs["times"] = sorted(set(valid))
+    # Slots already marked as run today would otherwise stay marked under the
+    # new schedule and skip their first day.
+    bs["last_runs"] = {}
+    save_settings(message.from_user.id, s)
+    note = f"\n⚠️ Не понял: {', '.join(bad)}" if bad else ""
+    await message.answer(f"✅ Время: <b>{', '.join(bs['times'])}</b>{note}")
+    await message.answer(_sched_text(s), reply_markup=_sched_kb(s))
+
+
+@router.callback_query(F.data == "sched:clear")
+async def sched_clear(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    bs = s.setdefault("bump_schedule", {})
+    bs["times"] = []
+    bs["last_runs"] = {}
+    bs["enabled"] = False           # a schedule with no slots is not a schedule
+    save_settings(callback.from_user.id, s)
+    await callback.answer("Расписание убрано", show_alert=True)
+    await callback.message.edit_text(_sched_text(s), reply_markup=_sched_kb(s))
+
+
+@router.callback_query(F.data == "sched:ceiling")
+async def sched_ceiling_start(callback: CallbackQuery, state: FSMContext) -> None:
+    cur = get_settings(callback.from_user.id).get(
+        "bump_schedule", {}).get("daily_ceiling", 0)
+    await state.set_state(SeleniumState.waiting_sched_ceiling)
+    await callback.message.edit_text(
+        f"💰 <b>Потолок трат в день</b>\n\n"
+        f"Сейчас: {f'{float(cur):.0f} ₽' if cur else 'не задан'}\n\n"
+        f"Пришлите сумму в рублях. Когда за сутки потрачено больше — "
+        f"расписание пропускает запуск.\n\n"
+        f"<i>0 — без ограничения.</i>",
+        reply_markup=_cancel_kb("sched:menu"))
+    await callback.answer()
+
+
+@router.message(SeleniumState.waiting_sched_ceiling)
+async def sched_ceiling_save(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        amount = float(raw)
+        if amount < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число, например: <b>300</b>")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    bs = s.setdefault("bump_schedule", {})
+    bs["daily_ceiling"] = amount
+    # The ceiling is enforced against price_per_bump; keep it in step with the
+    # tariff so the cap counts real money rather than a stale figure.
+    if promo_price(s):
+        bs["price_per_bump"] = promo_price(s)
+    save_settings(message.from_user.id, s)
+    await message.answer(_sched_text(s), reply_markup=_sched_kb(s))
 
 
 # ---------------------------------------------------------------------------
@@ -1199,7 +1393,7 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
             for row in rep["failed"][:6]:
                 st = _esc(str(row.get("status") or "?"))
                 parts.append(f"   • {_esc(row['title'])[:26]}  <code>{st}</code>"
-                             f"\n     {_esc(row['reason'])[:150]}")
+                             f"\n     {_esc(row['reason'])[:400]}")
         if rep.get("unknown"):
             parts.append("")
             parts.append(f"❔ Незнакомый статус, не трогал: "

@@ -371,7 +371,10 @@ async def panel_republish(user_id: int, rows: list[dict]
             # Keep the panel's own trace: it names the actions it saw, which is
             # what tells us whether the id is even known to the panel.
             failed.append({**row,
-                           "reason": f"{row.get('reason', '')} · панель: {msg[:120]}"})
+                           # Not truncated to 120: the panel's answer ends with
+                           # the actions it actually saw, which is the one thing
+                           # that says whether the id is known to it at all.
+                           "reason": f"{row.get('reason', '')} · панель: {msg[:400]}"})
     return done, failed
 
 
@@ -1642,7 +1645,7 @@ class TaskManager:
                 # — without it the seller can't tell what to change.
                 st = _esc(str(row.get("status") or "?"))
                 body.append(f"   • {_esc(row['title'])[:26]}  <code>{st}</code>\n"
-                            f"     {_esc(row['reason'])[:150]}")
+                            f"     {_esc(row['reason'])[:400]}")
             body.append("<i>Повтор будет позже — с нарастающей паузой.</i>")
 
         if backlog:
