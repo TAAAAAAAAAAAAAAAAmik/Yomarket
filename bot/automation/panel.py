@@ -708,7 +708,7 @@ def _get_update_fields(session, hdrs, item_id: str) -> tuple[list[dict], str]:
     """GET update-fields for an item. Returns (fields, error)."""
     try:
         r = session.get(
-            f"{PANEL_URL}/nova-api/items/{item_id}/update-fields"
+            f"{PANEL_URL}/nova-api/{resource}/{item_id}/update-fields"
             f"?editing=true&editMode=update",
             headers=hdrs, timeout=(6, 10), allow_redirects=False,
         )
@@ -725,7 +725,7 @@ def _get_update_fields(session, hdrs, item_id: str) -> tuple[list[dict], str]:
 
 def _put_item(session, hdrs, item_id: str, form: dict):
     return session.post(
-        f"{PANEL_URL}/nova-api/items/{item_id}?editing=true&editMode=update",
+        f"{PANEL_URL}/nova-api/{resource}/{item_id}?editing=true&editMode=update",
         data=form, headers=hdrs, timeout=(6, 15),
     )
 
@@ -751,9 +751,112 @@ def panel_update_item_sync(
     return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
 
 
+# Nova resources a listing might live under. The panel exposes no resource
+# index (/nova-api/resources answers with nothing), so the names are probed
+# rather than enumerated — `items` holds some listings but not the «unlimited»
+# ones, whose ids answer 404 there.
+_ITEM_RESOURCES = ("items", "ads", "goods", "products", "lots", "offers",
+                   "unlimiteds", "unlimited-items", "adverts")
+
+
+def _row_title(res: dict) -> str:
+    """The display name of a Nova row, wherever this panel keeps it."""
+    title = res.get("title") or res.get("display") or ""
+    if isinstance(title, dict):
+        title = title.get("value") or title.get("title") or ""
+    if title:
+        return str(title)
+    fields = res.get("fields")
+    if isinstance(fields, dict):
+        fields = list(fields.values())
+    for f in (fields or []):
+        if not isinstance(f, dict):
+            continue
+        fa = str(f.get("attribute", "")).lower()
+        fn = str(f.get("name", "")).lower()
+        if "title" in fa or "name" in fa or "назван" in fn or "наимен" in fn:
+            v = f.get("value")
+            if isinstance(v, dict):
+                v = v.get("title") or v.get("name") or v.get("display")
+            if v:
+                return str(v)
+    return ""
+
+
+def panel_find_listing_sync(
+    cookie_string: str, titles: list, resources: tuple = _ITEM_RESOURCES,
+) -> tuple[dict, str]:
+    """Blocking: locate listings by title across the panel's own resources.
+
+    Returns ({title_key: (resource, id)}, trace). The Integration API and the
+    panel number the same listing differently, and not every listing sits in
+    `items` — so the panel's own lists are searched, by the one field both
+    sides share.
+    """
+    import re as _re
+
+    def key(t) -> str:
+        return _re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", "", str(t or "")).lower()
+
+    wanted = {key(t): t for t in titles if key(t)}
+    found: dict = {}
+    trace: list[str] = []
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+
+    for res_name in resources:
+        if len(found) == len(wanted):
+            break
+        rows = []
+        # Walk pages: a listing missing from page one is not a listing absent
+        # from the panel.
+        for page in (1, 2, 3):
+            try:
+                r = session.get(f"{PANEL_URL}/nova-api/{res_name}",
+                                params={"perPage": "100", "page": str(page)},
+                                headers=hdrs, timeout=(6, 12),
+                                allow_redirects=False)
+            except Exception as e:
+                trace.append(f"{res_name}: {str(e)[:30]}")
+                break
+            if r.status_code != 200:
+                if page == 1:
+                    trace.append(f"{res_name}: {r.status_code}")
+                break
+            try:
+                chunk = (r.json() or {}).get("resources") or []
+            except Exception:
+                break
+            rows += [x for x in chunk if isinstance(x, dict)]
+            if len(chunk) < 100:
+                break
+        if not rows:
+            continue
+        trace.append(f"{res_name}: {len(rows)} шт.")
+        for row in rows:
+            rid = row.get("id")
+            if isinstance(rid, dict):
+                rid = rid.get("value")
+            k = key(_row_title(row))
+            if not k or not rid:
+                continue
+            if k in wanted and k not in found:
+                found[k] = (res_name, str(rid))
+                continue
+            # Titles are truncated differently on each side, so a prefix match
+            # is what actually pairs them.
+            for wk in wanted:
+                if wk in found:
+                    continue
+                if k.startswith(wk[:24]) or wk.startswith(k[:24]):
+                    found[wk] = (res_name, str(rid))
+                    break
+    return found, "; ".join(trace)[:300]
+
+
 def panel_publish_item_sync(
     cookie_string: str, item_id: str, uid: int | None = None,
-    public: bool = True,
+    public: bool = True, resource: str = "items",
 ) -> tuple[bool, str]:
     """
     Blocking: make an item public (or hide it with public=False).
@@ -772,7 +875,7 @@ def panel_publish_item_sync(
     actions: list[dict] = []
     try:
         r = session.get(
-            f"{PANEL_URL}/nova-api/items/actions",
+            f"{PANEL_URL}/nova-api/{resource}/actions",
             params={"resources": str(item_id)},
             headers=hdrs, timeout=(6, 10), allow_redirects=False,
         )
@@ -797,7 +900,7 @@ def panel_publish_item_sync(
         if any(kw in blob for kw in want_kws):
             try:
                 resp = session.post(
-                    f"{PANEL_URL}/nova-api/items/action?action={key}",
+                    f"{PANEL_URL}/nova-api/{resource}/action?action={key}",
                     data={"resources": str(item_id)},
                     headers=hdrs, timeout=(6, 15),
                 )

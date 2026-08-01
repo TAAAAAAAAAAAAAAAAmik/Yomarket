@@ -353,53 +353,44 @@ async def panel_republish(user_id: int, rows: list[dict]
         return [], [{**r, "reason": f"{r.get('reason', '')} · нет входа в панель"}
                     for r in rows]
 
-    from automation.panel import panel_list_items_sync, panel_publish_item_sync
+    from automation.panel import (panel_find_listing_sync,
+                                  panel_publish_item_sync)
     loop = asyncio.get_event_loop()
 
-    # The two systems number the same listing differently: an id from the
-    # Integration API is unknown to the panel, whose actions endpoint answers
-    # 404 for it. Match by title instead — the panel's own list is the only
-    # place its ids exist.
-    ok_list, panel_items = await loop.run_in_executor(
-        None, panel_list_items_sync, creds["cookies"])
-    by_title: dict[str, str] = {}
-    if ok_list and isinstance(panel_items, list):
-        for it in panel_items:
-            key = _title_key(it.get("title"))
-            if key and it.get("id"):
-                by_title.setdefault(key, str(it["id"]))
-    else:
-        return [], [{**r, "reason": f"{r.get('reason', '')} · панель не отдала "
-                                    f"список товаров: {str(panel_items)[:80]}"}
-                    for r in rows]
+    # The two systems number the same listing differently, and not every
+    # listing lives in the panel's `items` resource — an id from the API
+    # answered 404 there. Find each one by title across the panel's own lists,
+    # then act on the resource that actually holds it.
+    found, trace = await loop.run_in_executor(
+        None, panel_find_listing_sync, creds["cookies"],
+        [r.get("title") for r in rows])
 
     done, failed = [], []
     for row in rows:
-        panel_id = _match_panel_id(row.get("title"), by_title)
-        if not panel_id:
+        hit = found.get(_title_key(row.get("title")))
+        if not hit:
             failed.append({**row,
                            "reason": f"{row.get('reason', '')} · в панели не "
-                                     f"нашёл товар с таким названием"})
+                                     f"нашёл этот товар (искал: {trace})"})
             continue
+        res_name, panel_id = hit
         try:
             ok, msg = await asyncio.wait_for(
                 loop.run_in_executor(None, panel_publish_item_sync,
                                      creds["cookies"], panel_id,
-                                     user_id, True),
+                                     user_id, True, res_name),
                 timeout=60)
         except Exception as e:
             ok, msg = False, str(e)[:120]
         if ok:
             done.append(row)
         else:
-            # Keep the panel's own trace: it names the actions it saw, which is
-            # what tells us whether the id is even known to the panel.
             # The panel's own markup is stripped: the reason is escaped
             # downstream, so its tags would reach the seller as literal <code>.
             plain = re.sub(r"<[^>]+>", "", str(msg)).replace("\n", " ")
             failed.append({**row,
                            "reason": f"{row.get('reason', '')} · панель "
-                                     f"#{panel_id}: {plain[:400]}"})
+                                     f"{res_name}#{panel_id}: {plain[:300]}"})
     return done, failed
 
 
