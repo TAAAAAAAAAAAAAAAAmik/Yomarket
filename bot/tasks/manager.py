@@ -1611,10 +1611,19 @@ class TaskManager:
         # answer coming from the marketplace, not a guess about its states.
         # Each ban carries an expiry: it is inferred from a single ad and
         # applied to every ad in that state, so it must be able to heal.
+        #
+        # A status the panel just published from is not barred, and any
+        # standing ban on it is lifted. The API refusing `unpublish` is the
+        # normal case the panel fallback exists to handle — barring it would
+        # switch off restore for the one state it is built around, and every
+        # later pass would skip in silence.
+        recovered = {str(r.get("status") or "").lower() for r in via_panel}
+        for st in recovered:
+            barred_until.pop(st, None)
         for row in rep["failed"]:
             if "incorrect_status" in str(row.get("reason", "")):
                 st = str(row.get("status") or "").lower()
-                if st:
+                if st and st not in recovered:
                     barred_until[st] = now + _RESTORE_BARRED_TTL
         ar["barred_until"] = barred_until
         ar.pop("barred_statuses", None)          # superseded by the dated form

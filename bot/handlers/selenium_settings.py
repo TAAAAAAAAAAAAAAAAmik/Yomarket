@@ -1088,6 +1088,13 @@ def _restore_text(s: dict, creds=None) -> str:
         lines.append(f"Всего восстановлено: <b>{total}</b>")
     if held:
         lines.append(f"⏸ Отложено после отказов: {held}")
+    # A barred status silences restore for every ad in it, so it cannot stay
+    # invisible: "поднято 0" with no explanation reads as a broken feature.
+    from tasks.manager import _barred_map
+    barred = [st for st, until in _barred_map(ar).items() if until > _time.time()]
+    if barred:
+        lines.append(f"🚫 Статусы в бане: <b>{', '.join(barred)}</b> "
+                     f"— эти объявления пропускаются")
     lines += [
         "",
         "Снятые с продажи объявления публикуются заново. "
@@ -1116,8 +1123,16 @@ def _restore_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
              callback_data="restore:instant")
     held = [f for f in (ar.get("failures") or {}).values()
             if float(f.get("until", 0) or 0) > _time.time()]
-    if held:
-        b.button(text=f"⏸ Отложенные ({len(held)})", callback_data="restore:held")
+    # A barred status holds ads back just as a per-ad wait does, and it used to
+    # hide the only button that lifts either — leaving no way out of a ban that
+    # silences the whole feature.
+    from tasks.manager import _barred_map
+    barred = [st for st, u in _barred_map(ar).items() if u > _time.time()]
+    if held or barred:
+        label = f"⏸ Отложенные ({len(held)})" if held else "🚫 Снять баны"
+        if held and barred:
+            label = f"⏸ Отложенные ({len(held)}) · баны {len(barred)}"
+        b.button(text=label, callback_data="restore:held")
     b.button(text="⬅️ К объявлениям", callback_data="menu:ads")
     b.adjust(2, 1, 2, 1, 1, 1)
     return b.as_markup()
@@ -1352,6 +1367,7 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
         # manual button looked broken next to the feature that worked.
         retryable = [r for r in rep["failed"]
                      if "incorrect_status" in str(r.get("reason", ""))]
+        done = []
         if retryable:
             from tasks.manager import panel_republish
             done, still = await panel_republish(uid, retryable)
@@ -1359,10 +1375,17 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
             rep["failed"] = [r for r in rep["failed"]
                              if r not in retryable] + still
 
+        # A status the panel just published from is not barred, and a standing
+        # ban on it is lifted: the API refusing «unpublish» is exactly what the
+        # fallback is for, and barring it would silence restore for the one
+        # state it exists to handle.
+        recovered = {str(r.get("status") or "").lower() for r in done}
+        for st in recovered:
+            barred_until.pop(st, None)
         for row in rep["failed"]:
             if "incorrect_status" in str(row.get("reason", "")):
                 st = str(row.get("status") or "").lower()
-                if st:
+                if st and st not in recovered:
                     barred_until[st] = now + _RESTORE_BARRED_TTL
         ar["barred_until"] = barred_until
         ar.pop("barred_statuses", None)
