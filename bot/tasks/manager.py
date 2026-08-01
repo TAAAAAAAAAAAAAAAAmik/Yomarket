@@ -365,13 +365,23 @@ async def panel_republish(user_id: int, rows: list[dict]
         None, panel_find_listing_sync, creds["cookies"],
         [r.get("title") for r in rows])
 
+    # Nothing matched at all, while the panel clearly holds listings: that is
+    # not a naming quirk but the panel being logged into a different shop than
+    # the API token belongs to. Said plainly, because no amount of matching can
+    # fix an account mismatch — and it is the same cause behind the panel
+    # answering "нет прав" to promotion.
+    mismatch = not found and "шт." in trace
     done, failed = [], []
     for row in rows:
         hit = found.get(_title_key(row.get("title")))
         if not hit:
-            failed.append({**row,
-                           "reason": f"{row.get('reason', '')} · в панели не "
-                                     f"нашёл этот товар (искал: {trace})"})
+            note = (" · ⚠️ в панели другой магазин: она не знает ни одного "
+                    "вашего объявления. Войдите в панель тем же аккаунтом, "
+                    "которому принадлежит этот магазин "
+                    "(«Панель продавца» → войти по email)"
+                    if mismatch else
+                    f" · в панели не нашёл этот товар (искал: {trace})")
+            failed.append({**row, "reason": f"{row.get('reason', '')}{note}"})
             continue
         res_name, panel_id = hit
         try:

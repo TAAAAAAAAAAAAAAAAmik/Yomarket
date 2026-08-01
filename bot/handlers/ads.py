@@ -279,9 +279,12 @@ async def bump_ad_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
             hint = ""
             if "нет прав" in msg.lower():
                 # Nova authorizes per record, so this is about this listing
-                hint = ("\n\nПанель отказала в самом действии. Обычные "
-                        "причины: профиль магазина ещё не прошёл проверку, "
-                        "либо объявление не активно.")
+                hint = ("\n\nПанель отказала в самом действии. Чаще всего "
+                        "это значит, что <b>в панель вошёл другой аккаунт</b> "
+                        "— не тот, которому принадлежит этот магазин: чужие "
+                        "объявления она трогать не даёт.\n\nПроверьте "
+                        "«Панель продавца» → войдите по email тем же "
+                        "аккаунтом. Реже — профиль ещё не прошёл проверку.")
             await callback.message.edit_text(f"⛔ {msg[:400]}{hint}")
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {str(e)[:200]}")
