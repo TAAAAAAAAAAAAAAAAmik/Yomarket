@@ -363,7 +363,8 @@ async def panel_republish(user_id: int, rows: list[dict]
     from storage import get_panel_creds
     creds = get_panel_creds(user_id)
     if not creds or not creds.get("cookies"):
-        return [], [{**r, "reason": f"{r.get('reason', '')} · нет входа в панель"}
+        return [], [{**r, "panel": "unreached",
+                     "reason": f"{r.get('reason', '')} · нет входа в панель"}
                     for r in rows]
 
     from automation.panel import (panel_find_listing_sync,
@@ -395,7 +396,10 @@ async def panel_republish(user_id: int, rows: list[dict]
             note = (f" · ⚠️ панель и токен — разные магазины ({_shop_label(user_id)})"
                     if mismatch else
                     f" · в панели не нашёл этот товар (искал: {trace})")
-            failed.append({**row, "reason": f"{row.get('reason', '')}{note}"})
+            # Not found is a verdict on where the listing is, not on its
+            # status — marked so, so it cannot bar anything.
+            failed.append({**row, "panel": "not_found",
+                           "reason": f"{row.get('reason', '')}{note}"})
             continue
         res_name, panel_id = hit
         try:
@@ -412,7 +416,7 @@ async def panel_republish(user_id: int, rows: list[dict]
             # The panel's own markup is stripped: the reason is escaped
             # downstream, so its tags would reach the seller as literal <code>.
             plain = re.sub(r"<[^>]+>", "", str(msg)).replace("\n", " ")
-            failed.append({**row,
+            failed.append({**row, "panel": "refused",
                            "reason": f"{row.get('reason', '')} · панель "
                                      f"{res_name}#{panel_id}: {plain[:300]}"})
     return done, failed
@@ -1630,12 +1634,12 @@ class TaskManager:
         # normal case the panel fallback exists to handle — barring it would
         # switch off restore for the one state it is built around, and every
         # later pass would skip in silence.
-        # Bans learned while the panel could not be reached are meaningless —
-        # they were never a verdict on the status. Drop them as soon as that is
-        # what the failures say, so a fixed configuration is not held back by
-        # week-old noise.
-        if any(k in str(r.get("reason", "")) for r in rep["failed"]
-               for k in ("разные магазины", "нет входа в панель")):
+        # A pass that never got a verdict out of the panel — no login, or the
+        # listing not located there — says nothing about any status. Bans
+        # standing from such a pass were never evidence, so they are dropped
+        # rather than holding restore back for a week after the cause is fixed.
+        if any(r.get("panel") in ("unreached", "not_found")
+               for r in rep["failed"]):
             barred_until.clear()
         recovered = {str(r.get("status") or "").lower() for r in via_panel}
         for st in recovered:
@@ -1644,12 +1648,11 @@ class TaskManager:
             reason = str(row.get("reason", ""))
             if "incorrect_status" not in reason:
                 continue
-            # A refusal that never reached the panel says nothing about the
-            # status: the fallback stopped at a different shop or a missing
-            # login. Barring on that would blame the state for a configuration
-            # problem — and silence restore for a week once it is fixed.
-            if any(k in reason for k in ("разные магазины", "нет входа в панель",
-                                         "не отдала список")):
+            # Only the panel actually refusing the action is evidence about
+            # the status. Matching on the reason text was tried and let «в
+            # панели не нашёл этот товар» through, which barred `unpublish` —
+            # the one state restore exists for — over a lookup problem.
+            if row.get("panel") != "refused":
                 continue
             st = str(row.get("status") or "").lower()
             if st and st not in recovered:
