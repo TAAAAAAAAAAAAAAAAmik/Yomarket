@@ -1683,6 +1683,16 @@ class TaskManager:
         # so long. Reporting it only when something *else* happened defeats the
         # purpose, so a status not seen before counts as news in its own right.
         # Each distinct status is announced once, not every hour.
+        # Taken down by hand: the marketplace will not publish these back, so
+        # they are named once and then left alone. Reporting them every pass
+        # would be an hourly error about something only the seller can undo.
+        told_manual = set(str(x) for x in (ar.get("told_manual") or []))
+        manual_new = [r for r in (rep.get("manual") or [])
+                      if str(r["id"]) not in told_manual]
+        if manual_new:
+            ar["told_manual"] = sorted(told_manual
+                                       | {str(r["id"]) for r in manual_new})
+
         seen_unknown = set(ar.get("seen_unknown") or [])
         new_unknown = sorted({str(r["status"]) for r in rep.get("unknown") or []}
                              - seen_unknown)
@@ -1700,7 +1710,8 @@ class TaskManager:
                    f"отказов {len(rep['failed'])}")
         ar["last_result"] = summary
 
-        if not rep["restored"] and not fresh_failures and not new_unknown:
+        if (not rep["restored"] and not fresh_failures and not new_unknown
+                and not manual_new):
             return ""                                # nothing happened, say nothing
 
         body: list[str] = []
@@ -1719,6 +1730,23 @@ class TaskManager:
                         f"— их публиковать нечем")
             for row in rep["no_stock"][:5]:
                 body.append(f"   • {_esc(row['title'])[:34]} — {_esc(row.get('note'))}")
+        if manual_new:
+            body.append("")
+            body.append(f"✋ <b>Сняты вручную: {len(manual_new)}</b> — "
+                        f"Юмаркет возвращает в продажу только истёкшие, "
+                        f"эти нужно вернуть самому на сайте:")
+            for row in manual_new[:6]:
+                body.append(f"   • {_esc(row['title'])[:40]}")
+
+        if manual_new:
+            body.append("")
+            body.append(f"✋ <b>Сняты вручную: {len(manual_new)}</b>")
+            for row in manual_new[:6]:
+                body.append(f"   • {_esc(row['title'])[:40]}")
+            body.append("<i>Юмаркет возвращает в продажу только истёкшие "
+                        "объявления. Снятые вручную нужно вернуть самому — "
+                        "бот их больше не трогает.</i>")
+
         if new_unknown:
             affected = [r for r in rep["unknown"] if str(r["status"]) in new_unknown]
             body.append("")

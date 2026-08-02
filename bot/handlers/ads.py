@@ -33,6 +33,16 @@ def _can_publish(raw: str) -> bool:
     return str(raw).lower() in YooMarketAPI._DOWN
 
 
+def _manual_only(raw: str) -> bool:
+    """Taken down by hand — this marketplace only republishes expired listings.
+
+    Offering a button that is certain to answer incorrect_status is worse than
+    saying plainly that it has to be done on the site.
+    """
+    from api.yoomarket import YooMarketAPI
+    return str(raw).lower() in YooMarketAPI._MANUAL_ONLY
+
+
 def _can_unpublish(raw: str) -> bool:
     return str(raw).lower() in ("publish", "published", "active")
 
@@ -213,7 +223,10 @@ async def show_ad_detail(
             f"📊 Статус: {status}\n"
             f"🏷 Категория: {category}\n"
             f"👁 Просмотры: {views}\n\n"
-            f"📝 <b>Описание:</b>\n{description}"
+            + ("ℹ️ <i>Снят с продажи вручную. Юмаркет возвращает автоматически "
+               "только истёкшие объявления — это нужно опубликовать на сайте.</i>"
+               "\n\n" if _manual_only(status_raw) else "")
+            + f"📝 <b>Описание:</b>\n{description}"
         )
         b = InlineKeyboardBuilder()
         b.button(text="✏️ Изменить цену", callback_data=f"ad_price:{callback_data.ad_id}")

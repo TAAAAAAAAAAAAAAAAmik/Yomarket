@@ -166,17 +166,21 @@ class YooMarketAPI:
         """Take an ad off sale — POST /ads/{ad_id}/unpublish."""
         return await self._post(f"/ads/{ad_id}/unpublish")
 
-    # Statuses that mean "was on sale, is not now" — the ones worth restoring.
+    # Statuses this marketplace will bring back on sale. Expiry is the case it
+    # supports: a listing that ran out of time can be published again.
     # Deliberately excludes moderate/draft (on their way up already) and
     # blocked/fraud (a republish would be refused and the block is not ours to
     # undo).
-    # "unpublish" is what this marketplace actually reports for an ad taken off
-    # sale — it is the state POST /ads/{id}/unpublish leaves behind, and the one
-    # POST /ads/{id}/publish undoes. It was missing, so the very ads restore
-    # exists for were the ones it ignored.
-    _DOWN = ("unpublish", "unpublished", "unpublic", "inactive", "sold",
-             "expired", "archived", "disabled", "closed", "hidden",
-             "not_active", "paused", "stopped")
+    _DOWN = ("expired", "inactive", "sold", "archived", "disabled", "closed",
+             "hidden", "not_active", "paused", "stopped")
+
+    # Taken off sale by hand. The marketplace does not accept publish for these
+    # — every attempt answers incorrect_status, confirmed against the live API
+    # on three listings over several days. Only expiry is auto-restorable here,
+    # so these are recognised and explained rather than retried forever. They
+    # are not in _NEVER: that list means "nothing to say about it", while these
+    # deserve to be named, and can still be put back by hand on the site.
+    _MANUAL_ONLY = ("unpublish", "unpublished", "unpublic")
     # "publish" is this marketplace's word for a live ad — without it 12 live
     # listings read as an unknown status. Cancelled/rejected ads are terminal,
     # not merely taken down: publishing one answers incorrect_status, so they
@@ -266,7 +270,7 @@ class YooMarketAPI:
         barred = {str(x).lower() for x in (skip_statuses or ())}
 
         report = {"restored": [], "no_stock": [], "failed": [], "skipped": 0,
-                  "unknown": [],
+                  "unknown": [], "manual": [],
                   "statuses": sorted({self._ad_state(a) for a in ads}),
                   "total": len(ads), "dry_run": dry_run}
 
@@ -280,6 +284,15 @@ class YooMarketAPI:
                 continue
             state = self._ad_state(ad)
             if state in self._NEVER or state in barred:
+                continue
+            if state in self._MANUAL_ONLY:
+                # Taken down by hand. The marketplace refuses publish for these,
+                # so sending one is a guaranteed error report every pass; they
+                # are listed as needing the seller instead.
+                report["manual"].append(
+                    {"id": str(aid),
+                     "title": str(ad.get("title") or ad.get("name") or f"#{aid}"),
+                     "status": state})
                 continue
             if state not in self._DOWN:
                 # A status belonging to neither list is not silently dropped.
