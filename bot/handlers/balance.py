@@ -270,23 +270,33 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
     # probe with no money in it, which is why the balance always read zero.
     # The panel is where the figure lives, and where withdrawal already reads
     # it from.
+    panel_err = ""
     if balance in (None, "", "—"):
         panel_bal, panel_err = await _panel_balance(callback.from_user.id)
         if panel_bal is not None:
             balance = panel_bal
-        elif panel_err:
-            err = err or panel_err
 
-    if balance in (None, "", "—") and raw is not None:
-        # Nothing found anywhere: say what the response actually contained, so
-        # the missing field can be named instead of guessed at.
-        await callback.message.edit_text(
-            "💰 <b>Баланс</b>\n\n"
-            "Юмаркет не прислал баланс в ответе.\n\n"
-            f"<code>{_esc(_shape(raw))[:600]}</code>\n\n"
-            "<i>Покажите это сообщение — по составу ответа будет видно, "
-            "где маркетплейс держит баланс.</i>",
-            reply_markup=_kb())
+    if balance in (None, "", "—"):
+        # Neither source answered. Report both attempts, not just the API's
+        # shape: the previous version hid the panel's reason behind a message
+        # about /check, so two rounds went by without knowing what the panel
+        # said. The build stamp is here for the same reason it is on the
+        # restore screen — output from a stale container looks identical.
+        from handlers.start import BOT_VERSION
+        from storage import get_panel_creds
+        has_panel = bool((get_panel_creds(callback.from_user.id) or {}).get("cookies"))
+        lines = [f"💰 <b>Баланс</b>  <code>{BOT_VERSION}</code>", ""]
+        lines.append("<b>API:</b> в ответе нет баланса — это только проверка "
+                     "доступа:")
+        lines.append(f"<code>{_esc(_shape(raw))[:400]}</code>" if raw
+                     else f"<code>{_esc(err or 'нет ответа')[:200]}</code>")
+        lines.append("")
+        lines.append(f"<b>Панель:</b> {'вход есть' if has_panel else '❌ вход не выполнен'}"
+                     + (f" — {_esc(panel_err)[:200]}" if panel_err else ""))
+        if not has_panel:
+            lines.append("<i>Баланс есть только в панели. Войдите: "
+                         "«Настройки» → «Панель продавца».</i>")
+        await callback.message.edit_text("\n".join(lines), reply_markup=_kb())
         await callback.answer()
         return
 
