@@ -104,6 +104,55 @@ async def _refresh_menu(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+async def _pairing_note(uid: int, cookies: str) -> str:
+    """Warn at login if the panel and the API token hold different shops.
+
+    Everything that needs both sides — republishing a listing the API refuses,
+    promoting a specific ad — silently does nothing when they disagree, and the
+    disagreement is invisible until something fails hours later. Checked once,
+    here, where it is cheap and where it can still be acted on.
+    """
+    token = get_token(uid)
+    if not token:
+        return ""
+    try:
+        from api.yoomarket import YooMarketAPI
+        from automation.panel import panel_find_listing_sync
+
+        api = YooMarketAPI(token)
+        await api.start()
+        try:
+            data = await api.get_ads()
+        finally:
+            await api.close()
+        titles = [str(a.get("title") or "") for a
+                  in (data.get("data") or data.get("items") or [])[:8]]
+        if not titles:
+            return ""
+        loop = asyncio.get_event_loop()
+        found, trace = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_find_listing_sync, cookies, titles),
+            timeout=45)
+    except Exception as e:
+        logger.info("pairing check skipped for %s: %s", uid, e)
+        return ""
+    if found or "шт." not in trace:
+        return ""
+
+    from storage import get_active_account, get_shop_name
+    shop = get_shop_name(uid) or "—"
+    acc = get_active_account(uid)
+    return (f"\n\n⚠️ <b>Внимание: панель и токен — разные магазины.</b>\n"
+            f"Бот работает с «{shop}»"
+            + (f" (аккаунт «{acc}»)" if acc else "")
+            + ", а в панели ни одного его объявления нет.\n\n"
+            f"Продвижение и создание товаров будут работать с магазином "
+            f"панели, а восстановление — нет: оно берёт объявление из API и "
+            f"публикует его в панели.\n\n"
+            f"Войдите в панель почтой магазина «{shop}» — или переключите "
+            f"аккаунт в «Настройки» → «Аккаунты».")
+
+
 async def _finish_login(
     message: Message, status_msg: Message, uid: int, login: str, cookies: str,
     chat_token: str = "",
@@ -133,6 +182,7 @@ async def _finish_login(
             "✅ <b>Успешно вошли в панель!</b>\n"
             "🔬 Куки проверены — API панели отвечает.\n\n"
             "Теперь доступно создание товаров и авто-функции."
+            + await _pairing_note(uid, cookies)
         )
     else:
         await status_msg.edit_text(
