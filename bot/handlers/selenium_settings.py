@@ -1085,41 +1085,38 @@ def _restore_text(s: dict, creds=None, uid: int | None = None) -> str:
         # failure mode that costs the most time to recognise.
         from storage import get_active_account, get_panel_creds, get_shop_name
         acc = get_active_account(uid)
-        lines.append(f"🏪 Магазин: <b>{_esc(get_shop_name(uid) or '—')}</b>"
-                     + (f"  ·  аккаунт «{_esc(acc)}»" if acc else ""))
-        # Both sides on one screen: restore needs them to be the same shop, and
+        # Both sides on one line: restore needs them to be the same shop, and
         # showing only one half is what let them drift apart unnoticed.
-        panel_login = (get_panel_creds(uid) or {}).get("login") or ""
-        lines.append(f"🌐 Панель: <b>{_esc(panel_login) if panel_login else 'вход не выполнен'}</b>")
+        panel_login = (get_panel_creds(uid) or {}).get("login") or "вход не выполнен"
+        lines.append(f"🏪 {_esc(get_shop_name(uid) or '—')}"
+                     + (f" «{_esc(acc)}»" if acc else "")
+                     + f"  ·  🌐 {_esc(panel_login)}")
     lines += [
-        f"Статус: {_st(on)}",
-        f"Проверка: каждые {interval} ч",
-        f"Последний запуск: {last_run}",
-        f"Требовать остатки: {'✅ да' if ar.get('require_stock', True) else '❌ нет'}",
-        f"Сразу после продажи: {'✅ да' if ar.get('instant', True) else '❌ нет'}",
+        f"{_st(on)}  ·  каждые {interval} ч  ·  запуск: {last_run}",
+        f"📦 Остатки: {'обязательны' if ar.get('require_stock', True) else 'не важны'}"
+        f"  ·  ⚡ Сразу после продажи: "
+        f"{'да' if ar.get('instant', True) else 'нет'}",
     ]
+    tail = []
     if ar.get("last_result"):
-        lines.append(f"Прошлый результат: {ar['last_result']}")
+        tail.append(ar["last_result"])
     if total:
-        lines.append(f"Всего восстановлено: <b>{total}</b>")
+        tail.append(f"всего {total}")
     if held:
-        lines.append(f"⏸ Отложено после отказов: {held}")
+        tail.append(f"⏸ отложено {held}")
+    if tail:
+        lines.append("  ·  ".join(tail))
     # A barred status silences restore for every ad in it, so it cannot stay
     # invisible: "поднято 0" with no explanation reads as a broken feature.
     from tasks.manager import _barred_map
     barred = [st for st, until in _barred_map(ar).items() if until > _time.time()]
     if barred:
-        lines.append(f"🚫 Статусы в бане: <b>{', '.join(barred)}</b> "
-                     f"— эти объявления пропускаются")
+        lines.append(f"🚫 В бане: <b>{', '.join(barred)}</b> — пропускаются")
     lines += [
         "",
-        "Истёкшие объявления публикуются заново — это тот случай, который "
-        "Юмаркет поддерживает. Распроданные пропускаются, публиковать их нечем.",
-        "✋ Снятые с продажи вручную маркетплейс вернуть не даёт: "
-        "их нужно опубликовать самому на сайте.",
-        "⚡ С включённым «сразу после продажи» товар возвращается "
-        "в момент покупки, а не ждёт следующей проверки.",
-        "<i>Публикация уходит на модерацию, а не сразу в продажу.</i>",
+        "<i>Возвращает истёкшие и распроданные — снятые вручную Юмаркет "
+        "не отдаёт, их публикуют на сайте. Публикация идёт через "
+        "модерацию.</i>",
     ]
     return "\n".join(lines)
 
