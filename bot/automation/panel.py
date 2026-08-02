@@ -805,6 +805,46 @@ def _row_haystack(res: dict) -> str:
     return " ".join(str(p) for p in parts if p)
 
 
+def _nova_global_search(session, hdrs, query: str) -> list[dict]:
+    """Nova's own cross-resource search: [{resource, id, title}].
+
+    Guessing resource names is how the last search failed — every candidate
+    but `items` answered 404, while the listing sat in a resource nobody
+    guessed. Nova already knows where its records live, so it is asked.
+    """
+    out = []
+    for path in ("/nova-api/search", "/nova-api/global-search"):
+        try:
+            r = session.get(PANEL_URL + path, params={"search": query[:60]},
+                            headers=hdrs, timeout=(6, 12), allow_redirects=False)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+        try:
+            data = r.json()
+        except Exception:
+            continue
+        rows = data if isinstance(data, list) else (
+            data.get("resources") or data.get("data") or [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            res = (row.get("resourceName") or row.get("resource")
+                   or row.get("resourceUriKey") or "")
+            rid = row.get("resourceId") or row.get("id")
+            if isinstance(rid, dict):
+                rid = rid.get("value")
+            title = str(row.get("title") or row.get("resourceTitle")
+                        or row.get("display") or "")
+            if res and rid:
+                out.append({"resource": str(res), "id": str(rid),
+                            "title": title})
+        if out:
+            break
+    return out
+
+
 def panel_find_listing_sync(
     cookie_string: str, titles: list, resources: tuple = _ITEM_RESOURCES,
 ) -> tuple[dict, str]:
@@ -827,6 +867,21 @@ def panel_find_listing_sync(
     samples: list[str] = []
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
+
+    # Ask Nova where each listing lives before walking resources by name: it
+    # knows, and the names were the part that kept being wrong.
+    for t in titles:
+        wk = key(t)
+        if len(wk) < 8 or wk in found:
+            continue
+        for hit in _nova_global_search(session, hdrs, str(t)):
+            hk = key(hit["title"])
+            if hk and (wk in hk or hk in wk or hk[:24] in wk or wk[:24] in hk):
+                found[wk] = (hit["resource"], hit["id"])
+                trace.append(f"поиск: {hit['resource']}#{hit['id']}")
+                break
+    if len(found) == len(wanted):
+        return found, "; ".join(trace)[:400]
 
     for res_name in resources:
         if len(found) == len(wanted):

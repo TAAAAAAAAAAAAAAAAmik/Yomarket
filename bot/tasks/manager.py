@@ -343,14 +343,6 @@ def _shop_label(user_id: int) -> str:
     return f"{shop}" + (f" · аккаунт «{account}»" if account else "")
 
 
-def _panel_sample(trace: str) -> str:
-    """The panel-side titles the finder collected, if it reported any."""
-    marker = "названия в панели: "
-    if marker in trace:
-        return trace.split(marker, 1)[1][:120]
-    return "другие товары"
-
-
 async def panel_republish(user_id: int, rows: list[dict]
                           ) -> tuple[list[dict], list[dict]]:
     """Retry refused publishes through the panel. Returns (done, still_failed).
@@ -391,16 +383,16 @@ async def panel_republish(user_id: int, rows: list[dict]
     # the API token belongs to. Said plainly, because no amount of matching can
     # fix an account mismatch — and it is the same cause behind the panel
     # answering "нет прав" to promotion.
-    mismatch = not found and "шт." in trace
+    # Deliberately not concluding "different shops" from an empty result: this
+    # panel keeps listings in more than one resource, so failing to find them
+    # means the search missed, not that the shop is wrong. That inference cost
+    # several rounds chasing a configuration that was correct all along.
+    mismatch = False
     done, failed = [], []
     for row in rows:
         hit = found.get(_title_key(row.get("title")))
         if not hit:
-            note = (f" · ⚠️ панель и токен — разные магазины. Бот работает с "
-                    f"«{_shop_label(user_id)}», а панель показывает другое: "
-                    f"{_panel_sample(trace)}. Проверьте, какой аккаунт активен "
-                    f"(«Настройки» → «Аккаунты» — нужен тот, чей токен от "
-                    f"этого магазина), и что вход в панель сделан им же"
+            note = (f" · ⚠️ панель и токен — разные магазины ({_shop_label(user_id)})"
                     if mismatch else
                     f" · в панели не нашёл этот товар (искал: {trace})")
             failed.append({**row, "reason": f"{row.get('reason', '')}{note}"})
