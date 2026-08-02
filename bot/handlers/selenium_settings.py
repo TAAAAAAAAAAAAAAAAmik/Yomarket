@@ -1079,10 +1079,14 @@ def _restore_text(s: dict, creds=None, uid: int | None = None) -> str:
         # Which shop this acts on. Adding an account is not switching to it,
         # and a token from one shop paired with a panel from another is the
         # failure mode that costs the most time to recognise.
-        from storage import get_active_account, get_shop_name
+        from storage import get_active_account, get_panel_creds, get_shop_name
         acc = get_active_account(uid)
         lines.append(f"🏪 Магазин: <b>{_esc(get_shop_name(uid) or '—')}</b>"
                      + (f"  ·  аккаунт «{_esc(acc)}»" if acc else ""))
+        # Both sides on one screen: restore needs them to be the same shop, and
+        # showing only one half is what let them drift apart unnoticed.
+        panel_login = (get_panel_creds(uid) or {}).get("login") or ""
+        lines.append(f"🌐 Панель: <b>{_esc(panel_login) if panel_login else 'вход не выполнен'}</b>")
     lines += [
         f"Статус: {_st(on)}",
         f"Проверка: каждые {interval} ч",
