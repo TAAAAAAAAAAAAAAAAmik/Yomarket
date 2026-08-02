@@ -40,6 +40,32 @@ _RESTORE_MAX_PER_PASS = 40
 _RESTORE_BARRED_TTL = 7 * 86400
 
 
+async def shop_balance(user_id: int, api) -> tuple[float, str]:
+    """The shop's balance → (amount, formatted) — «—» when it can't be read.
+
+    The Integration API has none: /check answers identity only, so every
+    caller reading it saw zero and reported it as fact. The panel holds the
+    figure, and it is the one withdrawal acts on.
+    """
+    try:
+        amount, text = await api.get_balance()
+        if text not in ("—", None):
+            return amount, text
+    except Exception:
+        pass
+    from handlers.balance import _panel_balance
+    try:
+        shown, _err = await _panel_balance(user_id)
+    except Exception:
+        shown = None
+    if shown is None:
+        return 0.0, "—"
+    try:
+        return float(shown), f"{float(shown):.0f} ₽"
+    except (TypeError, ValueError):
+        return 0.0, str(shown)
+
+
 def _barred_map(ar: dict) -> dict:
     """{status: expiry} of statuses restore should skip.
 
@@ -1398,7 +1424,7 @@ class TaskManager:
         min_amount = float(aw.get("min_amount", 500) or 0)
 
         try:
-            balance, balance_str = await api.get_balance()
+            balance, balance_str = await shop_balance(user_id, api)
         except Exception as e:
             logger.warning("Auto-withdraw balance for %s: %s", user_id, e)
             return ""
@@ -1470,7 +1496,7 @@ class TaskManager:
             spent_today = float(bs.get("spent_today", 0) or 0)
 
         try:
-            _bal, balance_str = await api.get_balance()
+            _bal, balance_str = await shop_balance(user_id, api)
         except Exception:
             balance_str = "—"
 
@@ -1917,7 +1943,7 @@ class TaskManager:
                 threshold = float(bn.get("threshold", 1000) or 0)
                 last_bal = float(bn.get("last_notified_balance", 0.0) or 0)
                 try:
-                    balance, balance_str = await api.get_balance()
+                    balance, balance_str = await shop_balance(user_id, api)
                     # An unreadable balance must not be recorded as 0: that would
                     # re-arm the alert and fire a false "crossed the threshold"
                     # the moment a real number came back.

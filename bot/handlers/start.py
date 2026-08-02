@@ -12,7 +12,7 @@ from storage import delete_token, get_token, save_token, get_settings, save_sett
 router = Router()
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-08-02-balance-shapes"
+BOT_VERSION = "2026-08-02-balance-from-panel"
 
 
 class AuthState(StatesGroup):
@@ -20,7 +20,12 @@ class AuthState(StatesGroup):
 
 
 def _extract_shop(info: dict) -> tuple[str, str]:
-    """Returns (name, balance_str) from /check response."""
+    """Returns (name, balance_str) from /check response.
+
+    /check answers {status, shop:{id,title}, integration:{…}, ts} — identity
+    only, no money. The balance comes back "—" here on purpose; it is read from
+    the panel where it actually lives.
+    """
     shop = info.get("shop") or info.get("data") or info
     if isinstance(shop, dict):
         name = shop.get("name") or shop.get("shop_name") or shop.get("title") or "Магазин"
@@ -151,8 +156,9 @@ async def process_token(message: Message, state: FSMContext, **data) -> None:
     from storage import get_panel_creds, render_custom_text
     if get_panel_creds(message.from_user.id):
         await message.answer(
-            f"✅ <b>Токен обновлён</b>\n\n🏪 <b>{name}</b>\n"
-            f"💰 Баланс: <b>{balance} ₽</b>")
+            f"✅ <b>Токен обновлён</b>\n\n🏪 <b>{name}</b>"
+            # Only when the response carried one — "— ₽" is not a balance.
+            + (f"\n💰 Баланс: <b>{balance} ₽</b>" if balance != "—" else ""))
         await _send_menu(message, message.from_user.id)
         return
 

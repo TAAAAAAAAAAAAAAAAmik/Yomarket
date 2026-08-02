@@ -101,6 +101,45 @@ def _shape(data, limit: int = 12) -> str:
     return type(data).__name__
 
 
+async def _panel_balance(uid: int) -> tuple[str | None, str]:
+    """The balance as the panel reports it → (formatted, error).
+
+    The Integration API has no balance anywhere: /check returns identity only.
+    The panel's balances resource is the sole source, and it is the same one
+    withdrawal acts on, so the figure shown and the figure withdrawn agree.
+    """
+    import asyncio as _a
+    from storage import get_panel_creds
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
+        return None, "нужен вход в панель продавца"
+    from automation.panel import panel_balances_sync
+    try:
+        ok, rows = await _a.wait_for(
+            _a.get_event_loop().run_in_executor(
+                None, panel_balances_sync, creds["cookies"]),
+            timeout=45)
+    except Exception as e:
+        return None, f"панель не ответила: {str(e)[:60]}"
+    if not ok or not isinstance(rows, list):
+        return None, f"панель: {str(rows)[:80]}"
+
+    # Several rows can exist (one per currency); the roubles one is the balance
+    # a seller means, and any single row is unambiguous on its own.
+    best = None
+    for row in rows:
+        amt = _money(row.get("amount"))
+        if amt is None:
+            continue
+        cur = str(row.get("currency") or "").lower()
+        if "rub" in cur or "руб" in cur or "₽" in cur or not cur:
+            return f"{amt:.2f}".rstrip("0").rstrip("."), ""
+        best = best if best is not None else amt
+    if best is not None:
+        return f"{best:.2f}".rstrip("0").rstrip("."), ""
+    return None, "панель не показала сумму"
+
+
 def _parse_check(data: dict) -> tuple[str, str, str | None]:
     """Parse /check response → (name, balance, pending)."""
     logger.info("CHECK raw response: %s", data)
@@ -226,6 +265,17 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
         except Exception as e:
             if err is None:
                 err = str(e)[:200]
+
+    # /check answers {status, shop:{id,title}, integration:{…}, ts} — an auth
+    # probe with no money in it, which is why the balance always read zero.
+    # The panel is where the figure lives, and where withdrawal already reads
+    # it from.
+    if balance in (None, "", "—"):
+        panel_bal, panel_err = await _panel_balance(callback.from_user.id)
+        if panel_bal is not None:
+            balance = panel_bal
+        elif panel_err:
+            err = err or panel_err
 
     if balance in (None, "", "—") and raw is not None:
         # Nothing found anywhere: say what the response actually contained, so
