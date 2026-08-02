@@ -3343,3 +3343,53 @@ def panel_item_actions_sync(cookie_string: str, item_id: str) -> str:
     names = [f"{a.get('name') or '?'}[{a.get('uriKey') or '?'}]"
              for a in actions if isinstance(a, dict)]
     return ", ".join(names)[:400]
+
+
+def panel_resource_census_sync(cookie_string: str, needle: str = "") -> str:
+    """Read-only: every panel resource with its row count and a few names.
+
+    The failure trace is capped at a few hundred characters, so a run that
+    walked a dozen resources showed the first two and hid the answer. This
+    walks the same list and reports all of it, marking any resource whose rows
+    mention `needle` — which is what identifies where the listings live.
+    """
+    import re as _re
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+
+    def key(t) -> str:
+        return _re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", "", str(t or "")).lower()
+
+    want = key(needle)
+    names = list(_ITEM_RESOURCES)
+    for r in panel_discover_resources_sync(cookie_string):
+        if r not in names:
+            names.append(r)
+
+    lines: list[str] = []
+    for res in names:
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/{res}",
+                            params={"perPage": "100"}, headers=hdrs,
+                            timeout=(6, 12), allow_redirects=False)
+        except Exception as e:
+            lines.append(f"{res}: ошибка {str(e)[:30]}")
+            continue
+        if r.status_code != 200:
+            continue                      # 404 is noise; only what exists matters
+        try:
+            rows = [x for x in ((r.json() or {}).get("resources") or [])
+                    if isinstance(x, dict)]
+        except Exception:
+            lines.append(f"{res}: ответ не разобран")
+            continue
+        titles = [_row_title(x) or "?" for x in rows]
+        hit = ""
+        if want:
+            for t in titles:
+                if want[:20] in key(t) or key(t)[:20] in want:
+                    hit = f"  ⬅️ СОВПАЛО: {t[:40]}"
+                    break
+        lines.append(f"{res}: {len(rows)} — "
+                     + ", ".join(t[:26] for t in titles[:3]) + hit)
+    return "\n".join(lines) or "панель не отдала ни одного ресурса"

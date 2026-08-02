@@ -1401,12 +1401,12 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
         # ban on it is lifted: the API refusing «unpublish» is exactly what the
         # fallback is for, and barring it would silence restore for the one
         # state it exists to handle.
-        # Bans learned while the panel could not be reached are meaningless —
-        # they were never a verdict on the status. Drop them as soon as that is
-        # what the failures say, so a fixed configuration is not held back by
-        # week-old noise.
-        if any(k in str(r.get("reason", "")) for r in rep["failed"]
-               for k in ("разные магазины", "нет входа в панель")):
+        # A pass that never got a verdict out of the panel — no login, or the
+        # listing not located there — says nothing about any status, so bans
+        # standing from one are dropped. Marked on the row rather than matched
+        # in its text: the text form let «в панели не нашёл этот товар» through.
+        if any(r.get("panel") in ("unreached", "not_found")
+               for r in rep["failed"]):
             barred_until.clear()
         recovered = {str(r.get("status") or "").lower() for r in done}
         for st in recovered:
@@ -1415,12 +1415,9 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
             reason = str(row.get("reason", ""))
             if "incorrect_status" not in reason:
                 continue
-            # A refusal that never reached the panel says nothing about the
-            # status: the fallback stopped at a different shop or a missing
-            # login. Barring on that would blame the state for a configuration
-            # problem — and silence restore for a week once it is fixed.
-            if any(k in reason for k in ("разные магазины", "нет входа в панель",
-                                         "не отдала список")):
+            # Only the panel actually refusing the action is evidence about
+            # the status.
+            if row.get("panel") != "refused":
                 continue
             st = str(row.get("status") or "").lower()
             if st and st not in recovered:
@@ -1586,6 +1583,37 @@ async def _panel_actions_for(uid: int, item_id) -> str:
             timeout=30)
     except Exception as e:
         return f"ошибка: {str(e)[:90]}"
+
+
+@router.message(Command("panel_map"))
+async def panel_map(message: Message) -> None:
+    """Every panel resource, its size and sample names — read-only.
+
+    Walking resources blind and reporting a truncated trace is how three runs
+    went by without locating the listings. This prints the whole census at
+    once, and marks the resource whose rows carry the name being looked for.
+    """
+    import asyncio as _a
+    import html as _html
+    from storage import get_panel_creds
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет входа в панель — «Настройки» → «Панель продавца»")
+        return
+    needle = (message.text or "").partition(" ")[2].strip()
+    status = await message.answer("⏳ Обхожу ресурсы панели…")
+    from automation.panel import panel_resource_census_sync
+    try:
+        report = await _a.wait_for(
+            _a.get_event_loop().run_in_executor(
+                None, panel_resource_census_sync, creds["cookies"], needle),
+            timeout=180)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    await status.edit_text(
+        "🗺 <b>Ресурсы панели</b>"
+        + (f"\n<i>ищу: {_html.escape(needle)}</i>" if needle else "")
+        + f"\n\n<code>{_html.escape(report)[:3500]}</code>")
 
 
 @router.message(Command("restore_debug"))
