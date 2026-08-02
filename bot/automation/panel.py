@@ -755,8 +755,67 @@ def panel_update_item_sync(
 # index (/nova-api/resources answers with nothing), so the names are probed
 # rather than enumerated — `items` holds some listings but not the «unlimited»
 # ones, whose ids answer 404 there.
-_ITEM_RESOURCES = ("items", "ads", "goods", "products", "lots", "offers",
-                   "unlimiteds", "unlimited-items", "adverts")
+_ITEM_RESOURCES = ("items", "ad-groups", "ad-group", "ads", "goods", "products",
+                   "lots", "offers", "unlimiteds", "unlimited-items", "adverts")
+
+# Resources that plainly hold something other than a listing. «ad-groups» is
+# deliberately absent: it was assumed to be an organisational bucket and
+# excluded, but on this panel `items` turned out to hold the units being sold
+# (individual accounts with a balance), which leaves the listing itself
+# somewhere else — and a group of identical units is exactly what a listing is.
+_NOT_A_LISTING = frozenset({
+    "categories", "tags", "users", "roles", "permissions", "settings", "logs",
+    "reviews", "orders", "chats", "messages", "notifications", "balances",
+    "withdrawals", "transactions", "payments", "nova-notifications",
+})
+
+_RESOURCE_CACHE: dict[str, list[str]] = {}
+
+
+def panel_discover_resources_sync(cookie_string: str) -> list[str]:
+    """Every Nova resource this panel exposes, asked rather than guessed.
+
+    Guessing names is how the search kept missing: nine candidates were tried
+    and only `items` existed. Nova's index endpoint answers empty on this
+    panel, so the names are also read out of the SPA's own page — they appear
+    there as uriKeys and router paths. Cached per session cookie: the list does
+    not change between passes, and each pass would otherwise refetch it.
+    """
+    import re as _re
+    ck = cookie_string[-32:]
+    if ck in _RESOURCE_CACHE:
+        return _RESOURCE_CACHE[ck]
+
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    names: list[str] = []
+
+    def add(found):
+        for r in found:
+            r = str(r).strip().lower()
+            if r and r not in names and _re.fullmatch(r"[a-z0-9_\-]{3,40}", r):
+                names.append(r)
+
+    for path in ("/nova-api/navigation", "/nova-api/resources"):
+        try:
+            r = session.get(PANEL_URL + path, headers=hdrs,
+                            timeout=(6, 10), allow_redirects=False)
+            if r.status_code == 200:
+                add(_re.findall(r'"uriKey"\s*:\s*"([^"]+)"', r.text))
+        except Exception:
+            pass
+    if not names:
+        try:
+            html = session.get(PANEL_URL + "/", timeout=(6, 12),
+                               allow_redirects=True).text
+            add(_re.findall(r'"uriKey"\s*:\s*"([^"]+)"', html))
+            add(_re.findall(r'/resources/([a-z0-9_\-]+)', html, _re.I))
+        except Exception:
+            pass
+
+    names = [n for n in names if n not in _NOT_A_LISTING]
+    _RESOURCE_CACHE[ck] = names
+    return names
 
 
 def _row_title(res: dict) -> str:
@@ -883,7 +942,19 @@ def panel_find_listing_sync(
     if len(found) == len(wanted):
         return found, "; ".join(trace)[:400]
 
-    for res_name in resources:
+    # Beyond the guessed names, walk what the panel says it actually has. Nine
+    # guesses found only `items`, and `items` turned out to hold the units being
+    # sold rather than the listings — so the resource that holds them is one
+    # nobody named.
+    try:
+        discovered = [r for r in panel_discover_resources_sync(cookie_string)
+                      if r not in resources]
+    except Exception:
+        discovered = []
+    if discovered:
+        trace.append(f"ещё есть: {', '.join(discovered[:12])}")
+
+    for res_name in tuple(resources) + tuple(discovered):
         if len(found) == len(wanted):
             break
         rows = []
