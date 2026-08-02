@@ -33,6 +33,21 @@ def _names(user_id: int) -> list[str]:
     return sorted(get_accounts(user_id).keys())
 
 
+def _shop_of(user_id: int, account: str) -> str:
+    """The shop name stored for one account.
+
+    Settings are keyed per account, so the name saved when that token was last
+    checked is read from its own key rather than the active one — otherwise
+    every row would show the same shop.
+    """
+    try:
+        from storage import _load_settings, _merge_defaults
+        raw = _load_settings().get(f"{user_id}::{account}", {})
+        return str(_merge_defaults(raw).get("shop_name") or "")
+    except Exception:
+        return ""
+
+
 async def _render_menu(msg, user_id: int, edit: bool = True) -> None:
     accounts = _names(user_id)
     active = get_active_account(user_id)
@@ -41,10 +56,18 @@ async def _render_menu(msg, user_id: int, edit: bool = True) -> None:
     if not accounts:
         lines.append("Нет добавленных аккаунтов. Отправьте /start и введите токен.")
     else:
-        lines.append("Нажмите на аккаунт, чтобы переключиться:")
+        lines.append("Нажмите на аккаунт, чтобы переключиться:\n")
+        # The account name says nothing about which shop its token opens, so
+        # picking the right one was guesswork — and picking wrong is what makes
+        # the panel and the token disagree.
         for i, name in enumerate(accounts):
             mark = " ✅" if name == active else ""
-            b.button(text=f"🏪 {name}{mark}", callback_data=f"acc:switch:{i}")
+            shop = _shop_of(user_id, name)
+            lines.append(f"• <b>{name}</b>{mark}"
+                         + (f" — магазин «{shop}»" if shop else
+                            " — <i>магазин не определён</i>"))
+            b.button(text=f"🏪 {name}{(' · ' + shop[:18]) if shop else ''}{mark}",
+                     callback_data=f"acc:switch:{i}")
     b.button(text="➕ Добавить аккаунт", callback_data="acc:add")
     if len(accounts) > 1:
         b.button(text="🗑 Удалить текущий", callback_data="acc:del")
@@ -76,9 +99,38 @@ async def switch_account(callback: CallbackQuery) -> None:
         await callback.answer("Уже активен")
         return
     set_active_account(uid, name)
-    shop = get_shop_name(uid) or name
-    await callback.answer(f"✅ Переключено на «{shop}»", show_alert=True)
+    # Ask the marketplace who this token belongs to instead of trusting a name
+    # cached long ago: a stale shop name is what makes the wrong account look
+    # like the right one.
+    shop = await _refresh_shop(uid)
+    await callback.answer(f"✅ Переключено на «{shop or name}»", show_alert=True)
     await _render_menu(callback.message, uid)
+
+
+async def _refresh_shop(uid: int) -> str:
+    """Re-read the active token's shop name from the marketplace."""
+    from storage import get_token, save_shop_name
+    token = get_token(uid)
+    if not token:
+        return ""
+    try:
+        from api.yoomarket import YooMarketAPI
+        api = YooMarketAPI(token)
+        await api.start()
+        try:
+            info = await api.check()
+        finally:
+            await api.close()
+        shop = info.get("shop") or info.get("data") or info
+        name = ""
+        if isinstance(shop, dict):
+            name = str(shop.get("name") or shop.get("shop_name")
+                       or shop.get("title") or "")
+        if name:
+            save_shop_name(uid, name)
+        return name
+    except Exception:
+        return get_shop_name(uid) or ""
 
 
 @router.callback_query(F.data == "acc:add")
