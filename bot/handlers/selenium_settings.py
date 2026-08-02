@@ -1066,7 +1066,7 @@ async def run_bump_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None
 # Auto-restore
 # ---------------------------------------------------------------------------
 
-def _restore_text(s: dict, creds=None) -> str:
+def _restore_text(s: dict, creds=None, uid: int | None = None) -> str:
     ar = s.get("auto_restore", {})
     on = ar.get("enabled", False)
     interval = ar.get("interval_hours", 1)
@@ -1074,8 +1074,16 @@ def _restore_text(s: dict, creds=None) -> str:
     total = int(ar.get("restored_total", 0) or 0)
     held = len([f for f in (ar.get("failures") or {}).values()
                 if float(f.get("until", 0) or 0) > _time.time()])
-    lines = [
-        "🔄 <b>Авто-восстановление</b>\n",
+    lines = ["🔄 <b>Авто-восстановление</b>\n"]
+    if uid is not None:
+        # Which shop this acts on. Adding an account is not switching to it,
+        # and a token from one shop paired with a panel from another is the
+        # failure mode that costs the most time to recognise.
+        from storage import get_active_account, get_shop_name
+        acc = get_active_account(uid)
+        lines.append(f"🏪 Магазин: <b>{_esc(get_shop_name(uid) or '—')}</b>"
+                     + (f"  ·  аккаунт «{_esc(acc)}»" if acc else ""))
+    lines += [
         f"Статус: {_st(on)}",
         f"Проверка: каждые {interval} ч",
         f"Последний запуск: {last_run}",
@@ -1140,14 +1148,16 @@ def _restore_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data == "selenium:restore:menu")
 async def restore_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    uid = callback.from_user.id
     await state.clear()
     s = get_settings(callback.from_user.id)
-    await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
+    await callback.message.edit_text(_restore_text(s, uid=uid), reply_markup=_restore_kb(s))
     await callback.answer()
 
 
 @router.callback_query(F.data == "selenium:restore:toggle")
 async def restore_toggle(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
     s = get_settings(callback.from_user.id)
     s["auto_restore"]["enabled"] = not s["auto_restore"].get("enabled", False)
     # Turning it on should act promptly, not wait out an interval that already
@@ -1155,12 +1165,13 @@ async def restore_toggle(callback: CallbackQuery) -> None:
     if s["auto_restore"]["enabled"]:
         s["auto_restore"]["last_restore_run"] = 0
     save_settings(callback.from_user.id, s)
-    await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
+    await callback.message.edit_text(_restore_text(s, uid=uid), reply_markup=_restore_kb(s))
     await callback.answer("Включено" if s["auto_restore"]["enabled"] else "Выключено")
 
 
 @router.callback_query(F.data == "restore:stock")
 async def restore_stock_toggle(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
     s = get_settings(callback.from_user.id)
     ar = s.setdefault("auto_restore", {})
     ar["require_stock"] = not ar.get("require_stock", True)
@@ -1169,11 +1180,12 @@ async def restore_stock_toggle(callback: CallbackQuery) -> None:
         "Распроданные будут пропускаться" if ar["require_stock"]
         else "Публиковать буду и без остатков — маркетплейс может отказать",
         show_alert=True)
-    await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
+    await callback.message.edit_text(_restore_text(s, uid=uid), reply_markup=_restore_kb(s))
 
 
 @router.callback_query(F.data == "restore:instant")
 async def restore_instant_toggle(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
     s = get_settings(callback.from_user.id)
     ar = s.setdefault("auto_restore", {})
     ar["instant"] = not ar.get("instant", True)
@@ -1183,7 +1195,7 @@ async def restore_instant_toggle(callback: CallbackQuery) -> None:
         if ar["instant"] else
         "Возврат только по расписанию — до часа ожидания",
         show_alert=True)
-    await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
+    await callback.message.edit_text(_restore_text(s, uid=uid), reply_markup=_restore_kb(s))
 
 
 @router.callback_query(F.data == "restore:interval")
@@ -1201,6 +1213,7 @@ async def restore_interval(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(SeleniumState.waiting_restore_interval)
 async def restore_save_interval(message: Message, state: FSMContext) -> None:
+    uid = message.from_user.id
     try:
         hours = float((message.text or "").replace(",", ".").strip())
         if not 0.25 <= hours <= 168:
@@ -1212,7 +1225,7 @@ async def restore_save_interval(message: Message, state: FSMContext) -> None:
     s.setdefault("auto_restore", {})["interval_hours"] = hours
     save_settings(message.from_user.id, s)
     await state.clear()
-    await message.answer(_restore_text(s), reply_markup=_restore_kb(s))
+    await message.answer(_restore_text(s, uid=uid), reply_markup=_restore_kb(s))
 
 
 @router.callback_query(F.data == "restore:held")
@@ -1263,6 +1276,7 @@ async def restore_held(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "restore:unhold")
 async def restore_unhold(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
     s = get_settings(callback.from_user.id)
     ar = s.setdefault("auto_restore", {})
     ar["failures"] = {}
@@ -1272,7 +1286,7 @@ async def restore_unhold(callback: CallbackQuery) -> None:
     ar.pop("barred_statuses", None)
     save_settings(callback.from_user.id, s)
     await callback.answer("Отсрочки сняты", show_alert=True)
-    await callback.message.edit_text(_restore_text(s), reply_markup=_restore_kb(s))
+    await callback.message.edit_text(_restore_text(s, uid=uid), reply_markup=_restore_kb(s))
 
 
 @router.callback_query(F.data == "restore:preview")
@@ -1448,7 +1462,7 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
         logger.error("Manual restore error: %s", e)
         result_text = f"❌ Ошибка: {_esc(str(e)[:200])}"
     await callback.message.edit_text(
-        (result_text + "\n\n" + _restore_text(s))[:4000],
+        (result_text + "\n\n" + _restore_text(s, uid=uid))[:4000],
         reply_markup=_restore_kb(s))
 
 

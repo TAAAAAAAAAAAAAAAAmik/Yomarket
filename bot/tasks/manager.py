@@ -330,6 +330,27 @@ def _message_notify_kb(chat_id: str, order_id: str = "") -> InlineKeyboardMarkup
     return builder.as_markup()
 
 
+def _shop_label(user_id: int) -> str:
+    """The shop the bot's token belongs to, with the active account name.
+
+    Naming both sides is what turns "разные магазины" from a verdict into
+    something the seller can act on: adding an account is not the same as
+    switching to it, and that is the usual reason the two drift apart.
+    """
+    from storage import get_active_account, get_shop_name
+    shop = get_shop_name(user_id) or "магазин без имени"
+    account = get_active_account(user_id)
+    return f"{shop}" + (f" · аккаунт «{account}»" if account else "")
+
+
+def _panel_sample(trace: str) -> str:
+    """The panel-side titles the finder collected, if it reported any."""
+    marker = "названия в панели: "
+    if marker in trace:
+        return trace.split(marker, 1)[1][:120]
+    return "другие товары"
+
+
 async def panel_republish(user_id: int, rows: list[dict]
                           ) -> tuple[list[dict], list[dict]]:
     """Retry refused publishes through the panel. Returns (done, still_failed).
@@ -375,11 +396,11 @@ async def panel_republish(user_id: int, rows: list[dict]
     for row in rows:
         hit = found.get(_title_key(row.get("title")))
         if not hit:
-            note = (" · ⚠️ панель и токен — разные магазины: она не знает "
-                    "ни одного объявления этого. Сведите их: либо войдите в "
-                    "панель аккаунтом этого магазина («Панель продавца»), "
-                    "либо переключите бота на аккаунт панели "
-                    "(«Настройки» → «Аккаунты»)"
+            note = (f" · ⚠️ панель и токен — разные магазины. Бот работает с "
+                    f"«{_shop_label(user_id)}», а панель показывает другое: "
+                    f"{_panel_sample(trace)}. Проверьте, какой аккаунт активен "
+                    f"(«Настройки» → «Аккаунты» — нужен тот, чей токен от "
+                    f"этого магазина), и что вход в панель сделан им же"
                     if mismatch else
                     f" · в панели не нашёл этот товар (искал: {trace})")
             failed.append({**row, "reason": f"{row.get('reason', '')}{note}"})
