@@ -40,6 +40,67 @@ def _pick(*sources_and_keys) -> object | None:
     return None
 
 
+_MONEY_KEYS = ("balance", "wallet", "money", "balance_rub", "amount")
+_PENDING_KEYS = ("pending_balance", "pending", "hold", "frozen")
+
+
+def _money(value):
+    """A number out of whatever shape the marketplace wrapped it in.
+
+    This API returns money as {"amount": 99.99, "currency": "RUB"} — the ad
+    price arrives that way. Read as a plain value it stringifies to the whole
+    dict, which is neither a balance nor a number.
+    """
+    if isinstance(value, dict):
+        for k in ("amount", "value", "sum", "balance"):
+            if k in value and value[k] not in (None, ""):
+                value = value[k]
+                break
+        else:
+            return None
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    try:
+        return float(str(value).replace(" ", "").replace("\u00a0", "")
+                     .replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def _deep_find(node, keys, depth: int = 4):
+    """First value under any of `keys`, searched breadth-first.
+
+    A one-level lookup missed a balance nested one dict deeper than expected
+    and reported zero, which reads as "the shop has no money" rather than "the
+    bot did not look there".
+    """
+    level = [node]
+    for _ in range(depth):
+        nxt = []
+        for cur in level:
+            if not isinstance(cur, dict):
+                continue
+            for k in keys:
+                if k in cur and cur[k] not in (None, ""):
+                    got = _money(cur[k]) if keys is _MONEY_KEYS else cur[k]
+                    if got is not None:
+                        return got
+            nxt.extend(v for v in cur.values() if isinstance(v, (dict, list)))
+        level = [x for v in nxt for x in (v if isinstance(v, list) else [v])]
+        if not level:
+            break
+    return None
+
+
+def _shape(data, limit: int = 12) -> str:
+    """The keys a response actually has — for saying why nothing was found."""
+    if isinstance(data, dict):
+        inner = [f"{k}:{_shape(v, 4)}" if isinstance(v, dict) else k
+                 for k in list(data)[:limit] for v in [data[k]]]
+        return "{" + ", ".join(inner) + "}"
+    return type(data).__name__
+
+
 def _parse_check(data: dict) -> tuple[str, str, str | None]:
     """Parse /check response → (name, balance, pending)."""
     logger.info("CHECK raw response: %s", data)
@@ -48,12 +109,18 @@ def _parse_check(data: dict) -> tuple[str, str, str | None]:
         shop = data
     srcs = (shop, data)
 
-    name = _pick(srcs, "name", "shop_name", "title") or "—"
-    balance = _pick(srcs, "balance", "wallet", "money", "balance_rub", "amount")
-    pending = _pick(srcs, "pending_balance", "pending", "hold", "frozen")
+    # The shop name sits as deep as the balance does — a one-level lookup
+    # reported «—» for a shop the response plainly names.
+    name = (_pick(srcs, "name", "shop_name", "title")
+            or _deep_find(data, ("name", "shop_name", "title")) or "—")
+    balance = _deep_find(data, _MONEY_KEYS)
+    pending = _deep_find(data, _PENDING_KEYS)
 
-    bal_str = str(balance) if balance is not None else "0"
-    pend_str = str(pending) if pending is not None else None
+    # Empty, not "0": a balance the response never carried is not a balance of
+    # zero, and showing zero for it reads as «денег нет» instead of «не нашёл».
+    bal_str = f"{balance:.2f}".rstrip("0").rstrip(".") if balance is not None else ""
+    pend = _money(pending) if pending is not None else None
+    pend_str = (f"{pend:.2f}".rstrip("0").rstrip(".")) if pend else None
     return str(name), bal_str, pend_str
 
 
@@ -159,6 +226,19 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
         except Exception as e:
             if err is None:
                 err = str(e)[:200]
+
+    if balance in (None, "", "—") and raw is not None:
+        # Nothing found anywhere: say what the response actually contained, so
+        # the missing field can be named instead of guessed at.
+        await callback.message.edit_text(
+            "💰 <b>Баланс</b>\n\n"
+            "Юмаркет не прислал баланс в ответе.\n\n"
+            f"<code>{_esc(_shape(raw))[:600]}</code>\n\n"
+            "<i>Покажите это сообщение — по составу ответа будет видно, "
+            "где маркетплейс держит баланс.</i>",
+            reply_markup=_kb())
+        await callback.answer()
+        return
 
     if balance not in (None, "", "—"):
         text = (

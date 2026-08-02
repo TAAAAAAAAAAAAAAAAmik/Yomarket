@@ -375,27 +375,17 @@ class YooMarketAPI:
         # Primary: /check (same endpoint used by balance handler)
         try:
             data = await self._get("/check")
-            shop = data.get("data") or data.get("shop") or data.get("seller") or data
-            raw = None
-            for src in (shop, data):
-                if not isinstance(src, dict):
-                    continue
-                for key in ("balance", "wallet", "money", "balance_rub", "amount"):
-                    # `in` rather than a truthiness chain: a balance of 0 is a
-                    # real value, not a missing one.
-                    if key in src and src[key] not in (None, ""):
-                        raw = src[key]
-                        break
-                if raw is not None:
-                    break
-            if raw is not None:
-                try:
-                    amount = float(str(raw).replace(" ", "").replace(",", "."))
-                    return amount, f"{amount:.0f} ₽"
-                except (ValueError, TypeError):
-                    pass
+            # Shared with the balance screen: this API wraps money as
+            # {"amount": …, "currency": …} and nests the shop deeper than one
+            # level, either of which used to read as zero.
+            from handlers.balance import _MONEY_KEYS, _deep_find
+            amount = _deep_find(data, _MONEY_KEYS)
+            if amount is not None:
+                return amount, f"{amount:.0f} ₽"
         except RuntimeError:
             pass
+        except Exception as e:
+            logger.warning("Balance parse failed: %s", e)
 
         # No dedicated balance endpoint exists: the spec lists /check as the
         # only place shop data is returned. Report the shape we got instead of
