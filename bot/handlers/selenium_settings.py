@@ -1074,7 +1074,11 @@ def _restore_text(s: dict, creds=None, uid: int | None = None) -> str:
     total = int(ar.get("restored_total", 0) or 0)
     held = len([f for f in (ar.get("failures") or {}).values()
                 if float(f.get("until", 0) or 0) > _time.time()])
-    lines = ["🔄 <b>Авто-восстановление</b>\n"]
+    # The build stamp lives here on purpose: several rounds were spent reading
+    # output from a container that had not been rebuilt, and a screenshot that
+    # names its own build settles that in one glance.
+    from handlers.start import BOT_VERSION
+    lines = [f"🔄 <b>Авто-восстановление</b>  <code>{BOT_VERSION}</code>\n"]
     if uid is not None:
         # Which shop this acts on. Adding an account is not switching to it,
         # and a token from one shop paired with a panel from another is the
