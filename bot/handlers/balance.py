@@ -1025,8 +1025,12 @@ async def wd_execute(callback: CallbackQuery, api: YooMarketAPI) -> None:
     res, err = await _run_panel(uid, panel_withdraw_sync,
                                 aw.get("panel_balance_id"),
                                 aw.get("panel_action_key"), values, uid, True)
-    ok = isinstance(res, tuple) and res[0]
-    msg = res[1] if isinstance(res, tuple) else (err or "не удалось")
+    # _run_panel already unpacks (ok, payload): success gives (payload, ""),
+    # failure gives (None, reason). Re-testing for a tuple here made every
+    # outcome read as failure — a payout that went through was reported «❌ не
+    # удалось» with no reason, inviting a second attempt at real money.
+    ok = err == "" and res is not None
+    msg = str(res) if ok else (err or "панель не ответила")
     _log_withdrawal(uid, float(amount), "manual", bool(ok))
     b = InlineKeyboardBuilder()
     b.button(text="📜 История", callback_data="balance:history")
