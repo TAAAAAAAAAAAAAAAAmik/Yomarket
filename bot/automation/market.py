@@ -218,19 +218,42 @@ def fetch_offers_sync(url: str) -> tuple[bool, object]:
                   f"списков-кандидатов: {len(lists)}"}
 
 
+def _norm(s: str) -> str:
+    return re.sub(r"[^\w]+", "", str(s or "")).lower()
+
+
 def find_position(offers: list[dict], *, ad_id: str = "",
                   title: str = "", seller: str = "") -> dict | None:
-    """Our own row among the offers, matched by id, then title, then shop.
+    """Our own row among the offers: by id, then by shop, then by title.
 
-    Id first because it cannot be ambiguous; the title is the practical
-    fallback, since the storefront does not always carry the seller ad id.
+    The order matters and is not the obvious one. An offers list is every
+    seller's copy of the *same* product, so the titles are near-identical —
+    matching on the title first lands on whoever happens to be at the top,
+    which reads as "you are 1st" no matter where the listing really sits. The
+    shop name is what separates our row from the others; the title is only a
+    tie-breaker within it, and a last resort when the page carries no seller.
     """
     if ad_id:
         for row in offers:
             if row["id"] and str(row["id"]) == str(ad_id):
                 return row
-    def _norm(s: str) -> str:
-        return re.sub(r"[^\w]+", "", str(s or "")).lower()
+
+    if seller:
+        want = _norm(seller)
+        mine = [r for r in offers if want and want in _norm(r["seller"])]
+        if len(mine) == 1:
+            return mine[0]
+        if mine:
+            # Several listings from the same shop on one page — the title picks
+            # out which one is being watched.
+            if title:
+                exact = [r for r in mine if _norm(r["title"]) == _norm(title)]
+                if exact:
+                    return exact[0]
+                loose = [r for r in mine if _norm(title) in _norm(r["title"])]
+                if loose:
+                    return loose[0]
+            return mine[0]
 
     if title:
         want = _norm(title)
@@ -239,11 +262,6 @@ def find_position(offers: list[dict], *, ad_id: str = "",
                 return row
         for row in offers:                      # decorated titles differ a bit
             if want and want in _norm(row["title"]):
-                return row
-    if seller:
-        want = _norm(seller)
-        for row in offers:
-            if want and want in _norm(row["seller"]):
                 return row
     return None
 

@@ -273,6 +273,20 @@ def _money(value) -> str:
         return str(value)
 
 
+def _watch_name(w: dict) -> str:
+    """What to call a watched listing in a notification."""
+    title = str(w.get("title") or "").strip()
+    if title:
+        return title[:40]
+    url = str(w.get("url") or "").split("://")[-1]
+    return (url[:34] + "…") if len(url) > 35 else (url or "товар")
+
+
+def _promo_price(settings: dict) -> int:
+    from handlers.selenium_settings import promo_price
+    return promo_price(settings)
+
+
 def _card(title: str, body: list[str], footer: str = "") -> str:
     # Empty strings are deliberate spacing, so only None is dropped — filtering
     # on truthiness collapsed the blank lines that separate the blocks.
@@ -1303,89 +1317,133 @@ class TaskManager:
             msg += f" · к оплате {spent} ₽"
         return count, msg
 
-    async def _check_position(self, user_id: int, settings: dict, now: float,
-                              api: YooMarketAPI | None = None) -> str:
-        """Watch where the shop sits in the offers list; act when it slips.
+    async def _promote_one(self, user_id: int, item_id: str,
+                           settings: dict) -> tuple[bool, str]:
+        """Pay for one «Премиум» promotion of one listing.
 
-        Returns a notification, or '' to stay quiet. Promotion costs money, so
-        falling below the threshold only *promotes* when the seller switched
-        that on explicitly — otherwise it just says so, which is the safe
-        default for a trigger that spends.
+        The position trigger fires for a single listing, so it must pay for
+        that one. Routing it through the shop-wide bump would charge for every
+        selected listing because one of them slipped — the difference between
+        one tariff and thirty.
         """
-        pp = settings.setdefault("promo_position", {})
-        url = (pp.get("url") or "").strip()
-        if not url:
-            return ""
-        interval = float(pp.get("interval_hours", 1) or 1)
-        if (now - float(pp.get("last_check", 0) or 0)) / 3600 < interval:
-            return ""
+        from automation.panel import panel_bump_item_sync
+        from handlers.selenium_settings import promo_params
+        from storage import get_panel_creds
 
-        from automation.market import cheapest, fetch_offers_sync, find_position
-        from storage import get_shop_name
-
+        creds = get_panel_creds(user_id)
+        if not creds or not creds.get("cookies"):
+            return False, "нужен вход в панель"
+        params = promo_params(settings)
+        if not params:
+            return False, "не выбран тариф «Премиум»"
+        if not item_id:
+            return False, "товар не привязан к наблюдению"
         loop = asyncio.get_event_loop()
         try:
-            ok, res = await asyncio.wait_for(
-                loop.run_in_executor(None, fetch_offers_sync, url), timeout=60)
+            ok, msg = await asyncio.wait_for(
+                loop.run_in_executor(None, panel_bump_item_sync,
+                                     creds["cookies"], str(item_id), user_id,
+                                     True, params),
+                timeout=120,
+            )
+        except asyncio.TimeoutError:
+            return False, "панель не ответила вовремя"
         except Exception as e:
-            logger.warning("position check for %s: %s", user_id, e)
-            return ""
-        pp["last_check"] = now
-        if not ok:
-            return ""                       # page unreadable; stay quiet
+            return False, str(e)[:120]
+        return bool(ok), str(msg)
 
-        offers = res["offers"]
+    async def _check_position(self, user_id: int, settings: dict, now: float,
+                              api: YooMarketAPI | None = None) -> str:
+        """Walk the watched listings; act on the ones that slipped.
+
+        Returns a notification, or '' to stay quiet. One watch per listing:
+        a shop does not have "a position", each listing has its own, on its own
+        page. Promotion costs money, so a slip only *pays* when the seller
+        switched that on — and even then the cooldown and the daily cap in
+        automation/position.py stand between a bad day and an empty card.
+        """
+        from automation.market import fetch_offers_sync
+        from automation.position import (evaluate, is_due, note_promotion,
+                                         watches)
+        from storage import get_shop_name
+
+        pp = settings.setdefault("promo_position", {})
+        ws = watches(pp)
+        if not ws:
+            return ""
         shop = get_shop_name(user_id) or ""
-        mine = find_position(offers, seller=shop) if shop else None
-        if not mine:
-            return ""                       # cannot locate ourselves — no alarm
+        loop = asyncio.get_event_loop()
+        blocks: list[str] = []
+        checked = 0
 
-        pos = int(mine["pos"])
-        prev = int(pp.get("last_pos", 0) or 0)
-        pp["last_pos"] = pos
-        threshold = int(pp.get("max_position", 3) or 3)
+        for w in ws:
+            if not is_due(w, pp, now):
+                continue
+            url = (w.get("url") or "").strip()
+            if not url:
+                continue
+            checked += 1
+            try:
+                ok, res = await asyncio.wait_for(
+                    loop.run_in_executor(None, fetch_offers_sync, url),
+                    timeout=60)
+            except Exception as e:
+                logger.warning("position check for %s: %s", user_id, e)
+                ok, res = False, str(e)[:120]
+            if not ok:
+                # A page that will not load says nothing about the position, so
+                # nothing is claimed and nothing is paid. Repeated failures are
+                # reported once — silence would let a dead watch look healthy.
+                w["last_check"] = now
+                w["fails"] = int(w.get("fails") or 0) + 1
+                if w["fails"] == 3:
+                    blocks.append(
+                        f"⚠️ <b>{_esc(_watch_name(w))}</b>\n"
+                        f"Страница не читается 3 проверки подряд: "
+                        f"{_esc(str(res))[:120]}")
+                continue
+            w["fails"] = 0
 
-        body: list[str] = []
-        slipped = pos > threshold
-        # Alert once per slip, and again only if it gets worse — a listing
-        # sitting at 7th place should not shout every hour.
-        alerted_at = int(pp.get("last_alert_pos", 0) or 0)
-        if slipped and (pos > alerted_at or alerted_at == 0):
-            pp["last_alert_pos"] = pos
-            body.append(f"📉 Опустились на <b>{pos}-е место</b>"
-                        + (f" (было {prev})" if prev and prev != pos else ""))
-            body.append(f"🎯 Порог: не ниже {threshold}-го")
-        elif not slipped and alerted_at:
-            pp["last_alert_pos"] = 0
-            body.append(f"📈 Вернулись на <b>{pos}-е место</b> — порог соблюдён")
+            verdict = evaluate(w, res["offers"], shop=shop, pp=pp, now=now)
+            lines = list(verdict.lines)
+            if verdict.promote:
+                ok_paid, msg = await self._promote_one(
+                    user_id, str(w.get("item_id") or ""), settings)
+                if ok_paid:
+                    note_promotion(w, now)
+                    w.pop("last_fail", None)
+                    price = _promo_price(settings)
+                    lines.append("⭐ Поднял" + (f" · {price} ₽" if price else "")
+                                 + f": {_esc(str(msg))[:160]}")
+                else:
+                    # A listing that stays down retries every hour, and a
+                    # misconfiguration — no tariff, nothing bound — fails the
+                    # same way every time. Say it once, and again only when the
+                    # answer changes.
+                    reason = str(msg)[:160]
+                    if w.get("last_fail") != reason:
+                        w["last_fail"] = reason
+                        lines.append(f"⚠️ Не поднял: {_esc(reason)}")
+            if lines:
+                head = f"<b>{_esc(_watch_name(w))}</b>"
+                if verdict.found:
+                    head += f" — {verdict.pos} место"
+                blocks.append(head + "\n" + "\n".join(lines))
 
-        # Undercutting: the cheapest offer on the page against ours
-        low = cheapest(offers)
-        if pp.get("undercut_notify", True) and low is not None and mine["price"]:
-            if low < float(mine["price"]):
-                body.append("")
-                body.append(f"💰 Дешевле всех: <b>{low:.0f} ₽</b>, "
-                            f"у вас {float(mine['price']):.0f} ₽")
-        floor = float(pp.get("min_price", 0) or 0)
-        if floor and low is not None and low < floor:
-            body.append(f"⚠️ Цена на витрине упала ниже {floor:.0f} ₽")
-
-        if not body:
+        if not blocks:
             return ""
-
-        promoted = ""
-        if slipped and pp.get("auto_promote"):
-            from handlers.selenium_settings import promo_params
-            if promo_params(settings):
-                count, msg = await self._panel_bump(user_id, api)
-                promoted = (f"\n⭐ Поднятие: {_esc(str(msg))[:120]}"
-                            if count or msg else "")
-            else:
-                promoted = "\n⚠️ Не поднял: не выбран тариф «Премиум»"
-
-        return _card("📍 <b>ПОЗИЦИЯ НА ВИТРИНЕ</b>", body,
-                     f"🏪 {_esc(shop)}   ·   предложений: {len(offers)}"
-                     + promoted)
+        # An over-long send fails whole — including the part that says money was
+        # spent — so the message is kept well inside Telegram's 4096 as the
+        # watch list grows. Whole blocks are dropped, never a cut mid-tag.
+        kept, used = [], 0
+        for block in blocks:
+            if used + len(block) > 2800 and kept:
+                kept.append(f"…и ещё {len(blocks) - len(kept)} — /pos_debug")
+                break
+            kept.append(block)
+            used += len(block)
+        return _card("📍 <b>ПОЗИЦИЯ НА ВИТРИНЕ</b>", kept,
+                     f"🏪 {_esc(shop)}   ·   проверено: {checked}")
 
     async def _auto_withdraw(self, user_id: int, api: YooMarketAPI,
                              settings: dict, now: float) -> str:

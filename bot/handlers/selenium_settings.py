@@ -27,6 +27,10 @@ class SeleniumState(StatesGroup):
     waiting_pos_url = State()
     waiting_pos_threshold = State()
     waiting_pos_interval = State()
+    waiting_pos_price = State()
+    waiting_pos_guard = State()
+    waiting_pos_cooldown = State()
+    waiting_pos_limit = State()
     waiting_sched_times = State()
     waiting_sched_ceiling = State()
 
@@ -170,8 +174,9 @@ def _bump_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
                   f"{('по времени · ' + ', '.join(times[:3])) if (bs.get('enabled') and times) else 'выкл'}",
              callback_data="sched:menu")
     pp = s.get("promo_position", {})
+    n_watch = len(pp.get("watches") or ([1] if pp.get("url") else []))
     b.button(text=f"📍 По позиции: "
-                  f"{'не ниже ' + str(pp.get('max_position', 3)) if pp.get('enabled') else 'выкл'}",
+                  f"{f'следит за {n_watch}' if pp.get('enabled') and n_watch else 'выкл'}",
              callback_data="pos:menu")
     b.button(text=f"⏱ Интервал: {interval} ч", callback_data="selenium:bump:set_interval")
     b.button(text="⬅️ К объявлениям", callback_data="menu:ads")
@@ -367,172 +372,718 @@ async def sched_ceiling_save(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Positional trigger: promote when the listing slips down the offers list
+# Positional trigger: promote when a listing slips down the offers list
 #
 # Position is not in the seller API — it exists only on the public storefront,
-# so the page the buyer sees is read and our row located in it. Slipping below
-# the threshold only *promotes* when that is switched on explicitly: the trigger
-# spends money, so the default is to warn.
+# so the page a buyer sees is read and our row located in it. One watch per
+# listing: a shop with thirty items does not have one position, it has thirty,
+# and a single page could never speak for all of them.
+#
+# The rules themselves live in automation/position.py, away from Telegram, and
+# are covered by bot/tests/test_position.py. This module is the screen.
 # ---------------------------------------------------------------------------
 
+def _pos_settings(uid: int) -> tuple[dict, dict, list]:
+    """(settings, promo_position, watches) with the legacy config migrated."""
+    from automation.position import watches as _watches
+    s = get_settings(uid)
+    pp = s.setdefault("promo_position", {})
+    return s, pp, _watches(pp)
+
+
+def _watch_label(w: dict, idx: int) -> str:
+    name = (w.get("title") or "").strip() or _short_url(w.get("url", ""))
+    pos = int(w.get("last_pos") or 0)
+    where = f"{pos} место" if pos else "—"
+    return f"{idx + 1}. {name[:22]} · {where}"
+
+
+def _short_url(url: str) -> str:
+    u = str(url or "").split("://")[-1]
+    return (u[:34] + "…") if len(u) > 35 else u
+
+
 def _pos_text(s: dict) -> str:
+    from automation.position import daily_limit, cooldown_hours, watches
     pp = s.get("promo_position", {})
-    on = pp.get("enabled", False)
-    url = pp.get("url") or ""
+    ws = watches(pp)
     lines = [
         "📍 <b>Поднятие по позиции</b>\n",
-        f"Статус: {_st(on)}",
-        f"Порог: не ниже <b>{pp.get('max_position', 3)}</b>-го места",
+        f"Статус: {_st(pp.get('enabled', False))}",
         f"Проверка: каждые {pp.get('interval_hours', 1)} ч",
-        f"Страница: {('<code>' + _esc(url[:60]) + '</code>') if url else '<b>не задана</b>'}",
+        f"Товаров под наблюдением: <b>{len(ws)}</b>",
+        f"Режим: {'⭐ поднимать автоматически' if pp.get('auto_promote') else '🔔 только предупреждать'}",
     ]
-    if pp.get("last_pos"):
-        lines.append(f"Последняя позиция: <b>{pp['last_pos']}</b>")
-    lines.append(f"Поднимать автоматически: "
-                 f"{'✅ да' if pp.get('auto_promote') else '❌ только предупреждать'}")
-    lines.append(f"Сообщать, если кто-то дешевле: "
-                 f"{'✅' if pp.get('undercut_notify', True) else '❌'}")
-    if pp.get("min_price"):
-        lines.append(f"Тревога, если цена ниже: <b>{pp['min_price']:.0f} ₽</b>")
+    if pp.get("auto_promote"):
+        price = promo_price(s)
+        lines.append(f"Пауза между поднятиями: {cooldown_hours(pp):.0f} ч")
+        cap = daily_limit(pp)
+        lines.append("Лимит в сутки на товар: "
+                     + (f"<b>{cap}</b>" + (f" (до {cap * price} ₽)" if price else "")
+                        if cap else "без лимита"))
+        if not promo_params(s):
+            lines.append("⚠️ <b>Тариф «Премиум» не выбран</b> — поднять не смогу")
+    if ws:
+        lines.append("")
+        for i, w in enumerate(ws):
+            thr = int(w.get("max_position") or 3)
+            pos = int(w.get("last_pos") or 0)
+            if not pos:
+                mark = "⚪"
+            elif pos <= thr:
+                mark = "🟢"
+            else:
+                mark = "🔴"
+            name = _esc((w.get("title") or "").strip() or _short_url(w.get("url", "")))
+            row = f"{mark} <b>{name[:30]}</b> — "
+            row += f"{pos} место" if pos else "ещё не проверял"
+            row += f", порог {thr}"
+            if w.get("alarmed"):
+                row += " ⚠️ не нахожу на странице"
+            lines.append(row)
+    else:
+        lines.append("")
+        lines.append("Пока ничего не отслеживается. Добавьте товар: пришлите "
+                     "адрес страницы, где виден <b>список предложений</b> — "
+                     "именно по нему считается место.")
     lines.append("")
     lines.append("<i>Позиции нет в API — бот читает публичную витрину и ищет "
-                 "ваш магазин в списке предложений.</i>")
-    if pp.get("auto_promote"):
-        lines.append("⚠️ <b>Поднятие платное</b> — сработает при падении ниже порога.")
+                 "в списке ваш магазин.</i>")
     return "\n".join(lines)
 
 
 def _pos_kb(s: dict) -> InlineKeyboardMarkup:
+    from automation.position import MAX_WATCHES, watches
     pp = s.get("promo_position", {})
+    ws = watches(pp)
     on = pp.get("enabled", False)
     b = InlineKeyboardBuilder()
+    for i, w in enumerate(ws[:MAX_WATCHES]):
+        b.button(text=_watch_label(w, i), callback_data=f"pos:w:{i}")
+    if len(ws) < MAX_WATCHES:
+        b.button(text="➕ Добавить товар", callback_data="pos:add")
     b.button(text="🔴 Выключить" if on else "🟢 Включить", callback_data="pos:toggle")
-    b.button(text="🔗 Страница витрины", callback_data="pos:url")
-    b.button(text=f"🎯 Порог: {pp.get('max_position', 3)}", callback_data="pos:threshold")
+    b.button(text=("⭐ Режим: поднимать" if pp.get("auto_promote")
+                   else "🔔 Режим: сигнал"), callback_data="pos:auto")
     b.button(text=f"⏱ Проверка: {pp.get('interval_hours', 1)} ч",
              callback_data="pos:interval")
-    b.button(text=("⭐ Поднимать: авто" if pp.get("auto_promote")
-                   else "🔔 Поднимать: только сигнал"),
-             callback_data="pos:auto")
     b.button(text=("💰 Дешевле: сообщать" if pp.get("undercut_notify", True)
                    else "💰 Дешевле: молчать"), callback_data="pos:undercut")
-    b.button(text="🔍 Проверить сейчас", callback_data="pos:check")
+    if pp.get("auto_promote"):
+        b.button(text=f"⏸ Пауза: {pp.get('cooldown_hours', 6):.0f} ч",
+                 callback_data="pos:cooldown")
+        b.button(text=f"🧾 Лимит/сутки: {pp.get('daily_limit', 3) or '∞'}",
+                 callback_data="pos:limit")
+    if ws:
+        b.button(text="🔍 Проверить все", callback_data="pos:checkall")
     b.button(text="⬅️ К продвижению", callback_data="selenium:bump:menu")
-    b.adjust(2, 2, 1, 1, 1, 1)
+    # One watch per row so its name and place stay readable; the settings pair
+    # up below them.
+    rows = [1] * len(ws[:MAX_WATCHES])
+    rows += [1] if len(ws) < MAX_WATCHES else []
+    rows += [2, 2] + ([2] if pp.get("auto_promote") else [])
+    rows += ([1] if ws else []) + [1]
+    b.adjust(*rows)
     return b.as_markup()
+
+
+async def _pos_screen(callback: CallbackQuery) -> None:
+    s, _pp, _ws = _pos_settings(callback.from_user.id)
+    save_settings(callback.from_user.id, s)      # persist a migration, if any
+    await _pos_edit(callback.message, _pos_text(s), _pos_kb(s))
+
+
+async def _pos_edit(message, text: str, kb: InlineKeyboardMarkup) -> None:
+    """Edit, and fall back to a fresh message when Telegram refuses.
+
+    "message is not modified" comes back for a screen redrawn unchanged — the
+    normal case for a check that found nothing new — and an unhandled one used
+    to look like the button did nothing.
+    """
+    try:
+        await message.edit_text(text[:4000], reply_markup=kb)
+    except Exception as e:
+        if "not modified" in str(e).lower():
+            return
+        try:
+            await message.answer(text[:4000], reply_markup=kb)
+        except Exception:
+            logger.warning("position screen: %s", e)
 
 
 @router.callback_query(F.data == "pos:menu")
 async def pos_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    s = get_settings(callback.from_user.id)
-    await callback.message.edit_text(_pos_text(s), reply_markup=_pos_kb(s))
+    await _pos_screen(callback)
     await callback.answer()
 
 
 @router.callback_query(F.data == "pos:toggle")
 async def pos_toggle(callback: CallbackQuery) -> None:
-    s = get_settings(callback.from_user.id)
-    pp = s.setdefault("promo_position", {})
+    s, pp, ws = _pos_settings(callback.from_user.id)
     turning_on = not pp.get("enabled", False)
-    if turning_on and not (pp.get("url") or "").strip():
-        await callback.answer("Сначала укажите страницу витрины", show_alert=True)
+    if turning_on and not ws:
+        await callback.answer("Сначала добавьте товар для наблюдения",
+                              show_alert=True)
         return
     pp["enabled"] = turning_on
     if turning_on:
-        pp["last_check"] = 0          # check on the next tick, not in an hour
+        for w in ws:
+            w["last_check"] = 0          # check on the next tick, not in an hour
     save_settings(callback.from_user.id, s)
-    await callback.message.edit_text(_pos_text(s), reply_markup=_pos_kb(s))
+    await _pos_edit(callback.message, _pos_text(s), _pos_kb(s))
     await callback.answer("Включено" if turning_on else "Выключено")
 
 
 @router.callback_query(F.data == "pos:auto")
 async def pos_auto(callback: CallbackQuery) -> None:
-    s = get_settings(callback.from_user.id)
-    pp = s.setdefault("promo_position", {})
+    s, pp, _ws = _pos_settings(callback.from_user.id)
     pp["auto_promote"] = not pp.get("auto_promote", False)
     save_settings(callback.from_user.id, s)
-    await callback.answer(
-        "Буду поднимать автоматически — это тратит деньги при каждом падении"
-        if pp["auto_promote"] else "Только предупреждаю, деньги не трачу",
-        show_alert=True)
-    await callback.message.edit_text(_pos_text(s), reply_markup=_pos_kb(s))
+    if pp["auto_promote"] and not promo_params(s):
+        await callback.answer(
+            "Включено, но тариф «Премиум» не выбран — поднять не смогу. "
+            "Настройте тариф в «Премиум продвижении».", show_alert=True)
+    else:
+        await callback.answer(
+            "Буду поднимать автоматически — каждое поднятие платное"
+            if pp["auto_promote"] else "Только предупреждаю, деньги не трачу",
+            show_alert=True)
+    await _pos_edit(callback.message, _pos_text(s), _pos_kb(s))
 
 
 @router.callback_query(F.data == "pos:undercut")
 async def pos_undercut(callback: CallbackQuery) -> None:
-    s = get_settings(callback.from_user.id)
-    pp = s.setdefault("promo_position", {})
+    s, pp, _ws = _pos_settings(callback.from_user.id)
     pp["undercut_notify"] = not pp.get("undercut_notify", True)
     save_settings(callback.from_user.id, s)
-    await callback.message.edit_text(_pos_text(s), reply_markup=_pos_kb(s))
+    await _pos_edit(callback.message, _pos_text(s), _pos_kb(s))
     await callback.answer()
 
 
-@router.callback_query(F.data == "pos:url")
-async def pos_url_start(callback: CallbackQuery, state: FSMContext) -> None:
+# --- adding a watch --------------------------------------------------------
+
+@router.callback_query(F.data == "pos:add")
+async def pos_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SeleniumState.waiting_pos_url)
     await callback.message.edit_text(
-        "🔗 <b>Страница витрины</b>\n\n"
-        "Откройте свой товар как покупатель — на странице, где виден "
-        "<b>список предложений</b> — и пришлите её адрес.\n\n"
-        "<i>Именно по этому списку считается позиция.</i>",
+        "🔗 <b>Какую страницу смотреть</b>\n\n"
+        "Откройте свой товар так, как его видит покупатель — на странице, где "
+        "виден <b>список предложений</b> от разных продавцов — и пришлите её "
+        "адрес.\n\n"
+        "<i>Место считается именно по этому списку. Для каждого товара нужна "
+        "своя страница.</i>",
         reply_markup=_cancel_kb("pos:menu"))
     await callback.answer()
 
 
 @router.message(SeleniumState.waiting_pos_url)
 async def pos_url_save(message: Message, state: FSMContext) -> None:
+    from automation.position import MAX_WATCHES, new_watch, watches
+
     url = (message.text or "").strip()
-    if not url.startswith("http"):
+    if not url.lower().startswith("http"):
         await message.answer("❌ Пришлите полный адрес, начиная с https://")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
-    s.setdefault("promo_position", {})["url"] = url
+    pp = s.setdefault("promo_position", {})
+    ws = watches(pp)
+    if len(ws) >= MAX_WATCHES:
+        await message.answer(f"❌ Больше {MAX_WATCHES} товаров не отслеживаю")
+        return
+    if any((w.get("url") or "").strip() == url for w in ws):
+        await message.answer("ℹ️ Эта страница уже отслеживается",
+                             reply_markup=_pos_kb(s))
+        return
+    ws.append(new_watch(url))
+    pp["watches"] = ws
     save_settings(message.from_user.id, s)
-    await message.answer(_pos_text(s), reply_markup=_pos_kb(s))
+
+    idx = len(ws) - 1
+    note = await _pos_probe(message.from_user.id, idx, message)
+    s = get_settings(message.from_user.id)
+    await message.answer(_watch_text(s, idx, note), reply_markup=_watch_kb(s, idx))
 
 
-@router.callback_query(F.data == "pos:threshold")
-async def pos_threshold_start(callback: CallbackQuery, state: FSMContext) -> None:
-    cur = get_settings(callback.from_user.id).get(
-        "promo_position", {}).get("max_position", 3)
-    await state.set_state(SeleniumState.waiting_pos_threshold)
-    await callback.message.edit_text(
-        f"🎯 <b>Порог позиции</b>\n\nСейчас: не ниже <b>{cur}</b>-го места\n\n"
-        f"Пришлите число: при падении ниже этого места бот сработает.",
-        reply_markup=_cancel_kb("pos:menu"))
+async def _pos_probe(uid: int, idx: int, message=None) -> str:
+    """Read the page once and try to recognise our own row.
+
+    Done at the moment the page is added, because a watch that cannot find its
+    listing is useless and the seller should learn that now — not from silence
+    a week later. The matched title is remembered: it is what tells two
+    listings of the same shop apart on later checks.
+    """
+    import asyncio
+
+    from automation.market import fetch_offers_sync, find_position
+    from automation.position import watches
+    from storage import get_shop_name
+
+    s = get_settings(uid)
+    ws = watches(s.setdefault("promo_position", {}))
+    if idx >= len(ws):
+        return ""
+    w = ws[idx]
+    if message:
+        try:
+            await message.answer("⏳ Открываю страницу...")
+        except Exception:
+            pass
+    loop = asyncio.get_event_loop()
+    try:
+        ok, res = await asyncio.wait_for(
+            loop.run_in_executor(None, fetch_offers_sync, w["url"]), timeout=60)
+    except Exception as e:
+        return f"⚠️ Страница не открылась: {_esc(str(e)[:120])}"
+    if not ok:
+        return f"⚠️ {_esc(str(res)[:200])}"
+
+    offers = res["offers"]
+    shop = get_shop_name(uid) or ""
+    mine = find_position(offers, seller=shop) if shop else None
+    if not mine:
+        return (f"⚠️ Нашёл {len(offers)} предложений, но вашего магазина "
+                f"«{_esc(shop) or '—'}» среди них нет. Проверьте адрес — "
+                f"нужна страница, где ваш товар есть в списке.")
+    w["title"] = mine["title"] or w.get("title") or ""
+    # The storefront id, kept for finding this row again — NOT the panel id the
+    # paid action needs. Those are different numbers, and binding the listing
+    # in the panel is a separate, deliberate step.
+    if mine.get("id"):
+        w["market_id"] = str(mine["id"])
+    w["last_pos"] = int(mine["pos"])
+    save_settings(uid, s)
+    return (f"✅ Нашёл вас на <b>{mine['pos']}-м месте</b> из {len(offers)}"
+            + (f", цена {float(mine['price']):.0f} ₽" if mine.get("price") else ""))
+
+
+# --- one watch -------------------------------------------------------------
+
+def _watch_text(s: dict, idx: int, note: str = "") -> str:
+    from automation.position import watches
+    pp = s.get("promo_position", {})
+    ws = watches(pp)
+    if idx >= len(ws):
+        return "Наблюдение удалено."
+    w = ws[idx]
+    thr = int(w.get("max_position") or 3)
+    lines = [
+        f"📍 <b>{_esc((w.get('title') or '').strip() or 'Товар без названия')}</b>\n",
+        f"Страница: <code>{_esc(_short_url(w.get('url', '')))}</code>",
+        f"🎯 Поднимать, если место ниже <b>{thr}</b>",
+    ]
+    pos = int(w.get("last_pos") or 0)
+    when = _fmt_ts(w.get("last_check"))
+    lines.append("Последняя проверка: "
+                 + (f"<b>{pos} место</b>" + (f" · {when}" if when != "—" else "")
+                    if pos else "ещё не проверял"))
+    guard = float(w.get("undercut_guard") or 0)
+    lines.append("⛔ Не поднимать, если конкурент дешевле больше чем на: "
+                 + (f"<b>{guard:.0f} ₽</b>" if guard else "не ограничено"))
+    floor = float(w.get("min_price") or 0)
+    lines.append("⚠️ Сигнал, если цена на витрине упала ниже: "
+                 + (f"<b>{floor:.0f} ₽</b>" if floor else "не задан"))
+    if w.get("item_id"):
+        lines.append(f"Товар в панели: <code>{_esc(w['item_id'])}</code>")
+    else:
+        lines.append("Товар в панели: <b>не привязан</b> — "
+                     "поднимать нечего, привяжите")
+    if w.get("promos_today"):
+        lines.append(f"Поднятий сегодня: <b>{w['promos_today']}</b>")
+    if w.get("alarmed"):
+        lines.append("")
+        lines.append("⚠️ Товар не находится на странице несколько проверок "
+                     "подряд — проверьте адрес.")
+    if note:
+        lines.append("")
+        lines.append(note)
+    return "\n".join(lines)
+
+
+def _watch_kb(s: dict, idx: int) -> InlineKeyboardMarkup:
+    from automation.position import watches
+    ws = watches(s.get("promo_position", {}))
+    b = InlineKeyboardBuilder()
+    if idx >= len(ws):
+        b.button(text="⬅️ Назад", callback_data="pos:menu")
+        return b.as_markup()
+    w = ws[idx]
+    b.button(text=f"🎯 Порог места: {int(w.get('max_position') or 3)}",
+             callback_data=f"pos:wt:{idx}")
+    guard = float(w.get("undercut_guard") or 0)
+    b.button(text=f"⛔ Порог цены: {f'{guard:.0f} ₽' if guard else 'нет'}",
+             callback_data=f"pos:wg:{idx}")
+    floor = float(w.get("min_price") or 0)
+    b.button(text=f"⚠️ Сигнал цены: {f'{floor:.0f} ₽' if floor else 'нет'}",
+             callback_data=f"pos:wp:{idx}")
+    b.button(text=("🔗 Товар: привязан" if w.get("item_id") else "🔗 Привязать товар"),
+             callback_data=f"pos:wi:{idx}")
+    b.button(text="🔍 Проверить сейчас", callback_data=f"pos:wc:{idx}")
+    b.button(text="🗑 Удалить", callback_data=f"pos:wd:{idx}")
+    b.button(text="⬅️ К списку", callback_data="pos:menu")
+    b.adjust(2, 2, 1, 1, 1)
+    return b.as_markup()
+
+
+def _watch_at(uid: int, data: str) -> tuple[dict, dict, list, int] | None:
+    """(settings, pp, watches, idx) for a `pos:xx:<idx>` callback, or None."""
+    from automation.position import watches
+    try:
+        idx = int(str(data).split(":")[-1])
+    except ValueError:
+        return None
+    s = get_settings(uid)
+    pp = s.setdefault("promo_position", {})
+    ws = watches(pp)
+    if not 0 <= idx < len(ws):
+        return None
+    return s, pp, ws, idx
+
+
+@router.callback_query(F.data.startswith("pos:w:"))
+async def pos_watch_card(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    got = _watch_at(callback.from_user.id, callback.data)
+    if not got:
+        await callback.answer("Наблюдение не найдено", show_alert=True)
+        await _pos_screen(callback)
+        return
+    s, _pp, _ws, idx = got
+    await _pos_edit(callback.message, _watch_text(s, idx), _watch_kb(s, idx))
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pos:wd:"))
+async def pos_watch_delete(callback: CallbackQuery) -> None:
+    got = _watch_at(callback.from_user.id, callback.data)
+    if not got:
+        await callback.answer("Уже удалено")
+        await _pos_screen(callback)
+        return
+    s, pp, ws, idx = got
+    name = (ws[idx].get("title") or "").strip() or _short_url(ws[idx].get("url", ""))
+    ws.pop(idx)
+    pp["watches"] = ws
+    if not ws:
+        pp["enabled"] = False
+    save_settings(callback.from_user.id, s)
+    await callback.answer(f"Удалено: {name[:40]}")
+    await _pos_edit(callback.message, _pos_text(s), _pos_kb(s))
+
+
+@router.callback_query(F.data.startswith("pos:wc:"))
+async def pos_watch_check(callback: CallbackQuery) -> None:
+    """Read this watch's page right now. Reads only — spends nothing."""
+    got = _watch_at(callback.from_user.id, callback.data)
+    if not got:
+        await callback.answer("Наблюдение не найдено", show_alert=True)
+        return
+    _s, _pp, _ws, idx = got
+    await callback.answer("⏳ Смотрю витрину...")
+    await _pos_edit(callback.message, "⏳ Читаю список предложений...",
+                    _cancel_kb("pos:menu"))
+    text = await _pos_report(callback.from_user.id, idx)
+    s = get_settings(callback.from_user.id)
+    await _pos_edit(callback.message, text, _watch_kb(s, idx))
+
+
+async def _pos_report(uid: int, idx: int) -> str:
+    """The standings on one watched page, as the seller sees them."""
+    import asyncio
+
+    from automation.market import cheapest, fetch_offers_sync, find_position
+    from automation.position import watches
+    from storage import get_shop_name
+
+    s = get_settings(uid)
+    ws = watches(s.setdefault("promo_position", {}))
+    if idx >= len(ws):
+        return "Наблюдение удалено."
+    w = ws[idx]
+    loop = asyncio.get_event_loop()
+    try:
+        ok, res = await asyncio.wait_for(
+            loop.run_in_executor(None, fetch_offers_sync, w["url"]), timeout=60)
+    except Exception as e:
+        return f"❌ Страница не открылась: {_esc(str(e)[:200])}"
+    if not ok:
+        return f"❌ {_esc(str(res)[:400])}"
+
+    offers = res["offers"]
+    shop = get_shop_name(uid) or ""
+    mine = find_position(offers, ad_id=str(w.get("market_id") or ""),
+                         title=str(w.get("title") or ""), seller=shop)
+    thr = int(w.get("max_position") or 3)
+    lines = [f"📍 <b>{_esc((w.get('title') or 'Позиция на витрине')[:40])}</b>\n",
+             f"Предложений на странице: <b>{len(offers)}</b>"]
+    if mine:
+        w["last_pos"] = int(mine["pos"])
+        w["last_check"] = _time.time()
+        save_settings(uid, s)
+        verdict = "🟢 в пределах порога" if mine["pos"] <= thr else "🔴 ниже порога"
+        lines.append(f"Ваше место: <b>{mine['pos']}</b> из {len(offers)} "
+                     f"(порог {thr}) — {verdict}")
+        if mine["price"]:
+            lines.append(f"Ваша цена: <b>{float(mine['price']):.0f} ₽</b>")
+    else:
+        lines.append(f"❔ Не нашёл ваш товар в списке "
+                     f"(магазин «{_esc(shop) or '—'}»)")
+    others = [o for o in offers if not mine or o["pos"] != mine["pos"]]
+    low = cheapest(others or offers)
+    if low is not None:
+        lines.append(f"Дешевле всех у конкурентов: <b>{low:.0f} ₽</b>")
+    lines.append("")
+    lines.append("<b>Топ страницы:</b>")
+    for row in offers[:8]:
+        mark = "👉" if mine and row["pos"] == mine["pos"] else "  "
+        price = f"{float(row['price']):.0f} ₽" if row["price"] is not None else "—"
+        who = row["seller"][:16] or row["title"][:20]
+        lines.append(f"{mark} {row['pos']}. {price} · {_esc(who)}")
+    return "\n".join(lines)[:3800]
+
+
+@router.callback_query(F.data == "pos:checkall")
+async def pos_check_all(callback: CallbackQuery) -> None:
+    from automation.position import watches
+    s = get_settings(callback.from_user.id)
+    ws = watches(s.setdefault("promo_position", {}))
+    if not ws:
+        await callback.answer("Нечего проверять", show_alert=True)
+        return
+    await callback.answer("⏳ Проверяю...")
+    await _pos_edit(callback.message,
+                    f"⏳ Читаю витрину: 0 из {len(ws)}...", _cancel_kb("pos:menu"))
+    out: list[str] = []
+    for i, w in enumerate(ws):
+        rep = await _pos_report(callback.from_user.id, i)
+        head = (w.get("title") or "").strip() or _short_url(w.get("url", ""))
+        first = next((l for l in rep.split("\n")
+                      if "Ваше место" in l or "Не нашёл" in l or l.startswith("❌")),
+                     "—")
+        out.append(f"{i + 1}. <b>{_esc(head[:28])}</b>\n   {first}")
+    s = get_settings(callback.from_user.id)
+    await _pos_edit(callback.message,
+                    "📍 <b>Позиции сейчас</b>\n\n" + "\n".join(out)[:3600],
+                    _pos_kb(s))
+
+
+# --- binding a watch to a panel listing ------------------------------------
+
+@router.callback_query(F.data.startswith("pos:wi:"))
+async def pos_watch_item(callback: CallbackQuery) -> None:
+    """Pick which panel listing this watch promotes.
+
+    Without it the trigger can detect a slip and do nothing about it: the panel
+    action is per-listing, and the storefront id is not the panel id.
+    """
+    import asyncio
+
+    from automation.panel import panel_list_items_sync
+    from storage import get_panel_creds
+
+    got = _watch_at(callback.from_user.id, callback.data)
+    if not got:
+        await callback.answer("Наблюдение не найдено", show_alert=True)
+        return
+    _s, _pp, _ws, idx = got
+    uid = callback.from_user.id
+    items = _ITEMS_CACHE.get(uid)
+    if not items:
+        creds = get_panel_creds(uid)
+        if not creds or not creds.get("cookies"):
+            await callback.answer("⚠️ Нужен вход в панель продавца",
+                                  show_alert=True)
+            return
+        await callback.answer("⏳ Загружаю товары...")
+        await _pos_edit(callback.message, "⏳ Загружаю товары из панели...",
+                        _cancel_kb(f"pos:w:{idx}"))
+        loop = asyncio.get_event_loop()
+        ok, res = await loop.run_in_executor(
+            None, panel_list_items_sync, creds["cookies"])
+        if not ok:
+            await _pos_edit(callback.message, f"❌ {_esc(str(res)[:200])}",
+                            _cancel_kb(f"pos:w:{idx}"))
+            return
+        items = [{"id": str(i.get("id")), "title": str(i.get("title") or i.get("id"))}
+                 for i in res if i.get("id")]
+        _ITEMS_CACHE[uid] = items
+    else:
+        await callback.answer()
+
+    b = InlineKeyboardBuilder()
+    for j, it in enumerate(items[:40]):
+        b.button(text=it["title"][:36], callback_data=f"pos:wis:{idx}:{j}")
+    b.button(text="⬅️ Назад", callback_data=f"pos:w:{idx}")
+    b.adjust(1)
+    await _pos_edit(
+        callback.message,
+        "🔗 <b>Какой товар поднимать</b>\n\n"
+        "Выберите объявление из панели — именно его бот оплатит и поднимет, "
+        "когда позиция упадёт ниже порога.",
+        b.as_markup())
+
+
+@router.callback_query(F.data.startswith("pos:wis:"))
+async def pos_watch_item_set(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")
+    try:
+        idx, j = int(parts[2]), int(parts[3])
+    except (IndexError, ValueError):
+        await callback.answer("Список устарел", show_alert=True)
+        return
+    items = _ITEMS_CACHE.get(callback.from_user.id) or []
+    got = _watch_at(callback.from_user.id, f"x:{idx}")
+    if not got or j >= len(items):
+        await callback.answer("Список устарел — откройте заново", show_alert=True)
+        return
+    s, _pp, ws, idx = got
+    ws[idx]["item_id"] = items[j]["id"]
+    if not (ws[idx].get("title") or "").strip():
+        ws[idx]["title"] = items[j]["title"]
+    save_settings(callback.from_user.id, s)
+    await callback.answer(f"Привязано: {items[j]['title'][:40]}")
+    await _pos_edit(callback.message, _watch_text(s, idx), _watch_kb(s, idx))
+
+
+# --- thresholds ------------------------------------------------------------
+
+async def _ask_number(callback: CallbackQuery, state: FSMContext,
+                      st: State, idx: int, text: str) -> None:
+    await state.set_state(st)
+    await state.update_data(pos_idx=idx)
+    await _pos_edit(callback.message, text, _cancel_kb(f"pos:w:{idx}"))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pos:wt:"))
+async def pos_threshold_start(callback: CallbackQuery, state: FSMContext) -> None:
+    got = _watch_at(callback.from_user.id, callback.data)
+    if not got:
+        await callback.answer("Наблюдение не найдено", show_alert=True)
+        return
+    _s, _pp, ws, idx = got
+    await _ask_number(
+        callback, state, SeleniumState.waiting_pos_threshold, idx,
+        f"🎯 <b>Порог места</b>\n\nСейчас: не ниже "
+        f"<b>{int(ws[idx].get('max_position') or 3)}</b>-го\n\n"
+        f"Пришлите число от 1 до 100. Как только товар окажется ниже этого "
+        f"места в списке — бот сработает.")
 
 
 @router.message(SeleniumState.waiting_pos_threshold)
 async def pos_threshold_save(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
     try:
         n = int((message.text or "").strip())
         if not 1 <= n <= 100:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Нужно число от 1 до 100")
+        await message.answer("❌ Нужно целое число от 1 до 100")
         return
     await state.clear()
-    s = get_settings(message.from_user.id)
-    pp = s.setdefault("promo_position", {})
-    pp["max_position"] = n
-    pp["last_alert_pos"] = 0         # a new threshold re-arms the alert
+    got = _watch_at(message.from_user.id, f"x:{data.get('pos_idx', 0)}")
+    if not got:
+        await message.answer("Наблюдение уже удалено")
+        return
+    s, _pp, ws, idx = got
+    ws[idx]["max_position"] = n
+    ws[idx]["last_alert_pos"] = 0          # a new threshold re-arms the alert
     save_settings(message.from_user.id, s)
-    await message.answer(_pos_text(s), reply_markup=_pos_kb(s))
+    await message.answer(_watch_text(s, idx), reply_markup=_watch_kb(s, idx))
 
+
+@router.callback_query(F.data.startswith("pos:wg:"))
+async def pos_guard_start(callback: CallbackQuery, state: FSMContext) -> None:
+    got = _watch_at(callback.from_user.id, callback.data)
+    if not got:
+        await callback.answer("Наблюдение не найдено", show_alert=True)
+        return
+    _s, _pp, ws, idx = got
+    cur = float(ws[idx].get("undercut_guard") or 0)
+    await _ask_number(
+        callback, state, SeleniumState.waiting_pos_guard, idx,
+        f"⛔ <b>Порог цены</b>\n\n"
+        f"Сейчас: {f'{cur:.0f} ₽' if cur else 'не ограничено'}\n\n"
+        f"Поднятие платное, и оно бессмысленно, когда рядом стоит тот же товар "
+        f"заметно дешевле: покупатель всё равно уйдёт к нему.\n\n"
+        f"Пришлите, на сколько рублей конкурент может быть дешевле, чтобы "
+        f"поднятие всё ещё имело смысл. Больше этой разницы — бот не платит, "
+        f"а предупредит вас.\n\n"
+        f"<i>0 — снять ограничение.</i>")
+
+
+@router.message(SeleniumState.waiting_pos_guard)
+async def pos_guard_save(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    try:
+        v = float((message.text or "").replace(",", ".").replace(" ", "").strip())
+        if v < 0 or v > 1_000_000:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Нужно число от 0 до 1 000 000")
+        return
+    await state.clear()
+    got = _watch_at(message.from_user.id, f"x:{data.get('pos_idx', 0)}")
+    if not got:
+        await message.answer("Наблюдение уже удалено")
+        return
+    s, _pp, ws, idx = got
+    ws[idx]["undercut_guard"] = v
+    save_settings(message.from_user.id, s)
+    await message.answer(_watch_text(s, idx), reply_markup=_watch_kb(s, idx))
+
+
+@router.callback_query(F.data.startswith("pos:wp:"))
+async def pos_price_start(callback: CallbackQuery, state: FSMContext) -> None:
+    got = _watch_at(callback.from_user.id, callback.data)
+    if not got:
+        await callback.answer("Наблюдение не найдено", show_alert=True)
+        return
+    _s, _pp, ws, idx = got
+    cur = float(ws[idx].get("min_price") or 0)
+    await _ask_number(
+        callback, state, SeleniumState.waiting_pos_price, idx,
+        f"⚠️ <b>Сигнал по цене</b>\n\n"
+        f"Сейчас: {f'{cur:.0f} ₽' if cur else 'не задан'}\n\n"
+        f"Пришлите цену: если на витрине кто-то опустится ниже неё, бот "
+        f"сообщит — это повод пересмотреть свою.\n\n"
+        f"<i>0 — выключить сигнал.</i>")
+
+
+@router.message(SeleniumState.waiting_pos_price)
+async def pos_price_save(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    try:
+        v = float((message.text or "").replace(",", ".").replace(" ", "").strip())
+        if v < 0 or v > 10_000_000:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Нужно число от 0 до 10 000 000")
+        return
+    await state.clear()
+    got = _watch_at(message.from_user.id, f"x:{data.get('pos_idx', 0)}")
+    if not got:
+        await message.answer("Наблюдение уже удалено")
+        return
+    s, _pp, ws, idx = got
+    ws[idx]["min_price"] = v
+    save_settings(message.from_user.id, s)
+    await message.answer(_watch_text(s, idx), reply_markup=_watch_kb(s, idx))
+
+
+# --- shop-wide settings ----------------------------------------------------
 
 @router.callback_query(F.data == "pos:interval")
 async def pos_interval_start(callback: CallbackQuery, state: FSMContext) -> None:
     cur = get_settings(callback.from_user.id).get(
         "promo_position", {}).get("interval_hours", 1)
     await state.set_state(SeleniumState.waiting_pos_interval)
-    await callback.message.edit_text(
+    await _pos_edit(
+        callback.message,
         f"⏱ <b>Как часто проверять позицию</b>\n\nСейчас: {cur} ч\n\n"
-        f"Пришлите число часов (можно дробное: 0.5 — каждые полчаса):",
-        reply_markup=_cancel_kb("pos:menu"))
+        f"Пришлите число часов (можно дробное: 0.5 — каждые полчаса).",
+        _cancel_kb("pos:menu"))
     await callback.answer()
 
 
@@ -552,56 +1103,68 @@ async def pos_interval_save(message: Message, state: FSMContext) -> None:
     await message.answer(_pos_text(s), reply_markup=_pos_kb(s))
 
 
-@router.callback_query(F.data == "pos:check")
-async def pos_check_now(callback: CallbackQuery) -> None:
-    """Read the storefront right now and show the standings — spends nothing."""
-    import asyncio
+@router.callback_query(F.data == "pos:cooldown")
+async def pos_cooldown_start(callback: CallbackQuery, state: FSMContext) -> None:
+    cur = get_settings(callback.from_user.id).get(
+        "promo_position", {}).get("cooldown_hours", 6)
+    await state.set_state(SeleniumState.waiting_pos_cooldown)
+    await _pos_edit(
+        callback.message,
+        f"⏸ <b>Пауза между поднятиями</b>\n\nСейчас: {cur} ч\n\n"
+        f"Товар, упавший вниз, остаётся внизу — без паузы бот платил бы за "
+        f"него на каждой проверке. Пришлите, сколько часов ждать после "
+        f"поднятия, прежде чем поднимать этот же товар снова.",
+        _cancel_kb("pos:menu"))
+    await callback.answer()
 
-    from automation.market import cheapest, fetch_offers_sync, find_position
-    from storage import get_shop_name
 
-    s = get_settings(callback.from_user.id)
-    pp = s.get("promo_position", {})
-    url = (pp.get("url") or "").strip()
-    if not url:
-        await callback.answer("Сначала укажите страницу витрины", show_alert=True)
-        return
-    await callback.answer("⏳ Смотрю витрину...")
-    await callback.message.edit_text("⏳ Читаю список предложений...")
+@router.message(SeleniumState.waiting_pos_cooldown)
+async def pos_cooldown_save(message: Message, state: FSMContext) -> None:
     try:
-        loop = asyncio.get_event_loop()
-        ok, res = await asyncio.wait_for(
-            loop.run_in_executor(None, fetch_offers_sync, url), timeout=60)
-    except Exception as e:
-        ok, res = False, str(e)[:200]
-    if not ok:
-        await callback.message.edit_text(
-            f"❌ {_esc(str(res))[:400]}", reply_markup=_pos_kb(s))
+        h = float((message.text or "").replace(",", ".").strip())
+        if not 0 <= h <= 168:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Нужно число от 0 до 168")
         return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    s.setdefault("promo_position", {})["cooldown_hours"] = h
+    save_settings(message.from_user.id, s)
+    await message.answer(_pos_text(s), reply_markup=_pos_kb(s))
 
-    offers = res["offers"]
-    shop = get_shop_name(callback.from_user.id) or ""
-    mine = find_position(offers, seller=shop) if shop else None
-    low = cheapest(offers)
-    lines = [f"📍 <b>Позиция на витрине</b>\n",
-             f"Предложений на странице: <b>{len(offers)}</b>"]
-    if mine:
-        lines.append(f"Ваше место: <b>{mine['pos']}</b> из {len(offers)}")
-        if mine["price"]:
-            lines.append(f"Ваша цена: <b>{float(mine['price']):.0f} ₽</b>")
-    else:
-        lines.append(f"❔ Не нашёл магазин «{_esc(shop) or '—'}» в списке")
-    if low is not None:
-        lines.append(f"Минимальная цена: <b>{low:.0f} ₽</b>")
-    lines.append("")
-    lines.append("<b>Топ страницы:</b>")
-    for row in offers[:8]:
-        mark = "👉" if mine and row["pos"] == mine["pos"] else "  "
-        price = f"{float(row['price']):.0f} ₽" if row["price"] is not None else "—"
-        lines.append(f"{mark} {row['pos']}. {price} · "
-                     f"{_esc(row['seller'][:16] or row['title'][:20])}")
-    await callback.message.edit_text("\n".join(lines)[:3800],
-                                     reply_markup=_pos_kb(s))
+
+@router.callback_query(F.data == "pos:limit")
+async def pos_limit_start(callback: CallbackQuery, state: FSMContext) -> None:
+    s = get_settings(callback.from_user.id)
+    cur = s.get("promo_position", {}).get("daily_limit", 3)
+    price = promo_price(s)
+    await state.set_state(SeleniumState.waiting_pos_limit)
+    await _pos_edit(
+        callback.message,
+        f"🧾 <b>Лимит поднятий в сутки</b>\n\n"
+        f"Сейчас: {cur if cur else 'без лимита'}"
+        + (f" (до {cur * price} ₽ на товар в день)" if cur and price else "")
+        + "\n\nСколько раз за сутки бот может оплатить поднятие <b>одного</b> "
+          "товара. Пришлите число.\n\n<i>0 — без лимита (не советую).</i>",
+        _cancel_kb("pos:menu"))
+    await callback.answer()
+
+
+@router.message(SeleniumState.waiting_pos_limit)
+async def pos_limit_save(message: Message, state: FSMContext) -> None:
+    try:
+        n = int((message.text or "").strip())
+        if not 0 <= n <= 50:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Нужно целое число от 0 до 50")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    s.setdefault("promo_position", {})["daily_limit"] = n
+    save_settings(message.from_user.id, s)
+    await message.answer(_pos_text(s), reply_markup=_pos_kb(s))
 
 
 # ---------------------------------------------------------------------------

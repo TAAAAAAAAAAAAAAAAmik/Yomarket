@@ -1241,6 +1241,73 @@ async def promo_debug(message: Message) -> None:
     await status.delete()
 
 
+async def _pos_debug_watches(message: Message) -> None:
+    """Dry-run every watch: position, thresholds and the decision — no charge.
+
+    `evaluate` is called on a throwaway copy of each watch so a diagnostic run
+    cannot move the real state (an alert marked as delivered, a cooldown
+    started) and make the next scheduled run behave differently.
+    """
+    import copy
+    import html as _html
+    import time as _time
+
+    from automation.market import fetch_offers_sync
+    from automation.position import evaluate, is_due, watches
+    from storage import get_settings, get_shop_name
+
+    s = get_settings(message.from_user.id)
+    pp = s.setdefault("promo_position", {})
+    ws = watches(pp)
+    if not ws:
+        await message.answer(
+            "Наблюдений нет. Добавьте товар в «Объявления» → «Премиум "
+            "продвижение» → «По позиции», либо укажите адрес:\n"
+            "<code>/pos_debug https://yoomarket.net/...</code>")
+        return
+
+    shop = get_shop_name(message.from_user.id) or ""
+    status = await message.answer(f"⏳ Проверяю {len(ws)} наблюдений...")
+    now = _time.time()
+    out = [f"магазин: {shop or '—'}",
+           f"режим: {'поднимать' if pp.get('auto_promote') else 'только сигнал'}",
+           f"интервал: {pp.get('interval_hours', 1)} ч, "
+           f"пауза: {pp.get('cooldown_hours', 6)} ч, "
+           f"лимит/сутки: {pp.get('daily_limit', 3)}", ""]
+    loop = asyncio.get_event_loop()
+    for i, w in enumerate(ws, 1):
+        out.append(f"{i}. {(w.get('title') or w.get('url'))[:46]}")
+        out.append(f"   порог места: {w.get('max_position')}, "
+                   f"порог цены: {w.get('undercut_guard') or '—'}, "
+                   f"сигнал цены: {w.get('min_price') or '—'}")
+        out.append(f"   товар в панели: {w.get('item_id') or 'НЕ ПРИВЯЗАН'}, "
+                   f"по расписанию: {'да' if is_due(w, pp, now) else 'ещё рано'}")
+        try:
+            ok, res = await asyncio.wait_for(
+                loop.run_in_executor(None, fetch_offers_sync, w.get("url", "")),
+                timeout=60)
+        except Exception as e:
+            ok, res = False, str(e)[:120]
+        if not ok:
+            out.append(f"   ❌ {res}")
+            out.append("")
+            continue
+        probe = copy.deepcopy(w)
+        v = evaluate(probe, res["offers"], shop=shop, pp=pp, now=now)
+        out.append(f"   предложений: {len(res['offers'])}, "
+                   f"наше место: {v.pos if v.found else 'не нашёл'}, "
+                   f"дешевле всех: {v.cheapest}")
+        out.append(f"   решение: {'ПОДНЯЛ БЫ' if v.promote else 'не поднимать'}"
+                   f" — {v.reason}")
+        for line in v.lines:
+            out.append(f"   сказал бы: {re.sub(r'<[^>]+>', '', line)[:90]}")
+        out.append("")
+    text = _html.escape("\n".join(out))
+    for j in range(0, min(len(text), 7000), 3500):
+        await message.answer(f"<code>{text[j:j + 3500]}</code>")
+    await status.delete()
+
+
 @router.message(Command("pos_debug"))
 async def pos_debug(message: Message) -> None:
     """/pos_debug <ссылка> — прочитать список предложений и наши позиции.
@@ -1251,10 +1318,10 @@ async def pos_debug(message: Message) -> None:
     """
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer(
-            "Укажите страницу витрины, где виден список предложений:\n"
-            "<code>/pos_debug https://yoomarket.net/...</code>\n\n"
-            "<i>Откройте свой товар как покупатель и скопируйте адрес.</i>")
+        # Without an address: replay every configured watch and show what the
+        # trigger would decide right now. Nothing is charged — this is the
+        # answer to "почему не поднял" without spending to find out.
+        await _pos_debug_watches(message)
         return
     url = parts[1].strip()
 

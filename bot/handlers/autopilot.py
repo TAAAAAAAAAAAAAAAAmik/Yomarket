@@ -48,8 +48,10 @@ def _no_tariff(s: dict) -> tuple[str, str]:
 
 
 def _no_showcase_url(s: dict) -> tuple[str, str]:
-    if not (s.get("promo_position", {}).get("url") or "").strip():
-        return "нужна ссылка на витрину", "pos:url"
+    """Position is per listing, so the watch list is what must not be empty."""
+    from automation.position import watches
+    if not watches(dict(s.get("promo_position", {}))):
+        return "добавьте товар для наблюдения", "pos:add"
     return "", ""
 
 
@@ -130,11 +132,10 @@ AUTOMATIONS: list[dict] = [
         "title": "Следить за позицией",
         "short": "Позиция",
         "path": ("promo_position", "enabled"),
-        "defaults": {("promo_position", "max_position"): 3,
-                     ("promo_position", "interval_hours"): 1},
+        "defaults": {("promo_position", "interval_hours"): 1},
         "note": lambda s: (
-            f"ниже {s.get('promo_position', {}).get('max_position', 3)} места"
-            + (" — продвигать" if s.get("promo_position", {}).get("auto_promote")
+            f"{len((s.get('promo_position') or {}).get('watches') or [])} товар(ов)"
+            + (" — поднимать" if s.get("promo_position", {}).get("auto_promote")
                else " — предупреждать")
         ),
         "warn": _no_showcase_url,
