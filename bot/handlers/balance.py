@@ -582,6 +582,24 @@ async def auto_min_save(message: Message, state: FSMContext) -> None:
     s = get_settings(message.from_user.id)
     s.setdefault("auto_withdraw", {})["min_amount"] = amount
     save_settings(message.from_user.id, s)
+
+    # The commission has a floor: on this marketplace 3%, but never below 30 ₽.
+    # At the form's own minimum of 40 ₽ that flat part takes three quarters of
+    # the payout, and a threshold set low would repeat that on every run. The
+    # figures come from the panel where they are known, so the warning matches
+    # whatever it actually charges.
+    warn = ""
+    lim = s.get("auto_withdraw", {}).get("limits") or {}
+    fee_min, fee_pct = float(lim.get("fee_min") or 30), float(lim.get("fee_pct") or 3)
+    fee = max(amount * fee_pct / 100, fee_min)
+    if amount > 0 and fee / amount >= 0.1:
+        warn = (f"\n\n⚠️ При {amount:.0f} ₽ комиссия составит {fee:.0f} ₽ — "
+                f"{fee / amount * 100:.0f}% от суммы, на руки "
+                f"{amount - fee:.0f} ₽. Комиссия не бывает меньше "
+                f"{fee_min:.0f} ₽, поэтому редкие крупные выводы выгоднее "
+                f"частых мелких.")
+    if warn:
+        await message.answer(f"✅ Порог: <b>{amount:.0f} ₽</b>{warn}")
     await message.answer(_auto_text(s), reply_markup=_auto_kb(s))
 
 
