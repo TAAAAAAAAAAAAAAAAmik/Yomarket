@@ -21,8 +21,6 @@ STATUS_EMOJI = {
 
 class AdEditState(StatesGroup):
     waiting_new_price = State()
-    waiting_bulk_percent = State()
-    waiting_bulk_description = State()
 
 
 def _status(raw: str) -> str:
@@ -109,17 +107,14 @@ def _ads_keyboard(ads: list[dict], next_cursor: str | None):
     b = InlineKeyboardBuilder()
     b.button(text="📦 Товары", callback_data="pitems:cats")
     b.button(text="➕ Добавить товар", callback_data="create_ad:start")
-    b.button(text="🛠 Управление", callback_data="pitems:list")
     b.button(text="📦 Паки", callback_data="packs:menu")
-    b.button(text="💰 Все цены", callback_data="ads:bulk_price")
-    b.button(text="📝 Описание всех", callback_data="ads:bulk_desc")
     # Listing automation lives here rather than in the auto-settings menu:
     # both act on ads, so this is where they are looked for.
     b.button(text="⭐ Премиум продвижение", callback_data="selenium:bump:menu")
     b.button(text="🔄 Авто-восстановление", callback_data="selenium:restore:menu")
     b.button(text="🔄 Обновить", callback_data="ads_load")
     b.button(text="⬅️ Меню", callback_data="menu:main")
-    b.adjust(2, 2, 2, 2, 2)
+    b.adjust(2, 2, 2, 1)
     return b.as_markup()
 
 
@@ -141,7 +136,7 @@ async def ads_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
         text = _load_error(e)
         b = InlineKeyboardBuilder()
         b.button(text="🔄 Повторить", callback_data="ads_load")
-        b.button(text="🛠 Управление (панель)", callback_data="pitems:list")
+        b.button(text="📦 Товары (панель)", callback_data="pitems:cats")
         b.button(text="➕ Добавить товар", callback_data="create_ad:start")
         b.button(text="⬅️ Главное меню", callback_data="menu:main")
         b.adjust(2, 1, 1)
@@ -391,87 +386,3 @@ async def ad_activate(callback: CallbackQuery, api: YooMarketAPI) -> None:
         await callback.message.edit_text("✅ Статус обновлён", reply_markup=back_keyboard())
 
 
-@router.callback_query(F.data == "ads:bulk_price")
-async def bulk_price_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AdEditState.waiting_bulk_percent)
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data="ads_load")
-    await callback.message.edit_text(
-        "💰 <b>Изменить цены всех товаров</b>\n\n"
-        "Введите процент изменения:\n"
-        "• <b>+10</b> — поднять на 10%\n"
-        "• <b>-15</b> — снизить на 15%\n"
-        "• <b>20</b> — поднять на 20%",
-        reply_markup=b.as_markup(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "ads:bulk_desc")
-async def bulk_desc_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AdEditState.waiting_bulk_description)
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data="ads_load")
-    await callback.message.edit_text(
-        "📝 <b>Изменить описание всех товаров</b>\n\n"
-        "Введите новый текст описания (будет применён ко всем активным товарам):",
-        reply_markup=b.as_markup(),
-    )
-    await callback.answer()
-
-
-@router.message(AdEditState.waiting_bulk_description)
-async def bulk_desc_save(message: Message, state: FSMContext, api: YooMarketAPI) -> None:
-    desc = (message.text or "").strip()
-    if not desc:
-        await message.answer("❌ Введите текст описания")
-        return
-    await state.clear()
-    await message.answer("⏳ Обновляю описания...")
-    try:
-        data = await api.get_ads()
-        ads = data.get("data") or data.get("items") or []
-        count = 0
-        for ad in ads:
-            ad_id = ad.get("id")
-            if not ad_id:
-                continue
-            try:
-                # The spec has no endpoint for editing a description:
-                # only price, publish/unpublish, items and value are exposed.
-                raise RuntimeError(
-                    "API не поддерживает изменение описания — "
-                    "отредактируйте товар в панели"
-                )
-                count += 1
-            except Exception:
-                pass
-        b = InlineKeyboardBuilder()
-        b.button(text="📦 Мои товары", callback_data="ads_load")
-        b.adjust(1)
-        await message.answer(f"✅ Описание обновлено у <b>{count}</b> товаров", reply_markup=b.as_markup())
-    except Exception as e:
-        from keyboards.main import back_keyboard
-        await message.answer(f"❌ Ошибка: {e}", reply_markup=back_keyboard())
-
-
-@router.message(AdEditState.waiting_bulk_percent)
-async def bulk_price_save(message: Message, state: FSMContext, api: YooMarketAPI) -> None:
-    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
-    try:
-        percent = float(raw)
-        if percent == 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите число, например: <b>+10</b> или <b>-15</b>")
-        return
-    await state.clear()
-    await message.answer("⏳ Обновляю цены...")
-    try:
-        count, msg = await api.bulk_change_prices(percent)
-        b = InlineKeyboardBuilder()
-        b.button(text="📦 Мои товары", callback_data="ads_load")
-        b.adjust(1)
-        await message.answer(msg, reply_markup=b.as_markup())
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}", reply_markup=back_keyboard())

@@ -745,38 +745,6 @@ class YooMarketAPI:
             payload["discount"] = discount
         return await self._patch(f"/ads/{ad_id}/price", json=payload)
 
-    async def bulk_change_prices(self, percent: float) -> tuple[int, str]:
-        """Change all ad prices by percent (+/-). Returns (count, message)."""
-        data = await self.get_ads()
-        ads = data.get("data") or data.get("items") or []
-        if not ads:
-            return 0, "ℹ️ Нет объявлений"
-        count = 0
-        last_err = ""
-        for ad in ads:
-            ad_id = ad.get("id")
-            # GET /ads returns price nested:
-            # {"amount": 149, "base_amount": 149, "currency": "RUB"}
-            raw = ad.get("price")
-            if isinstance(raw, dict):
-                raw = raw.get("amount", raw.get("base_amount", 0))
-            try:
-                current_price = int(float(str(raw or 0)))
-            except (TypeError, ValueError):
-                continue
-            if not ad_id or current_price <= 0:
-                continue
-            new_price = max(1, round(current_price * (1 + percent / 100)))
-            try:
-                await self.update_price(ad_id, new_price)
-                count += 1
-            except RuntimeError as e:
-                last_err = str(e)
-        sign = "+" if percent >= 0 else ""
-        if count:
-            return count, f"✅ Обновлено {count} товаров ({sign}{percent:.0f}%)"
-        return 0, f"⚠️ Не удалось обновить цены ({last_err})"
-
     async def get_reviews(self) -> dict:
         """Fetch reviews/feedback. Tries common endpoint names."""
         for path in ("/reviews", "/feedback", "/ratings"):

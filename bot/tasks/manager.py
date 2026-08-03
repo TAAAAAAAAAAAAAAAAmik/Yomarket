@@ -1635,7 +1635,8 @@ class TaskManager:
         # what the failures say, so a fixed configuration is not held back by
         # week-old noise.
         if any(k in str(r.get("reason", "")) for r in rep["failed"]
-               for k in ("разные магазины", "нет входа в панель")):
+               for k in ("разные магазины", "нет входа в панель",
+                         "не нашёл этот товар")):
             barred_until.clear()
         recovered = {str(r.get("status") or "").lower() for r in via_panel}
         for st in recovered:
@@ -1649,7 +1650,7 @@ class TaskManager:
             # login. Barring on that would blame the state for a configuration
             # problem — and silence restore for a week once it is fixed.
             if any(k in reason for k in ("разные магазины", "нет входа в панель",
-                                         "не отдала список")):
+                                         "не отдала список", "не нашёл этот товар")):
                 continue
             st = str(row.get("status") or "").lower()
             if st and st not in recovered:
