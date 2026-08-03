@@ -1584,6 +1584,29 @@ async def _panel_actions_for(uid: int, item_id) -> str:
         return f"ошибка: {str(e)[:90]}"
 
 
+@router.message(Command("withdraw_debug"))
+async def withdraw_debug(message: Message) -> None:
+    """Where the payout action lives — read-only, runs nothing."""
+    import asyncio as _a
+    import html as _html
+    from storage import get_panel_creds
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет входа в панель — «Настройки» → «Панель продавца»")
+        return
+    status = await message.answer("⏳ Смотрю, где живёт «Вывести»…")
+    from automation.panel import panel_withdraw_probe_sync
+    try:
+        report = await _a.wait_for(
+            _a.get_event_loop().run_in_executor(
+                None, panel_withdraw_probe_sync, creds["cookies"]),
+            timeout=120)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    await status.edit_text("💸 <b>Вывод: что предлагает панель</b>\n\n"
+                           f"<code>{_html.escape(report)[:3500]}</code>")
+
+
 @router.message(Command("panel_map"))
 async def panel_map(message: Message) -> None:
     """Every panel resource, its size and sample names — read-only.

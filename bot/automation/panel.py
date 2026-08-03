@@ -3482,3 +3482,57 @@ def panel_shop_balance_sync(cookie_string: str,
                  for f in fields if isinstance(f, dict)][:14]
         tried.append(f"{sid}: поля — {', '.join(n for n in names if n)}")
     return False, "; ".join(tried)[:400] or "магазин не прочитан"
+
+
+def panel_withdraw_probe_sync(cookie_string: str) -> str:
+    """Read-only: where the «Вывести» action actually lives.
+
+    Withdrawal asks /nova-api/balances/actions — the same resource that turned
+    out to hold no balance, which is on the shop's own record instead. This
+    reports, for the shop and for `balances`, what each answers and which
+    actions each offers, so the payout is aimed from evidence rather than from
+    the guess that was inherited. Runs nothing: it lists actions only.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    out: list[str] = []
+
+    shop_ids: list[str] = []
+    try:
+        r = session.get(f"{PANEL_URL}/nova-api/shops", params={"perPage": "20"},
+                        headers=hdrs, timeout=(6, 12), allow_redirects=False)
+        out.append(f"shops → {r.status_code}")
+        if r.status_code == 200:
+            for row in (r.json() or {}).get("resources") or []:
+                rid = row.get("id") if isinstance(row, dict) else None
+                if isinstance(rid, dict):
+                    rid = rid.get("value", rid.get("id"))
+                if rid is not None:
+                    shop_ids.append(str(rid))
+            out.append(f"магазины: {', '.join(shop_ids) or 'нет'}")
+    except Exception as e:
+        out.append(f"shops: {str(e)[:50]}")
+
+    for res, ids in (("shops", shop_ids[:2]), (_BALANCE_RES, [""])):
+        for rid in ids or [""]:
+            params = {"resources": rid} if rid else {}
+            try:
+                r = session.get(f"{PANEL_URL}/nova-api/{res}/actions",
+                                params=params, headers=hdrs,
+                                timeout=(6, 10), allow_redirects=False)
+            except Exception as e:
+                out.append(f"{res}/actions: {str(e)[:50]}")
+                continue
+            label = f"{res}{'#' + rid if rid else ''}/actions → {r.status_code}"
+            if r.status_code != 200:
+                out.append(label)
+                continue
+            try:
+                acts = (r.json() or {}).get("actions") or []
+            except Exception:
+                out.append(f"{label}: ответ не разобран")
+                continue
+            names = [f"{a.get('name') or '?'}[{a.get('uriKey') or '?'}]"
+                     for a in acts if isinstance(a, dict)]
+            out.append(f"{label}: {', '.join(names) or 'действий нет'}")
+    return "\n".join(out)[:1800]
