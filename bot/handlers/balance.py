@@ -23,6 +23,7 @@ class WithdrawState(StatesGroup):
     waiting_auto_min = State()
     waiting_req_value = State()      # a requisite field in the panel withdraw wizard
     waiting_panel_amount = State()   # amount for a manual panel withdrawal
+    waiting_option_search = State()  # filtering a long option list by name
 
 
 def _pick(*sources_and_keys) -> object | None:
@@ -790,15 +791,42 @@ async def _wd_ask_next(message, state: FSMContext) -> None:
         await state.update_data(wd_queue=queue)
 
     if f["options"]:
+        # Indices point into the full list, never into a filtered view: the
+        # answer handler resolves them against `f["options"]`.
+        query = (data.get("wd_filter") or "").strip().lower()
+        shown = [(i, o) for i, o in enumerate(f["options"])
+                 if not query or query in str(o["label"]).lower()]
+        total = len(f["options"])
+        # The SBP bank list runs well past thirty entries, and cutting it there
+        # silently hid every bank after the thirtieth — «Яндекс Банк» among
+        # them. What does not fit is reachable by name instead of lost.
+        clipped = shown[:_WD_MAX_BUTTONS]
+
         b = InlineKeyboardBuilder()
-        for i, o in enumerate(f["options"][:30]):
+        for i, o in clipped:
             b.button(text=str(o["label"])[:40], callback_data=f"wd:opt:{i}")
+        rows = [1] * len(clipped)
+        if total > len(clipped) or query:
+            b.button(text="🔎 Найти по названию", callback_data="wd:find")
+            rows.append(1)
+        if query:
+            b.button(text="↩️ Весь список", callback_data="wd:findoff")
+            rows.append(1)
         if not f["required"]:
             b.button(text="⏭ Пропустить", callback_data="wd:skip")
+            rows.append(1)
         b.button(text="❌ Отмена", callback_data="balance:auto")
-        b.adjust(1)
-        await message.edit_text(
-            f"💳 <b>{label}</b>{hint}\n\nВыберите:", reply_markup=b.as_markup())
+        rows.append(1)
+        b.adjust(*rows)
+
+        head = f"💳 <b>{label}</b>{hint}\n\n"
+        if query:
+            head += (f"По запросу «{_esc(query)}»: {len(shown)} из {total}.\n"
+                     if shown else
+                     f"По запросу «{_esc(query)}» ничего нет ({total} всего).\n")
+        elif total > len(clipped):
+            head += f"Показаны первые {len(clipped)} из {total}.\n"
+        await message.edit_text(head + "Выберите:", reply_markup=b.as_markup())
     else:
         await state.set_state(WithdrawState.waiting_req_value)
         b = InlineKeyboardBuilder()
@@ -811,6 +839,37 @@ async def _wd_ask_next(message, state: FSMContext) -> None:
             f"✍️ <b>{label}</b>{hint}\n\n"
             f"Пришлите значение{f' ({_esc(ph)})' if ph else ''}:",
             reply_markup=b.as_markup())
+
+
+_WD_MAX_BUTTONS = 30
+
+
+@router.callback_query(F.data == "wd:find")
+async def wd_find(callback: CallbackQuery, state: FSMContext) -> None:
+    """Ask for a few letters, so a long list is reachable by name."""
+    await state.set_state(WithdrawState.waiting_option_search)
+    b = InlineKeyboardBuilder()
+    b.button(text="↩️ Весь список", callback_data="wd:findoff")
+    await callback.message.edit_text(
+        "🔎 Введите часть названия — например «яндекс»:",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.message(WithdrawState.waiting_option_search)
+async def wd_find_apply(message: Message, state: FSMContext) -> None:
+    await state.update_data(wd_filter=(message.text or "").strip())
+    await state.set_state(None)
+    sent = await message.answer("⏳")
+    await _wd_ask_next(sent, state)
+
+
+@router.callback_query(F.data == "wd:findoff")
+async def wd_find_off(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(wd_filter="")
+    await state.set_state(None)
+    await _wd_ask_next(callback.message, state)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("wd:opt:"))
@@ -830,7 +889,9 @@ async def wd_pick_option(callback: CallbackQuery, state: FSMContext) -> None:
     values = dict(data.get("wd_values") or {})
     values[f["attribute"]] = o["value"]
     await callback.answer(str(o["label"])[:40])
-    await state.update_data(wd_values=values, wd_qi=qi + 1)
+    # Cleared with the step: a filter typed for the bank list must not carry
+    # over and hide most of the next field's choices.
+    await state.update_data(wd_values=values, wd_qi=qi + 1, wd_filter="")
     await _wd_ask_next(callback.message, state)
 
 
