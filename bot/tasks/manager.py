@@ -1462,10 +1462,13 @@ class TaskManager:
             from automation.panel import panel_withdraw_limits_sync
             loop = asyncio.get_event_loop()
             lim = {}
+            # With the stored payment system, so the form reshapes and states
+            # its limits — without it «Сумма» is not even visible yet.
+            chosen = {k: v for k, v in values.items() if k == "system"}
             try:
                 lim_ok, got = await asyncio.wait_for(
                     loop.run_in_executor(None, panel_withdraw_limits_sync,
-                                         creds["cookies"], balance_id),
+                                         creds["cookies"], balance_id, chosen),
                     timeout=45)
                 if lim_ok and isinstance(got, dict):
                     lim = got

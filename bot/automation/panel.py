@@ -1820,10 +1820,18 @@ def withdraw_limits(fields: list) -> dict:
     }
 
 
-def panel_withdraw_limits_sync(cookie_string: str,
-                               balance_id: str) -> tuple[bool, object]:
-    """Blocking: the payout limits the panel states for this balance."""
-    ok, got = panel_withdraw_fields_sync(cookie_string, balance_id)
+def panel_withdraw_limits_sync(cookie_string: str, balance_id: str,
+                               chosen: dict | None = None) -> tuple[bool, object]:
+    """Blocking: the payout limits the panel states for this balance.
+
+    The choice of payment system has to be passed in. Read without it, the
+    «Сумма» field comes back `visible: false` with `helpText: null` and
+    `dependsOn: {"system": null}` — the limits simply are not in the form yet.
+    They appear once the system is chosen, which is also when they can differ
+    between СБП, Steam and crypto, so reading them per-system is not merely a
+    workaround but the correct question.
+    """
+    ok, got = panel_withdraw_fields_sync(cookie_string, balance_id, chosen)
     if not ok or not isinstance(got, dict):
         return False, got
     return True, withdraw_limits(got.get("fields") or [])
