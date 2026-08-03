@@ -1786,6 +1786,49 @@ def panel_withdraw_fields_sync(
                   "balance_id": str(balance_id), "fields": out_fields}
 
 
+def withdraw_limits(fields: list) -> dict:
+    """Per-payout limits, read from the form's own help text.
+
+    The «Сумма» field explains itself: «Минимальная сумма: 40 ₽»,
+    «Максимальная сумма: 75 000 ₽», «Комиссия: 3% от суммы (мин. 30 ₽)».
+    Auto-withdraw was submitting the entire balance, which a shop holding more
+    than the per-payout ceiling can never pass — so the ceiling is read rather
+    than assumed, and read from the panel so a change to it follows along.
+
+    Returns {"min": float, "max": float, "fee_pct": float, "fee_min": float};
+    a value the text does not state comes back 0.
+    """
+    import re as _re
+    text = " ".join(str(f.get("help") or "") + " " + str(f.get("label") or "")
+                    for f in (fields or []) if isinstance(f, dict))
+    text = text.replace("\u00a0", " ")
+
+    def num(pattern: str) -> float:
+        m = _re.search(pattern, text, _re.I)
+        if not m:
+            return 0.0
+        try:
+            return float(m.group(1).replace(" ", "").replace(",", "."))
+        except (TypeError, ValueError):
+            return 0.0
+
+    return {
+        "min": num(r"минимальн\w*\s+сумм\w*\s*:?\s*([\d\s.,]+)"),
+        "max": num(r"максимальн\w*\s+сумм\w*\s*:?\s*([\d\s.,]+)"),
+        "fee_pct": num(r"комисси\w*\s*:?\s*([\d.,]+)\s*%"),
+        "fee_min": num(r"мин\.?\s*([\d\s.,]+)\s*₽"),
+    }
+
+
+def panel_withdraw_limits_sync(cookie_string: str,
+                               balance_id: str) -> tuple[bool, object]:
+    """Blocking: the payout limits the panel states for this balance."""
+    ok, got = panel_withdraw_fields_sync(cookie_string, balance_id)
+    if not ok or not isinstance(got, dict):
+        return False, got
+    return True, withdraw_limits(got.get("fields") or [])
+
+
 def _finance_resource_names(session, hdrs) -> tuple[list[str], list[str]]:
     """(all resource uriKeys the panel exposes, the finance-looking ones)."""
     keys: list[str] = []

@@ -1433,6 +1433,8 @@ class TaskManager:
         if balance < min_amount:
             return ""                                   # below threshold, quiet
 
+        sent_amount = float(int(balance))
+        more_left = False
         method = aw.get("method", "api")
         if method == "panel":
             balance_id = aw.get("panel_balance_id") or ""
@@ -1447,15 +1449,52 @@ class TaskManager:
             creds = get_panel_creds(user_id)
             if not creds or not creds.get("cookies"):
                 return "💸 Авто-вывод: нужен вход в панель продавца."
-            # The wizard stores the method and requisites without an amount —
-            # auto-withdraw takes the whole available balance.
-            values = {**values, "amount": int(balance)}
+            # The wizard stores the method and requisites without an amount.
+            # The whole balance used to be submitted, which a shop holding more
+            # than the per-payout ceiling can never pass — the panel states
+            # «Максимальная сумма: 75 000 ₽» and rejects anything above it. The
+            # limits are read from the form rather than hardcoded, so a change
+            # on their side follows along.
+            from automation.panel import panel_withdraw_limits_sync
             loop = asyncio.get_event_loop()
+            lim = {}
+            try:
+                lim_ok, got = await asyncio.wait_for(
+                    loop.run_in_executor(None, panel_withdraw_limits_sync,
+                                         creds["cookies"], balance_id),
+                    timeout=45)
+                if lim_ok and isinstance(got, dict):
+                    lim = got
+            except Exception as e:
+                logger.info("Withdraw limits for %s: %s", user_id, e)
+
+            cap = float(lim.get("max") or 0)
+            floor = float(lim.get("min") or 0)
+            amount = int(min(balance, cap) if cap else balance)
+            if floor and amount < floor:
+                return (f"💸 Авто-вывод: на счёте {balance:.0f} ₽, а минимум "
+                        f"для выплаты — {floor:.0f} ₽. Жду накопления.")
+            left = balance - amount
+
+            values = {**values, "amount": amount}
             ok, msg = await asyncio.wait_for(
                 loop.run_in_executor(None, panel_withdraw_sync,
                                      creds["cookies"], balance_id, action_key,
                                      values, user_id, True),
                 timeout=60)
+            if ok:
+                fee = max(amount * float(lim.get("fee_pct") or 0) / 100,
+                          float(lim.get("fee_min") or 0))
+                msg = (f"выведено {amount:.0f} ₽"
+                       + (f", придёт ≈{amount - fee:.0f} ₽ после комиссии"
+                          if fee else "")
+                       + (f". Остаток {left:.0f} ₽ — за раз можно не больше "
+                          f"{cap:.0f} ₽, выведу в следующий заход" if left >= 1
+                          else ""))
+                sent_amount = float(amount)
+                # More than one payout's worth is left: come back next tick
+                # instead of waiting out the interval.
+                more_left = left >= max(floor, 1)
         else:
             ok, msg = await api.withdraw_balance(min_amount)
             if not ok and "не поддерживает" in msg:
@@ -1466,10 +1505,15 @@ class TaskManager:
                 return ("💸 Авто-вывод выключен: вывод через API недоступен. "
                         "Настройте вывод через панель в «Баланс» → «Автовывод».")
 
-        aw["last_run"] = now
+        # Zero, not `now`, when a payout ceiling left money behind: the next
+        # tick should continue rather than wait out the whole interval.
+        aw["last_run"] = 0 if more_left else now
         aw["last_result"] = msg
         hist = settings.setdefault("withdrawal_history", [])
-        hist.insert(0, {"amount": float(int(balance)), "ts": now,
+        # What was actually sent, not what the balance happened to be — the
+        # ceiling means those differ, and the history is what the seller
+        # reconciles against.
+        hist.insert(0, {"amount": sent_amount, "ts": now,
                         "type": "auto",
                         "status": "requested" if ok else "failed"})
         del hist[100:]
