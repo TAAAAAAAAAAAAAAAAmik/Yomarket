@@ -704,8 +704,13 @@ def _build_update_form(fields: list[dict], overrides: dict) -> dict:
     return form
 
 
-def _get_update_fields(session, hdrs, item_id: str) -> tuple[list[dict], str]:
-    """GET update-fields for an item. Returns (fields, error)."""
+def _get_update_fields(session, hdrs, item_id: str,
+                       resource: str = "items") -> tuple[list[dict], str]:
+    """GET update-fields for an item. Returns (fields, error).
+
+    `resource` was previously read from an enclosing scope that does not exist,
+    so every call raised NameError and came back as "не получил поля товара".
+    """
     try:
         r = session.get(
             f"{PANEL_URL}/nova-api/{resource}/{item_id}/update-fields"
@@ -723,7 +728,7 @@ def _get_update_fields(session, hdrs, item_id: str) -> tuple[list[dict], str]:
         return [], str(e)[:60]
 
 
-def _put_item(session, hdrs, item_id: str, form: dict):
+def _put_item(session, hdrs, item_id: str, form: dict, resource: str = "items"):
     return session.post(
         f"{PANEL_URL}/nova-api/{resource}/{item_id}?editing=true&editMode=update",
         data=form, headers=hdrs, timeout=(6, 15),
