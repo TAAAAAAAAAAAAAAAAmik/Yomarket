@@ -1085,39 +1085,38 @@ def _restore_text(s: dict, creds=None, uid: int | None = None) -> str:
         # failure mode that costs the most time to recognise.
         from storage import get_active_account, get_panel_creds, get_shop_name
         acc = get_active_account(uid)
-        lines.append(f"🏪 Магазин: <b>{_esc(get_shop_name(uid) or '—')}</b>"
-                     + (f"  ·  аккаунт «{_esc(acc)}»" if acc else ""))
-        # Both sides on one screen: restore needs them to be the same shop, and
+        # Both sides on one line: restore needs them to be the same shop, and
         # showing only one half is what let them drift apart unnoticed.
-        panel_login = (get_panel_creds(uid) or {}).get("login") or ""
-        lines.append(f"🌐 Панель: <b>{_esc(panel_login) if panel_login else 'вход не выполнен'}</b>")
+        panel_login = (get_panel_creds(uid) or {}).get("login") or "вход не выполнен"
+        lines.append(f"🏪 {_esc(get_shop_name(uid) or '—')}"
+                     + (f" «{_esc(acc)}»" if acc else "")
+                     + f"  ·  🌐 {_esc(panel_login)}")
     lines += [
-        f"Статус: {_st(on)}",
-        f"Проверка: каждые {interval} ч",
-        f"Последний запуск: {last_run}",
-        f"Требовать остатки: {'✅ да' if ar.get('require_stock', True) else '❌ нет'}",
-        f"Сразу после продажи: {'✅ да' if ar.get('instant', True) else '❌ нет'}",
+        f"{_st(on)}  ·  каждые {interval} ч  ·  запуск: {last_run}",
+        f"📦 Остатки: {'обязательны' if ar.get('require_stock', True) else 'не важны'}"
+        f"  ·  ⚡ Сразу после продажи: "
+        f"{'да' if ar.get('instant', True) else 'нет'}",
     ]
+    tail = []
     if ar.get("last_result"):
-        lines.append(f"Прошлый результат: {ar['last_result']}")
+        tail.append(ar["last_result"])
     if total:
-        lines.append(f"Всего восстановлено: <b>{total}</b>")
+        tail.append(f"всего {total}")
     if held:
-        lines.append(f"⏸ Отложено после отказов: {held}")
+        tail.append(f"⏸ отложено {held}")
+    if tail:
+        lines.append("  ·  ".join(tail))
     # A barred status silences restore for every ad in it, so it cannot stay
     # invisible: "поднято 0" with no explanation reads as a broken feature.
     from tasks.manager import _barred_map
     barred = [st for st, until in _barred_map(ar).items() if until > _time.time()]
     if barred:
-        lines.append(f"🚫 Статусы в бане: <b>{', '.join(barred)}</b> "
-                     f"— эти объявления пропускаются")
+        lines.append(f"🚫 В бане: <b>{', '.join(barred)}</b> — пропускаются")
     lines += [
         "",
-        "Снятые с продажи объявления публикуются заново. "
-        "Распроданные пропускаются — публиковать их нечем.",
-        "⚡ С включённым «сразу после продажи» товар возвращается "
-        "в момент покупки, а не ждёт следующей проверки.",
-        "<i>Публикация уходит на модерацию, а не сразу в продажу.</i>",
+        "<i>Возвращает истёкшие и распроданные — снятые вручную Юмаркет "
+        "не отдаёт, их публикуют на сайте. Публикация идёт через "
+        "модерацию.</i>",
     ]
     return "\n".join(lines)
 
@@ -1401,13 +1400,12 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
         # ban on it is lifted: the API refusing «unpublish» is exactly what the
         # fallback is for, and barring it would silence restore for the one
         # state it exists to handle.
-        # Bans learned while the panel could not be reached are meaningless —
-        # they were never a verdict on the status. Drop them as soon as that is
-        # what the failures say, so a fixed configuration is not held back by
-        # week-old noise.
-        if any(k in str(r.get("reason", "")) for r in rep["failed"]
-               for k in ("разные магазины", "нет входа в панель",
-                         "не нашёл этот товар")):
+        # A pass that never got a verdict out of the panel — no login, or the
+        # listing not located there — says nothing about any status, so bans
+        # standing from one are dropped. Marked on the row rather than matched
+        # in its text: the text form let «в панели не нашёл этот товар» through.
+        if any(r.get("panel") in ("unreached", "not_found")
+               for r in rep["failed"]):
             barred_until.clear()
         recovered = {str(r.get("status") or "").lower() for r in done}
         for st in recovered:
@@ -1416,12 +1414,9 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
             reason = str(row.get("reason", ""))
             if "incorrect_status" not in reason:
                 continue
-            # A refusal that never reached the panel says nothing about the
-            # status: the fallback stopped at a different shop or a missing
-            # login. Barring on that would blame the state for a configuration
-            # problem — and silence restore for a week once it is fixed.
-            if any(k in reason for k in ("разные магазины", "нет входа в панель",
-                                         "не отдала список", "не нашёл этот товар")):
+            # Only the panel actually refusing the action is evidence about
+            # the status.
+            if row.get("panel") != "refused":
                 continue
             st = str(row.get("status") or "").lower()
             if st and st not in recovered:
@@ -1587,6 +1582,60 @@ async def _panel_actions_for(uid: int, item_id) -> str:
             timeout=30)
     except Exception as e:
         return f"ошибка: {str(e)[:90]}"
+
+
+@router.message(Command("withdraw_debug"))
+async def withdraw_debug(message: Message) -> None:
+    """Where the payout action lives — read-only, runs nothing."""
+    import asyncio as _a
+    import html as _html
+    from storage import get_panel_creds
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет входа в панель — «Настройки» → «Панель продавца»")
+        return
+    status = await message.answer("⏳ Смотрю, где живёт «Вывести»…")
+    from automation.panel import panel_withdraw_probe_sync
+    try:
+        report = await _a.wait_for(
+            _a.get_event_loop().run_in_executor(
+                None, panel_withdraw_probe_sync, creds["cookies"]),
+            timeout=120)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    await status.edit_text("💸 <b>Вывод: что предлагает панель</b>\n\n"
+                           f"<code>{_html.escape(report)[:3500]}</code>")
+
+
+@router.message(Command("panel_map"))
+async def panel_map(message: Message) -> None:
+    """Every panel resource, its size and sample names — read-only.
+
+    Walking resources blind and reporting a truncated trace is how three runs
+    went by without locating the listings. This prints the whole census at
+    once, and marks the resource whose rows carry the name being looked for.
+    """
+    import asyncio as _a
+    import html as _html
+    from storage import get_panel_creds
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет входа в панель — «Настройки» → «Панель продавца»")
+        return
+    needle = (message.text or "").partition(" ")[2].strip()
+    status = await message.answer("⏳ Обхожу ресурсы панели…")
+    from automation.panel import panel_resource_census_sync
+    try:
+        report = await _a.wait_for(
+            _a.get_event_loop().run_in_executor(
+                None, panel_resource_census_sync, creds["cookies"], needle),
+            timeout=180)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    await status.edit_text(
+        "🗺 <b>Ресурсы панели</b>"
+        + (f"\n<i>ищу: {_html.escape(needle)}</i>" if needle else "")
+        + f"\n\n<code>{_html.escape(report)[:3500]}</code>")
 
 
 @router.message(Command("restore_debug"))

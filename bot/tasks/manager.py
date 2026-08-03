@@ -40,6 +40,32 @@ _RESTORE_MAX_PER_PASS = 40
 _RESTORE_BARRED_TTL = 7 * 86400
 
 
+async def shop_balance(user_id: int, api) -> tuple[float, str]:
+    """The shop's balance → (amount, formatted) — «—» when it can't be read.
+
+    The Integration API has none: /check answers identity only, so every
+    caller reading it saw zero and reported it as fact. The panel holds the
+    figure, and it is the one withdrawal acts on.
+    """
+    try:
+        amount, text = await api.get_balance()
+        if text not in ("—", None):
+            return amount, text
+    except Exception:
+        pass
+    from handlers.balance import _panel_balance
+    try:
+        shown, _err = await _panel_balance(user_id)
+    except Exception:
+        shown = None
+    if shown is None:
+        return 0.0, "—"
+    try:
+        return float(shown), f"{float(shown):.0f} ₽"
+    except (TypeError, ValueError):
+        return 0.0, str(shown)
+
+
 def _barred_map(ar: dict) -> dict:
     """{status: expiry} of statuses restore should skip.
 
@@ -185,33 +211,9 @@ _DONE_STATUSES = ("confirmed", "completed", "done")
 _BACK_STATUSES = ("refunded", "cancelled", "returned")
 
 
-def _window_stats(order_details: dict, known_orders: dict,
-                  since_ts: float) -> dict:
-    """Order figures for everything first seen at/after since_ts.
-
-    Revenue counts completed orders only — an order that came in and was
-    refunded is not money earned — so «выручка» in a report means what it says.
-    Orders are dated by when the bot first saw them (seen_at): the only per-order
-    timestamp kept locally, and good enough for "today" once the bot is running.
-    """
-    orders = completed = refunded = revenue = 0
-    for oid, det in order_details.items():
-        seen = det.get("seen_at", 0)
-        if not seen or seen < since_ts:
-            continue
-        orders += 1
-        st = str(known_orders.get(oid) or known_orders.get(str(oid)) or "")
-        try:
-            price = int(float(str(det.get("price", 0))))
-        except (ValueError, TypeError):
-            price = 0
-        if st in _DONE_STATUSES:
-            completed += 1
-            revenue += price
-        elif st in _BACK_STATUSES:
-            refunded += 1
-    return {"orders": orders, "completed": completed,
-            "refunded": refunded, "revenue": revenue}
+# Windowed order figures used to live here. They now come from stats_source,
+# which reads the panel's ledger and falls back to this same local history, so
+# the report and the «Статистика» screen cannot disagree about a day.
 
 
 def _today_stats(order_details: dict, known_orders: dict) -> tuple[int, int]:
@@ -363,7 +365,8 @@ async def panel_republish(user_id: int, rows: list[dict]
     from storage import get_panel_creds
     creds = get_panel_creds(user_id)
     if not creds or not creds.get("cookies"):
-        return [], [{**r, "reason": f"{r.get('reason', '')} · нет входа в панель"}
+        return [], [{**r, "panel": "unreached",
+                     "reason": f"{r.get('reason', '')} · нет входа в панель"}
                     for r in rows]
 
     from automation.panel import (panel_find_listing_sync,
@@ -395,7 +398,10 @@ async def panel_republish(user_id: int, rows: list[dict]
             note = (f" · ⚠️ панель и токен — разные магазины ({_shop_label(user_id)})"
                     if mismatch else
                     f" · в панели не нашёл этот товар (искал: {trace})")
-            failed.append({**row, "reason": f"{row.get('reason', '')}{note}"})
+            # Not found is a verdict on where the listing is, not on its
+            # status — marked so, so it cannot bar anything.
+            failed.append({**row, "panel": "not_found",
+                           "reason": f"{row.get('reason', '')}{note}"})
             continue
         res_name, panel_id = hit
         try:
@@ -412,7 +418,7 @@ async def panel_republish(user_id: int, rows: list[dict]
             # The panel's own markup is stripped: the reason is escaped
             # downstream, so its tags would reach the seller as literal <code>.
             plain = re.sub(r"<[^>]+>", "", str(msg)).replace("\n", " ")
-            failed.append({**row,
+            failed.append({**row, "panel": "refused",
                            "reason": f"{row.get('reason', '')} · панель "
                                      f"{res_name}#{panel_id}: {plain[:300]}"})
     return done, failed
@@ -1394,7 +1400,7 @@ class TaskManager:
         min_amount = float(aw.get("min_amount", 500) or 0)
 
         try:
-            balance, balance_str = await api.get_balance()
+            balance, balance_str = await shop_balance(user_id, api)
         except Exception as e:
             logger.warning("Auto-withdraw balance for %s: %s", user_id, e)
             return ""
@@ -1403,7 +1409,13 @@ class TaskManager:
         if balance < min_amount:
             return ""                                   # below threshold, quiet
 
-        method = aw.get("method", "api")
+        sent_amount = float(int(balance))
+        more_left = False
+        # The panel is the only route: the Integration API has no withdrawal
+        # endpoint, and the screen says so. Defaulting to "api" meant the
+        # automatic run reported «не удалось получить баланс через API» — an
+        # error about a road that does not exist.
+        method = aw.get("method") or "panel"
         if method == "panel":
             balance_id = aw.get("panel_balance_id") or ""
             action_key = aw.get("panel_action_key") or ""
@@ -1417,29 +1429,79 @@ class TaskManager:
             creds = get_panel_creds(user_id)
             if not creds or not creds.get("cookies"):
                 return "💸 Авто-вывод: нужен вход в панель продавца."
-            # The wizard stores the method and requisites without an amount —
-            # auto-withdraw takes the whole available balance.
-            values = {**values, "amount": int(balance)}
+            # The wizard stores the method and requisites without an amount.
+            # The whole balance used to be submitted, which a shop holding more
+            # than the per-payout ceiling can never pass — the panel states
+            # «Максимальная сумма: 75 000 ₽» and rejects anything above it. The
+            # limits are read from the form rather than hardcoded, so a change
+            # on their side follows along.
+            from automation.panel import panel_withdraw_limits_sync
             loop = asyncio.get_event_loop()
+            lim = {}
+            # With the stored payment system, so the form reshapes and states
+            # its limits — without it «Сумма» is not even visible yet.
+            chosen = {k: v for k, v in values.items() if k == "system"}
+            try:
+                lim_ok, got = await asyncio.wait_for(
+                    loop.run_in_executor(None, panel_withdraw_limits_sync,
+                                         creds["cookies"], balance_id, chosen),
+                    timeout=45)
+                if lim_ok and isinstance(got, dict):
+                    lim = got
+            except Exception as e:
+                logger.info("Withdraw limits for %s: %s", user_id, e)
+
+            cap = float(lim.get("max") or 0)
+            floor = float(lim.get("min") or 0)
+            amount = int(min(balance, cap) if cap else balance)
+            if floor and amount < floor:
+                return (f"💸 Авто-вывод: на счёте {balance:.0f} ₽, а минимум "
+                        f"для выплаты — {floor:.0f} ₽. Жду накопления.")
+            left = balance - amount
+
+            values = {**values, "amount": amount}
             ok, msg = await asyncio.wait_for(
                 loop.run_in_executor(None, panel_withdraw_sync,
                                      creds["cookies"], balance_id, action_key,
                                      values, user_id, True),
                 timeout=60)
+            if ok:
+                fee = max(amount * float(lim.get("fee_pct") or 0) / 100,
+                          float(lim.get("fee_min") or 0))
+                # The panel's own words are kept, not replaced. Accepting a
+                # payout is not the same as paying it: the answer can be
+                # «ссылка для подтверждения реквизитов отправлена на почту»,
+                # and reporting «выведено» over that would claim money moved
+                # when it is waiting on the seller's inbox.
+                msg = (f"заявка на {amount:.0f} ₽"
+                       + (f" (придёт ≈{amount - fee:.0f} ₽ после комиссии)"
+                          if fee else "")
+                       + f" — {msg}" if msg else f"заявка на {amount:.0f} ₽")
+                if left >= 1:
+                    msg += (f". Остаток {left:.0f} ₽ — за раз не больше "
+                            f"{cap:.0f} ₽, продолжу в следующий заход")
+                sent_amount = float(amount)
+                # More than one payout's worth is left: come back next tick
+                # instead of waiting out the interval.
+                more_left = left >= max(floor, 1)
         else:
-            ok, msg = await api.withdraw_balance(min_amount)
-            if not ok and "не поддерживает" in msg:
-                # Do not repeat a doomed API attempt on every interval
-                aw["enabled"] = False
-                aw["last_run"] = now
-                aw["last_result"] = msg
-                return ("💸 Авто-вывод выключен: вывод через API недоступен. "
-                        "Настройте вывод через панель в «Баланс» → «Автовывод».")
+            # An explicitly stored "api" method from before this was known.
+            aw["enabled"] = False
+            aw["last_run"] = now
+            aw["last_result"] = "вывода через API нет"
+            return ("💸 Авто-вывод выключен: у Юмаркета нет вывода через API. "
+                    "Настройте его через панель: «Баланс» → «Автовывод» → "
+                    "«Настроить вывод через панель».")
 
-        aw["last_run"] = now
+        # Zero, not `now`, when a payout ceiling left money behind: the next
+        # tick should continue rather than wait out the whole interval.
+        aw["last_run"] = 0 if more_left else now
         aw["last_result"] = msg
         hist = settings.setdefault("withdrawal_history", [])
-        hist.insert(0, {"amount": float(int(balance)), "ts": now,
+        # What was actually sent, not what the balance happened to be — the
+        # ceiling means those differ, and the history is what the seller
+        # reconciles against.
+        hist.insert(0, {"amount": sent_amount, "ts": now,
                         "type": "auto",
                         "status": "requested" if ok else "failed"})
         del hist[100:]
@@ -1447,33 +1509,40 @@ class TaskManager:
                      [f"💰 Баланс был: <b>{balance_str}</b>", "",
                       ("✅ " if ok else "⚠️ ") + _esc(msg)])
 
-    async def _daily_report_text(self, api: YooMarketAPI, settings: dict) -> str:
+    async def _daily_report_text(self, user_id: int, api: YooMarketAPI,
+                                 settings: dict) -> str:
         """The end-of-day summary, as today's numbers rather than lifetime ones.
 
-        The old report showed the all-time completed count under a «за сегодня»
-        heading; here every figure is the day's own, with revenue net of what
-        promotion cost, so the line the seller reads is the money that actually
-        moved.
-        """
-        details = settings.get("known_order_details", {})
-        known = settings.get("known_orders", {})
-        day_start = time.time() - (time.time() % 86400)
-        st = _window_stats(details, known, day_start)
+        The figures come from the panel's own ledger, with the bot's order
+        history as the fallback: built from local tracking alone, the report
+        counted only what the poller happened to witness, so a restart or a
+        sale made before the bot came up simply vanished from the day.
 
-        bs = settings.get("bump_schedule", {})
-        spent_today = 0.0
-        if bs.get("spent_day") == datetime.now().strftime("%Y-%m-%d"):
-            spent_today = float(bs.get("spent_today", 0) or 0)
+        The balance line used to read an undefined name — the exception was
+        caught and every report went out saying «—». It is passed in now.
+        """
+        from stats_source import LOCAL, day_start, events_for, summarize
+
+        events, source, panel_err = await events_for(user_id, settings, force=True)
+        d0 = day_start()
+        st = summarize(events, d0)
+
+        spent_today = st["spend"]
+        if not spent_today and source == LOCAL:
+            bs = settings.get("bump_schedule", {})
+            if bs.get("spent_day") == datetime.now().strftime("%Y-%m-%d"):
+                spent_today = float(bs.get("spent_today", 0) or 0)
 
         try:
-            _bal, balance_str = await api.get_balance()
-        except Exception:
+            _bal, balance_str = await shop_balance(user_id, api)
+        except Exception as e:
+            logger.warning("Daily report balance for %s: %s", user_id, e)
             balance_str = "—"
 
         net = st["revenue"] - spent_today
         body = [
             f"🛒 Заказов за день: <b>{st['orders']}</b>",
-            f"✅ Выполнено: <b>{st['completed']}</b>"
+            f"✅ Продаж: <b>{st['sales']}</b>"
             + (f"   ↩️ Возвраты: {st['refunded']}" if st['refunded'] else ""),
             "",
             f"💵 Выручка: <b>{_money(st['revenue'])} ₽</b>",
@@ -1481,11 +1550,17 @@ class TaskManager:
         if spent_today:
             body.append(f"⬆️ Продвижение: −{_money(spent_today)} ₽")
             body.append(f"🟰 Чистыми: <b>{_money(net)} ₽</b>")
+        if st["payout_count"]:
+            body.append(f"💸 Выведено: <b>{_money(st['payouts'])} ₽</b>")
         body.append("")
         body.append(f"💰 Баланс сейчас: <b>{balance_str}</b>")
         if not st["orders"]:
             body.append("")
-            body.append("<i>Сегодня заказов не было.</i>")
+            body.append("<i>Сегодня продаж не было.</i>")
+        if source == LOCAL:
+            body.append("")
+            body.append("<i>Считано по истории бота — панель не ответила"
+                        + (f" ({_esc(panel_err)})" if panel_err else "") + ".</i>")
 
         return _card("📊 <b>ИТОГИ ДНЯ</b>", body,
                      f"🗓 {datetime.now().strftime('%d.%m.%Y')}")
@@ -1630,13 +1705,12 @@ class TaskManager:
         # normal case the panel fallback exists to handle — barring it would
         # switch off restore for the one state it is built around, and every
         # later pass would skip in silence.
-        # Bans learned while the panel could not be reached are meaningless —
-        # they were never a verdict on the status. Drop them as soon as that is
-        # what the failures say, so a fixed configuration is not held back by
-        # week-old noise.
-        if any(k in str(r.get("reason", "")) for r in rep["failed"]
-               for k in ("разные магазины", "нет входа в панель",
-                         "не нашёл этот товар")):
+        # A pass that never got a verdict out of the panel — no login, or the
+        # listing not located there — says nothing about any status. Bans
+        # standing from such a pass were never evidence, so they are dropped
+        # rather than holding restore back for a week after the cause is fixed.
+        if any(r.get("panel") in ("unreached", "not_found")
+               for r in rep["failed"]):
             barred_until.clear()
         recovered = {str(r.get("status") or "").lower() for r in via_panel}
         for st in recovered:
@@ -1645,12 +1719,11 @@ class TaskManager:
             reason = str(row.get("reason", ""))
             if "incorrect_status" not in reason:
                 continue
-            # A refusal that never reached the panel says nothing about the
-            # status: the fallback stopped at a different shop or a missing
-            # login. Barring on that would blame the state for a configuration
-            # problem — and silence restore for a week once it is fixed.
-            if any(k in reason for k in ("разные магазины", "нет входа в панель",
-                                         "не отдала список", "не нашёл этот товар")):
+            # Only the panel actually refusing the action is evidence about
+            # the status. Matching on the reason text was tried and let «в
+            # панели не нашёл этот товар» through, which barred `unpublish` —
+            # the one state restore exists for — over a lookup problem.
+            if row.get("panel") != "refused":
                 continue
             st = str(row.get("status") or "").lower()
             if st and st not in recovered:
@@ -1681,6 +1754,16 @@ class TaskManager:
         # so long. Reporting it only when something *else* happened defeats the
         # purpose, so a status not seen before counts as news in its own right.
         # Each distinct status is announced once, not every hour.
+        # Taken down by hand: the marketplace will not publish these back, so
+        # they are named once and then left alone. Reporting them every pass
+        # would be an hourly error about something only the seller can undo.
+        told_manual = set(str(x) for x in (ar.get("told_manual") or []))
+        manual_new = [r for r in (rep.get("manual") or [])
+                      if str(r["id"]) not in told_manual]
+        if manual_new:
+            ar["told_manual"] = sorted(told_manual
+                                       | {str(r["id"]) for r in manual_new})
+
         seen_unknown = set(ar.get("seen_unknown") or [])
         new_unknown = sorted({str(r["status"]) for r in rep.get("unknown") or []}
                              - seen_unknown)
@@ -1698,7 +1781,8 @@ class TaskManager:
                    f"отказов {len(rep['failed'])}")
         ar["last_result"] = summary
 
-        if not rep["restored"] and not fresh_failures and not new_unknown:
+        if (not rep["restored"] and not fresh_failures and not new_unknown
+                and not manual_new):
             return ""                                # nothing happened, say nothing
 
         body: list[str] = []
@@ -1717,6 +1801,23 @@ class TaskManager:
                         f"— их публиковать нечем")
             for row in rep["no_stock"][:5]:
                 body.append(f"   • {_esc(row['title'])[:34]} — {_esc(row.get('note'))}")
+        if manual_new:
+            body.append("")
+            body.append(f"✋ <b>Сняты вручную: {len(manual_new)}</b> — "
+                        f"Юмаркет возвращает в продажу только истёкшие, "
+                        f"эти нужно вернуть самому на сайте:")
+            for row in manual_new[:6]:
+                body.append(f"   • {_esc(row['title'])[:40]}")
+
+        if manual_new:
+            body.append("")
+            body.append(f"✋ <b>Сняты вручную: {len(manual_new)}</b>")
+            for row in manual_new[:6]:
+                body.append(f"   • {_esc(row['title'])[:40]}")
+            body.append("<i>Юмаркет возвращает в продажу только истёкшие "
+                        "объявления. Снятые вручную нужно вернуть самому — "
+                        "бот их больше не трогает.</i>")
+
         if new_unknown:
             affected = [r for r in rep["unknown"] if str(r["status"]) in new_unknown]
             body.append("")
@@ -1887,7 +1988,7 @@ class TaskManager:
                 threshold = float(bn.get("threshold", 1000) or 0)
                 last_bal = float(bn.get("last_notified_balance", 0.0) or 0)
                 try:
-                    balance, balance_str = await api.get_balance()
+                    balance, balance_str = await shop_balance(user_id, api)
                     # An unreadable balance must not be recorded as 0: that would
                     # re-arm the alert and fire a false "crossed the threshold"
                     # the moment a real number came back.
@@ -1915,12 +2016,16 @@ class TaskManager:
                 today_str = datetime.now().strftime("%Y-%m-%d")
                 last_day = dr.get("last_report_day", "")
                 if last_day != today_str and datetime.now().hour >= report_hour:
-                    settings["daily_report"]["last_report_day"] = today_str
                     try:
                         await self._notify(
                             user_id,
-                            await self._daily_report_text(api, settings),
+                            await self._daily_report_text(user_id, api, settings),
                             reply_markup=_balance_notify_kb())
+                        # Marked only once it actually went out. Marking first
+                        # meant a panel timeout or a failed send burned the day:
+                        # the report was recorded as delivered and never
+                        # retried, which is «статистика не приходит» exactly.
+                        settings["daily_report"]["last_report_day"] = today_str
                     except Exception as e:
                         logger.warning("Daily report error for user %s: %s", user_id, e)
 

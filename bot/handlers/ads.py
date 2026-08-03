@@ -11,12 +11,40 @@ from keyboards.main import AdCallback, PaginationCallback, back_keyboard
 
 router = Router()
 
+# What this marketplace actually reports is publish / unpublish; the older
+# names are kept because other endpoints still use them.
 STATUS_EMOJI = {
+    "publish": "🟢 В продаже",
     "active": "🟢 Активен",
+    "unpublish": "🙈 Снят с продажи",
     "inactive": "🔴 Неактивен",
+    "moderate": "🕓 На модерации",
     "blocked": "⛔ Заблокирован",
     "sold": "✅ Продан",
 }
+
+# Which statuses each action is offered for. Hardcoding "active"/"inactive"
+# meant a listing in «unpublish» — this marketplace's word for taken down —
+# got no publish button at all: the bot showed it and offered nothing to do
+# with it. The classification the restore logic already uses is reused instead
+# of a second, differently-wrong list.
+def _can_publish(raw: str) -> bool:
+    from api.yoomarket import YooMarketAPI
+    return str(raw).lower() in YooMarketAPI._DOWN
+
+
+def _manual_only(raw: str) -> bool:
+    """Taken down by hand — this marketplace only republishes expired listings.
+
+    Offering a button that is certain to answer incorrect_status is worse than
+    saying plainly that it has to be done on the site.
+    """
+    from api.yoomarket import YooMarketAPI
+    return str(raw).lower() in YooMarketAPI._MANUAL_ONLY
+
+
+def _can_unpublish(raw: str) -> bool:
+    return str(raw).lower() in ("publish", "published", "active")
 
 
 class AdEditState(StatesGroup):
@@ -190,14 +218,17 @@ async def show_ad_detail(
             f"📊 Статус: {status}\n"
             f"🏷 Категория: {category}\n"
             f"👁 Просмотры: {views}\n\n"
-            f"📝 <b>Описание:</b>\n{description}"
+            + ("ℹ️ <i>Снят с продажи вручную. Юмаркет возвращает автоматически "
+               "только истёкшие объявления — это нужно опубликовать на сайте.</i>"
+               "\n\n" if _manual_only(status_raw) else "")
+            + f"📝 <b>Описание:</b>\n{description}"
         )
         b = InlineKeyboardBuilder()
         b.button(text="✏️ Изменить цену", callback_data=f"ad_price:{callback_data.ad_id}")
-        if status_raw == "active":
-            b.button(text="⏸ Приостановить", callback_data=f"ad_pause:{callback_data.ad_id}")
-        elif status_raw in ("inactive", "disabled", "paused"):
-            b.button(text="▶️ Активировать", callback_data=f"ad_activate:{callback_data.ad_id}")
+        if _can_unpublish(status_raw):
+            b.button(text="⏸ Снять с продажи", callback_data=f"ad_pause:{callback_data.ad_id}")
+        elif _can_publish(status_raw):
+            b.button(text="▶️ Вернуть в продажу", callback_data=f"ad_activate:{callback_data.ad_id}")
         b.button(text="⬅️ К товарам", callback_data="ads_load")
         b.adjust(2, 1, 1)
         keyboard = b.as_markup()
@@ -346,8 +377,8 @@ async def ad_pause(callback: CallbackQuery, api: YooMarketAPI) -> None:
         b = InlineKeyboardBuilder()
         b.button(text="⬆️ Поднять товар", callback_data=f"ad_bump:{ad_id}")
         b.button(text="✏️ Изменить цену", callback_data=f"ad_price:{ad_id}")
-        if status_raw in ("inactive", "disabled", "paused"):
-            b.button(text="▶️ Активировать", callback_data=f"ad_activate:{ad_id}")
+        if _can_publish(status_raw):
+            b.button(text="▶️ Вернуть в продажу", callback_data=f"ad_activate:{ad_id}")
         b.button(text="⬅️ К товарам", callback_data="ads_load")
         b.adjust(1, 1, 1)
         await callback.message.edit_text(text, reply_markup=b.as_markup())
@@ -377,8 +408,8 @@ async def ad_activate(callback: CallbackQuery, api: YooMarketAPI) -> None:
         b = InlineKeyboardBuilder()
         b.button(text="⬆️ Поднять товар", callback_data=f"ad_bump:{ad_id}")
         b.button(text="✏️ Изменить цену", callback_data=f"ad_price:{ad_id}")
-        if status_raw == "active":
-            b.button(text="⏸ Приостановить", callback_data=f"ad_pause:{ad_id}")
+        if _can_unpublish(status_raw):
+            b.button(text="⏸ Снять с продажи", callback_data=f"ad_pause:{ad_id}")
         b.button(text="⬅️ К товарам", callback_data="ads_load")
         b.adjust(1, 1, 1)
         await callback.message.edit_text(text, reply_markup=b.as_markup())
