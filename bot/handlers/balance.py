@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from datetime import datetime
@@ -721,8 +722,10 @@ async def wd_pick_system(callback: CallbackQuery, state: FSMContext) -> None:
         # Fallback map if the re-read did not reshape visibility
         reqs = _fallback_reqs(str(sysopt["label"]), res)
     values = {"system": sysopt["value"]}
+    # Carried in state: the option lookup below needs the seller's panel
+    # session, and the step that performs it only has the message to hand.
     await state.update_data(wd_values=values, wd_system_label=str(sysopt["label"]),
-                            wd_queue=reqs, wd_qi=0)
+                            wd_queue=reqs, wd_qi=0, wd_uid=callback.from_user.id)
     await _wd_ask_next(callback.message, state)
 
 
@@ -757,6 +760,35 @@ async def _wd_ask_next(message, state: FSMContext) -> None:
     await state.update_data(wd_qi=qi)
     label = _esc(f["label"])
     hint = f"\n<i>{_esc(f['help'])}</i>" if f.get("help") else ""
+
+    # A dependent select ships with `options: []` until the choices it depends
+    # on are known — «Банк» arrives empty and only fills in once the payment
+    # system is picked. Without asking for them the wizard fell through to a
+    # text prompt and made the seller type a bank name by hand. The promotion
+    # flow already resolves dependent options this way; withdrawal now does too.
+    if (not f["options"] and f.get("component", "").endswith("select-field")
+            and not f.get("_looked_up")):
+        f["_looked_up"] = True
+        from storage import get_panel_creds
+        from automation.panel import panel_action_field_options_sync
+        creds = get_panel_creds(data.get("wd_uid") or message.chat.id) or {}
+        if creds.get("cookies"):
+            await message.edit_text(f"⏳ Узнаю список: {label}…")
+            try:
+                opts, _trace = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, panel_action_field_options_sync,
+                        creds["cookies"], str(data.get("wd_balance_id") or ""),
+                        str(data.get("wd_action") or ""), f["attribute"],
+                        dict(data.get("wd_values") or {}),
+                        f.get("component_key") or "", f.get("depends_on") or {}),
+                    timeout=45)
+                f["options"] = opts or []
+            except Exception as e:
+                logger.info("Withdraw options for %s: %s", f["attribute"], e)
+        queue[qi] = f
+        await state.update_data(wd_queue=queue)
+
     if f["options"]:
         b = InlineKeyboardBuilder()
         for i, o in enumerate(f["options"][:30]):
