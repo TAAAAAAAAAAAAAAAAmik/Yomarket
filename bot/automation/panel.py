@@ -3587,3 +3587,416 @@ def panel_withdraw_probe_sync(cookie_string: str) -> str:
                      for a in acts if isinstance(a, dict)]
             out.append(f"{label}: {', '.join(names) or 'действий нет'}")
     return "\n".join(out)[:1800]
+
+
+# ─────────────────────────────── статистика ───────────────────────────────
+#
+# The bot's statistics used to be built entirely out of `known_orders` — orders
+# the poller happened to see while it was running. Anything sold before the bot
+# started, or while it was down, simply did not exist, and a restarted container
+# reported an empty shop. The panel keeps the real ledger, so the figures are
+# read from there and the local history is only a fallback.
+
+_SPACES = "    "
+
+
+def _num(value) -> float | None:
+    """A signed number out of whatever the panel rendered.
+
+    Panel money arrives as text: «1 234,56 ₽», «−300 ₽», «+50». The comma is a
+    decimal separator here (the balance «605,226 ₽» is 605 roubles 226 —
+    settled with the seller), and the thousands separator is a space.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if value is None:
+        return None
+    text = _strip_html(value)
+    if not text:
+        return None
+    for ch in _SPACES:
+        text = text.replace(ch, "")
+    text = (text.replace(" ", "").replace("₽", "").replace("руб", "")
+            .replace("−", "-").replace("–", "-").replace("+", ""))
+    m = re.search(r"-?\d+(?:[.,]\d+)?", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", "."))
+    except ValueError:
+        return None
+
+
+_DT_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M:%S",
+               "%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d")
+
+
+def _ts(value) -> float | None:
+    """Epoch seconds out of a panel date, in any of the shapes it uses."""
+    from datetime import datetime, timezone
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Milliseconds are also seen; anything past year 5000 is one.
+        v = float(value)
+        return v / 1000 if v > 1e11 else v
+    text = _strip_html(value).strip()
+    if not text:
+        return None
+    iso = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(iso)
+        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+    except ValueError:
+        pass
+    for fmt in _DT_FORMATS:
+        try:
+            return datetime.strptime(text[:19], fmt).replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _fields_of(row) -> list[dict]:
+    """A Nova row's fields as a list, whichever container it used."""
+    fields = row.get("fields") if isinstance(row, dict) else None
+    if isinstance(fields, dict):
+        fields = list(fields.values())
+    return [f for f in (fields or []) if isinstance(f, dict)]
+
+
+def _field_text(f: dict) -> str:
+    """The readable value of a field — BelongsTo renders as a nested dict."""
+    val = f.get("value")
+    if isinstance(val, dict):
+        val = (val.get("title") or val.get("name") or val.get("display")
+               or val.get("value") or "")
+    if isinstance(val, list):
+        val = ", ".join(str(x) for x in val if not isinstance(x, (dict, list)))
+    if isinstance(val, bool):
+        return "да" if val else "нет"
+    return _strip_html(val)
+
+
+def _row_id(row: dict):
+    rid = row.get("id")
+    if isinstance(rid, dict):
+        rid = rid.get("value", rid.get("id"))
+    return rid
+
+
+# What a money row means. Read from the row's own wording, because the panel
+# does not label direction: a payout and a sale are both just «операция».
+_OUT_KWS = ("вывод", "вывел", "выплат", "списан", "списыв", "withdraw", "payout",
+            "премиум", "премк", "поднят", "продвиж", "реклам", "комисс",
+            "штраф", "расход", "оплата услуг", "покупк", "debit", "минус")
+_IN_KWS = ("продаж", "продан", "заказ", "пополн", "начисл", "зачисл", "доход",
+           "приход", "поступ", "sale", "order", "deposit", "credit", "плюс",
+           "возврат средств")
+
+
+def _direction(haystack: str, amount: float | None) -> str:
+    """"in" | "out" | "?" — what this operation did to the balance."""
+    if amount is not None and amount < 0:
+        return "out"
+    low = haystack.lower()
+    for kw in _OUT_KWS:
+        if kw in low:
+            return "out"
+    for kw in _IN_KWS:
+        if kw in low:
+            return "in"
+    return "?"
+
+
+_SALE_KWS = ("продаж", "продан", "заказ", "sale", "order")
+_BUMP_KWS_OPS = ("премиум", "премк", "поднят", "продвиж", "реклам", "vip",
+                 "выделен", "закреп")
+_PAYOUT_KWS = ("вывод", "вывел", "выплат", "withdraw", "payout")
+
+
+def _op_kind(haystack: str, direction: str) -> str:
+    """Finer than direction: sale / bump / payout / other."""
+    low = haystack.lower()
+    if any(k in low for k in _PAYOUT_KWS):
+        return "payout"
+    if any(k in low for k in _BUMP_KWS_OPS):
+        return "bump"
+    if any(k in low for k in _SALE_KWS):
+        return "sale"
+    return "in" if direction == "in" else ("out" if direction == "out" else "other")
+
+
+def _parse_operation(row: dict) -> dict:
+    """One ledger row → {id, ts, amount, kind, direction, title, status, text}."""
+    ts = amount = None
+    title = status = ""
+    kind_bits: list[str] = []
+    all_text: list[str] = []
+
+    for f in _fields_of(row):
+        label = (str(f.get("name") or "") + " "
+                 + str(f.get("attribute") or "")).lower()
+        comp = str(f.get("component") or "").lower()
+        text = _field_text(f)
+        if not text:
+            continue
+        all_text.append(text)
+        if ts is None and ("date" in comp or any(
+                t in label for t in ("created", "дата", "date", "время", "time"))):
+            got = _ts(f.get("value") if not isinstance(f.get("value"), dict) else text)
+            if got:
+                ts = got
+                continue
+        if amount is None and any(t in label for t in (
+                "сумм", "amount", "цена", "price", "total", "итог", "money",
+                "стоим", "value")):
+            got = _num(f.get("value"))
+            if got is not None:
+                amount = got
+                continue
+        if any(t in label for t in ("тип", "type", "операц", "operation",
+                                    "назнач", "kind", "категор", "commen",
+                                    "коммент", "описан", "descr")):
+            kind_bits.append(text)
+        elif any(t in label for t in ("статус", "status", "состоян", "state")):
+            status = status or text
+        elif any(t in label for t in ("товар", "наимен", "назван", "title",
+                                      "name", "объявл", "лот", "item")):
+            title = title or text
+
+    haystack = " ".join(kind_bits + [title, status, _row_title(row)])
+    if not haystack.strip():
+        haystack = " ".join(all_text)
+    direction = _direction(haystack, amount)
+    return {
+        "id": _row_id(row),
+        "ts": ts,
+        "amount": abs(amount) if amount is not None else None,
+        "signed": amount,
+        "direction": direction,
+        "kind": _op_kind(haystack, direction),
+        "title": title or _row_title(row),
+        "status": status,
+        "type": " / ".join(b for b in kind_bits if b)[:80],
+    }
+
+
+_OPS_RESOURCES = ("operations", "operation", "transactions", "payments",
+                  "orders", "sales", "deals")
+
+
+def panel_operations_sync(cookie_string: str, resource: str = "operations",
+                          pages: int = 6, per_page: int = 100,
+                          since: float = 0.0) -> tuple[bool, object]:
+    """Blocking: the shop's money ledger from the panel, newest first.
+
+    Returns (True, [operation, …]) or (False, reason). `since` (epoch seconds,
+    0 = everything) both filters the result and stops paging once a whole page
+    predates it — but the early stop applies only while the rows really are
+    coming newest-first, since a panel that sorts the other way would otherwise
+    be cut off at its oldest end, which is exactly the data being asked for.
+    """
+    try:
+        session = _make_panel_requests_session(cookie_string)
+        hdrs = _panel_xsrf_headers(session, cookie_string)
+    except Exception as e:
+        return False, f"сессия панели: {str(e)[:80]}"
+
+    ops: list[dict] = []
+    descending = True
+    last_ts: float | None = None
+    reason = ""
+    read_a_page = False
+
+    for page in range(1, max(1, pages) + 1):
+        params = {"perPage": str(per_page), "page": str(page),
+                  "orderBy": "id", "orderByDirection": "desc"}
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/{resource}", params=params,
+                            headers=hdrs, timeout=(6, 20), allow_redirects=False)
+        except Exception as e:
+            reason = f"{resource}: {str(e)[:60]}"
+            break
+        if r.status_code == 401:
+            return False, "401: сессия панели истекла — войдите снова"
+        if r.status_code != 200:
+            reason = f"{resource} → {r.status_code}"
+            break
+        try:
+            body = r.json() or {}
+        except Exception:
+            reason = f"{resource}: ответ не разобран"
+            break
+        rows = [x for x in (body.get("resources") or []) if isinstance(x, dict)]
+        read_a_page = True
+        if not rows:
+            break
+
+        page_max_ts = 0.0
+        for row in rows:
+            op = _parse_operation(row)
+            if op["ts"]:
+                if last_ts is not None and op["ts"] > last_ts + 60:
+                    descending = False
+                last_ts = op["ts"]
+                page_max_ts = max(page_max_ts, op["ts"])
+            if since and (op["ts"] or 0) < since:
+                continue
+            ops.append(op)
+
+        if since and descending and page_max_ts and page_max_ts < since:
+            break
+        if not body.get("next_page_url"):
+            break
+
+    # An empty result after a page really was read is an answer — "no
+    # operations in this window" — not a failure to reach the panel. Reporting
+    # it as an error is what would silently push the screen onto the local
+    # fallback and relabel correct figures as untrustworthy.
+    if not ops and not read_a_page:
+        return False, reason or f"{resource}: пусто"
+    return True, ops
+
+
+def panel_find_ledger_sync(cookie_string: str) -> tuple[bool, object]:
+    """Blocking: which panel resource actually holds dated money rows.
+
+    `operations` is the one this panel uses, but naming it in one place and
+    guessing elsewhere is what sent the balance hunt around in circles. This
+    tries the known candidates and returns the first that answers with rows
+    carrying both a date and an amount → (True, (resource, ops)).
+    """
+    best: tuple[str, list] | None = None
+    tried: list[str] = []
+    for res in _OPS_RESOURCES:
+        ok, got = panel_operations_sync(cookie_string, resource=res, pages=1,
+                                        per_page=50)
+        if not ok or not isinstance(got, list):
+            tried.append(f"{res}: {str(got)[:40]}")
+            continue
+        dated = [o for o in got if o.get("ts") and o.get("amount") is not None]
+        tried.append(f"{res}: {len(got)} строк, с датой и суммой {len(dated)}")
+        if dated and (best is None or len(dated) > len(best[1])):
+            best = (res, got)
+        if best and len(dated) >= 5:
+            break
+    if best:
+        return True, best
+    return False, "; ".join(tried)[:400] or "ни один ресурс не ответил"
+
+
+def panel_shop_metrics_sync(cookie_string: str,
+                            shop_id: str = "") -> tuple[bool, object]:
+    """Blocking: the numbers the panel prints on the shop's own page.
+
+    «Оплаченные заказы», «Сумма продаж», rating, review count — all-time totals
+    the seller can check against with their own eyes. Returns
+    (True, {"shop": id, "metrics": {name: {"text","value"}}}) or (False, why).
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+
+    ids = [str(shop_id)] if shop_id else []
+    if not ids:
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/shops", params={"perPage": "50"},
+                            headers=hdrs, timeout=(6, 12), allow_redirects=False)
+        except Exception as e:
+            return False, f"shops: {str(e)[:60]}"
+        if r.status_code == 401:
+            return False, "401: сессия панели истекла — войдите снова"
+        if r.status_code != 200:
+            return False, f"shops → {r.status_code}"
+        try:
+            for row in (r.json() or {}).get("resources") or []:
+                rid = _row_id(row) if isinstance(row, dict) else None
+                if rid is not None:
+                    ids.append(str(rid))
+        except Exception:
+            return False, "shops: ответ не разобран"
+    if not ids:
+        return False, "в панели нет ни одного магазина"
+
+    sid = ids[0]
+    try:
+        r = session.get(f"{PANEL_URL}/nova-api/shops/{sid}", headers=hdrs,
+                        timeout=(6, 15), allow_redirects=False)
+    except Exception as e:
+        return False, f"shops/{sid}: {str(e)[:60]}"
+    if r.status_code != 200:
+        return False, f"shops/{sid} → {r.status_code}"
+    try:
+        fields = ((r.json() or {}).get("resource") or {}).get("fields") or []
+    except Exception:
+        return False, f"shops/{sid}: ответ не разобран"
+
+    metrics: dict[str, dict] = {}
+    for f in fields:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("name") or f.get("attribute") or "").strip()
+        if not name:
+            continue
+        text = _field_text(f)
+        if not text:
+            continue
+        metrics[name] = {"text": text, "value": _num(f.get("value"))}
+    if not metrics:
+        return False, f"shops/{sid}: страница без полей"
+    return True, {"shop": sid, "metrics": metrics}
+
+
+def panel_stats_probe_sync(cookie_string: str) -> str:
+    """Read-only: what the panel's ledger rows actually look like.
+
+    Every real answer in this project came from printing the server's own
+    response instead of guessing at it. This shows which resource holds the
+    money rows, the field names on one row, and how the first few rows were
+    understood — so a wrong reading is visible rather than silently averaged
+    into a total.
+    """
+    from datetime import datetime, timezone
+    out: list[str] = []
+
+    ok, got = panel_find_ledger_sync(cookie_string)
+    if not ok:
+        out.append(f"журнал операций не найден: {got}")
+        res = "operations"
+        ops: list[dict] = []
+    else:
+        res, ops = got
+        out.append(f"журнал: {res}, строк на первой странице: {len(ops)}")
+
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    try:
+        r = session.get(f"{PANEL_URL}/nova-api/{res}", params={"perPage": "5"},
+                        headers=hdrs, timeout=(6, 15), allow_redirects=False)
+        body = r.json() or {}
+        out.append(f"{res} → {r.status_code}, всего: {body.get('total', '?')}")
+        rows = [x for x in (body.get("resources") or []) if isinstance(x, dict)]
+        if rows:
+            names = [f"{f.get('name') or '?'}[{f.get('attribute') or '?'}"
+                     f"·{f.get('component') or '?'}]" for f in _fields_of(rows[0])]
+            out.append("поля строки: " + ", ".join(names)[:600])
+            out.append("значения 1-й строки: " + ", ".join(
+                f"{f.get('name') or f.get('attribute')}={_field_text(f)[:28]}"
+                for f in _fields_of(rows[0]))[:600])
+    except Exception as e:
+        out.append(f"{res}: {str(e)[:80]}")
+
+    for op in ops[:5]:
+        when = (datetime.fromtimestamp(op["ts"], tz=timezone.utc)
+                .strftime("%d.%m %H:%M") if op.get("ts") else "без даты")
+        out.append(f"  · {when} | {op.get('kind')} / {op.get('direction')} | "
+                   f"{op.get('amount')} ₽ | {str(op.get('type') or '')[:24]} | "
+                   f"{str(op.get('title') or '')[:24]}")
+
+    ok_m, m = panel_shop_metrics_sync(cookie_string)
+    if ok_m and isinstance(m, dict):
+        out.append("поля магазина: " + ", ".join(
+            f"{k}={v['text'][:20]}" for k, v in (m.get("metrics") or {}).items())[:700])
+    else:
+        out.append(f"магазин: {m}")
+
+    return "\n".join(out)[:3000]

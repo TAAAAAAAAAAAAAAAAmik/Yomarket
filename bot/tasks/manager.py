@@ -211,33 +211,9 @@ _DONE_STATUSES = ("confirmed", "completed", "done")
 _BACK_STATUSES = ("refunded", "cancelled", "returned")
 
 
-def _window_stats(order_details: dict, known_orders: dict,
-                  since_ts: float) -> dict:
-    """Order figures for everything first seen at/after since_ts.
-
-    Revenue counts completed orders only — an order that came in and was
-    refunded is not money earned — so «выручка» in a report means what it says.
-    Orders are dated by when the bot first saw them (seen_at): the only per-order
-    timestamp kept locally, and good enough for "today" once the bot is running.
-    """
-    orders = completed = refunded = revenue = 0
-    for oid, det in order_details.items():
-        seen = det.get("seen_at", 0)
-        if not seen or seen < since_ts:
-            continue
-        orders += 1
-        st = str(known_orders.get(oid) or known_orders.get(str(oid)) or "")
-        try:
-            price = int(float(str(det.get("price", 0))))
-        except (ValueError, TypeError):
-            price = 0
-        if st in _DONE_STATUSES:
-            completed += 1
-            revenue += price
-        elif st in _BACK_STATUSES:
-            refunded += 1
-    return {"orders": orders, "completed": completed,
-            "refunded": refunded, "revenue": revenue}
+# Windowed order figures used to live here. They now come from stats_source,
+# which reads the panel's ledger and falls back to this same local history, so
+# the report and the «Статистика» screen cannot disagree about a day.
 
 
 def _today_stats(order_details: dict, known_orders: dict) -> tuple[int, int]:
@@ -1533,33 +1509,40 @@ class TaskManager:
                      [f"💰 Баланс был: <b>{balance_str}</b>", "",
                       ("✅ " if ok else "⚠️ ") + _esc(msg)])
 
-    async def _daily_report_text(self, api: YooMarketAPI, settings: dict) -> str:
+    async def _daily_report_text(self, user_id: int, api: YooMarketAPI,
+                                 settings: dict) -> str:
         """The end-of-day summary, as today's numbers rather than lifetime ones.
 
-        The old report showed the all-time completed count under a «за сегодня»
-        heading; here every figure is the day's own, with revenue net of what
-        promotion cost, so the line the seller reads is the money that actually
-        moved.
-        """
-        details = settings.get("known_order_details", {})
-        known = settings.get("known_orders", {})
-        day_start = time.time() - (time.time() % 86400)
-        st = _window_stats(details, known, day_start)
+        The figures come from the panel's own ledger, with the bot's order
+        history as the fallback: built from local tracking alone, the report
+        counted only what the poller happened to witness, so a restart or a
+        sale made before the bot came up simply vanished from the day.
 
-        bs = settings.get("bump_schedule", {})
-        spent_today = 0.0
-        if bs.get("spent_day") == datetime.now().strftime("%Y-%m-%d"):
-            spent_today = float(bs.get("spent_today", 0) or 0)
+        The balance line used to read an undefined name — the exception was
+        caught and every report went out saying «—». It is passed in now.
+        """
+        from stats_source import LOCAL, day_start, events_for, summarize
+
+        events, source, panel_err = await events_for(user_id, settings, force=True)
+        d0 = day_start()
+        st = summarize(events, d0)
+
+        spent_today = st["spend"]
+        if not spent_today and source == LOCAL:
+            bs = settings.get("bump_schedule", {})
+            if bs.get("spent_day") == datetime.now().strftime("%Y-%m-%d"):
+                spent_today = float(bs.get("spent_today", 0) or 0)
 
         try:
             _bal, balance_str = await shop_balance(user_id, api)
-        except Exception:
+        except Exception as e:
+            logger.warning("Daily report balance for %s: %s", user_id, e)
             balance_str = "—"
 
         net = st["revenue"] - spent_today
         body = [
             f"🛒 Заказов за день: <b>{st['orders']}</b>",
-            f"✅ Выполнено: <b>{st['completed']}</b>"
+            f"✅ Продаж: <b>{st['sales']}</b>"
             + (f"   ↩️ Возвраты: {st['refunded']}" if st['refunded'] else ""),
             "",
             f"💵 Выручка: <b>{_money(st['revenue'])} ₽</b>",
@@ -1567,11 +1550,17 @@ class TaskManager:
         if spent_today:
             body.append(f"⬆️ Продвижение: −{_money(spent_today)} ₽")
             body.append(f"🟰 Чистыми: <b>{_money(net)} ₽</b>")
+        if st["payout_count"]:
+            body.append(f"💸 Выведено: <b>{_money(st['payouts'])} ₽</b>")
         body.append("")
         body.append(f"💰 Баланс сейчас: <b>{balance_str}</b>")
         if not st["orders"]:
             body.append("")
-            body.append("<i>Сегодня заказов не было.</i>")
+            body.append("<i>Сегодня продаж не было.</i>")
+        if source == LOCAL:
+            body.append("")
+            body.append("<i>Считано по истории бота — панель не ответила"
+                        + (f" ({_esc(panel_err)})" if panel_err else "") + ".</i>")
 
         return _card("📊 <b>ИТОГИ ДНЯ</b>", body,
                      f"🗓 {datetime.now().strftime('%d.%m.%Y')}")
@@ -2027,12 +2016,16 @@ class TaskManager:
                 today_str = datetime.now().strftime("%Y-%m-%d")
                 last_day = dr.get("last_report_day", "")
                 if last_day != today_str and datetime.now().hour >= report_hour:
-                    settings["daily_report"]["last_report_day"] = today_str
                     try:
                         await self._notify(
                             user_id,
-                            await self._daily_report_text(api, settings),
+                            await self._daily_report_text(user_id, api, settings),
                             reply_markup=_balance_notify_kb())
+                        # Marked only once it actually went out. Marking first
+                        # meant a panel timeout or a failed send burned the day:
+                        # the report was recorded as delivered and never
+                        # retried, which is «статистика не приходит» exactly.
+                        settings["daily_report"]["last_report_day"] = today_str
                     except Exception as e:
                         logger.warning("Daily report error for user %s: %s", user_id, e)
 
