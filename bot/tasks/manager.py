@@ -1435,7 +1435,11 @@ class TaskManager:
 
         sent_amount = float(int(balance))
         more_left = False
-        method = aw.get("method", "api")
+        # The panel is the only route: the Integration API has no withdrawal
+        # endpoint, and the screen says so. Defaulting to "api" meant the
+        # automatic run reported «не удалось получить баланс через API» — an
+        # error about a road that does not exist.
+        method = aw.get("method") or "panel"
         if method == "panel":
             balance_id = aw.get("panel_balance_id") or ""
             action_key = aw.get("panel_action_key") or ""
@@ -1496,14 +1500,13 @@ class TaskManager:
                 # instead of waiting out the interval.
                 more_left = left >= max(floor, 1)
         else:
-            ok, msg = await api.withdraw_balance(min_amount)
-            if not ok and "не поддерживает" in msg:
-                # Do not repeat a doomed API attempt on every interval
-                aw["enabled"] = False
-                aw["last_run"] = now
-                aw["last_result"] = msg
-                return ("💸 Авто-вывод выключен: вывод через API недоступен. "
-                        "Настройте вывод через панель в «Баланс» → «Автовывод».")
+            # An explicitly stored "api" method from before this was known.
+            aw["enabled"] = False
+            aw["last_run"] = now
+            aw["last_result"] = "вывода через API нет"
+            return ("💸 Авто-вывод выключен: у Юмаркета нет вывода через API. "
+                    "Настройте его через панель: «Баланс» → «Автовывод» → "
+                    "«Настроить вывод через панель».")
 
         # Zero, not `now`, when a payout ceiling left money behind: the next
         # tick should continue rather than wait out the whole interval.

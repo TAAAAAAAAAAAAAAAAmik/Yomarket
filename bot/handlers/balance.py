@@ -350,12 +350,11 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
 
 @router.callback_query(F.data == "balance:withdraw")
 async def withdraw_start(callback: CallbackQuery, state: FSMContext, api: YooMarketAPI) -> None:
-    bal_str = "?"
-    if api:
-        try:
-            amount, bal_str = await api.get_balance()
-        except Exception:
-            pass
+    # The panel is where the money is: the API has no balance, so reading it
+    # here printed «Доступно: — ₽» on the very screen that asks how much to
+    # take out.
+    from tasks.manager import shop_balance
+    amount, bal_str = await shop_balance(callback.from_user.id, api)
     await state.set_state(WithdrawState.waiting_amount)
     b = InlineKeyboardBuilder()
     b.button(text="💸 Вывести всё", callback_data="balance:withdraw_all")
@@ -485,7 +484,7 @@ async def threshold_save(message: Message, state: FSMContext) -> None:
 def _auto_text(s: dict) -> str:
     aw = s.get("auto_withdraw", {})
     on = aw.get("enabled", False)
-    method = aw.get("method", "api")
+    method = aw.get("method") or "panel"
     lines = [
         "🤖 <b>Автовывод</b>\n",
         f"Статус: {'🟢 ВКЛ' if on else '🔴 ВЫКЛ'}",
@@ -497,11 +496,9 @@ def _auto_text(s: dict) -> str:
         lines.append("Способ: <b>через панель</b>")
         lines.append("Реквизиты: " + ("настроены" if vals else "не заданы"))
     else:
-        lines.append("Способ: <b>через API</b>")
         lines.append("")
-        lines.append("⚠️ <b>Вывод через API у Юмаркета отсутствует.</b> "
-                     "Реальный вывод — только через панель. Настройте его "
-                     "кнопкой ниже.")
+        lines.append("⚠️ <b>Не настроен.</b> Вывод идёт только через панель — "
+                     "у Юмаркета нет вывода через API. Настройте кнопкой ниже.")
     if aw.get("last_result"):
         lines.append(f"\nПоследнее: {_esc(aw['last_result'])}")
     return "\n".join(lines)
