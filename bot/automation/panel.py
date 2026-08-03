@@ -3393,3 +3393,92 @@ def panel_resource_census_sync(cookie_string: str, needle: str = "") -> str:
         lines.append(f"{res}: {len(rows)} — "
                      + ", ".join(t[:26] for t in titles[:3]) + hit)
     return "\n".join(lines) or "панель не отдала ни одного ресурса"
+
+
+def panel_shop_balance_sync(cookie_string: str,
+                            shop_id: str = "") -> tuple[bool, object]:
+    """Blocking: the shop's balance, read where the panel actually shows it.
+
+    The seller's own screenshot settled this: the figure lives on the shop's
+    page — /resources/shops/{id} — not in a `balances` resource, which is what
+    the code had been asking for. Returns (True, {"amount": float, "field":
+    name, "shop": id}) or (False, reason).
+
+    The detail record is fetched rather than the list row: Nova's index omits
+    most fields, and the balance is one of the omitted ones on this panel.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+
+    ids = [str(shop_id)] if shop_id else []
+    if not ids:
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/shops",
+                            params={"perPage": "50"}, headers=hdrs,
+                            timeout=(6, 12), allow_redirects=False)
+        except Exception as e:
+            return False, f"shops: {str(e)[:60]}"
+        if r.status_code == 401:
+            return False, "401: сессия панели истекла — войдите снова"
+        if r.status_code != 200:
+            return False, f"shops → {r.status_code}"
+        try:
+            rows = (r.json() or {}).get("resources") or []
+        except Exception:
+            return False, "shops: ответ не разобран"
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            rid = row.get("id")
+            if isinstance(rid, dict):
+                rid = rid.get("value", rid.get("id"))
+            if rid is not None:
+                ids.append(str(rid))
+        if not ids:
+            return False, "в панели нет ни одного магазина"
+
+    tried = []
+    for sid in ids[:5]:
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/shops/{sid}",
+                            headers=hdrs, timeout=(6, 12),
+                            allow_redirects=False)
+        except Exception as e:
+            tried.append(f"{sid}: {str(e)[:30]}")
+            continue
+        if r.status_code != 200:
+            tried.append(f"{sid}: {r.status_code}")
+            continue
+        try:
+            fields = ((r.json() or {}).get("resource") or {}).get("fields") or []
+        except Exception:
+            tried.append(f"{sid}: ответ не разобран")
+            continue
+        for f in fields:
+            if not isinstance(f, dict):
+                continue
+            label = (str(f.get("name") or "") + " "
+                     + str(f.get("attribute") or "")).lower()
+            # «Сумма продаж» and «оплаченные заказы» are metrics on the same
+            # page; the balance is the field that says balance.
+            if not any(t in label for t in ("баланс", "balance", "средства")):
+                continue
+            if any(t in label for t in ("продаж", "заказ", "sales", "order")):
+                continue
+            raw = _strip_html(f.get("value"))
+            if raw in (None, ""):
+                continue
+            try:
+                amount = float(str(raw).replace(" ", "").replace(" ", "")
+                               .replace("₽", "").replace(",", "."))
+            except (TypeError, ValueError):
+                continue
+            return True, {"amount": amount,
+                          "field": str(f.get("name") or f.get("attribute")),
+                          "shop": sid}
+        # Nothing matched: report what the page does offer, so the field can be
+        # named instead of guessed at again.
+        names = [str(f.get("name") or f.get("attribute"))
+                 for f in fields if isinstance(f, dict)][:14]
+        tried.append(f"{sid}: поля — {', '.join(n for n in names if n)}")
+    return False, "; ".join(tried)[:400] or "магазин не прочитан"

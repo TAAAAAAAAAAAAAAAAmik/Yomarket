@@ -113,16 +113,31 @@ async def _panel_balance(uid: int) -> tuple[str | None, str]:
     creds = get_panel_creds(uid)
     if not creds or not creds.get("cookies"):
         return None, "нужен вход в панель продавца"
-    from automation.panel import panel_balances_sync
+    from automation.panel import panel_balances_sync, panel_shop_balance_sync
+    loop = _a.get_event_loop()
+
+    # Where the panel actually shows it: the shop's own page. The `balances`
+    # resource was the earlier guess and answers nothing on this panel.
     try:
-        ok, rows = await _a.wait_for(
-            _a.get_event_loop().run_in_executor(
-                None, panel_balances_sync, creds["cookies"]),
+        ok, got = await _a.wait_for(
+            loop.run_in_executor(None, panel_shop_balance_sync,
+                                 creds["cookies"], ""),
             timeout=45)
     except Exception as e:
-        return None, f"панель не ответила: {str(e)[:60]}"
+        ok, got = False, f"не ответила: {str(e)[:60]}"
+    if ok and isinstance(got, dict):
+        amt = got.get("amount")
+        return f"{amt:.2f}".rstrip("0").rstrip("."), ""
+    shop_err = str(got)[:200]
+
+    try:
+        ok, rows = await _a.wait_for(
+            loop.run_in_executor(None, panel_balances_sync, creds["cookies"]),
+            timeout=45)
+    except Exception as e:
+        return None, f"магазин: {shop_err} · balances: {str(e)[:50]}"
     if not ok or not isinstance(rows, list):
-        return None, f"панель: {str(rows)[:80]}"
+        return None, f"магазин: {shop_err}"
 
     # Several rows can exist (one per currency); the roubles one is the balance
     # a seller means, and any single row is unambiguous on its own.
