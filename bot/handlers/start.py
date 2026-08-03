@@ -12,7 +12,7 @@ from storage import delete_token, get_token, save_token, get_settings, save_sett
 router = Router()
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-08-03-withdraw-verdict"
+BOT_VERSION = "2026-08-03-withdraw-truthful"
 
 
 class AuthState(StatesGroup):

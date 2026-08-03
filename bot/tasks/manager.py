@@ -1492,12 +1492,18 @@ class TaskManager:
             if ok:
                 fee = max(amount * float(lim.get("fee_pct") or 0) / 100,
                           float(lim.get("fee_min") or 0))
-                msg = (f"выведено {amount:.0f} ₽"
-                       + (f", придёт ≈{amount - fee:.0f} ₽ после комиссии"
+                # The panel's own words are kept, not replaced. Accepting a
+                # payout is not the same as paying it: the answer can be
+                # «ссылка для подтверждения реквизитов отправлена на почту»,
+                # and reporting «выведено» over that would claim money moved
+                # when it is waiting on the seller's inbox.
+                msg = (f"заявка на {amount:.0f} ₽"
+                       + (f" (придёт ≈{amount - fee:.0f} ₽ после комиссии)"
                           if fee else "")
-                       + (f". Остаток {left:.0f} ₽ — за раз можно не больше "
-                          f"{cap:.0f} ₽, выведу в следующий заход" if left >= 1
-                          else ""))
+                       + f" — {msg}" if msg else f"заявка на {amount:.0f} ₽")
+                if left >= 1:
+                    msg += (f". Остаток {left:.0f} ₽ — за раз не больше "
+                            f"{cap:.0f} ₽, продолжу в следующий заход")
                 sent_amount = float(amount)
                 # More than one payout's worth is left: come back next tick
                 # instead of waiting out the interval.
