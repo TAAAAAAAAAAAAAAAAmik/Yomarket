@@ -606,6 +606,43 @@ async def pos_url_save(message: Message, state: FSMContext) -> None:
     await message.answer(_watch_text(s, idx, note), reply_markup=_watch_kb(s, idx))
 
 
+async def _match_by_own_ads(uid: int, offers: list[dict]) -> tuple[dict | None,
+                                                                  set]:
+    """Our row in the listing, matched against the shop's own ad ids.
+
+    The storefront does not have to name the seller, and a shop name can be
+    changed or repeated. The ad ids cannot: the marketplace hands ours over
+    through the seller API, and a listing row carrying one of them is ours
+    beyond doubt. Returns (row or None, the ids we know about).
+    """
+    from api.yoomarket import YooMarketAPI
+    from storage import get_token
+
+    token = get_token(uid)
+    if not token:
+        return None, set()
+    api = YooMarketAPI(token)
+    try:
+        await api.start()
+        data = await api.get_ads()
+    except Exception as e:
+        logger.warning("own ads for position match (%s): %s", uid, e)
+        return None, set()
+    finally:
+        try:
+            await api.close()
+        except Exception:
+            pass
+    ids = {str(a.get("id")) for a in (data.get("data") or data.get("items")
+                                      or []) if a.get("id")}
+    if not ids:
+        return None, ids
+    for row in offers:
+        if row.get("id") and str(row["id"]) in ids:
+            return row, ids
+    return None, ids
+
+
 async def _pos_probe(uid: int, idx: int, message=None) -> str:
     """Read the page once and try to recognise our own row.
 
@@ -644,9 +681,19 @@ async def _pos_probe(uid: int, idx: int, message=None) -> str:
     offers = res["offers"]
     mine = find_position(offers, seller=shop) if shop else None
     if not mine:
-        return (f"⚠️ Нашёл {len(offers)} предложений, но вашего магазина "
-                f"«{_esc(shop) or '—'}» среди них нет. Проверьте адрес — "
-                f"нужна страница, где ваш товар есть в списке.")
+        # The listing may not name the seller at all. Our own ad ids do
+        # identify us, and the marketplace hands them over for the asking —
+        # a surer match than a shop name, and free of guesswork.
+        mine, ad_ids = await _match_by_own_ads(uid, offers)
+        if not mine:
+            seen = ", ".join(dict.fromkeys(
+                o["seller"] for o in offers[:6] if o["seller"])) or "—"
+            return (f"⚠️ Нашёл {len(offers)} предложений, но вашего товара "
+                    f"среди них нет.\n\nМагазин в боте: «{_esc(shop) or '—'}»; "
+                    f"продавцы в списке: {_esc(seen)}; "
+                    f"ваших объявлений известно: {len(ad_ids)}.\n\n"
+                    f"Если товар лежит глубже — пришлите адрес с фильтром, "
+                    f"который его сужает, иначе бот дочитывает не весь список.")
     w["title"] = mine["title"] or w.get("title") or ""
     # The storefront id, kept for finding this row again — NOT the panel id the
     # paid action needs. Those are different numbers, and binding the listing

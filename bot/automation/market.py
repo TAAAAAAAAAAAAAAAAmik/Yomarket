@@ -321,6 +321,132 @@ def get_page(url: str) -> tuple[bool, str]:
     return True, r.text
 
 
+# --- the listing as the storefront itself fetches it ------------------------
+#
+# The category page ships no offers: 81 KB of application shell, 1.5 KB of
+# visible text, and the list drawn in the browser afterwards. It is fetched
+# from here — found by reading the addresses compiled into the page's own
+# JavaScript (/pos_api):
+#
+#   https://api.yoo.market/api/products?category=virty&keyword=3.000.000
+#   → {"data": [ …15 offers… ], "meta": {…}, "links": {…}}
+#
+# Fifteen at a time, and a category holds hundreds, so the pages matter: the
+# seller's own listing sits far below the first screen, which is the whole
+# reason the feature exists.
+API_URL = "https://api.yoo.market"
+_API_HEADERS = {
+    "User-Agent": _BROWSER_HEADERS["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Origin": MARKET_URL,
+    "Referer": MARKET_URL + "/",
+}
+# 15 offers a page: twenty pages is three hundred places deep. Past that the
+# exact number stops meaning anything — a listing that far down is simply
+# buried, and the walk should stop rather than crawl the whole category.
+API_MAX_PAGES = 20
+
+
+def listing_query(url: str) -> dict:
+    """The API query a storefront address stands for.
+
+    /categories/black-russia/virty?keyword=3.000.000 asks the API for
+    category=virty (the deepest slug — the game above it is not what the
+    listing is filtered by) with the search carried across unchanged.
+    """
+    from urllib.parse import parse_qsl, urlparse
+    parts = urlparse(url if url.startswith("http") else MARKET_URL + url)
+    segments = [p for p in parts.path.split("/") if p]
+    query = {k: v for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if k not in ("page",)}
+    if "categories" in segments:
+        after = segments[segments.index("categories") + 1:]
+        if after:
+            query["category"] = after[-1]
+    return query
+
+
+def fetch_offers_api(url: str, shop: str = "",
+                     max_pages: int = API_MAX_PAGES) -> tuple[bool, object]:
+    """Blocking: the listing straight from the API the storefront calls.
+
+    Walks the pages until the shop is found, and stops the moment it is — a
+    routine check on a listing near the top costs one request. Returns
+    (True, {"offers": …, "note": …}) or (False, error).
+    """
+    import requests
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    query = listing_query(url)
+    if not query:
+        return False, "не понял адрес — нужна страница категории или поиска"
+
+    rows: list = []
+    next_url = f"{API_URL}/api/products"
+    params = dict(query)
+    pages = 0
+    total = None
+    seen: set = set()
+    while next_url and pages < max(1, max_pages):
+        try:
+            r = requests.get(next_url, params=params or None,
+                             headers=_API_HEADERS, timeout=(6, 20),
+                             verify=False)
+        except Exception as e:
+            if rows:
+                break                       # keep what the earlier pages gave
+            return False, f"API витрины не ответил: {str(e)[:100]}"
+        if r.status_code != 200:
+            if rows:
+                break
+            return False, f"API витрины: HTTP {r.status_code}"
+        try:
+            body = r.json()
+        except Exception:
+            if rows:
+                break
+            return False, "API витрины ответил не JSON"
+
+        batch = body.get("data") if isinstance(body, dict) else body
+        if not isinstance(batch, list):
+            # Not the shape expected — fall back on the generic search rather
+            # than insisting on a key name that may change.
+            found = _offer_lists(body)
+            batch = max(found, key=len) if found else []
+        if not batch:
+            break
+        sig = _signature(batch)
+        if sig in seen:
+            break                           # the same page came back
+        seen.add(sig)
+        rows.extend(batch)
+        pages += 1
+
+        meta = body.get("meta") if isinstance(body, dict) else None
+        if isinstance(meta, dict) and total is None:
+            total = meta.get("total")
+        if shop and find_position(_normalize(rows), seller=shop):
+            break
+        # Laravel hands the next page over in `links.next`; falling back on
+        # ?page=N keeps this working if that ever stops being included.
+        links = body.get("links") if isinstance(body, dict) else None
+        nxt = (links or {}).get("next") if isinstance(links, dict) else None
+        if nxt:
+            next_url, params = nxt, None
+        else:
+            next_url = f"{API_URL}/api/products"
+            params = {**query, "page": pages + 1}
+
+    if not rows:
+        return False, "API витрины вернул пустой список"
+    note = f"api, офферов: {len(rows)}, страниц: {pages}"
+    if total:
+        note += f" из {total}"
+    return True, {"offers": _normalize(rows), "note": note}
+
+
 def with_page(url: str, n: int) -> str:
     """The same listing, page n — keeping every filter already in the address.
 
@@ -427,9 +553,24 @@ MAX_LIST_PAGES = 6
 
 
 def fetch_listing(url: str, shop: str = ""):
-    """fetch_offers_sync tuned for finding one shop in a long listing."""
-    return fetch_offers_sync(url, max_pages=MAX_LIST_PAGES if shop else 1,
-                             want_seller=shop)
+    """The offers behind a storefront address, however they can be had.
+
+    The API first, because on this marketplace it is the only place the listing
+    exists — the page itself is an empty shell. Parsing the markup stays as the
+    second route: it costs nothing to keep, it is covered by tests, and it is
+    the right answer for a page that does render its list server-side.
+    """
+    ok, res = fetch_offers_api(url, shop)
+    if ok:
+        return ok, res
+    api_error = res
+    ok2, res2 = fetch_offers_sync(url, max_pages=MAX_LIST_PAGES if shop else 1,
+                                  want_seller=shop)
+    if ok2:
+        return ok2, res2
+    # Both failed: say so in one line rather than blaming whichever ran last.
+    return False, f"{api_error}; страница: {res2}"
+
 
 def _norm(s: str) -> str:
     return re.sub(r"[^\w]+", "", str(s or "")).lower()

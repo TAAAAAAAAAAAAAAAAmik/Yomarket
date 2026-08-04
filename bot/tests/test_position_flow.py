@@ -131,12 +131,55 @@ class AddingAWatch(FlowCase):
         self.assertTrue(any("2-м месте" in t for t in msg.sent), msg.sent)
 
     def test_a_link_we_are_not_on_says_so_instead_of_pretending(self):
+        """And says enough to act on: who IS in the list, and what we matched on.
+
+        "не нашёл" alone left the seller with nothing to check.
+        """
         self.patch(storage, "get_shop_name", lambda uid: "Другой магазин")
         msg = FakeMessage("https://yoomarket.net/p/1")
         self.run_(S.pos_url_save(msg, FakeState()))
         self.assertEqual(len(self.watches()), 1)
-        self.assertTrue(any("нет" in t and "магазина" in t for t in msg.sent),
-                        msg.sent)
+        said = "\n".join(msg.sent)
+        self.assertIn("вашего товара среди них нет", said)
+        self.assertIn("Другой магазин", said)      # what we looked for
+        self.assertIn("Спайк", said)               # who was actually there
+
+    def test_we_are_found_by_our_own_ad_id_when_the_listing_names_no_seller(self):
+        """The API listing does not have to carry a shop name.
+
+        Our ad ids do identify us, and the marketplace hands them over for the
+        asking — a surer match than a name, which can be changed or repeated.
+        """
+        anonymous = {"offers": M._normalize([
+            {"title": "Лот A", "price": 100, "id": 111},
+            {"title": "Лот B", "price": 130, "id": 220075},
+            {"title": "Лот C", "price": 140, "id": 333},
+        ]), "note": "api"}
+        self.patch(M, "fetch_listing", lambda url, shop="": (True, anonymous))
+        self.patch(storage, "get_token", lambda uid: "tok")
+
+        class FakeApi:
+            def __init__(self, token):
+                pass
+
+            async def start(self):
+                pass
+
+            async def close(self):
+                pass
+
+            async def get_ads(self, *a, **kw):
+                return {"data": [{"id": 220075}, {"id": 999}]}
+
+        import api.yoomarket as Y
+        self.patch(Y, "YooMarketAPI", FakeApi)
+
+        msg = FakeMessage("https://yoomarket.net/p/9")
+        self.run_(S.pos_url_save(msg, FakeState()))
+        ws = self.watches()
+        self.assertEqual(ws[0]["market_id"], "220075")
+        self.assertEqual(ws[0]["last_pos"], 2)
+        self.assertTrue(any("2-м месте" in t for t in msg.sent), msg.sent)
 
     def test_an_unreadable_page_still_saves_the_watch_with_the_reason(self):
         self.patch(M, "fetch_listing", lambda url, shop="": (False, "HTTP 503"))
