@@ -67,6 +67,61 @@ class AccessMiddleware:
         return await handler(event, data)
 
 
+_LAST_ERROR_AT: dict[int, float] = {}
+
+
+def _install_error_reporter(dp: Dispatcher) -> None:
+    """Показывать сбой обработчика пользователю, а не только в логах контейнера.
+
+    Необработанное исключение внутри обработчика aiogram просто пишет в лог.
+    Для человека это выглядит как «кнопка не нажимается»: нажатие не
+    подтверждено, экран не изменился, объяснений нет. Логи контейнера продавец
+    не читает — и не должен.
+    """
+    import time as _time
+    import traceback
+
+    from aiogram.types import ErrorEvent
+
+    @dp.errors()
+    async def _report(event: ErrorEvent) -> bool:
+        exc = event.exception
+        logger.exception("handler failed: %s", exc)
+
+        update = event.update
+        cq = getattr(update, "callback_query", None)
+        user = getattr(cq, "from_user", None) or getattr(
+            getattr(update, "message", None), "from_user", None)
+        if not user:
+            return True
+
+        # Один рассказ об ошибке в 15 секунд: упавший API иначе завалит чат
+        # одинаковыми сообщениями.
+        now = _time.time()
+        if now - _LAST_ERROR_AT.get(user.id, 0) < 15:
+            return True
+        _LAST_ERROR_AT[user.id] = now
+
+        where = getattr(cq, "data", "") or "сообщение"
+        text = (f"⚠️ <b>Сбой</b>\n\n"
+                f"Действие: <code>{where[:60]}</code>\n"
+                f"Причина: <code>{str(exc)[:250] or type(exc).__name__}</code>\n\n"
+                "<i>Это сообщение вместо молчания: раньше такая ошибка просто "
+                "ничего не делала.</i>")
+        # Бот берётся из самого события, а не запоминается при установке:
+        # запомненный — это лишний способ отправить ответ не туда.
+        target = getattr(event.update, "bot", None) or getattr(cq, "bot", None)
+        try:
+            if cq is not None:
+                await cq.answer()          # снять «часики» с кнопки
+            if target is not None:
+                await target.send_message(user.id, text)
+        except Exception:
+            logger.warning("could not report error to %s: %s", user.id,
+                           traceback.format_exc(limit=1))
+        return True
+
+
 class YooMarketMiddleware:
     """Injects per-user YooMarketAPI instance into handler data."""
 
@@ -131,6 +186,8 @@ async def main() -> None:
     dp.callback_query.middleware(AccessMiddleware())
     dp.message.middleware(YooMarketMiddleware())
     dp.callback_query.middleware(YooMarketMiddleware())
+
+    _install_error_reporter(dp)
 
     dp.include_router(admin.router)
     dp.include_router(start.router)

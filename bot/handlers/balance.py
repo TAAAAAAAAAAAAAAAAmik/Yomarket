@@ -180,7 +180,7 @@ def _parse_check(data: dict) -> tuple[str, str, str | None]:
     return str(name), bal_str, pend_str
 
 
-_DONE = ("confirmed", "completed", "done")
+from orderfields import DONE as _DONE
 _RUB = lambda v: f"{int(round(v)):,}".replace(",", " ")   # 1234 → "1 234"
 
 

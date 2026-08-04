@@ -148,6 +148,61 @@ def _newest_id(rows: list[dict]) -> str:
     return best
 
 
+# Кто отправил сообщение. Подстрока ищется только у отличительных слов: короткое
+# «me» встречается внутри «customer».
+_OWN_PARTS = ("shop", "seller", "store", "merchant", "продав", "магаз",
+              "support", "админ")
+_OWN_EXACT = frozenset({"me", "self", "own", "admin", "bot", "system"})
+
+
+def _is_own_message(msg: dict, in_support_chat: bool = False) -> bool:
+    """Сообщение написано магазином, а не собеседником.
+
+    В чате с поддержкой «support» и «админ» — это как раз собеседник, а не мы;
+    записав их в свои, бот считал бы такой чат всегда отвеченным.
+    """
+    if msg.get("is_mine") or msg.get("is_own"):
+        return True
+    sender = msg.get("sender_type") or msg.get("sender") or ""
+    if isinstance(sender, dict):
+        sender = (sender.get("type") or sender.get("role")
+                  or sender.get("name") or "")
+    sender = str(sender).lower()
+    parts = (tuple(p for p in _OWN_PARTS if p not in ("support", "админ"))
+             if in_support_chat else _OWN_PARTS)
+    exact = _OWN_EXACT - {"admin"} if in_support_chat else _OWN_EXACT
+    return sender in exact or any(k in sender for k in parts)
+
+
+def _ts_of(msg: dict) -> float:
+    """Время сообщения в секундах эпохи, 0 — если разобрать не вышло."""
+    raw = (msg.get("created_at") or msg.get("date") or msg.get("time")
+           or msg.get("timestamp"))
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return float(raw) / 1000 if float(raw) > 1e11 else float(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return 0.0
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _newest_msg(rows: list[dict]) -> dict:
+    """Самое свежее сообщение — по номеру, а не по месту в списке."""
+    best: dict = {}
+    best_id = ""
+    for m in rows:
+        mid = str(m.get("id", ""))
+        if not mid:
+            continue
+        if not best_id or _is_newer(mid, best_id):
+            best_id, best = mid, m
+    return best
+
+
 _USERNAME_RE = re.compile(r"@?([a-zA-Z][a-zA-Z0-9_]{3,31})")
 
 
@@ -207,13 +262,33 @@ def _order_username(order: dict) -> str:
     return u if u.startswith("@") else f"@{u}"
 
 
-_DONE_STATUSES = ("confirmed", "completed", "done")
-_BACK_STATUSES = ("refunded", "cancelled", "returned")
+# Списки статусов — общие с разбором заказа. Здесь не было «success», которым
+# этот маркетплейс помечает выполненный заказ: выручка по таким заказам никуда
+# не попадала.
+from orderfields import BACK as _BACK_STATUSES, DONE as _DONE_STATUSES
 
 
 # Windowed order figures used to live here. They now come from stats_source,
 # which reads the panel's ledger and falls back to this same local history, so
 # the report and the «Статистика» screen cannot disagree about a day.
+
+
+def _ar_context(details: dict | None, order_id: str, settings: dict) -> dict:
+    """Данные заказа для подстановок вида {товар} в автоответе."""
+    from autoreply import context
+    return context(details, order_id, settings.get("shop_name", ""))
+
+
+def _ar_log(settings: dict, chat_id: str, text: str, ok: bool, err: str,
+            rule: str) -> None:
+    """Записать отправку автоответа в журнал, который видно в боте.
+
+    Событийные автоответы (новый заказ, выполнен, возврат) отправлялись «в
+    никуда»: провал попадал только в логи контейнера. Журнал у них общий с
+    ответами на сообщения — продавцу неважно, какой механизм промолчал.
+    """
+    from autoreply import cfg, log
+    log(cfg(settings), chat_id=chat_id, text=text, ok=ok, err=err, rule=rule)
 
 
 def _today_stats(order_details: dict, known_orders: dict) -> tuple[int, int]:
@@ -638,26 +713,52 @@ class TaskManager:
             sold_now = False
             sold_ads: set[str] = set()
 
+            # Сколько заказов дочитать за проход. Каждый — отдельный запрос,
+            # поэтому на первом проходе полная витрина разбирается за
+            # несколько кругов, а дальше дочитываются только новые.
+            detail_budget = 8
+
             for order in orders:
                 oid = str(order.get("id", ""))
                 if not oid:
                     continue
 
-                status = str(order.get("status", ""))
+                # Разбор общий с экраном заказов: угаданные имена полей
+                # оставляли здесь «—» вместо товара, покупателя и суммы, а на
+                # этих значениях стоит и статистика, и подписи чатов.
+                from orderfields import describe as _describe
+                d = _describe(order)
+                prev_det = order_details.get(oid, {})
+                # Список отдаёт заказ без товара и покупателя — дочитываем
+                # карточку. Один раз на заказ: дальше берём из сохранённого.
+                if (not d["title"] or not d["buyer"]):
+                    if prev_det.get("enriched"):
+                        d["title"] = d["title"] or prev_det.get("title") or ""
+                        d["buyer"] = d["buyer"] or prev_det.get("buyer") or ""
+                        d["username"] = d["username"] or prev_det.get("username") or ""
+                        if d["price"] is None:
+                            d["price"] = prev_det.get("price")
+                    elif detail_budget > 0:
+                        detail_budget -= 1
+                        d = await self._enrich_order(api, oid, d)
+                status = d["status"]
                 prev_status = known.get(oid)
-                title = _order_field(order, "title", "ad_title", "product_name", default="—")
-                buyer = _order_field(order, "buyer_name", "buyer.name", default="—")
-                price = _order_field(order, "price", "total", "amount", default="—")
-                time_raw = order.get("created_at") or order.get("date") or order.get("created")
+                title = d["title"] or "—"
+                buyer = d["buyer"] or "—"
+                price = d["price"] if d["price"] is not None else "—"
+                time_raw = d["created"]
                 chat_id = str(order.get("chat_id") or oid)
-                username = _order_username(order)
-                quantity = _order_field(order, "quantity", "count", "qty", "amount_items")
+                username = d["username"] or _order_username(order)
+                quantity = d["quantity"]
                 category = _order_field(order, "category", "category_name", "ad_category")
 
-                prev_det = order_details.get(oid, {})
                 work_at = prev_det.get("work_at")
                 if status in ("work", "working", "processing") and prev_status not in ("work", "working", "processing"):
                     work_at = time.time()
+                # Спорный статус — это проблема сам по себе, ещё до того, как
+                # покупатель что-то написал.
+                disputed = any(cs in str(status).lower()
+                               for cs in _COMPLAINT_STATUSES)
                 order_details[oid] = {
                     "title": title,
                     "buyer": buyer,
@@ -668,6 +769,14 @@ class TaskManager:
                     "category": category,
                     "seen_at": prev_det.get("seen_at") or time.time(),
                     "work_at": work_at,
+                    "status": status,
+                    # Дочитанное не перечитывается на каждом проходе.
+                    "enriched": bool(d.get("enriched") or prev_det.get("enriched")),
+                    # Метки подсветки чата переживают пересборку записи — иначе
+                    # красный чат гас на следующем же проходе опроса.
+                    "waiting": prev_det.get("waiting", 0),
+                    "problem": (time.time() if disputed
+                                else prev_det.get("problem", 0)),
                 }
 
                 # If order moved to a terminal/changed status, clear its reminder record
@@ -754,8 +863,12 @@ class TaskManager:
                             reply_markup=_order_notify_kb(oid, chat_id),
                         )
                     if ar.get("enabled"):
-                        msg = self._pick_message(title, ar.get("message", "Спасибо за заказ!"), rules, responders_map)
-                        await self._send_chat(api, chat_id, msg)
+                        msg = self._pick_message(
+                            title, ar.get("message", "Спасибо за заказ!"),
+                            rules, responders_map,
+                            _ar_context(order_details.get(oid), oid, settings))
+                        ok, err = await self._send_chat(api, chat_id, msg)
+                        _ar_log(settings, chat_id, msg, ok, err, "новый заказ")
                     # AutoStars: ask the buyer for their @username in chat
                     await self._maybe_ask_stars_username(
                         api, settings, oid, title, chat_id)
@@ -763,8 +876,12 @@ class TaskManager:
                 elif prev_status != status and status in ("confirmed", "completed", "done"):
                     ev = ae.get("on_confirmed", {})
                     if ev.get("enabled"):
-                        msg = self._pick_message(title, ev.get("message", "Заказ подтверждён!"), rules, responders_map)
-                        await self._send_chat(api, chat_id, msg)
+                        msg = self._pick_message(
+                            title, ev.get("message", "Заказ подтверждён!"),
+                            rules, responders_map,
+                            _ar_context(order_details.get(oid), oid, settings))
+                        ok, err = await self._send_chat(api, chat_id, msg)
+                        _ar_log(settings, chat_id, msg, ok, err, "заказ выполнен")
                     cnt_today, rev_today = _today_stats(order_details, known)
                     buyer_line = _esc(f"👤 {buyer}" + (f" ({username})" if username else ""))
                     await self._notify(
@@ -783,8 +900,12 @@ class TaskManager:
                 elif prev_status != status and status in ("refunded", "cancelled", "returned"):
                     ev = ae.get("on_refunded", {})
                     if ev.get("enabled"):
-                        msg = self._pick_message(title, ev.get("message", "Возврат оформлен."), rules, responders_map)
-                        await self._send_chat(api, chat_id, msg)
+                        msg = self._pick_message(
+                            title, ev.get("message", "Возврат оформлен."),
+                            rules, responders_map,
+                            _ar_context(order_details.get(oid), oid, settings))
+                        ok, err = await self._send_chat(api, chat_id, msg)
+                        _ar_log(settings, chat_id, msg, ok, err, "возврат")
                     buyer_line = _esc(f"👤 {buyer}" + (f" ({username})" if username else ""))
                     await self._notify(
                         user_id,
@@ -842,6 +963,17 @@ class TaskManager:
 
                 newest_id = _newest_id(messages)
                 last_known = info.get("last_msg")
+
+                # Тот же признак, что и у чатов заказов: последним написал
+                # покупатель — чат ждёт ответа. Считается всегда, чтобы метка
+                # гасла, когда продавец ответил из панели.
+                newest = _newest_msg(messages)
+                if newest and _is_own_message(newest, in_support_chat=True):
+                    info["waiting"] = 0
+                    info["problem"] = 0
+                elif newest and not info.get("waiting"):
+                    info["waiting"] = _ts_of(newest) or time.time()
+
                 if last_known is None:
                     info["last_msg"] = newest_id      # baseline, stay quiet
                     continue
@@ -853,13 +985,10 @@ class TaskManager:
                     msg_id = str(msg.get("id", ""))
                     if not _is_newer(msg_id, last_known):
                         continue
-                    sender = msg.get("sender_type") or msg.get("sender") or ""
-                    if isinstance(sender, dict):
-                        sender = sender.get("type") or sender.get("role") or ""
-                    sender = str(sender).lower()
-                    if msg.get("is_mine") or msg.get("is_own") or sender in (
-                            "me", "self", "own", "shop", "seller"):
+                    if _is_own_message(msg, in_support_chat=True):
                         continue
+                    if _is_complaint_text(msg.get("text") or msg.get("message") or ""):
+                        info["problem"] = time.time()
 
                     if not announce:
                         continue
@@ -907,6 +1036,21 @@ class TaskManager:
                 newest_id = _newest_id(messages)
                 last_known_id = known_messages.get(order_id)
 
+                # Кто написал последним — этим и подсвечивается чат в списке.
+                # Считается на каждом проходе, даже когда новых сообщений нет:
+                # продавец мог ответить из панели или приложения, и тогда метка
+                # «покупатель ждёт» должна погаснуть сама.
+                newest = _newest_msg(messages)
+                if order_id in order_details:
+                    det = order_details[order_id]
+                    if newest and _is_own_message(newest):
+                        det["waiting"] = 0
+                        det["problem"] = 0
+                    elif newest:
+                        det.setdefault("waiting", 0)
+                        if not det["waiting"]:
+                            det["waiting"] = (_ts_of(newest) or time.time())
+
                 if last_known_id is None:
                     known_messages[order_id] = newest_id
                     continue
@@ -928,22 +1072,11 @@ class TaskManager:
                     # Skip what the shop itself sent; anything else counts as
                     # the buyer. Requiring a known buyer value meant an
                     # unfamiliar wording silently dropped every message.
-                    sender = msg.get("sender_type") or msg.get("sender") or ""
-                    if isinstance(sender, dict):
-                        sender = (sender.get("type") or sender.get("role")
-                                  or sender.get("name") or "")
-                    sender = str(sender).lower()
-                    if msg.get("is_mine") or msg.get("is_own"):
+                    if _is_own_message(msg):
                         continue
-                    # Substring match only for distinctive words: short ones
-                    # like "me" also occur inside "customer".
-                    _OWN_PARTS = ("shop", "seller", "store", "merchant",
-                                  "продав", "магаз", "support", "админ")
-                    _OWN_EXACT = {"me", "self", "own", "admin", "bot", "system"}
-                    if sender in _OWN_EXACT or any(k in sender for k in _OWN_PARTS):
-                        continue
-                    if sender and sender not in (
-                            "buyer", "client", "customer", "user"):
+                    sender = msg.get("sender_type") or msg.get("sender")
+                    if isinstance(sender, str) and sender.lower() not in (
+                            "", "buyer", "client", "customer", "user"):
                         logger.info("chat %s: unknown sender %r", chat_id, sender)
 
                     time_str = _fmt_time(msg.get("created_at") or msg.get("date"))
@@ -960,8 +1093,16 @@ class TaskManager:
                         continue
 
                     # Complaint detection → distinct high-priority alert
+                    is_complaint = _is_complaint_text(raw_text)
+                    alerted = False
+                    # Красным чат светится независимо от того, включены ли
+                    # уведомления о жалобах: выключенное уведомление — просьба
+                    # не дёргать, а не «считать, что всё хорошо».
+                    if is_complaint and order_id in order_details:
+                        order_details[order_id]["problem"] = time.time()
+
                     cn = settings.get("complaint_notify", {"enabled": True})
-                    if cn.get("enabled", True) and _is_complaint_text(raw_text):
+                    if cn.get("enabled", True) and is_complaint:
                         seen = cn.setdefault("seen", [])
                         mark = f"{order_id}:{msg_id}"
                         if mark not in seen:
@@ -969,6 +1110,7 @@ class TaskManager:
                             if len(seen) > 500:
                                 del seen[:250]
                             settings["complaint_notify"] = cn
+                            alerted = True
                             await self._notify(
                                 user_id,
                                 _card("🚨 <b>ЖАЛОБА КЛИЕНТА</b>",
@@ -980,12 +1122,12 @@ class TaskManager:
                                       f"{order_line}\n🧾 <code>#{order_id}</code>"),
                                 reply_markup=_message_notify_kb(chat_id, order_id),
                             )
-                            continue
 
                     # A complaint is an alert, not chat traffic, and is sent
                     # above regardless — this switch only silences ordinary
                     # buyer messages.
-                    if settings.get("notify_messages", {}).get("enabled", True):
+                    if not alerted and settings.get(
+                            "notify_messages", {}).get("enabled", True):
                         await self._notify(
                             user_id,
                             _card("💬 <b>СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ</b>",
@@ -995,6 +1137,14 @@ class TaskManager:
                                   f"{order_line}\n🧾 <code>#{order_id}</code>"),
                             reply_markup=_message_notify_kb(chat_id, order_id),
                         )
+
+                    # Уведомить продавца — половина дела; покупателю нужен
+                    # ответ. Отправляется после уведомления, чтобы продавец
+                    # видел и вопрос, и то, что бот на него ответил.
+                    await self._auto_answer(
+                        user_id, api, settings, chat_id=chat_id,
+                        order_id=order_id, text=raw_text, details=details,
+                        is_complaint=is_complaint)
 
                 known_messages[order_id] = newest_id
 
@@ -1256,23 +1406,130 @@ class TaskManager:
             )
         return True
 
-    def _pick_message(self, title: str, default: str, rules: list[dict], responders: dict | None = None) -> str:
-        title_lower = title.lower()
-        if responders:
-            for game_name, message in responders.items():
-                if game_name.lower() in title_lower:
-                    return message
-        for rule in rules:
-            kw = rule.get("keyword", "").lower()
-            if kw and kw in title_lower:
-                return rule.get("message", default)
-        return default
+    def _pick_message(self, title: str, default: str, rules: list[dict],
+                      responders: dict | None = None,
+                      ctx: dict | None = None) -> str:
+        """Текст автоответа для товара с таким заголовком.
 
-    async def _send_chat(self, api: YooMarketAPI, chat_id: str, text: str) -> None:
+        Побеждает самое длинное совпадение, а не первое по порядку словаря:
+        автоответчик для «Steam» перехватывал заказы «Steam Deck», хотя для них
+        был заведён свой, — просто потому, что его добавили раньше.
+        """
+        from autoreply import render
+        title_lower = (title or "").lower()
+        best: tuple[int, str] | None = None
+        for game_name, message in (responders or {}).items():
+            key = str(game_name).lower()
+            if key and key in title_lower and (best is None or len(key) > best[0]):
+                best = (len(key), str(message))
+        for rule in rules or []:
+            kw = str(rule.get("keyword", "")).lower()
+            if kw and kw in title_lower and (best is None or len(kw) > best[0]):
+                best = (len(kw), str(rule.get("message", default)))
+        return render(best[1] if best else default, ctx)
+
+    async def _enrich_order(self, api: YooMarketAPI, oid: str, d: dict) -> dict:
+        """Дочитать заказ, если список отдал одни номера.
+
+        GET /orders отдаёт скупую строку — номер, статус, ссылку на
+        объявление, — и экраны показывали «Заказ #1136046» вместо товара и
+        покупателя. Карточка заказа знает больше, а название товара при
+        необходимости берётся из самого объявления. Дочитывается один раз на
+        заказ: результат оседает в известных деталях.
+        """
+        from orderfields import ad_title, describe, order_ad_id
+
+        full: dict = {}
+        try:
+            full = await api.get_order(oid)
+        except Exception as e:
+            logger.info("order %s detail: %s", oid, e)
+        if isinstance(full, dict) and full:
+            deeper = describe(full.get("data") if isinstance(full.get("data"), dict)
+                              else full)
+            for key in ("title", "buyer", "username", "quantity"):
+                if not d.get(key):
+                    d[key] = deeper.get(key)
+            if d.get("price") in (None, "") and deeper.get("price") is not None:
+                d["price"] = deeper["price"]
+
+        if not d.get("title"):
+            ad_id = order_ad_id(full if isinstance(full, dict) else {}) or ""
+            if ad_id:
+                try:
+                    d["title"] = ad_title(await api.get_ad(ad_id))
+                except Exception as e:
+                    logger.info("ad %s for order %s: %s", ad_id, oid, e)
+        d["enriched"] = True
+        return d
+
+    async def _send_chat(self, api: YooMarketAPI, chat_id: str,
+                         text: str) -> tuple[bool, str]:
+        """Отправить сообщение в чат заказа → (получилось, причина).
+
+        Раньше провал уходил только в логи контейнера: покупатель не получал
+        ничего, а продавец был уверен, что автоответ работает. Результат
+        возвращается, и вызывающий его показывает.
+        """
+        if not (text or "").strip():
+            return False, "пустой текст"
         try:
             await api.send_message(chat_id, text)
+            return True, ""
         except Exception as e:
             logger.warning("Auto chat send failed (chat %s): %s", chat_id, e)
+            return False, str(e)[:150] or type(e).__name__
+
+    async def _auto_answer(self, user_id: int, api: YooMarketAPI, settings: dict,
+                           *, chat_id: str, order_id: str, text: str,
+                           details: dict, is_complaint: bool) -> None:
+        """Ответить покупателю на его сообщение, если есть чем и можно.
+
+        Бот присылал продавцу уведомление и молчал в чате — ночью покупатель
+        ждал до утра. Здесь тот же подбор правил, что показывает экран
+        «🧪 Проверка», так что настроенное и отправленное совпадают.
+        """
+        import autoreply as ar
+
+        conf = ar.cfg(settings)
+        if not conf.get("enabled"):
+            return
+        if is_complaint and not conf.get("reply_to_complaints"):
+            return          # на жалобу шаблон отвечать не должен — нужен человек
+
+        rule, matched = ar.pick(conf, text)
+        if not rule:
+            return
+        allowed, why = ar.gate(conf, chat_id)
+        if not allowed:
+            logger.info("autoreply skipped (chat %s): %s", chat_id, why)
+            return
+
+        body = ar.render(rule.get("text", ""),
+                         ar.context(details, order_id,
+                                    settings.get("shop_name", "")))
+        ok, err = await self._send_chat(api, chat_id, body)
+        ar.log(conf, chat_id=chat_id, text=body, ok=ok, err=err,
+               rule=matched or ("запасной" if rule.get("id") == "fallback" else ""))
+        if ok:
+            ar.note_sent(conf, chat_id)
+            if rule.get("id") != "fallback":
+                rule["hits"] = int(rule.get("hits", 0) or 0) + 1
+        else:
+            # Молчаливый провал — худший исход: продавец считает, что покупателю
+            # ответили. Сообщаем, но не чаще раза в час, чтобы упавшее API не
+            # превратилось в поток уведомлений.
+            now = time.time()
+            if now - float(conf.get("last_fail_notice", 0) or 0) > 3600:
+                conf["last_fail_notice"] = now
+                await self._notify(
+                    user_id,
+                    _card("⚠️ <b>АВТООТВЕТ НЕ ДОШЁЛ</b>",
+                          [f"💬 Чат <code>{_esc(chat_id)}</code>",
+                           f"❌ {_esc(err)}",
+                           "",
+                           "Покупателю ничего не отправлено — ответьте вручную."]),
+                    reply_markup=_message_notify_kb(chat_id, order_id))
 
     async def _panel_bump(self, user_id: int, api: YooMarketAPI | None = None,
                           ) -> tuple[int, str]:
