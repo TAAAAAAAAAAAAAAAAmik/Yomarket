@@ -378,6 +378,53 @@ class FindingOurOwn(unittest.TestCase):
         self.assertIn("https://yoomarket.net/categories/telegram/zvezdy", urls)
         self.assertIn("https://yoomarket.net/categories/zvezdy/telegram", urls)
 
+    def test_the_section_comes_from_the_catalogue_when_the_row_names_only_the_game(self):
+        """A row does not have to carry the whole path.
+
+        One really did give «black-russia» and nothing else, which builds an
+        address for the entire game — and our listing is hundreds of places
+        down a list it does not belong in.
+        """
+        import requests
+        tree = [{"id": 77, "slug": "black-russia", "children": [
+            {"id": 512, "slug": "akkaunty-s-virtami"},
+            {"id": 513, "slug": "virty"}]}]
+        row = {"id": 196439, "title": "Аккаунт", "category_id": 512,
+               "category": {"slug": "black-russia"}}
+        old = requests.get
+
+        def fake(url, params=None, **kw):
+            if url.endswith("/api/categories"):
+                return Reply({"data": tree})
+            if "/api/products/" in url:
+                return Reply({}, 404)
+            return Reply({"data": [row]})
+
+        requests.get = fake
+        try:
+            urls = M.listing_urls_for(196439, title="Аккаунт")
+        finally:
+            requests.get = old
+        self.assertEqual(
+            urls[0],
+            "https://yoomarket.net/categories/black-russia/akkaunty-s-virtami",
+            f"the section was not recovered: {urls}")
+
+    def test_the_catalogue_path_is_found_by_id_at_any_depth(self):
+        tree = [{"id": 1, "slug": "games", "children": [
+            {"id": 77, "slug": "black-russia",
+             "subcategories": [{"id": 512, "slug": "akkaunty-s-virtami"}]}]}]
+        self.assertEqual(M._find_by_id(tree, 512),
+                         ["games", "black-russia", "akkaunty-s-virtami"])
+        self.assertEqual(M._find_by_id(tree, 999), [])
+
+    def test_the_deepest_id_on_the_row_is_the_section(self):
+        self.assertEqual(M._category_id_of({"category_id": 512}), 512)
+        self.assertEqual(
+            M._category_id_of({"category": {"id": 77,
+                                            "section": {"id": 512}}}), 512)
+        self.assertIsNone(M._category_id_of({"title": "нет категории"}))
+
     def test_a_listing_that_is_nowhere_is_reported_as_nothing(self):
         self.assertEqual(M.find_own_listing(999999, "Нет такого товара"), {})
         self.assertEqual(M.listing_urls_for(999999, title="Нет такого"), [])

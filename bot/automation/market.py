@@ -533,6 +533,66 @@ def _slug_chain(node, depth: int = 0) -> list:
     return out
 
 
+def category_tree() -> list:
+    """The catalogue as the storefront's own menu gets it."""
+    import requests
+    try:
+        r = requests.get(f"{API_URL}/api/categories", headers=_API_HEADERS,
+                         timeout=(6, 20), verify=False)
+        body = r.json() if r.status_code == 200 else {}
+    except Exception as e:
+        logger.info("category tree: %s", e)
+        return []
+    rows = body.get("data") if isinstance(body, dict) else body
+    return rows if isinstance(rows, list) else []
+
+
+def _find_by_id(nodes, want, trail=()) -> list:
+    """The slugs leading down to a category id, outermost first."""
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict):
+            continue
+        here = trail + ((str(node.get("slug") or ""),) if node.get("slug")
+                        else ())
+        if str(node.get("id")) == str(want):
+            return [s for s in here if s]
+        for key in ("children", "subcategories", "items", "categories"):
+            got = _find_by_id(node.get(key), want, here)
+            if got:
+                return got
+    return []
+
+
+def category_slugs_for(cat_id) -> list:
+    """Where a category sits in the catalogue: ['black-russia', 'virty'].
+
+    A listing row names its category, but not always the whole path to it — the
+    one we saw carried the game and nothing else, which builds an address for
+    the whole game rather than the section, and our own listing is not in the
+    first hundreds of that.
+    """
+    if cat_id in (None, ""):
+        return []
+    return _find_by_id(category_tree(), cat_id)
+
+
+def _category_id_of(card: dict):
+    """The category a listing row says it belongs to."""
+    for key in ("category_id", "categoryId", "subcategory_id"):
+        if card.get(key) not in (None, ""):
+            return card[key]
+    node = card.get("category") or card.get("subcategory")
+    if isinstance(node, dict):
+        # The deepest id in there — the section, not the game above it
+        deepest = node.get("id")
+        for key in ("children", "subcategory", "section"):
+            inner = node.get(key)
+            if isinstance(inner, dict) and inner.get("id") is not None:
+                deepest = inner["id"]
+        return deepest
+    return None
+
+
 def listing_urls_for(market_id: str | int, card: dict | None = None,
                      title: str = "") -> list:
     """Storefront addresses a listing of ours could live at, likeliest first.
@@ -550,13 +610,20 @@ def listing_urls_for(market_id: str | int, card: dict | None = None,
     card = card if card is not None else find_own_listing(market_id, title)
     if not card:
         return []
+    out = []
+    # First and best: the catalogue itself, looked up by the category id the
+    # row carries. A row does not have to name the whole path — the one we saw
+    # gave the game and nothing else, and an address for the whole game puts
+    # our listing hundreds of places down a list it does not belong in.
+    path = category_slugs_for(_category_id_of(card))
+    if path:
+        out.append(f"{MARKET_URL}/categories/" + "/".join(path[-2:]))
+
     own = str(card.get("slug") or "")
     slugs = [s for s in dict.fromkeys(_slug_chain(card)) if s != own]
-    if not slugs:
-        return []
-    out = []
     pair = slugs[:2]
     if len(pair) == 2:
+        # The row names its section and its game without saying which is which
         out.append(f"{MARKET_URL}/categories/" + "/".join(reversed(pair)))
         out.append(f"{MARKET_URL}/categories/" + "/".join(pair))
     for one in slugs[:2]:
