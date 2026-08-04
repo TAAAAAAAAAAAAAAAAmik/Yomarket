@@ -775,16 +775,18 @@ async def pos_add_pick(callback: CallbackQuery) -> None:
     if not chosen:
         # Say which of the two steps failed. "Не смог" alone left nothing to
         # act on — and the two causes need different things from the seller.
-        from automation.market import search_key
+        from automation.market import search_keys
         if urls:
             why = (f"Нашёл товар на витрине, но ни одна из {len(urls)} "
                    f"страниц-кандидатов его не показала:\n"
                    + "\n".join(f"• <code>{_esc(_short_url(u))}</code>"
                                for u in urls[:4]))
         else:
-            why = (f"Не нашёл этот товар на витрине поиском по «"
-                   f"{_esc(search_key(ad['title']) or ad['title'][:30])}». "
-                   f"Возможно, он снят с публикации или называется иначе.")
+            tried = search_keys(ad["title"]) or [ad["title"][:30]]
+            why = ("Не нашёл этот товар в поиске витрины. Пробовал: "
+                   + ", ".join(f"«{_esc(k)}»" for k in tried)
+                   + ".\n\nВозможно, он снят с публикации, или витрина "
+                     "показывает его под другим названием.")
         b = InlineKeyboardBuilder()
         b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
         b.button(text="⬅️ Назад", callback_data="pos:add")

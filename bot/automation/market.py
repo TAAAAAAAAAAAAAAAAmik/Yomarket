@@ -426,22 +426,52 @@ def product_card(market_id: str | int) -> dict:
     return body if isinstance(body, dict) else {}
 
 
-def search_key(title: str) -> str:
-    """A piece of a title worth searching on.
+def search_words(title: str) -> list:
+    """The searchable words of a title, longest first.
 
-    Titles are written to catch the eye — «🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫» — and
-    the decorations are not searchable. What is left are the words a buyer
+    Titles are written to catch the eye — «💖Аккаунт 💖Баланс: 4.000.000 ₽⚡» —
+    and the decorations are not searchable. What is left are the words a buyer
     would actually type.
     """
     words = re.findall(r"[\w.]+", str(title or ""), re.UNICODE)
-    words = [w for w in words if len(w) > 1 and not w.isdigit() or
-             (w.isdigit() and len(w) >= 2)]
+    seen, out = set(), []
+    for w in words:
+        w = w.strip(".")
+        low = w.lower()
+        if len(w) < 3 or low in seen:
+            continue
+        seen.add(low)
+        out.append(w)
+    return sorted(out, key=len, reverse=True)
+
+
+def search_keys(title: str) -> list:
+    """Things to try in the marketplace's search box, likeliest first.
+
+    One word at a time rather than a phrase. Joining the two longest words gave
+    «Аккаунт 4.000.000» for a title that reads «💖Аккаунт 💖Баланс: 4.000.000 ₽»
+    — the words are not adjacent, so a search that matches phrases finds
+    nothing at all. A single distinctive word cannot have that problem.
+    """
+    words = search_words(title)
     if not words:
-        return ""
-    # Two longest words, in the order they appear: enough to be specific,
-    # short enough that a decorated title still matches.
-    best = sorted(words, key=len, reverse=True)[:2]
-    return " ".join(w for w in words if w in best)[:60]
+        return []
+    keys = words[:3]
+    # And the pair, in case the search is happy with several words: when it is,
+    # it narrows the results and our listing surfaces sooner.
+    if len(words) > 1:
+        ordered = [w for w in re.findall(r"[\w.]+", str(title), re.UNICODE)
+                   if w.strip(".") in words[:2]]
+        pair = " ".join(dict.fromkeys(ordered))[:60]
+        if pair and pair not in keys:
+            keys.append(pair)
+    return keys
+
+
+def search_key(title: str) -> str:
+    """The first thing worth searching for — kept for messages and tests."""
+    keys = search_keys(title)
+    return keys[0] if keys else ""
 
 
 def find_own_listing(market_id: str | int, title: str = "") -> dict:
@@ -456,28 +486,26 @@ def find_own_listing(market_id: str | int, title: str = "") -> dict:
     card = product_card(market_id)
     if card:
         return card
-    key = search_key(title)
-    if not key:
-        return {}
     want = str(market_id)
-    # A few pages, because the words that survive a decorated title are not
-    # always distinctive — «Быстрая выдача» matches half a category.
-    for page in range(1, 4):
-        try:
-            r = requests.get(f"{API_URL}/api/products",
-                             params={"keyword": key, "page": page},
-                             headers=_API_HEADERS, timeout=(6, 20),
-                             verify=False)
-            body = r.json() if r.status_code == 200 else {}
-        except Exception as e:
-            logger.info("search for own listing %s: %s", market_id, e)
-            return {}
-        rows = body.get("data") if isinstance(body, dict) else None
-        if not isinstance(rows, list) or not rows:
-            return {}
-        for row in rows:
-            if isinstance(row, dict) and str(row.get("id")) == want:
-                return row
+    for key in search_keys(title):
+        # A few pages per key: the words that survive a decorated title are not
+        # always distinctive — «Быстрая выдача» matches half a category.
+        for page in range(1, 4):
+            try:
+                r = requests.get(f"{API_URL}/api/products",
+                                 params={"keyword": key, "page": page},
+                                 headers=_API_HEADERS, timeout=(6, 20),
+                                 verify=False)
+                body = r.json() if r.status_code == 200 else {}
+            except Exception as e:
+                logger.info("search for own listing %s: %s", market_id, e)
+                return {}
+            rows = body.get("data") if isinstance(body, dict) else None
+            if not isinstance(rows, list) or not rows:
+                break                       # this key is exhausted, try another
+            for row in rows:
+                if isinstance(row, dict) and str(row.get("id")) == want:
+                    return row
     return {}
 
 

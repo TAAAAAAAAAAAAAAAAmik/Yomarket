@@ -345,8 +345,24 @@ class FindingOurOwn(unittest.TestCase):
 
     def test_a_decorated_title_still_yields_something_searchable(self):
         self.assertEqual(M.search_key("🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫"),
-                         "АВТОВЫДАЧА ЗВЁЗД")
-        self.assertEqual(M.search_key("⭐⭐⭐"), "")
+                         "АВТОВЫДАЧА")
+        self.assertEqual(M.search_keys("⭐⭐⭐"), [])
+
+    def test_words_are_searched_one_at_a_time_not_as_a_phrase(self):
+        """«💖Аккаунт 💖Баланс: 4.000.000 ₽» has «Аккаунт» and «4.000.000»
+        apart, so a phrase built from them matches nothing at all."""
+        keys = M.search_keys("💖Аккаунт 💖Баланс: 4.000.000 ₽⚡Уровень 3-")
+        self.assertEqual(keys[0], "4.000.000", "longest word goes first")
+        self.assertIn("Аккаунт", keys)
+        self.assertTrue(all(" " not in k for k in keys[:3]),
+                        f"the first tries must be single words: {keys}")
+
+    def test_every_key_is_tried_before_giving_up(self):
+        self.pages = {1: [{"id": 5, "title": "Чужое"}]}
+        M.find_own_listing(196439, "💖Аккаунт 💖Баланс: 4.000.000 ₽")
+        used = [p.get("keyword") for p in self.asked]
+        self.assertIn("4.000.000", used)
+        self.assertIn("Аккаунт", used)
 
     def test_our_row_is_found_past_the_first_page_of_results(self):
         row = M.find_own_listing(196439, "🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫")
@@ -355,7 +371,7 @@ class FindingOurOwn(unittest.TestCase):
 
     def test_the_search_uses_the_words_out_of_the_title(self):
         M.find_own_listing(196439, "🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫")
-        self.assertEqual(self.asked[0].get("keyword"), "АВТОВЫДАЧА ЗВЁЗД")
+        self.assertEqual(self.asked[0].get("keyword"), "АВТОВЫДАЧА")
 
     def test_the_address_is_built_from_the_row_we_found(self):
         urls = M.listing_urls_for(196439, title="🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫")

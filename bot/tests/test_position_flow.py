@@ -358,7 +358,8 @@ class AddingFromOwnListings(FlowCase):
         cb = self.pick()
         self.assertEqual(self.watches(), [])
         said = "\n".join(cb.message.sent)
-        self.assertIn("Не нашёл этот товар на витрине", said)
+        self.assertIn("Не нашёл этот товар в поиске витрины", said)
+        self.assertIn("Пробовал:", said)   # and by what
         self.assertNotIn("не показала", said)
 
     def test_a_stale_list_is_refused_rather_than_picking_the_wrong_item(self):
