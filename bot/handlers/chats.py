@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -12,6 +14,7 @@ from aiogram.filters import Command
 from storage import get_settings, save_settings
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 
 def _newest_id(rows: list[dict]) -> str:
@@ -105,24 +108,34 @@ def _format_messages(messages: list[dict]) -> str:
 
 
 async def _safe_edit(callback: CallbackQuery, text: str, markup=None) -> None:
-    """Показать экран, а если Telegram отказал — сказать почему.
+    """Показать экран во что бы то ни стало.
 
     Правка без защиты — это и есть «кнопка не нажимается»: слишком длинный
-    текст или повторное нажатие роняли обработчик до того, как он успевал
-    ответить на нажатие, и Telegram оставлял кнопку в вечной загрузке.
+    текст, повторное нажатие или недоступное сообщение роняли обработчик, и
+    Telegram оставлял кнопку в вечной загрузке. Если править нельзя — шлём
+    новым сообщением; если и это не вышло — говорим всплывающим окном. Молча
+    не уходим никогда.
     """
+    reason = ""
     try:
         await callback.message.edit_text(text, reply_markup=markup)
+        return
     except Exception as e:
         reason = str(e)
         if "not modified" in reason:
             return                      # экран и так уже такой — это не ошибка
-        try:
-            await callback.message.answer(
-                "⚠️ Не смог показать экран: "
-                f"<code>{_esc(reason[:200])}</code>", reply_markup=markup)
-        except Exception:
-            pass
+
+    try:
+        await callback.bot.send_message(callback.from_user.id, text,
+                                        reply_markup=markup)
+        return
+    except Exception as e:
+        reason = f"{reason} / {e}"
+
+    try:
+        await callback.answer(f"Не смог показать: {reason[:180]}", show_alert=True)
+    except Exception:
+        logger.warning("chat screen unreachable: %s", reason[:300])
 
 
 # Состояние чата, в порядке важности. Номер заказа человеку ничего не говорит —
