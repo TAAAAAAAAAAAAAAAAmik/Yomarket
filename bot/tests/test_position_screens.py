@@ -130,6 +130,31 @@ class Screens(unittest.TestCase):
                 for row in kb.inline_keyboard:
                     self.assertLessEqual(len(row), 3)
 
+    def test_the_spending_limits_are_reachable_in_both_modes(self):
+        """Including «сигнал».
+
+        They were hidden behind the «поднимать» switch, which put the budget
+        out of reach exactly when a seller wants to set it — before letting the
+        bot spend anything.
+        """
+        for auto in (False, True):
+            got = [b.callback_data
+                   for b in buttons(S._pos_kb(settings(1, auto_promote=auto)))]
+            for cb in ("pos:budget", "pos:limit", "pos:cooldown"):
+                self.assertIn(cb, got, f"missing in auto={auto}")
+
+    def test_the_screen_says_the_limits_are_not_active_yet_in_signal_mode(self):
+        text = S._pos_text(settings(1, auto_promote=False))
+        self.assertIn("Ограничения трат", text)
+        self.assertIn("вступят в силу", text)
+        self.assertNotIn("вступят в силу",
+                         S._pos_text(settings(1, auto_promote=True)))
+
+    def test_a_budget_is_shown_with_what_it_buys(self):
+        text = S._pos_text(settings(1, auto_promote=True, daily_budget=300))
+        self.assertIn("300 ₽", text)
+        self.assertIn("6 поднятий", text)      # tariff is 49 ₽ in the fixture
+
     def test_every_watch_is_reachable_from_the_list(self):
         s = settings(4)
         got = [b.callback_data for b in buttons(S._pos_kb(s))]

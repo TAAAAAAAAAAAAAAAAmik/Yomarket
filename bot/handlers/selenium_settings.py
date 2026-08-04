@@ -418,24 +418,32 @@ def _pos_text(s: dict) -> str:
         f"Товаров под наблюдением: <b>{len(ws)}</b>",
         f"Режим: {'⭐ поднимать автоматически' if pp.get('auto_promote') else '🔔 только предупреждать'}",
     ]
-    if pp.get("auto_promote"):
-        price = promo_price(s)
-        lines.append(f"Пауза между поднятиями: {cooldown_hours(pp):.0f} ч")
-        cap = daily_limit(pp)
-        lines.append("Лимит в сутки на товар: "
-                     + (f"<b>{cap}</b>" + (f" (до {cap * price} ₽)" if price else "")
-                        if cap else "без лимита"))
-        budget = daily_budget(pp)
-        if budget:
-            spent = spent_today(pp, _t.time())
-            lines.append(f"Бюджет в сутки: <b>{budget:.0f} ₽</b> "
-                         f"(потрачено {spent:.0f} ₽, "
-                         f"осталось {budget - spent:.0f} ₽)")
-        else:
-            lines.append("Бюджет в сутки: <b>не задан</b> — трат ничто не "
-                         "ограничивает")
-        if not promo_params(s):
-            lines.append("⚠️ <b>Тариф «Премиум» не выбран</b> — поднять не смогу")
+    # The spending limits are shown in both modes on purpose: they are what one
+    # wants set *before* switching the trigger over to paying, not after.
+    price = promo_price(s)
+    auto = pp.get("auto_promote")
+    lines.append("")
+    lines.append("<b>Ограничения трат</b>"
+                 + ("" if auto else " <i>(вступят в силу в режиме "
+                                    "«поднимать»)</i>"))
+    lines.append(f"• Пауза между поднятиями: {cooldown_hours(pp):.0f} ч")
+    cap = daily_limit(pp)
+    lines.append("• Лимит в сутки на товар: "
+                 + (f"<b>{cap}</b>" + (f" (до {cap * price} ₽)" if price else "")
+                    if cap else "без лимита"))
+    budget = daily_budget(pp)
+    if budget:
+        spent = spent_today(pp, _t.time())
+        lines.append(f"• Бюджет в сутки: <b>{budget:.0f} ₽</b>"
+                     + (f" (потрачено {spent:.0f} ₽, "
+                        f"осталось {budget - spent:.0f} ₽)" if spent else "")
+                     + (f" — это {int(budget // price)} поднятий"
+                        if price else ""))
+    else:
+        lines.append("• Бюджет в сутки: <b>не задан</b> — сумма трат ничем "
+                     "не ограничена")
+    if auto and not promo_params(s):
+        lines.append("⚠️ <b>Тариф «Премиум» не выбран</b> — поднять не смогу")
     if ws:
         lines.append("")
         for i, w in enumerate(ws):
@@ -482,14 +490,16 @@ def _pos_kb(s: dict) -> InlineKeyboardMarkup:
              callback_data="pos:interval")
     b.button(text=("💰 Дешевле: сообщать" if pp.get("undercut_notify", True)
                    else "💰 Дешевле: молчать"), callback_data="pos:undercut")
-    if pp.get("auto_promote"):
-        b.button(text=f"⏸ Пауза: {pp.get('cooldown_hours', 6):.0f} ч",
-                 callback_data="pos:cooldown")
-        b.button(text=f"🧾 Лимит/сутки: {pp.get('daily_limit', 3) or '∞'}",
-                 callback_data="pos:limit")
-        budget = float(pp.get("daily_budget", 0) or 0)
-        b.button(text=f"💸 Бюджет: {f'{budget:.0f} ₽/сут' if budget else 'без лимита'}",
-                 callback_data="pos:budget")
+    # Always offered, in both modes: a spending cap is something to set before
+    # turning the paying on, and hiding it behind that switch put it out of
+    # reach exactly when it was wanted.
+    b.button(text=f"⏸ Пауза: {pp.get('cooldown_hours', 6):.0f} ч",
+             callback_data="pos:cooldown")
+    b.button(text=f"🧾 Лимит/сутки: {pp.get('daily_limit', 3) or '∞'}",
+             callback_data="pos:limit")
+    budget = float(pp.get("daily_budget", 0) or 0)
+    b.button(text=f"💸 Бюджет: {f'{budget:.0f} ₽/сут' if budget else 'не задан'}",
+             callback_data="pos:budget")
     if ws:
         b.button(text="🔍 Проверить все", callback_data="pos:checkall")
     b.button(text="⬅️ К продвижению", callback_data="selenium:bump:menu")
@@ -497,7 +507,7 @@ def _pos_kb(s: dict) -> InlineKeyboardMarkup:
     # up below them.
     rows = [1] * len(ws[:MAX_WATCHES])
     rows += [1] if len(ws) < MAX_WATCHES else []
-    rows += [2, 2] + ([2, 1] if pp.get("auto_promote") else [])
+    rows += [2, 2, 2, 1]                  # switches, checks, limits, budget
     rows += ([1] if ws else []) + [1]
     b.adjust(*rows)
     return b.as_markup()
