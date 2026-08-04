@@ -191,6 +191,38 @@ class PaidPromotion(unittest.TestCase):
         self.assertIn("нет прав", first)
         self.assertIn("не хватает средств", second)
 
+    def test_the_daily_budget_stops_the_spending(self):
+        """A rouble cap on the whole trigger, honoured by the scheduler.
+
+        The count-per-listing cap says nothing about money once there are
+        several watches; this is the number the seller actually cares about.
+        """
+        s = settings_for(cooldown_hours=0, daily_limit=0, daily_budget=100)
+        now = time.time()
+        with Harness(self, settings=s) as h:
+            for i in range(6):
+                h.run(now + i * 3600)
+        # 49 ₽ apiece: two fit under 100, a third would not
+        self.assertEqual(len(h.charged), 2)
+        self.assertEqual(s["promo_position"]["spent_today"], 98)
+
+    def test_a_refused_promotion_does_not_eat_the_budget(self):
+        s = settings_for(cooldown_hours=0, daily_limit=0, daily_budget=100)
+        now = time.time()
+        with Harness(self, settings=s) as h:
+            h.bump_result = (False, "нет прав")
+            h.run(now)
+            self.assertEqual(s["promo_position"].get("spent_today", 0), 0)
+            h.bump_result = (True, "оплатите: https://pay/1")
+            h.run(now + 3600)
+        self.assertEqual(s["promo_position"]["spent_today"], 49)
+
+    def test_the_report_says_what_is_left(self):
+        s = settings_for(cooldown_hours=0, daily_limit=0, daily_budget=200)
+        with Harness(self, settings=s) as h:
+            note = h.run()
+        self.assertIn("осталось на сегодня 151 ₽", note)
+
     def test_price_guard_blocks_a_pointless_purchase(self):
         s = settings_for()
         s["promo_position"]["watches"][0]["undercut_guard"] = 20

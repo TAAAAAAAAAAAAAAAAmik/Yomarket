@@ -229,6 +229,139 @@ class SpendingGuards(unittest.TestCase):
             P.note_promotion(w, self.now + i)
 
 
+class TheCompetitionThatMatters(unittest.TestCase):
+    """Only the offers standing above us justify paying for a position.
+
+    A real listing had a 1 ₽ lot far below — a price nobody competes with.
+    Taken as "the competition", it would have blocked every promotion forever.
+    """
+
+    def setUp(self):
+        self.now = time.time()
+        self.pp = {"auto_promote": True, "cooldown_hours": 6, "daily_limit": 3}
+        # We are 4th at 270 ₽; the rubbish lot is 6th.
+        self.page = offers(("Лот", 239, "MoneyTravis"),
+                           ("Лот", 1975, "Timka"),
+                           ("Лот", 4775, "Timka"),
+                           ("Аккаунт с виртами", 270, "Спайк"),
+                           ("Лот", 125, "Timka"),
+                           ("Лот", 1, "Timka"))
+
+    def w(self, **kw):
+        kw.setdefault("max_position", 3)
+        return P.new_watch("u", title="Аккаунт с виртами", **kw)
+
+    def test_a_cut_price_lot_below_us_does_not_block_the_promotion(self):
+        v = P.evaluate(self.w(undercut_guard=50), self.page, shop="Спайк",
+                       pp=self.pp, now=self.now)
+        self.assertEqual(v.pos, 4)
+        self.assertEqual(v.cheapest, 1.0, "the raw minimum is still reported")
+        self.assertEqual(v.cheapest_above, 239.0)
+        self.assertTrue(v.promote, f"blocked by a lot nobody competes with: "
+                                   f"{v.reason}")
+
+    def test_someone_cheaper_above_us_does_block_it(self):
+        # 270 − 239 = 31, over a guard of 20
+        v = P.evaluate(self.w(undercut_guard=20), self.page, shop="Спайк",
+                       pp=self.pp, now=self.now)
+        self.assertFalse(v.promote)
+        self.assertIn("выше вас", v.reason)
+
+    def test_first_place_has_nothing_above_it_to_measure_against(self):
+        page = offers(("Аккаунт с виртами", 270, "Спайк"),
+                      ("Лот", 1, "Timka"), ("Лот", 2, "Timka"),
+                      ("Лот", 3, "Timka"), ("Лот", 4, "Timka"))
+        v = P.evaluate(self.w(undercut_guard=1), page, shop="Спайк",
+                       pp=self.pp, now=self.now)
+        self.assertEqual(v.pos, 1)
+        self.assertIsNone(v.cheapest_above)
+        self.assertEqual(v.cheapest, 1.0)
+        # Nothing to pay for and nothing to be undercut on: the reason must be
+        # the position, never the price of somebody below.
+        self.assertIn("порога", v.reason)
+        self.assertNotIn("дешевле", v.reason)
+
+
+class TheBudget(unittest.TestCase):
+    """A rouble cap on the whole trigger, not a count per listing."""
+
+    def setUp(self):
+        self.now = time.time()
+        self.pp = {"auto_promote": True, "cooldown_hours": 0, "daily_limit": 0,
+                   "daily_budget": 100}
+
+    def w(self):
+        return P.new_watch("u", title="Аккаунт Steam", max_position=2)
+
+    def test_spending_stops_at_the_cap(self):
+        w = self.w()
+        spent = 0
+        for _ in range(5):
+            v = P.evaluate(w, PAGE, shop="Спайк", pp=self.pp, now=self.now,
+                           price=49)
+            if not v.promote:
+                break
+            P.note_promotion(w, self.now, 49, self.pp)
+            spent += 49
+        self.assertEqual(spent, 98, "a third 49 ₽ would pass 100 ₽")
+        self.assertIn("бюджет", v.reason)
+
+    def test_the_cap_is_shared_across_watches(self):
+        a, b = self.w(), self.w()
+        P.evaluate(a, PAGE, shop="Спайк", pp=self.pp, now=self.now, price=60)
+        P.note_promotion(a, self.now, 60, self.pp)
+        v = P.evaluate(b, PAGE, shop="Спайк", pp=self.pp, now=self.now,
+                       price=60)
+        self.assertFalse(v.promote, "the second watch spent the same money")
+
+    def test_a_refused_promotion_costs_nothing(self):
+        w = self.w()
+        P.evaluate(w, PAGE, shop="Спайк", pp=self.pp, now=self.now, price=60)
+        # nothing recorded — the panel refused
+        self.assertEqual(P.spent_today(self.pp, self.now), 0)
+        self.assertTrue(P.evaluate(w, PAGE, shop="Спайк", pp=self.pp,
+                                   now=self.now, price=60).promote)
+
+    def test_the_budget_resets_next_day(self):
+        w = self.w()
+        P.note_promotion(w, self.now, 100, self.pp)
+        self.assertFalse(P.evaluate(w, PAGE, shop="Спайк", pp=self.pp,
+                                    now=self.now, price=49).promote)
+        tomorrow = self.now + 26 * 3600
+        self.assertEqual(P.spent_today(self.pp, tomorrow), 0)
+        self.assertTrue(P.evaluate(w, PAGE, shop="Спайк", pp=self.pp,
+                                   now=tomorrow, price=49).promote)
+
+    def test_no_budget_set_means_no_cap(self):
+        pp = {"auto_promote": True, "cooldown_hours": 0, "daily_limit": 0}
+        w = self.w()
+        for _ in range(6):
+            v = P.evaluate(w, PAGE, shop="Спайк", pp=pp, now=self.now,
+                           price=999)
+            self.assertTrue(v.promote)
+            P.note_promotion(w, self.now, 999, pp)
+
+    def test_what_is_left_is_reportable(self):
+        self.assertEqual(P.budget_left(self.pp, self.now), 100)
+        P.note_promotion(self.w(), self.now, 49, self.pp)
+        self.assertEqual(P.budget_left(self.pp, self.now), 51)
+        self.assertEqual(P.budget_left({}, self.now), -1, "no cap set")
+
+    def test_a_promotion_that_would_overshoot_is_refused_whole(self):
+        """No partial spending: 60 ₽ left, a 99 ₽ promotion does not happen."""
+        pp = dict(self.pp, daily_budget=60)
+        w = self.w()
+        v = P.evaluate(w, PAGE, shop="Спайк", pp=pp, now=self.now, price=99)
+        self.assertFalse(v.promote)
+        self.assertEqual(P.spent_today(pp, self.now), 0)
+
+    def test_the_cost_of_the_decision_is_carried_on_the_verdict(self):
+        v = P.evaluate(self.w(), PAGE, shop="Спайк", pp=self.pp, now=self.now,
+                       price=49)
+        self.assertTrue(v.promote)
+        self.assertEqual(v.cost, 49)
+
+
 class MissingListing(unittest.TestCase):
     def setUp(self):
         self.now = time.time()

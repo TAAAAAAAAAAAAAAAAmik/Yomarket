@@ -31,6 +31,7 @@ class SeleniumState(StatesGroup):
     waiting_pos_guard = State()
     waiting_pos_cooldown = State()
     waiting_pos_limit = State()
+    waiting_pos_budget = State()
     waiting_sched_times = State()
     waiting_sched_ceiling = State()
 
@@ -404,7 +405,10 @@ def _short_url(url: str) -> str:
 
 
 def _pos_text(s: dict) -> str:
-    from automation.position import daily_limit, cooldown_hours, watches
+    import time as _t
+
+    from automation.position import (cooldown_hours, daily_budget, daily_limit,
+                                     spent_today, watches)
     pp = s.get("promo_position", {})
     ws = watches(pp)
     lines = [
@@ -421,6 +425,15 @@ def _pos_text(s: dict) -> str:
         lines.append("Лимит в сутки на товар: "
                      + (f"<b>{cap}</b>" + (f" (до {cap * price} ₽)" if price else "")
                         if cap else "без лимита"))
+        budget = daily_budget(pp)
+        if budget:
+            spent = spent_today(pp, _t.time())
+            lines.append(f"Бюджет в сутки: <b>{budget:.0f} ₽</b> "
+                         f"(потрачено {spent:.0f} ₽, "
+                         f"осталось {budget - spent:.0f} ₽)")
+        else:
+            lines.append("Бюджет в сутки: <b>не задан</b> — трат ничто не "
+                         "ограничивает")
         if not promo_params(s):
             lines.append("⚠️ <b>Тариф «Премиум» не выбран</b> — поднять не смогу")
     if ws:
@@ -474,6 +487,9 @@ def _pos_kb(s: dict) -> InlineKeyboardMarkup:
                  callback_data="pos:cooldown")
         b.button(text=f"🧾 Лимит/сутки: {pp.get('daily_limit', 3) or '∞'}",
                  callback_data="pos:limit")
+        budget = float(pp.get("daily_budget", 0) or 0)
+        b.button(text=f"💸 Бюджет: {f'{budget:.0f} ₽/сут' if budget else 'без лимита'}",
+                 callback_data="pos:budget")
     if ws:
         b.button(text="🔍 Проверить все", callback_data="pos:checkall")
     b.button(text="⬅️ К продвижению", callback_data="selenium:bump:menu")
@@ -481,7 +497,7 @@ def _pos_kb(s: dict) -> InlineKeyboardMarkup:
     # up below them.
     rows = [1] * len(ws[:MAX_WATCHES])
     rows += [1] if len(ws) < MAX_WATCHES else []
-    rows += [2, 2] + ([2] if pp.get("auto_promote") else [])
+    rows += [2, 2] + ([2, 1] if pp.get("auto_promote") else [])
     rows += ([1] if ws else []) + [1]
     b.adjust(*rows)
     return b.as_markup()
@@ -1233,6 +1249,54 @@ async def pos_limit_save(message: Message, state: FSMContext) -> None:
     s = get_settings(message.from_user.id)
     s.setdefault("promo_position", {})["daily_limit"] = n
     save_settings(message.from_user.id, s)
+    await message.answer(_pos_text(s), reply_markup=_pos_kb(s))
+
+
+@router.callback_query(F.data == "pos:budget")
+async def pos_budget_start(callback: CallbackQuery, state: FSMContext) -> None:
+    import time as _t
+
+    from automation.position import daily_budget, spent_today
+
+    s = get_settings(callback.from_user.id)
+    pp = s.get("promo_position", {})
+    cur = daily_budget(pp)
+    price = promo_price(s)
+    spent = spent_today(pp, _t.time())
+    await state.set_state(SeleniumState.waiting_pos_budget)
+    await _pos_edit(
+        callback.message,
+        f"💸 <b>Сколько можно тратить в сутки</b>\n\n"
+        f"Сейчас: {f'{cur:.0f} ₽' if cur else 'без ограничения'}"
+        + (f"\nПотрачено сегодня: <b>{spent:.0f} ₽</b>" if spent else "")
+        + (f"\nОдно поднятие стоит <b>{price} ₽</b>" if price else "")
+        + "\n\nПотолок на <b>все</b> отслеживаемые товары вместе: как только "
+          "сумма за сутки упрётся в него, бот перестанет платить и просто "
+          "предупредит. Счёт обнуляется в полночь.\n\n"
+          "Пришлите сумму в рублях.\n\n<i>0 — снять ограничение.</i>",
+        _cancel_kb("pos:menu"))
+    await callback.answer()
+
+
+@router.message(SeleniumState.waiting_pos_budget)
+async def pos_budget_save(message: Message, state: FSMContext) -> None:
+    try:
+        v = float((message.text or "").replace(",", ".").replace(" ", "").strip())
+        if not 0 <= v <= 1_000_000:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Нужно число от 0 до 1 000 000")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    pp = s.setdefault("promo_position", {})
+    pp["daily_budget"] = v
+    save_settings(message.from_user.id, s)
+    price = promo_price(s)
+    if v and price:
+        await message.answer(
+            f"💸 Бюджет: <b>{v:.0f} ₽</b> в сутки — это до "
+            f"<b>{int(v // price)}</b> поднятий по {price} ₽.")
     await message.answer(_pos_text(s), reply_markup=_pos_kb(s))
 
 

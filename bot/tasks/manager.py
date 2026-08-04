@@ -1363,8 +1363,8 @@ class TaskManager:
         automation/position.py stand between a bad day and an empty card.
         """
         from automation.market import fetch_listing
-        from automation.position import (evaluate, is_due, note_promotion,
-                                         watches)
+        from automation.position import (budget_left, evaluate, is_due,
+                                         note_promotion, watches)
         from storage import get_shop_name
 
         pp = settings.setdefault("promo_position", {})
@@ -1404,16 +1404,23 @@ class TaskManager:
                 continue
             w["fails"] = 0
 
-            verdict = evaluate(w, res["offers"], shop=shop, pp=pp, now=now)
+            verdict = evaluate(w, res["offers"], shop=shop, pp=pp, now=now,
+                               price=_promo_price(settings))
             lines = list(verdict.lines)
             if verdict.promote:
                 ok_paid, msg = await self._promote_one(
                     user_id, str(w.get("item_id") or ""), settings)
                 if ok_paid:
-                    note_promotion(w, now)
-                    w.pop("last_fail", None)
                     price = _promo_price(settings)
+                    # Only a promotion that went through is recorded: a refusal
+                    # is not a purchase, and charging the day's budget for it
+                    # would stop the next real one.
+                    note_promotion(w, now, price, pp)
+                    w.pop("last_fail", None)
+                    left = budget_left(pp, now)
                     lines.append("⭐ Поднял" + (f" · {price} ₽" if price else "")
+                                 + (f" (осталось на сегодня {left:.0f} ₽)"
+                                    if left >= 0 else "")
                                  + f": {_esc(str(msg))[:160]}")
                 else:
                     # A listing that stays down retries every hour, and a

@@ -127,6 +127,29 @@ def _day(now: float) -> str:
     return _time.strftime("%Y-%m-%d", _time.localtime(now))
 
 
+def daily_budget(pp: dict) -> float:
+    """Roubles a day this trigger may spend across every watched listing.
+
+    Counted for the whole feature rather than per listing: what a seller wants
+    to cap is the money leaving the card, and «три поднятия на товар» says
+    nothing about that when there are ten watches. 0 = no cap.
+    """
+    try:
+        return max(0.0, float(pp.get("daily_budget", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def spent_today(pp: dict, now: float) -> float:
+    """What this trigger has already spent today, in roubles."""
+    if pp.get("spent_day") != _day(now):
+        return 0.0
+    try:
+        return float(pp.get("spent_today") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def promos_left(watch: dict, pp: dict, now: float) -> int:
     """How many more paid promotions this watch may make today. -1 = unlimited."""
     limit = daily_limit(pp)
@@ -136,14 +159,32 @@ def promos_left(watch: dict, pp: dict, now: float) -> int:
     return max(0, limit - used)
 
 
-def note_promotion(watch: dict, now: float) -> None:
-    """Record a promotion that actually happened, for the cooldown and the cap."""
+def budget_left(pp: dict, now: float) -> float:
+    """Roubles still available today. -1 = no cap set."""
+    budget = daily_budget(pp)
+    if not budget:
+        return -1.0
+    return max(0.0, budget - spent_today(pp, now))
+
+
+def note_promotion(watch: dict, now: float, price: float = 0,
+                   pp: dict | None = None) -> None:
+    """Record a promotion that actually happened.
+
+    Only what really went through is recorded: a refused action is not a
+    promotion, and counting it would spend the day's budget on nothing.
+    """
     today = _day(now)
     if watch.get("promo_day") != today:
         watch["promo_day"] = today
         watch["promos_today"] = 0
     watch["promos_today"] = int(watch.get("promos_today") or 0) + 1
     watch["last_promo"] = now
+    if pp is not None and price:
+        if pp.get("spent_day") != today:
+            pp["spent_day"] = today
+            pp["spent_today"] = 0
+        pp["spent_today"] = float(pp.get("spent_today") or 0) + float(price)
 
 
 class Verdict:
@@ -154,14 +195,18 @@ class Verdict:
     decides to do nothing can still explain itself on the debug screen.
     """
 
-    __slots__ = ("found", "pos", "price", "cheapest", "lines", "promote",
-                 "reason", "slipped")
+    __slots__ = ("found", "pos", "price", "cheapest", "cheapest_above",
+                 "lines", "promote", "reason", "slipped", "cost")
 
     def __init__(self) -> None:
         self.found = False
         self.pos = 0
         self.price: float | None = None
         self.cheapest: float | None = None
+        # What the offers standing above us cost — the only ones a paid
+        # position has to beat.
+        self.cheapest_above: float | None = None
+        self.cost = 0
         self.lines: list[str] = []
         self.promote = False
         self.reason = ""
@@ -175,7 +220,7 @@ class Verdict:
 
 def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
              pp: dict | None = None, now: float | None = None,
-             auto_promote: bool | None = None) -> Verdict:
+             auto_promote: bool | None = None, price: int = 0) -> Verdict:
     """Read one page's standings and decide. Updates the watch's own state.
 
     Deliberately quiet: this runs every hour, and an alert repeated every hour
@@ -237,11 +282,21 @@ def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
 
     others = [o for o in offers if o.get("pos") != v.pos]
     v.cheapest = _cheapest(others if others else offers)
+    # Only the offers *above* us decide whether paying for position is worth
+    # it: those are the ones a buyer sees first. A real listing had a 1 ₽ lot
+    # sitting far below — a price nobody is competing with, and taking it as
+    # "the competition" would have blocked every promotion for good.
+    v.cheapest_above = _cheapest([o for o in offers
+                                  if int(o.get("pos") or 0) < v.pos])
 
     if pp.get("undercut_notify", True) and v.cheapest is not None and v.price:
         if v.cheapest < v.price:
-            v.lines.append(f"💰 Дешевле у конкурента: <b>{v.cheapest:.0f} ₽</b> "
-                           f"против ваших {v.price:.0f} ₽")
+            line = (f"💰 Дешевле у конкурента: <b>{v.cheapest:.0f} ₽</b> "
+                    f"против ваших {v.price:.0f} ₽")
+            if (v.cheapest_above is not None
+                    and v.cheapest_above != v.cheapest):
+                line += f"; выше вас — от {v.cheapest_above:.0f} ₽"
+            v.lines.append(line)
     floor = float(watch.get("min_price") or 0)
     if floor and v.cheapest is not None and v.cheapest < floor:
         v.lines.append(f"⚠️ Цена на витрине упала ниже вашего порога "
@@ -256,11 +311,15 @@ def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
         return v
 
     guard = float(watch.get("undercut_guard") or 0)
-    if guard and v.cheapest is not None and v.price is not None \
-            and (v.price - v.cheapest) > guard:
-        # Paying for the top slot while someone is visibly cheaper buys a view
-        # that converts for them, not for us. Say so instead of spending.
-        v.reason = (f"конкурент дешевле на {v.price - v.cheapest:.0f} ₽ "
+    rival = v.cheapest_above if v.cheapest_above is not None else v.cheapest
+    if guard and rival is not None and v.price is not None \
+            and (v.price - rival) > guard:
+        # Paying for the top slot while someone visibly cheaper stands above us
+        # buys a view that converts for them, not for us. Measured against the
+        # offers above only: a cut-price lot further down the list is not
+        # competing for this position, and treating it as competition would
+        # block every promotion for good.
+        v.reason = (f"выше вас есть дешевле на {v.price - rival:.0f} ₽ "
                     f"(порог {guard:.0f}) — поднятие не окупится")
         v.lines.append(f"⛔ Не поднимаю: {v.reason}")
         return v
@@ -277,6 +336,16 @@ def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
         v.lines.append(f"⛔ Не поднимаю: {v.reason}")
         return v
 
+    budget = daily_budget(pp)
+    if budget and price:
+        spent = spent_today(pp, now)
+        if spent + price > budget:
+            v.reason = (f"дневной бюджет {budget:.0f} ₽ исчерпан "
+                        f"(потрачено {spent:.0f} ₽, поднятие стоит {price} ₽)")
+            v.lines.append(f"⛔ Не поднимаю: {v.reason}")
+            return v
+
     v.promote = True
+    v.cost = int(price or 0)
     v.reason = "ниже порога — поднимаю"
     return v
