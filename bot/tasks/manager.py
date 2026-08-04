@@ -1602,7 +1602,7 @@ class TaskManager:
             await self._send_chat(
                 api, chat_id,
                 "⚠️ Не получается выдать звёзды прямо сейчас. "
-                "Продавец уже уведомлён и выдаст их вручную.")
+                "Продавец уже уведомлён и выдаст их вручную.", settings)
             await self._notify(
                 user_id,
                 _card("⭐ <b>ЗВЁЗДЫ НЕ ВЫДАНЫ</b>",
@@ -1709,11 +1709,15 @@ class TaskManager:
             chat_id = entry.get("chat_id")
             reminded = int(entry.get("reminded") or 0)
             if waited >= self._STARS_REMIND_AFTER and not reminded and chat_id:
+                # Ни «@», ни слова «username»: это сообщение возвращается из
+                # чата, и раньше бот доставал из него «username» как ответ
+                # покупателя. Отпечаток теперь тоже ставится — вторая страховка.
                 await self._send_chat(
                     api, chat_id,
-                    "⭐ Напоминаем: пришлите ваш Telegram @username — и звёзды "
-                    "придут автоматически. Если username нет, его можно задать "
-                    "в настройках Telegram.")
+                    "⭐ Напоминаем: пришлите ваш ник в Telegram одним "
+                    "сообщением — и звёзды придут автоматически. "
+                    "Если ника нет, его можно задать в настройках Telegram.",
+                    settings)
                 entry["reminded"] = 1
                 entry["reminded_at"] = now
             if waited >= self._STARS_ESCALATE_AFTER and reminded < 2:
