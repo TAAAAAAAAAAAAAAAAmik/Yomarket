@@ -8,7 +8,18 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from storage import get_settings, save_settings
 
+import autoreply as ar
+from datetime import datetime
+
 router = Router()
+
+
+def _esc(value) -> str:
+    """Названия приходят с маркетплейса; «<» в них Telegram считает разметкой и
+    отвергает всё сообщение целиком."""
+    import html
+    return html.escape(str(value), quote=False)
+
 
 # ---------------------------------------------------------------------------
 # Category emoji mapping (best-effort)
@@ -61,16 +72,28 @@ def _cancel_kb() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-async def _load_all_ads(api) -> list[dict]:
-    """Fetch all ad pages from the API."""
+_LAST_ADS_ERROR: dict[int, str] = {}
+
+
+async def _load_all_ads(api, uid: int = 0) -> list[dict]:
+    """Все страницы объявлений из API.
+
+    Ошибка запроса запоминается, а не проглатывается: пустой список выглядит
+    точно так же, как «объявлений нет», и экран уверенно сообщал продавцу с
+    сотней товаров, что товаров у него нет.
+    """
+    _LAST_ADS_ERROR.pop(uid, None)
     ads: list[dict] = []
     if api is None:
+        _LAST_ADS_ERROR[uid] = "нет токена — отправьте /start"
         return ads
     cursor = None
     while True:
         try:
             data = await api.get_ads(cursor=cursor)
-        except Exception:
+        except Exception as e:
+            if not ads:
+                _LAST_ADS_ERROR[uid] = str(e)[:150] or type(e).__name__
             break
         items = data.get("data") or data.get("items") or []
         if not items:
@@ -80,6 +103,26 @@ async def _load_all_ads(api) -> list[dict]:
         if not cursor:
             break
     return ads
+
+
+def _count_label(n: int) -> str:
+    if n == 1:
+        return "1 товар"
+    if 2 <= n <= 4:
+        return f"{n} товара"
+    return f"{n} товаров"
+
+
+def _title_buttons(builder: InlineKeyboardBuilder, ads: list[dict]) -> int:
+    """Кнопки по названиям товаров. Возвращает, сколько получилось."""
+    counts: dict[str, int] = {}
+    for ad in ads:
+        t = _ad_title(ad)
+        counts[t] = counts.get(t, 0) + 1
+    for title, count in counts.items():
+        builder.button(text=f"{title[:30]} — {_count_label(count)}",
+                       callback_data=f"resp:game:{_key(title)}")
+    return len(counts)
 
 
 def _ad_title(ad: dict) -> str:
@@ -107,9 +150,16 @@ def _ad_category(ad: dict) -> str:
 
 @router.callback_query(F.data == "resp:cats")
 async def show_categories(callback: CallbackQuery, api) -> None:
-    ads = await _load_all_ads(api)
+    """Ответы, привязанные к конкретному товару.
 
-    # Collect unique non-empty categories
+    Экран строился вокруг категорий, и когда маркетплейс их не отдавал, он
+    сообщал «у вас нет активных объявлений» — продавцу с полной витриной.
+    Категория тут вспомогательная: если её нет, товары показываются сразу.
+    """
+    uid = callback.from_user.id
+    ads = await _load_all_ads(api, uid)
+    err = _LAST_ADS_ERROR.get(uid, "")
+
     seen: list[str] = []
     for ad in ads:
         cat = _ad_category(ad)
@@ -117,20 +167,29 @@ async def show_categories(callback: CallbackQuery, api) -> None:
             seen.append(cat)
 
     builder = InlineKeyboardBuilder()
-    if seen:
-        for cat in seen:
-            emoji = _cat_emoji(cat)
-            builder.button(
-                text=f"{emoji} {cat}",
-                callback_data=f"resp:cat:{_key(cat)}",
-            )
-    builder.button(text="⬅️ Назад", callback_data="auto:menu")
-    builder.adjust(1)
+    head = "🎮 <b>Ответы по товарам</b>\n\n"
 
-    if not seen:
-        text = "📩 <b>Автоответчики</b>\n\nУ вас пока нет активных объявлений.\nДобавьте товары на YooMarket, чтобы настроить автоответчики."
+    if err:
+        text = (head + f"❌ Объявления не загрузились:\n<code>{_esc(err)}</code>\n\n"
+                "<i>Это сбой связи с Юмаркетом, а не отсутствие товаров.</i>")
+    elif not ads:
+        text = (head + "Объявлений нет — привязывать ответ не к чему.\n\n"
+                "<i>Автоответы по ключевым словам работают и без объявлений: "
+                "они отвечают на сообщения покупателя.</i>")
+        builder.button(text="📩 Автоответы", callback_data="ar:menu")
+    elif not seen:
+        # Категорий в ответе API нет — шаг с категориями просто пропускаем.
+        n = _title_buttons(builder, ads)
+        text = (head + f"Товаров: <b>{n}</b>. Выберите, для какого настроить "
+                "ответ:")
     else:
-        text = "📩 <b>Автоответчики</b>\n\nВыберите категорию для настройки автоответчика:"
+        for cat in seen:
+            builder.button(text=f"{_cat_emoji(cat)} {cat}",
+                           callback_data=f"resp:cat:{_key(cat)}")
+        text = (head + f"Объявлений: <b>{len(ads)}</b>. Выберите категорию:")
+
+    builder.button(text="⬅️ Автоответы", callback_data="ar:menu")
+    builder.adjust(1)
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
@@ -153,35 +212,20 @@ async def show_games(callback: CallbackQuery, api) -> None:
     ]
 
     # Full category name from first match
-    cat_full = _ad_category(filtered[0]) if filtered else cat_key
-
-    # Group by title
-    title_counts: dict[str, int] = {}
-    for ad in filtered:
-        t = _ad_title(ad)
-        title_counts[t] = title_counts.get(t, 0) + 1
-
-    def _count_label(n: int) -> str:
-        if n == 1:
-            return "1 товар"
-        if 2 <= n <= 4:
-            return f"{n} товара"
-        return f"{n} товаров"
+    cat_full = _ad_category(filtered[0]) if filtered else ""
 
     builder = InlineKeyboardBuilder()
-    for title, count in title_counts.items():
-        builder.button(
-            text=f"{title} — {_count_label(count)}",
-            callback_data=f"resp:game:{_key(title)}",
-        )
+    n = _title_buttons(builder, filtered)
     builder.button(text="⬅️ Назад", callback_data="resp:cats")
     builder.adjust(1)
 
-    emoji = _cat_emoji(cat_full)
-    text = (
-        f"{emoji} <b>Категория: {cat_full}</b>\n\n"
-        "Выберите игру:"
-    )
+    if n:
+        text = (f"{_cat_emoji(cat_full)} <b>{_esc(cat_full)}</b>\n\n"
+                f"Товаров: <b>{n}</b>. Выберите, для какого настроить ответ:")
+    else:
+        # Категория пришла из старой кнопки, а витрина с тех пор изменилась.
+        text = ("📭 <b>В этой категории товаров нет</b>\n\n"
+                "Похоже, список изменился — вернитесь и выберите заново.")
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
@@ -209,25 +253,24 @@ async def show_game_responder(callback: CallbackQuery, api) -> None:
     existing = responders.get(full_title)
 
     emoji = _cat_emoji(cat_full)
-    header = f"{emoji} <b>{full_title}</b>\nКатегория: {cat_full}\n\n"
+    header = (f"{emoji} <b>{_esc(full_title)}</b>\n"
+              + (f"Категория: {_esc(cat_full)}\n" if cat_full else "")
+              + f"\n<i>Подстановки: {ar.HINT}</i>\n\n")
 
+    # Без категории возвращаться некуда — её экран показал бы пустоту.
+    back = f"resp:cat:{_key(cat_full)}" if cat_full else "resp:cats"
     builder = InlineKeyboardBuilder()
     if existing:
-        text = (
-            header
-            + "Текущий автоответчик:\n"
-            + "——————————————\n"
-            + f"{existing}\n"
-            + "——————————————"
-        )
+        text = (header + "Текущий ответ:\n"
+                + f"<blockquote>{_esc(existing)}</blockquote>")
         builder.button(text="✏️ Изменить", callback_data=f"resp:edit:{title_key}")
         builder.button(text="🗑 Удалить", callback_data=f"resp:del:{title_key}")
-        builder.button(text="⬅️ Назад", callback_data=f"resp:cat:{_key(cat_full)}")
+        builder.button(text="⬅️ Назад", callback_data=back)
         builder.adjust(2, 1)
     else:
-        text = header + "Текущий автоответчик: —"
-        builder.button(text="➕ Добавить автоответчик", callback_data=f"resp:add:{title_key}")
-        builder.button(text="⬅️ Назад", callback_data=f"resp:cat:{_key(cat_full)}")
+        text = header + "Ответа для этого товара пока нет."
+        builder.button(text="➕ Добавить ответ", callback_data=f"resp:add:{title_key}")
+        builder.button(text="⬅️ Назад", callback_data=back)
         builder.adjust(1)
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
@@ -418,10 +461,6 @@ async def _resolve_title(title_key: str, api) -> tuple[str, str]:
 # которой видно, что именно бот ответит на конкретное сообщение.
 # ═══════════════════════════════════════════════════════════════════════════
 
-import autoreply as ar
-from datetime import datetime
-
-
 class AutoReplyState(StatesGroup):
     kw = State()          # ключевые слова нового правила
     text = State()        # текст нового правила
@@ -432,11 +471,6 @@ class AutoReplyState(StatesGroup):
     cap = State()
     hours = State()
     test = State()
-
-
-def _esc(value) -> str:
-    import html
-    return html.escape(str(value), quote=False)
 
 
 def _conf(uid: int) -> tuple[dict, dict]:
