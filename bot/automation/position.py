@@ -48,13 +48,19 @@ FAILS_BEFORE_ALARM = 3
 
 
 def new_watch(url: str, *, title: str = "", item_id: str = "",
-              market_id: str = "",
+              market_id: str = "", category_id=None,
               max_position: int = DEFAULT_MAX_POSITION,
               min_price: float = 0, undercut_guard: float = 0) -> dict:
     return {
         "url": str(url or "").strip(),
         "item_id": str(item_id or ""),          # panel record — what gets paid
         "market_id": str(market_id or ""),      # storefront row — what gets found
+        # The section id, when the catalogue named it outright. Worth more than
+        # the address: this API answers /categories/<game>/<section> with the
+        # game, so a section inferred from the address can quietly become the
+        # whole game — 638 offers instead of 161, and a position counted in the
+        # wrong one.
+        "category_id": category_id,
         "title": str(title or ""),
         "max_position": int(max_position),
         "min_price": float(min_price or 0),

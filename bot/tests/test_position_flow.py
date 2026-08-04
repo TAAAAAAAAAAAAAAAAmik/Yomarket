@@ -88,7 +88,7 @@ class FlowCase(unittest.TestCase):
         self.patch(storage, "get_shop_name", lambda uid: "Спайк")
         self.patch(S, "get_settings", self._load)
         self.patch(S, "save_settings", self._save)
-        self.patch(M, "fetch_listing", lambda url, shop="": (True, PAGE))
+        self.patch(M, "fetch_listing", lambda url, shop="", category_id=None: (True, PAGE))
 
     # Copies on the way in and out, like the real store: settings live in the
     # database, so a handler that mutates its dict and forgets to save changes
@@ -155,7 +155,7 @@ class AddingAWatch(FlowCase):
             {"title": "Лот B", "price": 130, "id": 220075},
             {"title": "Лот C", "price": 140, "id": 333},
         ]), "note": "api"}
-        self.patch(M, "fetch_listing", lambda url, shop="": (True, anonymous))
+        self.patch(M, "fetch_listing", lambda url, shop="", category_id=None: (True, anonymous))
         self.patch(storage, "get_token", lambda uid: "tok")
 
         class FakeApi:
@@ -182,7 +182,7 @@ class AddingAWatch(FlowCase):
         self.assertTrue(any("2-м месте" in t for t in msg.sent), msg.sent)
 
     def test_an_unreadable_page_still_saves_the_watch_with_the_reason(self):
-        self.patch(M, "fetch_listing", lambda url, shop="": (False, "HTTP 503"))
+        self.patch(M, "fetch_listing", lambda url, shop="", category_id=None: (False, "HTTP 503"))
         msg = FakeMessage("https://yoomarket.net/p/1")
         self.run_(S.pos_url_save(msg, FakeState()))
         self.assertEqual(len(self.watches()), 1)
@@ -257,7 +257,7 @@ class AddingFromOwnListings(FlowCase):
         # Only the right way round has our listing in it.
         right = "https://yoomarket.net/categories/black-russia/virty"
 
-        def fetch(url, shop=""):
+        def fetch(url, shop="", category_id=None):
             self.fetched.append(url)
             if url == right:
                 return True, PAGE
@@ -311,7 +311,7 @@ class AddingFromOwnListings(FlowCase):
                    lambda slugs: {"id": 77, "slug": "black-russia",
                                   "ads_count": 638}
                    if slugs[-1:] == ["black-russia"] else {})
-        self.patch(M, "fetch_listing", lambda url, shop="": (True, PAGE))
+        self.patch(M, "fetch_listing", lambda url, shop="", category_id=None: (True, PAGE))
         self.pick()
         self.assertEqual(self.watches()[0]["url"],
                          "https://yoomarket.net/categories/virty/black-russia")
@@ -319,9 +319,10 @@ class AddingFromOwnListings(FlowCase):
     def test_a_section_that_exists_but_lacks_our_listing_is_not_accepted(self):
         """Existing is not the same as being where we stand."""
         self.patch(M, "fetch_listing",
-                   lambda url, shop="": (True, {"offers": M._normalize(
-                       [{"title": "Чужое", "price": 10,
-                         "shop": {"name": "Кто-то"}}]), "note": ""}))
+                   lambda url, shop="", category_id=None: (True, {
+                       "offers": M._normalize(
+                           [{"title": "Чужое", "price": 10,
+                             "shop": {"name": "Кто-то"}}]), "note": ""}))
         cb = self.pick()
         self.assertEqual(self.watches(), [])
         self.assertTrue(any("не показала" in t for t in cb.message.sent),
@@ -341,7 +342,7 @@ class AddingFromOwnListings(FlowCase):
 
     def test_when_no_page_has_it_the_manual_route_is_offered(self):
         self.patch(M, "fetch_listing",
-                   lambda url, shop="": (True, {"offers": [], "note": ""}))
+                   lambda url, shop="", category_id=None: (True, {"offers": [], "note": ""}))
         cb = self.pick()
         self.assertEqual(self.watches(), [], "nothing unverified is saved")
         said = "\n".join(cb.message.sent)
@@ -406,6 +407,20 @@ class NamingTheSectionByHand(FlowCase):
 
         self.patch(M, "category_children", children)
 
+        def slugs_for(cat_id):
+            for game in self.TREE:
+                for c in game.get("children", []):
+                    if str(c["id"]) == str(cat_id):
+                        return [game["slug"], c["slug"]]
+                if str(game["id"]) == str(cat_id):
+                    return [game["slug"]]
+            return []
+
+        self.patch(M, "category_slugs_for", slugs_for)
+        # fetch_listing now takes the section id as a third argument
+        self.patch(M, "fetch_listing",
+                   lambda url, shop="", category_id=None: (True, PAGE))
+
     def tearDown(self):
         S._PENDING_AD.pop(7, None)
         super().tearDown()
@@ -416,8 +431,8 @@ class NamingTheSectionByHand(FlowCase):
         data = [b.callback_data for row in cb.message.markups[-1].inline_keyboard
                 for b in row]
         self.assertIn("pos:cat:black-russia", data, "a game must open its sections")
-        self.assertIn("pos:catpick:|telegram", data,
-                      "one without sections is already the answer")
+        self.assertIn("pos:catpick:90", data,
+                      "one without sections is already the answer, by its id")
 
     def test_a_section_is_offered_with_how_much_it_holds(self):
         cb = FakeCallback("pos:cat:black-russia")
@@ -427,10 +442,12 @@ class NamingTheSectionByHand(FlowCase):
         self.assertTrue(any("Аккаунты с виртами" in l and "161" in l
                             for l in labels), labels)
         data = [b.callback_data for row in kb.inline_keyboard for b in row]
-        self.assertIn("pos:catpick:black-russia|akkaunty-s-virtami", data)
+        # By id, not by slugs: this API answers /categories/<game>/<section>
+        # with the game, so an address alone can widen to the whole game.
+        self.assertIn("pos:catpick:512", data)
 
     def test_choosing_a_section_sets_the_watch_up_completely(self):
-        cb = FakeCallback("pos:catpick:black-russia|akkaunty-s-virtami")
+        cb = FakeCallback("pos:catpick:512")
         self.run_(S.pos_category_chosen(cb))
         ws = self.watches()
         self.assertEqual(len(ws), 1)
@@ -439,14 +456,18 @@ class NamingTheSectionByHand(FlowCase):
             "https://yoomarket.net/categories/black-russia/akkaunty-s-virtami")
         self.assertEqual(ws[0]["market_id"], "220075")
         self.assertEqual(ws[0]["item_id"], "5150", "panel record not bound")
+        self.assertEqual(ws[0]["category_id"], "512",
+                         "the section id must be kept — the address alone is "
+                         "read loosely by this API")
         self.assertEqual(ws[0]["last_pos"], 2)
 
     def test_a_section_without_our_listing_is_not_saved(self):
         self.patch(M, "fetch_listing",
-                   lambda url, shop="": (True, {"offers": M._normalize(
-                       [{"title": "Чужое", "price": 5,
-                         "shop": {"name": "Кто-то"}}]), "note": ""}))
-        cb = FakeCallback("pos:catpick:black-russia|virty")
+                   lambda url, shop="", category_id=None: (True, {
+                       "offers": M._normalize(
+                           [{"title": "Чужое", "price": 5,
+                             "shop": {"name": "Кто-то"}}]), "note": ""}))
+        cb = FakeCallback("pos:catpick:513")
         self.run_(S.pos_category_chosen(cb))
         self.assertEqual(self.watches(), [])
         said = "\n".join(cb.message.sent)
@@ -455,7 +476,7 @@ class NamingTheSectionByHand(FlowCase):
 
     def test_the_choice_is_refused_when_no_listing_is_pending(self):
         S._PENDING_AD.pop(7, None)
-        cb = FakeCallback("pos:catpick:black-russia|virty")
+        cb = FakeCallback("pos:catpick:513")
         self.run_(S.pos_category_chosen(cb))
         self.assertEqual(self.watches(), [])
         self.assertTrue(cb.answers[0][1])

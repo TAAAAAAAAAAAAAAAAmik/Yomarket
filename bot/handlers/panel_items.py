@@ -1621,7 +1621,7 @@ async def _pos_debug_watches(message: Message) -> None:
         try:
             ok, res = await asyncio.wait_for(
                 loop.run_in_executor(None, fetch_listing, w.get("url", ""),
-                                     shop),
+                                     shop, w.get("category_id")),
                 timeout=120)
         except Exception as e:
             ok, res = False, str(e)[:120]

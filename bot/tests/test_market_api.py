@@ -281,6 +281,27 @@ class TheRightCatalogue(unittest.TestCase):
         self.assertEqual(meta["id"], 512, "took the game, not the section")
         self.assertEqual(meta["ads_count"], 638)
 
+    def test_the_game_is_not_offered_up_as_the_section(self):
+        """/api/categories/<game>/<section> answers with the game, section
+        ignored — this API really does that.
+
+        Handing that root back as "the section" let the game's own ads_count
+        confirm a query for the whole game: 638 offers instead of 161, and a
+        position counted in a list our listing is not really in.
+        """
+        import requests
+        old = requests.get
+        requests.get = lambda url, **kw: Reply(
+            {"id": 77, "slug": "black-russia", "ads_count": 638})
+        try:
+            got = M.category_meta(["black-russia", "akkaunty-s-virtami"])
+            root = M.category_meta(["black-russia"])
+        finally:
+            requests.get = old
+        self.assertEqual(got, {}, "the game was passed off as the section")
+        self.assertEqual(root.get("id"), 77,
+                         "an address naming only the game still resolves")
+
     def test_the_query_matching_the_sections_own_count_is_chosen(self):
         ok, res = M.fetch_offers_api(PAGE_URL)
         self.assertTrue(ok, res)
@@ -478,6 +499,41 @@ class Cheapest(unittest.TestCase):
 
     def test_all_zero_is_no_price_at_all(self):
         self.assertIsNone(M.cheapest([{"price": 0.0}, {"price": None}]))
+
+
+class TheSectionIdWins(ApiCase):
+    """When the catalogue named the section, its id is what gets asked for.
+
+    This API answers /api/categories/<game>/<section> with the *game* — so a
+    section inferred from an address can quietly widen to the whole game. That
+    is what happened on a real shop: 675 offers read out of a section holding
+    161, and our listing nowhere in them.
+    """
+
+    def test_a_known_section_id_is_used_as_is(self):
+        self.pages = {1: body([offer(1, "A")])}
+        ok, res = M.fetch_offers_api(PAGE_URL, category_id=512)
+        self.assertTrue(ok, res)
+        self.assertEqual(self.calls[0][1].get("category_id"), 512)
+
+    def test_a_known_id_needs_no_catalogue_lookup_at_all(self):
+        self.pages = {1: body([offer(1, "A")])}
+        M.fetch_offers_api(PAGE_URL, max_pages=1, category_id=512)
+        self.assertEqual(self.meta_calls, [],
+                         "the section is already known — nothing to look up")
+        self.assertEqual(len(self.calls), 1,
+                         "and no query shapes to try — one request, one answer")
+
+    def test_the_pages_own_filters_still_travel_with_it(self):
+        self.pages = {1: body([offer(1, "A")])}
+        M.fetch_offers_api(PAGE_URL, category_id=512)
+        self.assertEqual(self.calls[0][1].get("keyword"), "3.000.000")
+
+    def test_fetch_listing_passes_it_through(self):
+        self.pages = {1: body([offer(1, "A"), offer(2, "Spike")])}
+        ok, _res = M.fetch_listing(PAGE_URL, "Spike", 512)
+        self.assertTrue(ok)
+        self.assertEqual(self.calls[0][1].get("category_id"), 512)
 
 
 class Preference(ApiCase):

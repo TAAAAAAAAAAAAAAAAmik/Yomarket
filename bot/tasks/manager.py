@@ -1642,7 +1642,8 @@ class TaskManager:
             checked += 1
             try:
                 ok, res = await asyncio.wait_for(
-                    loop.run_in_executor(None, fetch_listing, url, shop),
+                    loop.run_in_executor(None, fetch_listing, url, shop,
+                                         w.get("category_id")),
                     timeout=120)
             except Exception as e:
                 logger.warning("position check for %s: %s", user_id, e)

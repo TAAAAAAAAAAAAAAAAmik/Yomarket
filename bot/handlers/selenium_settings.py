@@ -860,7 +860,7 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
     for r in rows[:60]:
         # A section with children is a step deeper; one without is the answer.
         target = (f"pos:cat:{r['slug']}" if r["has_children"]
-                  else f"pos:catpick:{parent}|{r['slug']}")
+                  else f"pos:catpick:{r['id']}")
         count = f" · {r['ads_count']}" if r.get("ads_count") else ""
         b.button(text=f"{r['title'][:30]}{count}", callback_data=target[:64])
     b.button(text="⬅️ Назад", callback_data="pos:add")
@@ -878,7 +878,8 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
 async def pos_category_chosen(callback: CallbackQuery) -> None:
     import asyncio
 
-    from automation.market import MARKET_URL, fetch_listing, find_position
+    from automation.market import (MARKET_URL, category_slugs_for,
+                                   fetch_listing, find_position)
     from automation.position import new_watch, watches
     from storage import get_shop_name
 
@@ -887,10 +888,19 @@ async def pos_category_chosen(callback: CallbackQuery) -> None:
         await callback.answer("Начните заново — выберите товар", show_alert=True)
         await _pos_screen(callback)
         return
-    raw = callback.data[len("pos:catpick:"):]
-    parent, _, child = raw.partition("|")
-    slugs = [s for s in (parent, child) if s]
-    url = f"{MARKET_URL}/categories/" + "/".join(slugs)
+    cat_id = callback.data[len("pos:catpick:"):]
+    # The section's own id, straight from the catalogue. The address is built
+    # from it for display and for later checks, but the id is what the listing
+    # is actually asked for: this API answers /categories/<game>/<section> with
+    # the game, so an address alone can quietly widen to the whole game.
+    loop0 = asyncio.get_event_loop()
+    try:
+        slugs = await asyncio.wait_for(
+            loop0.run_in_executor(None, category_slugs_for, cat_id), timeout=45)
+    except Exception:
+        slugs = []
+    url = (f"{MARKET_URL}/categories/" + "/".join(slugs[-2:])) if slugs else \
+        f"{MARKET_URL}/categories"
 
     await callback.answer("⏳ Проверяю раздел...")
     await _pos_edit(callback.message,
@@ -900,7 +910,8 @@ async def pos_category_chosen(callback: CallbackQuery) -> None:
     loop = asyncio.get_event_loop()
     try:
         ok, res = await asyncio.wait_for(
-            loop.run_in_executor(None, fetch_listing, url, shop), timeout=180)
+            loop.run_in_executor(None, fetch_listing, url, shop, cat_id),
+            timeout=180)
     except Exception as e:
         ok, res = False, str(e)[:120]
     mine = find_position(res["offers"], ad_id=ad["id"], title=ad["title"],
@@ -923,7 +934,8 @@ async def pos_category_chosen(callback: CallbackQuery) -> None:
     s = get_settings(callback.from_user.id)
     pp = s.setdefault("promo_position", {})
     ws = watches(pp)
-    w = new_watch(url, title=ad["title"], market_id=ad["id"])
+    w = new_watch(url, title=ad["title"], market_id=ad["id"],
+                  category_id=cat_id)
     w["last_pos"] = int(mine["pos"])
     ws.append(w)
     pp["watches"] = ws
@@ -1078,7 +1090,8 @@ async def _pos_probe(uid: int, idx: int, message=None) -> str:
     loop = asyncio.get_event_loop()
     try:
         ok, res = await asyncio.wait_for(
-            loop.run_in_executor(None, fetch_listing, w["url"], shop),
+            loop.run_in_executor(None, fetch_listing, w["url"], shop,
+                                 w.get("category_id")),
             timeout=120)
     except Exception as e:
         return f"⚠️ Страница не открылась: {_esc(str(e)[:120])}"
@@ -1260,7 +1273,8 @@ async def _pos_report(uid: int, idx: int) -> str:
     loop = asyncio.get_event_loop()
     try:
         ok, res = await asyncio.wait_for(
-            loop.run_in_executor(None, fetch_listing, w["url"], shop),
+            loop.run_in_executor(None, fetch_listing, w["url"], shop,
+                                 w.get("category_id")),
             timeout=120)
     except Exception as e:
         return f"❌ Страница не открылась: {_esc(str(e)[:200])}"

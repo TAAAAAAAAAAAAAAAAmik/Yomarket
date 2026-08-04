@@ -406,9 +406,16 @@ def category_meta(slugs: list) -> dict:
                     walk(v)
 
     walk(body)
-    # The deepest slug is what the listing is; the response's own root is the
-    # fallback for an address that names only the game.
-    return found or body
+    if found:
+        return found
+    # The root is only the answer when the address named it. Handing it back
+    # for /categories/black-russia/akkaunty-s-virtami — which this API answers
+    # with the game, ignoring the section — made the game's own ads_count
+    # "confirm" a query for the whole game, and the position was then counted
+    # in a list of 638 instead of 161.
+    if len(slugs) == 1 and str(body.get("slug") or "") == want:
+        return body
+    return {}
 
 
 def product_card(market_id: str | int) -> dict:
@@ -781,7 +788,8 @@ def _pick_query(candidates: list, expected) -> tuple[dict, dict | None, str, str
 
 
 def fetch_offers_api(url: str, shop: str = "",
-                     max_pages: int = API_MAX_PAGES) -> tuple[bool, object]:
+                     max_pages: int = API_MAX_PAGES,
+                     category_id=None) -> tuple[bool, object]:
     """Blocking: the listing straight from the API the storefront calls.
 
     Walks the pages until the shop is found and stops the moment it is, so a
@@ -789,10 +797,17 @@ def fetch_offers_api(url: str, shop: str = "",
     (True, {"offers": …, "note": …, "total": …, "complete": …}) or
     (False, error).
     """
-    slugs, _filters = listing_path(url)
-    meta_cat = category_meta(slugs) if slugs else {}
-    expected = meta_cat.get("ads_count")
-    candidates = listing_queries(url, meta_cat)
+    slugs, filters = listing_path(url)
+    if category_id not in (None, ""):
+        # The section was named outright — by the catalogue, not inferred from
+        # an address the API reads loosely. Nothing to search for.
+        meta_cat = {"id": category_id}
+        expected = None
+        candidates = [{**filters, "category_id": category_id}]
+    else:
+        meta_cat = category_meta(slugs) if slugs else {}
+        expected = meta_cat.get("ads_count")
+        candidates = listing_queries(url, meta_cat)
     if not candidates:
         return False, "не понял адрес — нужна страница категории или поиска"
 
@@ -961,7 +976,7 @@ def fetch_offers_sync(url: str, *, max_pages: int = 1,
 MAX_LIST_PAGES = 6
 
 
-def fetch_listing(url: str, shop: str = ""):
+def fetch_listing(url: str, shop: str = "", category_id=None):
     """The offers behind a storefront address, however they can be had.
 
     The API first, because on this marketplace it is the only place the listing
@@ -969,7 +984,7 @@ def fetch_listing(url: str, shop: str = ""):
     second route: it costs nothing to keep, it is covered by tests, and it is
     the right answer for a page that does render its list server-side.
     """
-    ok, res = fetch_offers_api(url, shop)
+    ok, res = fetch_offers_api(url, shop, category_id=category_id)
     if ok:
         return ok, res
     api_error = res

@@ -55,7 +55,7 @@ class Harness:
         from automation import panel
         from handlers import selenium_settings
 
-        def fetch(url, shop=""):
+        def fetch(url, shop="", category_id=None):
             return (True, self.offers) if self.fetch_ok else (False, "HTTP 503")
 
         def bump(cookies, item_id, uid=None, confirm=False, params=None):
@@ -290,7 +290,7 @@ class Scheduling(unittest.TestCase):
         pages = {"https://yoomarket.net/p/1": TOP,
                  "https://yoomarket.net/p/2": SLIPPED}
         with Harness(self, settings=s) as h:
-            M.fetch_listing = lambda url, shop="": (True, pages[url])
+            M.fetch_listing = lambda url, shop="", category_id=None: (True, pages[url])
             note = h.run()
         self.assertEqual(h.charged, ["330099"],
                          "only the listing that actually slipped is paid for")
