@@ -563,6 +563,49 @@ def _find_by_id(nodes, want, trail=()) -> list:
     return []
 
 
+def category_children(parent_slug: str = "") -> list:
+    """Top-level sections, or the sections inside one game.
+
+    [{"id":…, "slug":…, "title":…, "has_children": bool}] — enough to offer the
+    catalogue as buttons, which is the one way of naming a section that cannot
+    be got wrong by either side.
+    """
+    nodes = category_tree()
+    if parent_slug:
+        found = None
+
+        def walk(items):
+            nonlocal found
+            for n in items if isinstance(items, list) else []:
+                if not isinstance(n, dict):
+                    continue
+                if str(n.get("slug") or "") == parent_slug:
+                    found = n
+                    return
+                for key in ("children", "subcategories", "items", "categories"):
+                    if n.get(key):
+                        walk(n[key])
+                        if found:
+                            return
+
+        walk(nodes)
+        if not found:
+            return []
+        nodes = next((found[k] for k in ("children", "subcategories", "items",
+                                         "categories") if found.get(k)), [])
+    out = []
+    for n in nodes if isinstance(nodes, list) else []:
+        if not isinstance(n, dict) or not n.get("slug"):
+            continue
+        kids = next((n[k] for k in ("children", "subcategories", "items",
+                                    "categories") if n.get(k)), [])
+        out.append({"id": n.get("id"), "slug": str(n["slug"]),
+                    "title": str(n.get("title") or n.get("name") or n["slug"]),
+                    "has_children": bool(kids),
+                    "ads_count": n.get("ads_count")})
+    return out
+
+
 def category_slugs_for(cat_id) -> list:
     """Where a category sits in the catalogue: ['black-russia', 'virty'].
 

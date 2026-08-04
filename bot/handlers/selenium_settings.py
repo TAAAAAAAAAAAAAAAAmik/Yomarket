@@ -787,15 +787,17 @@ async def pos_add_pick(callback: CallbackQuery) -> None:
                    + ", ".join(f"«{_esc(k)}»" for k in tried)
                    + ".\n\nВозможно, он снят с публикации, или витрина "
                      "показывает его под другим названием.")
+        _PENDING_AD[callback.from_user.id] = ad
         b = InlineKeyboardBuilder()
+        b.button(text="📂 Выбрать раздел из каталога", callback_data="pos:cat:")
         b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
         b.button(text="⬅️ Назад", callback_data="pos:add")
         b.adjust(1)
         await _pos_edit(
             callback.message,
             f"❔ <b>{_esc(ad['title'][:40])}</b>\n\n{why}\n\n"
-            f"Откройте товар на витрине как покупатель и пришлите адрес "
-            f"страницы со списком предложений.",
+            f"Проще всего — указать раздел кнопками: бот покажет каталог "
+            f"витрины, вы выберете игру и раздел.",
             b.as_markup())
         return
 
@@ -811,6 +813,129 @@ async def pos_add_pick(callback: CallbackQuery) -> None:
             f"Страница: <code>{_esc(_short_url(chosen))}</code>\n{bound}")
     await _pos_edit(callback.message, _watch_text(s, idx_new, note),
                     _watch_kb(s, idx_new))
+
+
+# The listing a seller picked but whose page could not be worked out, kept
+# while they name its section by hand.
+_PENDING_AD: dict[int, dict] = {}
+
+
+@router.callback_query(F.data.startswith("pos:cat:"))
+async def pos_pick_category(callback: CallbackQuery) -> None:
+    """Name the section by tapping the marketplace's own catalogue.
+
+    Automatic detection reads what the listing row happens to carry, and that
+    is not always the section. The catalogue always is — and two taps beat
+    copying an address, which is what this whole screen exists to avoid.
+    """
+    import asyncio
+
+    from automation.market import category_children
+
+    parent = callback.data[len("pos:cat:"):]
+    ad = _PENDING_AD.get(callback.from_user.id)
+    if not ad:
+        await callback.answer("Начните заново — выберите товар", show_alert=True)
+        await _pos_screen(callback)
+        return
+    await callback.answer("⏳ Читаю каталог...")
+    loop = asyncio.get_event_loop()
+    try:
+        rows = await asyncio.wait_for(
+            loop.run_in_executor(None, category_children, parent), timeout=45)
+    except Exception as e:
+        rows = []
+        logger.warning("catalogue %s: %s", parent, e)
+    if not rows:
+        b = InlineKeyboardBuilder()
+        b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
+        b.button(text="⬅️ Назад", callback_data="pos:add")
+        b.adjust(1)
+        await _pos_edit(callback.message,
+                        "❌ Каталог витрины сейчас не читается. "
+                        "Пришлите адрес страницы вручную.", b.as_markup())
+        return
+
+    b = InlineKeyboardBuilder()
+    for r in rows[:60]:
+        # A section with children is a step deeper; one without is the answer.
+        target = (f"pos:cat:{r['slug']}" if r["has_children"]
+                  else f"pos:catpick:{parent}|{r['slug']}")
+        count = f" · {r['ads_count']}" if r.get("ads_count") else ""
+        b.button(text=f"{r['title'][:30]}{count}", callback_data=target[:64])
+    b.button(text="⬅️ Назад", callback_data="pos:add")
+    b.adjust(1)
+    await _pos_edit(
+        callback.message,
+        f"📂 <b>{'Раздел' if parent else 'Игра или категория'}</b>\n\n"
+        f"Товар: {_esc(ad['title'][:40])}\n\n"
+        + ("Выберите раздел, в котором он продаётся."
+           if parent else "Выберите игру или категорию."),
+        b.as_markup())
+
+
+@router.callback_query(F.data.startswith("pos:catpick:"))
+async def pos_category_chosen(callback: CallbackQuery) -> None:
+    import asyncio
+
+    from automation.market import MARKET_URL, fetch_listing, find_position
+    from automation.position import new_watch, watches
+    from storage import get_shop_name
+
+    ad = _PENDING_AD.get(callback.from_user.id)
+    if not ad:
+        await callback.answer("Начните заново — выберите товар", show_alert=True)
+        await _pos_screen(callback)
+        return
+    raw = callback.data[len("pos:catpick:"):]
+    parent, _, child = raw.partition("|")
+    slugs = [s for s in (parent, child) if s]
+    url = f"{MARKET_URL}/categories/" + "/".join(slugs)
+
+    await callback.answer("⏳ Проверяю раздел...")
+    await _pos_edit(callback.message,
+                    f"⏳ Ищу «{_esc(ad['title'][:36])}» в этом разделе...",
+                    _cancel_kb("pos:menu"))
+    shop = get_shop_name(callback.from_user.id) or ""
+    loop = asyncio.get_event_loop()
+    try:
+        ok, res = await asyncio.wait_for(
+            loop.run_in_executor(None, fetch_listing, url, shop), timeout=180)
+    except Exception as e:
+        ok, res = False, str(e)[:120]
+    mine = find_position(res["offers"], ad_id=ad["id"], title=ad["title"],
+                         seller=shop) if ok else None
+    if not mine:
+        b = InlineKeyboardBuilder()
+        b.button(text="📂 Выбрать другой раздел", callback_data="pos:cat:")
+        b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
+        b.adjust(1)
+        seen = len(res["offers"]) if ok else 0
+        await _pos_edit(
+            callback.message,
+            f"❔ В этом разделе товара нет.\n\n"
+            f"<code>{_esc(_short_url(url))}</code>\n"
+            + (f"Просмотрено предложений: {seen}" if ok
+               else f"❌ {_esc(str(res)[:150])}"),
+            b.as_markup())
+        return
+
+    s = get_settings(callback.from_user.id)
+    pp = s.setdefault("promo_position", {})
+    ws = watches(pp)
+    w = new_watch(url, title=ad["title"], market_id=ad["id"])
+    w["last_pos"] = int(mine["pos"])
+    ws.append(w)
+    pp["watches"] = ws
+    save_settings(callback.from_user.id, s)
+    idx = len(ws) - 1
+    bound = await _bind_panel_item(callback.from_user.id, idx, ad["title"])
+    _PENDING_AD.pop(callback.from_user.id, None)
+    s = get_settings(callback.from_user.id)
+    note = (f"✅ Нашёл на <b>{mine['pos']}-м месте</b> из "
+            f"{len(res['offers'])}\n{bound}")
+    await _pos_edit(callback.message, _watch_text(s, idx, note),
+                    _watch_kb(s, idx))
 
 
 async def _bind_panel_item(uid: int, idx: int, title: str) -> str:

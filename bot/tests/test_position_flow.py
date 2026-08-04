@@ -369,6 +369,106 @@ class AddingFromOwnListings(FlowCase):
         self.assertTrue(cb.answers[0][1], "should alert, not silently pass")
 
 
+class NamingTheSectionByHand(FlowCase):
+    """Two taps through the marketplace's own catalogue.
+
+    Automatic detection reads whatever the listing row happens to carry, and on
+    a real shop that turned out not to include the section. The catalogue
+    always has it — and tapping it beats copying an address, which is what the
+    whole screen exists to avoid.
+    """
+
+    TREE = [{"id": 77, "slug": "black-russia", "title": "Black Russia",
+             "children": [
+                 {"id": 512, "slug": "akkaunty-s-virtami",
+                  "title": "Аккаунты с виртами", "ads_count": 161},
+                 {"id": 513, "slug": "virty", "title": "Вирты",
+                  "ads_count": 638}]},
+            {"id": 90, "slug": "telegram", "title": "Telegram"}]
+
+    def setUp(self):
+        super().setUp()
+        S._PENDING_AD[7] = {"id": "220075", "title": "Аккаунт Steam"}
+        self.patch(storage, "get_panel_creds", lambda uid: {"cookies": "c=1"})
+        import automation.panel as P_
+        self.patch(P_, "panel_list_items_sync",
+                   lambda c: (True, [{"id": 5150, "title": "Аккаунт Steam"}]))
+
+        def children(parent=""):
+            if not parent:
+                return [{"id": n["id"], "slug": n["slug"], "title": n["title"],
+                         "has_children": bool(n.get("children")),
+                         "ads_count": None} for n in self.TREE]
+            node = next((n for n in self.TREE if n["slug"] == parent), None)
+            return [{"id": c["id"], "slug": c["slug"], "title": c["title"],
+                     "has_children": False, "ads_count": c["ads_count"]}
+                    for c in (node or {}).get("children", [])]
+
+        self.patch(M, "category_children", children)
+
+    def tearDown(self):
+        S._PENDING_AD.pop(7, None)
+        super().tearDown()
+
+    def test_the_top_level_offers_games_that_go_deeper(self):
+        cb = FakeCallback("pos:cat:")
+        self.run_(S.pos_pick_category(cb))
+        data = [b.callback_data for row in cb.message.markups[-1].inline_keyboard
+                for b in row]
+        self.assertIn("pos:cat:black-russia", data, "a game must open its sections")
+        self.assertIn("pos:catpick:|telegram", data,
+                      "one without sections is already the answer")
+
+    def test_a_section_is_offered_with_how_much_it_holds(self):
+        cb = FakeCallback("pos:cat:black-russia")
+        self.run_(S.pos_pick_category(cb))
+        kb = cb.message.markups[-1]
+        labels = [b.text for row in kb.inline_keyboard for b in row]
+        self.assertTrue(any("Аккаунты с виртами" in l and "161" in l
+                            for l in labels), labels)
+        data = [b.callback_data for row in kb.inline_keyboard for b in row]
+        self.assertIn("pos:catpick:black-russia|akkaunty-s-virtami", data)
+
+    def test_choosing_a_section_sets_the_watch_up_completely(self):
+        cb = FakeCallback("pos:catpick:black-russia|akkaunty-s-virtami")
+        self.run_(S.pos_category_chosen(cb))
+        ws = self.watches()
+        self.assertEqual(len(ws), 1)
+        self.assertEqual(
+            ws[0]["url"],
+            "https://yoomarket.net/categories/black-russia/akkaunty-s-virtami")
+        self.assertEqual(ws[0]["market_id"], "220075")
+        self.assertEqual(ws[0]["item_id"], "5150", "panel record not bound")
+        self.assertEqual(ws[0]["last_pos"], 2)
+
+    def test_a_section_without_our_listing_is_not_saved(self):
+        self.patch(M, "fetch_listing",
+                   lambda url, shop="": (True, {"offers": M._normalize(
+                       [{"title": "Чужое", "price": 5,
+                         "shop": {"name": "Кто-то"}}]), "note": ""}))
+        cb = FakeCallback("pos:catpick:black-russia|virty")
+        self.run_(S.pos_category_chosen(cb))
+        self.assertEqual(self.watches(), [])
+        said = "\n".join(cb.message.sent)
+        self.assertIn("В этом разделе товара нет", said)
+        self.assertIn("Просмотрено предложений: 1", said)
+
+    def test_the_choice_is_refused_when_no_listing_is_pending(self):
+        S._PENDING_AD.pop(7, None)
+        cb = FakeCallback("pos:catpick:black-russia|virty")
+        self.run_(S.pos_category_chosen(cb))
+        self.assertEqual(self.watches(), [])
+        self.assertTrue(cb.answers[0][1])
+
+    def test_an_unreadable_catalogue_falls_back_to_the_address(self):
+        self.patch(M, "category_children", lambda parent="": [])
+        cb = FakeCallback("pos:cat:")
+        self.run_(S.pos_pick_category(cb))
+        data = [b.callback_data for row in cb.message.markups[-1].inline_keyboard
+                for b in row]
+        self.assertIn("pos:addurl", data)
+
+
 class EditingAWatch(FlowCase):
     def setUp(self):
         super().setUp()
