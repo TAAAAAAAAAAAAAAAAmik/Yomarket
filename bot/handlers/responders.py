@@ -500,7 +500,7 @@ def _ar_kb(conf: dict) -> InlineKeyboardMarkup:
     b.button(text="⚙️ Когда отвечать", callback_data="ar:opts")
     b.button(text="📦 Ответы на события заказа", callback_data="ar:events")
     b.button(text="🎮 Ответы по товарам", callback_data="resp:cats")
-    b.button(text="⬅️ Авто-функции", callback_data="auto:menu")
+    b.button(text="⬅️ Чаты", callback_data="menu:chats")
     b.adjust(1, 2, 2, 1, 1, 1, 1)
     return b.as_markup()
 

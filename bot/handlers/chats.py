@@ -96,11 +96,111 @@ def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None,
     n = len(watched or {})
     builder.button(text=f"🛟 Поддержка и модерация{f' · {n}' if n else ''}",
                    callback_data="wchats:list")
-    builder.button(text="⬅️ Главное меню", callback_data="menu:main")
+    builder.button(text="⬅️ Чаты", callback_data="menu:chats")
     return builder.as_markup()
 
 
+# Чаты, которые есть у каждого продавца и живут вне заказов. Ищутся среди
+# отслеживаемых по названию: номер у каждого магазина свой, а название задаёт
+# сам продавец, когда добавляет чат.
+_WELL_KNOWN = {
+    "support": {"label": "Поддержка", "icon": "🛟", "title": "Чат с поддержкой",
+                "words": ("поддерж", "support", "саппорт")},
+    "market": {"label": "Юмаркет", "icon": "🏪", "title": "Чат с Юмаркет",
+               "words": ("юмаркет", "yoomarket", "маркет", "модерац", "админ")},
+}
+
+
+def _find_well_known(watched: dict, kind: str) -> str:
+    """Номер отслеживаемого чата, чьё название похоже на искомое, или ""."""
+    words = _WELL_KNOWN[kind]["words"]
+    for cid, info in (watched or {}).items():
+        label = str((info or {}).get("label") or "").lower()
+        if any(w in label for w in words):
+            return str(cid)
+    return ""
+
+
+def _hub_kb(watched: dict, ar_on: bool) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="💬 Список чатов", callback_data="chats:list")
+    b.button(text=f"{_WELL_KNOWN['support']['icon']} Чат с поддержкой",
+             callback_data="chats:kind:support")
+    b.button(text=f"{_WELL_KNOWN['market']['icon']} Чат с Юмаркет",
+             callback_data="chats:kind:market")
+    b.button(text=f"📩 Автоответы {'🟢' if ar_on else '🔴'}",
+             callback_data="ar:menu")
+    b.button(text="⬅️ Главное меню", callback_data="menu:main")
+    b.adjust(1, 2, 1, 1)
+    return b.as_markup()
+
+
 @router.callback_query(F.data == "menu:chats")
+async def chats_hub(callback: CallbackQuery, state: FSMContext) -> None:
+    """Раздел «Чаты»: переписка и автоответы в одном месте.
+
+    Раньше нажатие сразу грузило список заказов — на это уходил запрос к
+    маркетплейсу, а поддержка и автоответы прятались за ним. Хаб рисуется из
+    того, что уже сохранено, поэтому открывается мгновенно.
+    """
+    await state.clear()
+    s = get_settings(callback.from_user.id)
+    watched = s.get("watched_chats") or {}
+    conf = s.get("autoreplies", {}) or {}
+    ar_on = bool(conf.get("enabled"))
+    live = [r for r in (conf.get("rules") or []) if r.get("on", True)]
+
+    lines = ["💬 <b>Чаты</b>", ""]
+    lines.append("📋 Переписка по заказам — в «Списке чатов».")
+    for kind, meta in _WELL_KNOWN.items():
+        cid = _find_well_known(watched, kind)
+        lines.append(f"{meta['icon']} {meta['title']}: "
+                     + (f"<code>#{_esc(cid)}</code>" if cid else "<i>не добавлен</i>"))
+    if ar_on:
+        extra = (f"правил: {len(live)}" if live or (conf.get("fallback") or {}).get("on")
+                 else "⚠️ правил нет — бот молчит")
+        lines.append(f"📩 Автоответы: 🟢 включены, {extra}")
+    else:
+        lines.append("📩 Автоответы: 🔴 выключены")
+
+    await callback.message.edit_text("\n".join(lines),
+                                     reply_markup=_hub_kb(watched, ar_on))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("chats:kind:"))
+async def chats_well_known(callback: CallbackQuery, state: FSMContext) -> None:
+    """Открыть поддержку / Юмаркет — или предложить добавить, если её нет."""
+    kind = callback.data.rsplit(":", 1)[-1]
+    meta = _WELL_KNOWN.get(kind)
+    if not meta:
+        await callback.answer("Неизвестный чат", show_alert=True)
+        return
+    watched = get_settings(callback.from_user.id).get("watched_chats") or {}
+    cid = _find_well_known(watched, kind)
+    if cid:
+        await state.clear()
+        await _wchat_screen(callback, cid)
+        return
+
+    # Номер такого чата бот сам узнать не может: в API нет списка чатов.
+    await state.set_state(ReplyState.waiting_chat_id)
+    await state.update_data(label=meta["label"])
+    b = InlineKeyboardBuilder()
+    b.button(text="📋 Другие чаты вне заказов", callback_data="wchats:list")
+    b.button(text="❌ Отмена", callback_data="menu:chats")
+    b.adjust(1)
+    await callback.message.edit_text(
+        f"{meta['icon']} <b>{meta['title']}</b>\n\n"
+        "Такой чат ещё не добавлен. Пришлите его номер или ссылку — "
+        "он есть в адресе чата в панели:\n"
+        "<code>panel.yoomarket.net/chats/<b>1076867</b></code>\n\n"
+        f"<i>Название подставлю сам: «{meta['label']}».</i>",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "chats:list")
 async def show_chats(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.message.edit_text("⏳ Загружаю чаты...")
     watched = get_settings(callback.from_user.id).get("watched_chats") or {}
@@ -349,6 +449,7 @@ async def wchats_list(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "wchats:add")
 async def wchats_add(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ReplyState.waiting_chat_id)
+    await state.update_data(label="")   # без подсказанного названия, спросим текстом
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="wchats:list")
     await callback.message.edit_text(
@@ -363,19 +464,33 @@ async def wchats_add(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(ReplyState.waiting_chat_id)
 async def wchats_add_save(message: Message, state: FSMContext,
                           api: YooMarketAPI) -> None:
+    # Название запоминается тем экраном, который спрашивал номер: из «Чата с
+    # поддержкой» продавец шлёт одну цифру, и чат должен называться так, чтобы
+    # кнопка потом его нашла.
+    data = await state.get_data()
+    preset = str(data.get("label") or "").strip()
     await state.clear()
     parts = (message.text or "").split(maxsplit=1)
     if not parts:
         await message.answer("❌ Пришлите номер чата")
         return
     chat_id = parts[0].strip().rstrip("/").split("/")[-1]
-    label = parts[1].strip() if len(parts) > 1 else "Поддержка"
+    label = (parts[1].strip() if len(parts) > 1 else "") or preset or "Поддержка"
     await _add_watched(message, api, chat_id, label)
 
 
 @router.callback_query(F.data.startswith("wchat:"))
 async def wchat_detail(callback: CallbackQuery) -> None:
-    cid = callback.data.split(":", 1)[1]
+    await _wchat_screen(callback, callback.data.split(":", 1)[1])
+
+
+async def _wchat_screen(callback: CallbackQuery, cid: str) -> None:
+    """Экран одного чата вне заказов.
+
+    Отдельно от обработчика, потому что на него ведут и кнопки «Чат с
+    поддержкой» / «Чат с Юмаркет»: подменять callback.data ради переиспользования
+    нельзя — это pydantic-модель.
+    """
     watched = get_settings(callback.from_user.id).get("watched_chats") or {}
     info = watched.get(cid) or {}
     digits = "".join(ch for ch in str(cid) if ch.isdigit())
