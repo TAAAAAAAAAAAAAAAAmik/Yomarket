@@ -61,6 +61,7 @@ class PluginState(StatesGroup):
     stars_set_amount = State()
     stars_set_note = State()
     stars_set_cookies = State()
+    stars_set_one_cookie = State()
     stars_set_mnemonic = State()
     stars_set_keyword = State()
     # AutoRoblox
@@ -216,15 +217,30 @@ async def stars_settings(callback: CallbackQuery, state: FSMContext) -> None:
 
 # ── Данные Fragment (cookies + seed-фраза) ──────────────────────────────────
 
-def _creds_kb(has: bool) -> InlineKeyboardMarkup:
+# The three cookies Fragment logs a seller in with. They are asked for one at
+# a time because two of them are HttpOnly: `document.cookie` simply does not
+# contain them, so pasting that string left the session half-built and the
+# failure only showed up at the first delivery.
+FRAGMENT_COOKIES = (
+    ("stel_token", "🔑 stel_token"),
+    ("stel_ssid", "🆔 stel_ssid"),
+    ("stel_ton_token", "💎 stel_ton_token"),
+)
+
+
+def _creds_kb(has: bool, cookies: dict | None = None) -> InlineKeyboardMarkup:
+    cookies = cookies or {}
     b = InlineKeyboardBuilder()
-    b.button(text="🍪 Задать cookies Fragment", callback_data="plugins:stars:set_cookies")
-    b.button(text="🔐 Задать seed-фразу TON", callback_data="plugins:stars:set_mnemonic")
+    for i, (name, label) in enumerate(FRAGMENT_COOKIES):
+        mark = "✅" if cookies.get(name) else "▫️"
+        b.button(text=f"{mark} {label}", callback_data=f"plugins:stars:ck:{i}")
+    b.button(text="🔐 Seed-фраза TON", callback_data="plugins:stars:set_mnemonic")
+    b.button(text="📋 Вставить всё строкой", callback_data="plugins:stars:set_cookies")
     if has:
-        b.button(text="🧪 Проверить cookies", callback_data="plugins:stars:check_creds")
+        b.button(text="🧪 Проверить вход", callback_data="plugins:stars:check_creds")
         b.button(text="🗑 Удалить данные", callback_data="plugins:stars:del_creds")
     b.button(text="⬅️ Назад", callback_data="plugins:stars:settings")
-    b.adjust(2, 2, 1)
+    b.adjust(1, 1, 1, 1, 1, 2, 1)
     return b.as_markup()
 
 
@@ -233,18 +249,118 @@ async def stars_creds(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()  # Cancel из промптов cookies/seed ведёт сюда
     uid = callback.from_user.id
     creds = get_fragment_creds(uid) or {}
-    has_c = bool(creds.get("cookies"))
+    cookies = creds.get("cookies") or {}
     has_m = bool(creds.get("mnemonic"))
+    missing = [label for name, label in FRAGMENT_COOKIES if not cookies.get(name)]
+    ready = not missing and has_m
+    lines = ["🔑 <b>Данные Fragment</b>\n"]
+    for name, label in FRAGMENT_COOKIES:
+        lines.append(f"{'🟢' if cookies.get(name) else '🔴'} {label}")
+    lines.append(f"{'🟢' if has_m else '🔴'} 🔐 Seed-фраза TON")
+    extra = [k for k in cookies if k not in dict(FRAGMENT_COOKIES)]
+    if extra:
+        lines.append(f"\n<i>Ещё сохранено cookies: {len(extra)}</i>")
+    lines.append("")
+    if missing or not has_m:
+        lines.append("Заполните по одному — каждая кнопка спрашивает "
+                     "что-то одно.")
+    else:
+        lines.append("Всё на месте. Проверьте вход кнопкой ниже.")
+    lines.append("")
+    lines.append("⚠️ <b>Это доступ к вашему TON-кошельку и Fragment.</b> "
+                 "Данные хранятся только у бота, в чат не выводятся. "
+                 "Сообщения с секретами удаляются автоматически.")
     await callback.message.edit_text(
-        "🔑 <b>Данные Fragment</b>\n\n"
-        f"🍪 Cookies: <b>{'🟢 заданы' if has_c else '🔴 нет'}</b>\n"
-        f"🔐 Seed-фраза: <b>{'🟢 задана' if has_m else '🔴 нет'}</b>\n\n"
-        "⚠️ <b>Это доступ к вашему TON-кошельку и Fragment.</b> "
-        "Данные хранятся только у бота, в чат не выводятся. "
-        "Сообщения с секретами удаляются автоматически.",
-        reply_markup=_creds_kb(has_c and has_m),
+        "\n".join(lines), reply_markup=_creds_kb(ready, cookies))
+    await callback.answer()
+
+
+# Where each cookie is found, because two of them are HttpOnly and the console
+# trick does not reveal them.
+_COOKIE_HELP = {
+    "stel_token": ("Основной токен сессии Fragment.\n\n"
+                   "F12 → вкладка <b>Application</b> (в Firefox — "
+                   "<b>Хранилище</b>) → Cookies → <code>https://fragment.com</code> "
+                   "→ строка <code>stel_token</code> → скопируйте <b>Value</b>."),
+    "stel_ssid": ("Идентификатор сессии.\n\n"
+                  "Там же: Application → Cookies → fragment.com → "
+                  "<code>stel_ssid</code> → Value."),
+    "stel_ton_token": ("Токен привязанного TON-кошелька — появляется после "
+                       "входа на Fragment через кошелёк.\n\n"
+                       "Application → Cookies → fragment.com → "
+                       "<code>stel_ton_token</code> → Value."),
+}
+
+
+@router.callback_query(F.data.startswith("plugins:stars:ck:"))
+async def stars_set_one_cookie_prompt(callback: CallbackQuery,
+                                      state: FSMContext) -> None:
+    """Ask for a single cookie.
+
+    Pasting `document.cookie` cannot work here: stel_token and stel_ssid are
+    HttpOnly, so that string is missing exactly the values the session needs,
+    and nothing said so until the first delivery failed.
+    """
+    try:
+        idx = int(callback.data.split(":")[-1])
+        name, label = FRAGMENT_COOKIES[idx]
+    except (ValueError, IndexError):
+        await callback.answer("Неизвестное поле", show_alert=True)
+        return
+    await state.set_state(PluginState.stars_set_one_cookie)
+    await state.update_data(cookie_name=name)
+    creds = get_fragment_creds(callback.from_user.id) or {}
+    have = (creds.get("cookies") or {}).get(name)
+    await callback.message.edit_text(
+        f"{label}\n\n"
+        + (f"Сейчас: <b>задан</b> ({len(str(have))} символов)\n\n" if have else "")
+        + _COOKIE_HELP.get(name, "Пришлите значение этой cookie.")
+        + "\n\nПришлите <b>только значение</b> — без названия и без "
+          "<code>=</code>. Сообщение сразу удалится.",
+        reply_markup=_cancel_kb("plugins:stars:creds"),
     )
     await callback.answer()
+
+
+@router.message(PluginState.stars_set_one_cookie)
+async def stars_set_one_cookie_input(message: Message,
+                                     state: FSMContext) -> None:
+    data = await state.get_data()
+    name = data.get("cookie_name") or ""
+    raw = (message.text or "").strip()
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    creds = get_fragment_creds(message.from_user.id) or {}
+    cookies = dict(creds.get("cookies") or {})
+    # Pasted as «stel_token=abc» or as a whole cookie string — take what fits
+    # rather than saving the name as part of the value.
+    if "=" in raw:
+        parsed = _parse_cookies(raw)
+        if parsed.get(name):
+            raw = parsed[name]
+        elif len(parsed) == 1:
+            raw = next(iter(parsed.values()))
+        cookies.update({k: v for k, v in parsed.items() if k != name and v})
+    raw = raw.strip().strip(";").strip()
+    if not name or not raw:
+        await message.answer("❌ Пустое значение — ничего не сохранил.",
+                             reply_markup=_creds_kb(False, cookies))
+        return
+    cookies[name] = raw
+    save_fragment_creds(message.from_user.id, {"cookies": cookies})
+    creds = get_fragment_creds(message.from_user.id) or {}
+    left = [lbl for n, lbl in FRAGMENT_COOKIES if not cookies.get(n)]
+    if not creds.get("mnemonic"):
+        left.append("🔐 Seed-фраза TON")
+    await message.answer(
+        f"✅ Сохранено: <b>{name}</b>"
+        + (f"\n\nОсталось заполнить: {', '.join(left)}" if left
+           else "\n\nВсё готово — проверьте вход кнопкой «🧪 Проверить вход»."),
+        reply_markup=_creds_kb(not left and bool(creds.get("mnemonic")), cookies),
+    )
 
 
 @router.callback_query(F.data == "plugins:stars:set_cookies")
@@ -272,13 +388,24 @@ async def stars_set_cookies_input(message: Message, state: FSMContext) -> None:
     if not cookies:
         await message.answer(
             "❌ Не распознал cookies. Нужен формат <code>k=v; k2=v2</code>.",
-            reply_markup=_creds_kb(False))
+            reply_markup=_creds_kb(False, (get_fragment_creds(
+                message.from_user.id) or {}).get("cookies")))
         return
-    save_fragment_creds(message.from_user.id, {"cookies": cookies})
+    # Merge, never replace: the HttpOnly ones were entered by hand and are not
+    # in this string, and dropping them would undo that work silently.
+    existing = dict((get_fragment_creds(message.from_user.id) or {}).get(
+        "cookies") or {})
+    existing.update(cookies)
+    save_fragment_creds(message.from_user.id, {"cookies": existing})
     creds = get_fragment_creds(message.from_user.id) or {}
+    left = [lbl for n, lbl in FRAGMENT_COOKIES if not existing.get(n)]
     await message.answer(
-        f"✅ Cookies сохранены ({len(cookies)} шт.).",
-        reply_markup=_creds_kb(bool(creds.get("cookies") and creds.get("mnemonic"))),
+        f"✅ Разобрал {len(cookies)} cookie."
+        + (f"\n\n⚠️ Не хватает: {', '.join(left)} — их не бывает в "
+           f"<code>document.cookie</code>, задайте по одной."
+           if left else ""),
+        reply_markup=_creds_kb(
+            not left and bool(creds.get("mnemonic")), existing),
     )
 
 
@@ -307,7 +434,8 @@ async def stars_set_mnemonic_input(message: Message, state: FSMContext) -> None:
     if len(words) not in (12, 24):
         await message.answer(
             "❌ Нужно 24 слова (или 12). Проверьте seed-фразу.",
-            reply_markup=_creds_kb(False))
+            reply_markup=_creds_kb(False, (get_fragment_creds(
+                message.from_user.id) or {}).get("cookies")))
         return
     # validate the phrase derives a wallet before saving
     try:
@@ -318,7 +446,8 @@ async def stars_set_mnemonic_input(message: Message, state: FSMContext) -> None:
     except Exception as e:
         await message.answer(
             f"❌ Seed-фраза не подошла: {str(e)[:80]}",
-            reply_markup=_creds_kb(False))
+            reply_markup=_creds_kb(False, (get_fragment_creds(
+                message.from_user.id) or {}).get("cookies")))
         return
     save_fragment_creds(message.from_user.id, {"mnemonic": " ".join(words),
                                                "wallet_version": wv})
@@ -326,7 +455,9 @@ async def stars_set_mnemonic_input(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ Кошелёк сохранён.\n💼 Адрес: <code>{addr}</code>\n\n"
         "Пополните его TON для оплаты звёзд.",
-        reply_markup=_creds_kb(bool(creds.get("cookies") and creds.get("mnemonic"))),
+        reply_markup=_creds_kb(
+            bool(creds.get("cookies") and creds.get("mnemonic")),
+            creds.get("cookies")),
     )
 
 
