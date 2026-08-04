@@ -1381,6 +1381,202 @@ async def pos_raw(message: Message) -> None:
     await status.delete()
 
 
+def _pos_api_sync(url: str, shop: str) -> str:
+    """Blocking: find the request the storefront makes to fill its listing.
+
+    The category page ships no offers at all — 81 KB of application shell — so
+    the list arrives over a separate call made from the browser. That call has
+    to be found, and it is findable: its address is compiled into the page's own
+    JavaScript. The same trick already located the chat API
+    (panel_chat_debug_sync).
+
+    Read-only: every request here is a GET, and nothing is stored.
+    """
+    import json as _json
+    from urllib.parse import parse_qsl, urlparse
+
+    import requests
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+    from automation.market import MARKET_URL, _json_blobs, _offer_lists
+
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+    if not url.startswith("http"):
+        url = MARKET_URL + ("" if url.startswith("/") else "/") + url
+    parts = urlparse(url)
+    slugs = [p for p in parts.path.split("/") if p and p != "categories"]
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    hdrs = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": url, "Origin": MARKET_URL,
+            "Accept-Language": "ru-RU,ru;q=0.9"}
+    out = [f"путь: {slugs}", f"параметры: {params}"]
+
+    try:
+        html = requests.get(url, timeout=(6, 25), verify=False, headers={
+            "User-Agent": hdrs["User-Agent"],
+            "Accept": "text/html"}).text
+    except Exception as e:
+        return f"страница не открылась: {str(e)[:150]}"
+
+    # --- 1. What the page itself was given -----------------------------------
+    build_id = ""
+    m = re.search(r'id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if m:
+        try:
+            nd = _json.loads(m.group(1))
+            build_id = str(nd.get("buildId") or "")
+            props = (nd.get("props") or {}).get("pageProps") or {}
+            out.append(f"buildId: {build_id or '—'}; "
+                       f"pageProps: {sorted(props)[:12]}")
+            # Anything in there shaped like an address or an id we could reuse
+            flat = _json.dumps(nd, ensure_ascii=False)
+            urls = sorted(set(re.findall(
+                r'"(https?://[\w.\-]+[^"]{0,40})"', flat)))
+            if urls:
+                out.append("адреса в __NEXT_DATA__: " + ", ".join(urls[:8]))
+            ids = re.findall(r'"(category_?id|categoryId|id)":\s*(\d+)', flat)
+            if ids:
+                out.append(f"идентификаторы: {ids[:6]}")
+        except Exception as e:
+            out.append(f"__NEXT_DATA__ не разобрался: {str(e)[:60]}")
+
+    # --- 2. The endpoint compiled into the page's JavaScript ------------------
+    scripts = re.findall(r'<script[^>]+src="([^"]+)"', html)
+    bases, paths = set(), set()
+    for src in list(dict.fromkeys(scripts))[:12]:
+        full = src if src.startswith("http") else MARKET_URL + src
+        try:
+            js = requests.get(full, timeout=(6, 20), verify=False,
+                              headers={"User-Agent": hdrs["User-Agent"]}).text
+        except Exception:
+            continue
+        for b in re.findall(r'["\'`](https?://[\w.\-]*api[\w.\-]*)["\'`/]', js):
+            bases.add(b)
+        for p in re.findall(
+                r'["\'`](/(?:api|v\d)/[\w/\-{}$.]{2,60})["\'`]', js):
+            paths.add(p)
+        for p in re.findall(
+                r'["\'`](/[\w/\-]*(?:categor|offer|product|search|catalog'
+                r'|item|lot|filter)[\w/\-{}$.]{0,40})["\'`]', js, re.I):
+            if len(p) < 70:
+                paths.add(p)
+        if "graphql" in js.lower():
+            bases.add("(в бандле есть graphql)")
+    out.append(f"базы из JS: {sorted(bases)[:10] or 'ничего'}")
+    out.append(f"пути из JS: {sorted(paths)[:24] or 'ничего'}")
+
+    # --- 3. Try them, and say which one actually answers with the listing -----
+    def _try(full_url: str, label: str = "") -> str:
+        try:
+            r = requests.get(full_url, headers=hdrs, timeout=(6, 20),
+                             verify=False, allow_redirects=False)
+        except Exception as e:
+            return f"  {full_url[:90]} → {str(e)[:50]}"
+        body = r.text or ""
+        mark = ""
+        if shop and shop in body:
+            mark = "  ★★★ ЕСТЬ НАШ МАГАЗИН"
+        elif "отзыв" in body or '"price"' in body:
+            mark = "  ★ похоже на выдачу"
+        offers = 0
+        try:
+            for blob in ([r.json()] if "json" in
+                         r.headers.get("content-type", "") else
+                         _json_blobs(body)):
+                for lst in _offer_lists(blob):
+                    offers = max(offers, len(lst))
+        except Exception:
+            pass
+        if offers:
+            mark += f"  [офферов: {offers}]"
+        return (f"  {label or full_url[:90]} → {r.status_code}, "
+                f"{len(body)}б{mark}\n     {body[:160].strip()}")
+
+    out.append("\n— пробую —")
+    tried = set()
+
+    # Next.js Pages Router serves the page's own props as JSON
+    if build_id and len(out) < 60:
+        path = parts.path.strip("/")
+        nd_url = f"{MARKET_URL}/_next/data/{build_id}/{path}.json"
+        if parts.query:
+            nd_url += "?" + parts.query
+        out.append(_try(nd_url, f"/_next/data/{build_id}/…"))
+
+    # Whatever the bundles named, with this page's own parameters
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    for base in list(sorted(bases))[:3] + [MARKET_URL, "https://api.yoo.market"]:
+        if not base.startswith("http"):
+            continue
+        for p in sorted(paths)[:12]:
+            if "{" in p or "$" in p:
+                continue
+            full = base.rstrip("/") + p
+            if slugs and p.rstrip("/").endswith(("categories", "category")):
+                full += "/" + "/".join(slugs)
+            full += ("&" if "?" in full else "?") + query if query else ""
+            if full in tried or len(tried) > 22:
+                continue
+            tried.add(full)
+            out.append(_try(full))
+
+    # And the shapes such an API usually takes, in case the bundles hid theirs
+    if slugs:
+        guesses = [
+            f"/api/categories/{'/'.join(slugs)}/offers",
+            f"/api/categories/{'/'.join(slugs)}/products",
+            f"/api/categories/{'/'.join(slugs)}",
+            f"/api/offers?category={slugs[-1]}",
+            f"/api/products?category={slugs[-1]}",
+            f"/api/search?category={slugs[-1]}",
+        ]
+        for base in (MARKET_URL, "https://api.yoo.market",
+                     "https://api.yoo.market/v1"):
+            for g in guesses:
+                full = base + g
+                full += ("&" if "?" in full else "?") + query if query else ""
+                if full in tried or len(tried) > 40:
+                    continue
+                tried.add(full)
+                line = _try(full)
+                if "→ 404" not in line and "→ 403" not in line:
+                    out.append(line)
+    return "\n".join(out)
+
+
+@router.message(Command("pos_api"))
+async def pos_api(message: Message) -> None:
+    """/pos_api <ссылка> — найти запрос, которым витрина набирает список.
+
+    Read-only. Нужна потому, что страница категории не содержит предложений:
+    их подгружает браузер отдельным запросом, и его адрес зашит в JS страницы.
+    """
+    import html as _html
+
+    from storage import get_shop_name
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Укажите страницу витрины:\n"
+            "<code>/pos_api https://yoomarket.net/categories/...</code>")
+        return
+    shop = get_shop_name(message.from_user.id) or ""
+    status = await message.answer("⏳ Ищу, откуда витрина берёт список...")
+    loop = asyncio.get_event_loop()
+    try:
+        report = await asyncio.wait_for(
+            loop.run_in_executor(None, _pos_api_sync, parts[1].strip(), shop),
+            timeout=240)
+    except Exception as e:
+        report = f"не удалось: {str(e)[:200]}"
+    text = _html.escape(report)
+    for i in range(0, min(len(text), 14000), 3500):
+        await message.answer(f"<code>{text[i:i + 3500]}</code>")
+    await status.delete()
+
+
 async def _pos_debug_watches(message: Message) -> None:
     """Dry-run every watch: position, thresholds and the decision — no charge.
 
