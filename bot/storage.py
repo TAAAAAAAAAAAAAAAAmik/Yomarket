@@ -181,11 +181,20 @@ _DEFAULT_SETTINGS = {
     "plugins": {
         "auto_stars": {
             "enabled": False, "amount": 50, "note": "",
-            "keyword": "звёзд",       # заголовок заказа должен содержать это слово
+            # Пусто — узнаём звёздные заказы по всем обычным написаниям
+            # («звёзд», «звезд», «stars», «⭐»); своё слово здесь означает
+            # «только оно».
+            "keyword": "",
             "ask_username": True,      # спрашивать @username в чате заказа
             "pending": {},             # {order_id: {quantity, asked_at}} — ждём username
             "delivered": [],           # order_id, по которым звёзды уже выданы
             "wallet_version": "v4r2",
+            # Предупреждать, пока пополнить кошелёк ещё есть время: закончиться
+            # TON посреди оплаченного заказа — худший исход.
+            "low_balance_warn": True,
+            "low_balance_deliveries": 2,
+            "balance_checked_at": 0,
+            "balance_low": False,
         },
         "auto_roblox": {"enabled": False, "robux": 0, "note": ""},
         "auto_gifts": {"enabled": False, "gift_type": "", "note": ""},

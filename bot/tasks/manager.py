@@ -1299,18 +1299,21 @@ class TaskManager:
         self, api: YooMarketAPI, settings: dict,
         order_id: str, title: str, chat_id: str,
     ) -> None:
+        from automation.stars import is_stars_order, star_quantity
+
         p = settings.get("plugins", {}).get("auto_stars", {})
         if not p.get("enabled") or not p.get("ask_username", True):
             return
-        keyword = (p.get("keyword") or "звёзд").lower()
-        if keyword not in (title or "").lower():
+        if not is_stars_order(title, p.get("keyword") or ""):
             return
         pending: dict = p.setdefault("pending", {})
         delivered: list = p.setdefault("delivered", [])
         if order_id in pending or order_id in delivered:
             return
-        qty = _parse_star_qty(title, p.get("amount", 50))
-        pending[order_id] = {"quantity": qty, "asked_at": time.time()}
+        qty = star_quantity(title, p.get("amount", 50))
+        pending[order_id] = {"quantity": qty, "asked_at": time.time(),
+                             "title": title, "chat_id": chat_id,
+                             "reminded": 0}
         await self._send_chat(
             api, chat_id,
             "⭐ Для выдачи звёзд отправьте, пожалуйста, ваш Telegram "
@@ -1355,10 +1358,42 @@ class TaskManager:
             )
             return True
 
+        # Check the wallet can cover it before the buyer is left waiting. A
+        # purchase that dies halfway is worse than one that never started: the
+        # buyer has already been told it is on its way.
+        from automation.stars import deliveries_left, ton_needed
+        need = ton_needed(qty)
+        loop = asyncio.get_event_loop()
+        try:
+            from automation.fragment import get_wallet_balance_sync
+            ok_bal, bal = await asyncio.wait_for(
+                loop.run_in_executor(None, get_wallet_balance_sync,
+                                     creds["mnemonic"],
+                                     creds.get("wallet_version", "v4r2")),
+                timeout=45)
+        except Exception as e:
+            ok_bal, bal = False, str(e)[:80]
+        if ok_bal and isinstance(bal, dict) and bal.get("ton", 0) < need:
+            await self._send_chat(
+                api, chat_id,
+                "⚠️ Не получается выдать звёзды прямо сейчас. "
+                "Продавец уже уведомлён и выдаст их вручную.")
+            await self._notify(
+                user_id,
+                _card("⭐ <b>ЗВЁЗДЫ НЕ ВЫДАНЫ</b>",
+                      [f"Заказ #{_esc(order_id)}, @{_esc(username)}, {qty}⭐",
+                       "",
+                       f"На кошельке <b>{bal['ton']:.3f} TON</b>, "
+                       f"нужно ≈ <b>{need:.3f} TON</b>.",
+                       "Пополните кошелёк и выдайте вручную: "
+                       "Плагины → AutoStars → 🚀 Ручная выдача"]))
+            pending[order_id] = {**entry, "quantity": qty,
+                                 "asked_at": time.time()}
+            return True
+
         await self._send_chat(
             api, chat_id, f"⏳ Отправляю {qty}⭐ на @{username}…")
 
-        loop = asyncio.get_event_loop()
         try:
             ok, result = await asyncio.wait_for(
                 loop.run_in_executor(
@@ -1405,6 +1440,105 @@ class TaskManager:
                 "Выдайте вручную: Плагины → AutoStars → 🚀 Ручная выдача",
             )
         return True
+
+    # How long a buyer is given to send their username before being nudged, and
+    # how long before the seller is told the order is stuck. A paid order left
+    # silently waiting is the worst outcome here: the buyer is out of pocket
+    # and nobody knows.
+    _STARS_REMIND_AFTER = 1800          # 30 minutes
+    _STARS_ESCALATE_AFTER = 6 * 3600
+
+    async def _stars_pending_sweep(self, user_id: int, api: YooMarketAPI,
+                                   settings: dict, now: float) -> str:
+        """Chase the orders that asked for a username and never got one."""
+        p = settings.get("plugins", {}).get("auto_stars", {})
+        if not p.get("enabled"):
+            return ""
+        pending: dict = p.get("pending") or {}
+        if not pending:
+            return ""
+        stuck = []
+        for order_id, entry in list(pending.items()):
+            if not isinstance(entry, dict):
+                continue
+            waited = now - float(entry.get("asked_at") or 0)
+            chat_id = entry.get("chat_id")
+            reminded = int(entry.get("reminded") or 0)
+            if waited >= self._STARS_REMIND_AFTER and not reminded and chat_id:
+                await self._send_chat(
+                    api, chat_id,
+                    "⭐ Напоминаем: пришлите ваш Telegram @username — и звёзды "
+                    "придут автоматически. Если username нет, его можно задать "
+                    "в настройках Telegram.")
+                entry["reminded"] = 1
+                entry["reminded_at"] = now
+            if waited >= self._STARS_ESCALATE_AFTER and reminded < 2:
+                entry["reminded"] = 2
+                stuck.append((order_id, entry, waited))
+        if not stuck:
+            return ""
+        lines = []
+        for order_id, entry, waited in stuck[:8]:
+            lines.append(f"• #{_esc(str(order_id))} — {entry.get('quantity', '?')}⭐, "
+                         f"ждёт {waited / 3600:.0f} ч: "
+                         f"{_esc(str(entry.get('title') or ''))[:40]}")
+        return _card("⭐ <b>ЗВЁЗДЫ: ЖДУТ USERNAME</b>", lines,
+                     "Покупатели не прислали @username. Напишите им или "
+                     "выдайте вручную: Плагины → AutoStars")
+
+    async def _stars_balance_watch(self, user_id: int, settings: dict,
+                                   now: float) -> str:
+        """Warn while there is still time to top up, not at the checkout.
+
+        Running out mid-delivery leaves a buyer waiting on an order they have
+        already paid for, so the wallet is looked at on a schedule rather than
+        only when an order arrives.
+        """
+        from automation.stars import deliveries_left, ton_needed
+
+        p = settings.get("plugins", {}).get("auto_stars", {})
+        if not p.get("enabled") or not p.get("low_balance_warn", True):
+            return ""
+        if (now - float(p.get("balance_checked_at") or 0)) < 6 * 3600:
+            return ""
+        from storage import get_fragment_creds
+        creds = get_fragment_creds(user_id)
+        if not creds or not creds.get("mnemonic"):
+            return ""
+        p["balance_checked_at"] = now
+        loop = asyncio.get_event_loop()
+        try:
+            from automation.fragment import get_wallet_balance_sync
+            ok, bal = await asyncio.wait_for(
+                loop.run_in_executor(None, get_wallet_balance_sync,
+                                     creds["mnemonic"],
+                                     creds.get("wallet_version", "v4r2")),
+                timeout=45)
+        except Exception as e:
+            logger.info("AutoStars balance for %s: %s", user_id, e)
+            return ""
+        if not ok or not isinstance(bal, dict):
+            return ""
+        qty = int(p.get("amount", 50) or 50)
+        left = deliveries_left(bal.get("ton", 0), qty)
+        floor = int(p.get("low_balance_deliveries", 2) or 2)
+        was_low = bool(p.get("balance_low"))
+        p["balance_low"] = left <= floor
+        if left > floor:
+            if was_low:
+                return _card("⭐ <b>КОШЕЛЁК ПОПОЛНЕН</b>",
+                             [f"{bal['ton']:.3f} TON — хватит примерно на "
+                              f"<b>{left}</b> выдач по {qty}⭐"])
+            return ""
+        if was_low:
+            return ""                   # already said so; do not repeat hourly
+        return _card("⭐ <b>ЗАКАНЧИВАЕТСЯ TON</b>",
+                     [f"На кошельке <b>{bal['ton']:.3f} TON</b>",
+                      f"Хватит примерно на <b>{left}</b> выдач по {qty}⭐ "
+                      f"(≈ {ton_needed(qty):.3f} TON за выдачу)",
+                      "",
+                      "Пополните кошелёк, иначе выдача остановится на "
+                      "оплаченном заказе."])
 
     def _pick_message(self, title: str, default: str, rules: list[dict],
                       responders: dict | None = None,
@@ -2267,6 +2401,15 @@ class TaskManager:
                     count, msg = await self._panel_bump(user_id, api)
                     settings["auto_bump"]["last_bump_run"] = now
                     messages.append(f"⬆️ Авто-поднятие: {msg}")
+
+            # --- AutoStars: stuck orders and a wallet that is running out ---
+            if settings.get("plugins", {}).get("auto_stars", {}).get("enabled"):
+                for note in (await self._stars_pending_sweep(
+                                 user_id, api, settings, now),
+                             await self._stars_balance_watch(
+                                 user_id, settings, now)):
+                    if note:
+                        messages.append(note)
 
             # --- Position watch ---
             if settings.get("promo_position", {}).get("enabled"):

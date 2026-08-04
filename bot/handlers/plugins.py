@@ -133,19 +133,28 @@ def _stars_settings_text(settings: dict, has_creds: bool = False) -> str:
     p = settings["plugins"]["auto_stars"]
     amount = p.get("amount", 50)
     note = p.get("note") or "—"
-    keyword = p.get("keyword") or "звёзд"
+    keyword = p.get("keyword") or ""
     ask = "да" if p.get("ask_username", True) else "нет"
     creds = "🟢 настроены" if has_creds else "🔴 не настроены"
+    warn = "🟢 вкл" if p.get("low_balance_warn", True) else "🔴 выкл"
+    left = int(p.get("low_balance_deliveries", 2) or 2)
+    kw_line = (f"🔍 Своё слово в заказе: <code>{keyword}</code>"
+               if keyword else
+               "🔍 Узнаёт заказы сам: «звёзд», «звезд», «stars», «⭐»")
     return (
         f"⚙️ <b>Настройки AutoStars</b>\n\n"
         f"⭐ Кол-во по умолчанию: <b>{amount}</b>\n"
         f"🔑 Данные Fragment: <b>{creds}</b>\n"
-        f"🔍 Ключевое слово в заказе: <code>{keyword}</code>\n"
+        f"{kw_line}\n"
         f"👤 Спрашивать @username: <b>{ask}</b>\n"
-        f"📝 Заметка: <i>{note}</i>\n\n"
-        "<i>Автовыдача сработает, если заголовок заказа содержит ключевое "
-        "слово. Из заголовка бот сам возьмёт число звёзд (иначе — значение "
-        "по умолчанию).</i>"
+        f"⚠️ Предупреждать о балансе: <b>{warn}</b>"
+        + (f" (когда осталось ≤ {left} выдач)" if p.get("low_balance_warn", True)
+           else "")
+        + f"\n📝 Заметка: <i>{note}</i>\n\n"
+        "<i>Число звёзд бот берёт из заголовка — то, что стоит рядом со словом "
+        "«звёзд»/«stars», а не первое попавшееся число: год или цена в названии "
+        "иначе превращались бы в количество к покупке. Не нашёл — возьмёт "
+        "значение по умолчанию.</i>"
     )
 
 
@@ -159,9 +168,15 @@ def _stars_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
         text=("👤 Спрашивать username: вкл" if ask else "👤 Спрашивать username: выкл"),
         callback_data="plugins:stars:toggle_ask",
     )
+    warn = settings["plugins"]["auto_stars"].get("low_balance_warn", True)
+    builder.button(
+        text=("⚠️ Предупреждать о балансе: вкл" if warn
+              else "⚠️ Предупреждать о балансе: выкл"),
+        callback_data="plugins:stars:toggle_warn",
+    )
     builder.button(text="📝 Заметка", callback_data="plugins:stars:set_note")
     builder.button(text="⬅️ Назад", callback_data="plugins:auto_stars")
-    builder.adjust(2, 2, 1, 1)
+    builder.adjust(2, 2, 1, 1, 1)
     return builder.as_markup()
 
 
@@ -337,6 +352,24 @@ async def stars_del_creds(callback: CallbackQuery, state: FSMContext) -> None:
     delete_fragment_creds(callback.from_user.id)
     await callback.answer("🗑 Данные Fragment удалены", show_alert=True)
     await stars_creds(callback, state)
+
+
+@router.callback_query(F.data == "plugins:stars:toggle_warn")
+async def stars_toggle_warn(callback: CallbackQuery) -> None:
+    """Warn while the wallet can still be topped up, not at the checkout."""
+    uid = callback.from_user.id
+    s = get_settings(uid)
+    p = s["plugins"]["auto_stars"]
+    p["low_balance_warn"] = not p.get("low_balance_warn", True)
+    p["balance_checked_at"] = 0          # look again on the next cycle
+    save_settings(uid, s)
+    creds = get_fragment_creds(uid)
+    has = bool(creds and creds.get("cookies") and creds.get("mnemonic"))
+    await callback.message.edit_text(
+        _stars_settings_text(s, has), reply_markup=_stars_settings_keyboard(s))
+    await callback.answer(
+        "Скажу заранее, когда TON будет заканчиваться"
+        if p["low_balance_warn"] else "Молчу про баланс")
 
 
 @router.callback_query(F.data == "plugins:stars:toggle_ask")
