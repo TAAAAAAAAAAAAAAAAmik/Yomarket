@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import time
 from decimal import Decimal
 
@@ -185,9 +186,10 @@ def buy_stars_sync(
         return False, "Fragment принимает заказы от 50 звёзд"
 
     session = _make_session(cookies)
+    state = {"hash": api_hash or DEFAULT_HASH, "refreshed": False}
 
-    def _post(method: str, extra: dict) -> dict:
-        params = {"method": method, "hash": api_hash, **extra}
+    def _raw(method: str, extra: dict) -> dict:
+        params = {"method": method, "hash": state["hash"], **extra}
         try:
             r = session.post(FRAGMENT_API_URL, params=params, timeout=20)
             r.raise_for_status()
@@ -196,6 +198,25 @@ def buy_stars_sync(
             return {"ok": False, "error": f"сеть: {str(e)[:80]}"}
         except ValueError:
             return {"ok": False, "error": "не JSON от Fragment"}
+
+    def _post(method: str, extra: dict) -> dict:
+        """One API call, retried once with a fresh hash if the old one is stale.
+
+        Fragment issues a hash per session and answers a foreign one with «Bad
+        request». Left unhandled, that turned every delivery into a failure the
+        seller could do nothing about — the hash is not something they were
+        ever asked for.
+        """
+        out = _raw(method, extra)
+        said = str(out.get("error") or "").lower()
+        if "bad request" in said and not state["refreshed"]:
+            state["refreshed"] = True
+            fresh = fetch_api_hash_sync(cookies)
+            if fresh and fresh != state["hash"]:
+                state["hash"] = fresh
+                logger.info("Fragment: refreshed api hash mid-flight")
+                return _raw(method, extra)
+        return out
 
     # 1. find recipient
     search = _post("searchStarsRecipient", {"query": username})
@@ -319,21 +340,78 @@ def _extract_messages(link: dict) -> list[dict]:
     return []
 
 
-def check_fragment_session_sync(cookies: dict) -> tuple[bool, str]:
-    """Light check that the Fragment cookies are alive."""
+def fetch_api_hash_sync(cookies: dict) -> str:
+    """The api hash Fragment issued to this session, read off its own page.
+
+    Fragment stamps every request with a per-session hash, and a hash from
+    somebody else's session is answered with «Bad request» — which is what a
+    hardcoded one produced. It sits in the page's own JavaScript, so there is
+    no reason to make a seller find it by hand.
+    """
+    session = _make_session(cookies or {})
+    for url in ("https://fragment.com/stars/buy", "https://fragment.com/"):
+        try:
+            r = session.get(url, timeout=20)
+        except Exception as e:
+            logger.info("fragment hash from %s: %s", url, e)
+            continue
+        if r.status_code != 200:
+            continue
+        for pattern in (r'api\?hash=([0-9a-f]{8,32})',
+                        r'"apiHash"\s*:\s*"([0-9a-f]{8,32})"',
+                        r'hash["\']?\s*[:=]\s*["\']([0-9a-f]{16,32})["\']'):
+            m = re.search(pattern, r.text)
+            if m:
+                return m.group(1)
+    return ""
+
+
+def check_fragment_session_sync(cookies: dict,
+                                api_hash: str = "") -> tuple[bool, object]:
+    """Light check that the Fragment session is alive.
+
+    Returns (ok, message) or, when a fresh hash was discovered along the way,
+    (True, {"message":…, "api_hash":…}) so the caller can keep it: the hash is
+    what the previous version got wrong, and finding it is most of the fix.
+    """
     if not cookies:
         return False, "cookies не заданы"
     session = _make_session(cookies)
-    try:
-        r = session.post(FRAGMENT_API_URL,
-                         params={"method": "searchStarsRecipient",
-                                 "hash": DEFAULT_HASH, "query": "durov"},
-                         timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("ok") or data.get("found"):
-                return True, "cookies работают"
-            return False, f"Fragment ответил: {str(data)[:100]}"
-        return False, f"HTTP {r.status_code}"
-    except Exception as e:
-        return False, f"ошибка: {str(e)[:80]}"
+
+    def _try(h: str):
+        try:
+            r = session.post(FRAGMENT_API_URL,
+                             params={"method": "searchStarsRecipient",
+                                     "hash": h, "query": "durov"},
+                             timeout=15)
+        except Exception as e:
+            return None, f"ошибка сети: {str(e)[:80]}"
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}"
+        try:
+            return r.json(), ""
+        except ValueError:
+            return None, "Fragment ответил не JSON"
+
+    data, err = _try(api_hash or DEFAULT_HASH)
+    if data is not None and (data.get("ok") or data.get("found")):
+        return True, "сессия работает"
+
+    # «Bad request» is what a hash from another session earns. Fetch this
+    # session's own and try once more before blaming the cookies.
+    fresh = fetch_api_hash_sync(cookies)
+    if fresh and fresh != (api_hash or DEFAULT_HASH):
+        data2, err2 = _try(fresh)
+        if data2 is not None and (data2.get("ok") or data2.get("found")):
+            return True, {"message": "сессия работает (обновил api-hash)",
+                          "api_hash": fresh}
+        data, err = data2, err2
+
+    if err:
+        return False, err
+    said = str((data or {}).get("error") or data)[:120]
+    if "bad request" in said.lower():
+        return False, ("Fragment: «Bad request» — не подошёл api-hash. "
+                       "Задайте его вручную: F12 → Network → любой запрос "
+                       "к fragment.com/api?hash=… → скопируйте hash.")
+    return False, f"Fragment ответил: {said}"

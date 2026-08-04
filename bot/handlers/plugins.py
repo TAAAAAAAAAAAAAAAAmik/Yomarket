@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -62,6 +63,7 @@ class PluginState(StatesGroup):
     stars_set_note = State()
     stars_set_cookies = State()
     stars_set_one_cookie = State()
+    stars_set_hash = State()
     stars_set_mnemonic = State()
     stars_set_keyword = State()
     # AutoRoblox
@@ -235,12 +237,13 @@ def _creds_kb(has: bool, cookies: dict | None = None) -> InlineKeyboardMarkup:
         mark = "✅" if cookies.get(name) else "▫️"
         b.button(text=f"{mark} {label}", callback_data=f"plugins:stars:ck:{i}")
     b.button(text="🔐 Seed-фраза TON", callback_data="plugins:stars:set_mnemonic")
+    b.button(text="#️⃣ api-hash (обычно сам)", callback_data="plugins:stars:set_hash")
     b.button(text="📋 Вставить всё строкой", callback_data="plugins:stars:set_cookies")
     if has:
         b.button(text="🧪 Проверить вход", callback_data="plugins:stars:check_creds")
         b.button(text="🗑 Удалить данные", callback_data="plugins:stars:del_creds")
     b.button(text="⬅️ Назад", callback_data="plugins:stars:settings")
-    b.adjust(1, 1, 1, 1, 1, 2, 1)
+    b.adjust(1, 1, 1, 1, 1, 1, 2, 1)
     return b.as_markup()
 
 
@@ -257,6 +260,8 @@ async def stars_creds(callback: CallbackQuery, state: FSMContext) -> None:
     for name, label in FRAGMENT_COOKIES:
         lines.append(f"{'🟢' if cookies.get(name) else '🔴'} {label}")
     lines.append(f"{'🟢' if has_m else '🔴'} 🔐 Seed-фраза TON")
+    lines.append(f"{'🟢' if creds.get('api_hash') else '⚪'} #️⃣ api-hash "
+                 f"{'(задан)' if creds.get('api_hash') else '(подберётся сам)'}")
     extra = [k for k in cookies if k not in dict(FRAGMENT_COOKIES)]
     if extra:
         lines.append(f"\n<i>Ещё сохранено cookies: {len(extra)}</i>")
@@ -463,19 +468,74 @@ async def stars_set_mnemonic_input(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "plugins:stars:check_creds")
 async def stars_check_creds(callback: CallbackQuery) -> None:
+    """Check the session — and keep the api hash if the check had to find one.
+
+    Fragment stamps every request with a per-session hash. The hardcoded one
+    belonged to somebody else's session, which is answered with «Bad request»;
+    discovering the right one is most of what this check is for.
+    """
     from automation.fragment import check_fragment_session_sync
-    creds = get_fragment_creds(callback.from_user.id) or {}
+    uid = callback.from_user.id
+    creds = get_fragment_creds(uid) or {}
     await callback.answer("⏳ Проверяю…")
     loop = asyncio.get_event_loop()
     try:
         ok, msg = await asyncio.wait_for(
-            loop.run_in_executor(None, check_fragment_session_sync, creds.get("cookies")),
-            timeout=25,
+            loop.run_in_executor(None, check_fragment_session_sync,
+                                 creds.get("cookies"), creds.get("api_hash", "")),
+            timeout=40,
         )
     except Exception as e:
         ok, msg = False, str(e)[:80]
-    await callback.message.answer(
-        ("✅ " if ok else "⚠️ ") + f"Fragment: {msg}")
+    if ok and isinstance(msg, dict):
+        if msg.get("api_hash"):
+            save_fragment_creds(uid, {"api_hash": msg["api_hash"]})
+        msg = msg.get("message", "сессия работает")
+    await callback.message.answer(("✅ " if ok else "⚠️ ") + f"Fragment: {msg}")
+
+
+@router.callback_query(F.data == "plugins:stars:set_hash")
+async def stars_set_hash_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    creds = get_fragment_creds(callback.from_user.id) or {}
+    cur = creds.get("api_hash") or ""
+    await state.set_state(PluginState.stars_set_hash)
+    await callback.message.edit_text(
+        "#️⃣ <b>api-hash Fragment</b>\n\n"
+        + (f"Сейчас: <code>{cur}</code>\n\n" if cur else "")
+        + "Fragment помечает этим хешем каждый запрос, и у каждой сессии он "
+          "свой — чужой отвечает «Bad request».\n\n"
+          "Бот пробует найти его сам при проверке входа. Если не вышло:\n"
+          "F12 → вкладка <b>Network</b> → на fragment.com сделайте любое "
+          "действие → найдите запрос <code>api?hash=…</code> → скопируйте "
+          "значение после <code>hash=</code>.",
+        reply_markup=_cancel_kb("plugins:stars:creds"),
+    )
+    await callback.answer()
+
+
+@router.message(PluginState.stars_set_hash)
+async def stars_set_hash_input(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    await state.clear()
+    # Pasted as a whole URL or as «hash=…» — take the value out of it.
+    m = re.search(r"hash=([0-9a-zA-Z]+)", raw)
+    if m:
+        raw = m.group(1)
+    raw = raw.strip().strip(";").strip()
+    creds = get_fragment_creds(message.from_user.id) or {}
+    if not raw or len(raw) < 8:
+        await message.answer(
+            "❌ Не похоже на hash — нужно значение после <code>hash=</code>.",
+            reply_markup=_creds_kb(False, creds.get("cookies")))
+        return
+    save_fragment_creds(message.from_user.id, {"api_hash": raw})
+    creds = get_fragment_creds(message.from_user.id) or {}
+    cookies = creds.get("cookies") or {}
+    ready = (all(cookies.get(n) for n, _l in FRAGMENT_COOKIES)
+             and bool(creds.get("mnemonic")))
+    await message.answer(
+        f"✅ api-hash сохранён.\n\nПроверьте вход кнопкой «🧪 Проверить вход».",
+        reply_markup=_creds_kb(ready, cookies))
 
 
 @router.callback_query(F.data == "plugins:stars:del_creds")
