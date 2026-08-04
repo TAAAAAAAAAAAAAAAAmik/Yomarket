@@ -713,6 +713,11 @@ class TaskManager:
             sold_now = False
             sold_ads: set[str] = set()
 
+            # Сколько заказов дочитать за проход. Каждый — отдельный запрос,
+            # поэтому на первом проходе полная витрина разбирается за
+            # несколько кругов, а дальше дочитываются только новые.
+            detail_budget = 8
+
             for order in orders:
                 oid = str(order.get("id", ""))
                 if not oid:
@@ -723,6 +728,19 @@ class TaskManager:
                 # этих значениях стоит и статистика, и подписи чатов.
                 from orderfields import describe as _describe
                 d = _describe(order)
+                prev_det = order_details.get(oid, {})
+                # Список отдаёт заказ без товара и покупателя — дочитываем
+                # карточку. Один раз на заказ: дальше берём из сохранённого.
+                if (not d["title"] or not d["buyer"]):
+                    if prev_det.get("enriched"):
+                        d["title"] = d["title"] or prev_det.get("title") or ""
+                        d["buyer"] = d["buyer"] or prev_det.get("buyer") or ""
+                        d["username"] = d["username"] or prev_det.get("username") or ""
+                        if d["price"] is None:
+                            d["price"] = prev_det.get("price")
+                    elif detail_budget > 0:
+                        detail_budget -= 1
+                        d = await self._enrich_order(api, oid, d)
                 status = d["status"]
                 prev_status = known.get(oid)
                 title = d["title"] or "—"
@@ -734,7 +752,6 @@ class TaskManager:
                 quantity = d["quantity"]
                 category = _order_field(order, "category", "category_name", "ad_category")
 
-                prev_det = order_details.get(oid, {})
                 work_at = prev_det.get("work_at")
                 if status in ("work", "working", "processing") and prev_status not in ("work", "working", "processing"):
                     work_at = time.time()
@@ -753,6 +770,8 @@ class TaskManager:
                     "seen_at": prev_det.get("seen_at") or time.time(),
                     "work_at": work_at,
                     "status": status,
+                    # Дочитанное не перечитывается на каждом проходе.
+                    "enriched": bool(d.get("enriched") or prev_det.get("enriched")),
                     # Метки подсветки чата переживают пересборку записи — иначе
                     # красный чат гас на следующем же проходе опроса.
                     "waiting": prev_det.get("waiting", 0),
@@ -1408,6 +1427,41 @@ class TaskManager:
             if kw and kw in title_lower and (best is None or len(kw) > best[0]):
                 best = (len(kw), str(rule.get("message", default)))
         return render(best[1] if best else default, ctx)
+
+    async def _enrich_order(self, api: YooMarketAPI, oid: str, d: dict) -> dict:
+        """Дочитать заказ, если список отдал одни номера.
+
+        GET /orders отдаёт скупую строку — номер, статус, ссылку на
+        объявление, — и экраны показывали «Заказ #1136046» вместо товара и
+        покупателя. Карточка заказа знает больше, а название товара при
+        необходимости берётся из самого объявления. Дочитывается один раз на
+        заказ: результат оседает в известных деталях.
+        """
+        from orderfields import ad_title, describe, order_ad_id
+
+        full: dict = {}
+        try:
+            full = await api.get_order(oid)
+        except Exception as e:
+            logger.info("order %s detail: %s", oid, e)
+        if isinstance(full, dict) and full:
+            deeper = describe(full.get("data") if isinstance(full.get("data"), dict)
+                              else full)
+            for key in ("title", "buyer", "username", "quantity"):
+                if not d.get(key):
+                    d[key] = deeper.get(key)
+            if d.get("price") in (None, "") and deeper.get("price") is not None:
+                d["price"] = deeper["price"]
+
+        if not d.get("title"):
+            ad_id = order_ad_id(full if isinstance(full, dict) else {}) or ""
+            if ad_id:
+                try:
+                    d["title"] = ad_title(await api.get_ad(ad_id))
+                except Exception as e:
+                    logger.info("ad %s for order %s: %s", ad_id, oid, e)
+        d["enriched"] = True
+        return d
 
     async def _send_chat(self, api: YooMarketAPI, chat_id: str,
                          text: str) -> tuple[bool, str]:

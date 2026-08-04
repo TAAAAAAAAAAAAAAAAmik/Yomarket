@@ -133,6 +133,37 @@ def _to_number(value) -> float | None:
         return None
 
 
+def order_ad_id(order: dict) -> str:
+    """Номер объявления, по которому сделан заказ.
+
+    Список заказов у этого маркетплейса скупой: номер, статус и ссылка на
+    объявление. Название товара приходится дочитывать по этому номеру.
+    """
+    for key in ("ad_id", "product_id", "item_id", "listing_id", "offer_id",
+                "lot_id", "goods_id"):
+        got = _clean(order.get(key))
+        if got:
+            return got
+    for key in _ITEM_KEYS:
+        node = order.get(key)
+        if isinstance(node, dict):
+            got = _clean(node.get("id"))
+            if got:
+                return got
+    return ""
+
+
+def ad_title(payload) -> str:
+    """Название из ответа /ads/{id} — в конверте или без него."""
+    node = payload
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        node = payload["data"]
+    if not isinstance(node, dict):
+        return ""
+    return _deep(node, ("title", "name", "product_name"), skip=_PERSON_KEYS,
+                 depth=2)
+
+
 def order_quantity(order: dict) -> str:
     return _deep(order, ("quantity", "count", "qty", "amount_items", "items_count"),
                  skip=_PERSON_KEYS, depth=1)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -13,6 +15,7 @@ from orderfields import describe, money, status_icon, status_ru
 from storage import get_settings
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 
 class OrderSearchState(StatesGroup):
@@ -38,7 +41,26 @@ def _esc(value) -> str:
     return html.escape(str(value), quote=False)
 
 
-def _format_orders_text(orders: list[dict]) -> str:
+def _merge(order: dict, details: dict | None) -> dict:
+    """Заказ из списка, дополненный тем, что бот уже дочитал.
+
+    Список отдаёт номер и статус; товар и покупателя фоновый опрос дочитывает
+    из карточки заказа и хранит у себя. Без этого экран показывал «Заказ
+    #1136046» даже там, где название давно известно.
+    """
+    d = describe(order)
+    det = (details or {}).get(str(d["id"])) or {}
+    for key in ("title", "buyer", "username"):
+        if not d.get(key):
+            value = str(det.get(key) or "").strip()
+            d[key] = "" if value == "—" else value
+    if d.get("price") is None:
+        raw = det.get("price")
+        d["price"] = raw if isinstance(raw, (int, float)) else None
+    return d
+
+
+def _format_orders_text(orders: list[dict], details: dict | None = None) -> str:
     """Список заказов человеческим текстом.
 
     Раньше каждая строка печаталась по шаблону «товар — покупатель — сумма»,
@@ -52,7 +74,7 @@ def _format_orders_text(orders: list[dict]) -> str:
     by_status: dict[str, int] = {}
     rows: list[str] = []
     for order in orders:
-        d = describe(order)
+        d = _merge(order, details)
         by_status[d["status"]] = by_status.get(d["status"], 0) + 1
 
         head = f"{status_icon(d['status']) or '•'} "
@@ -78,10 +100,11 @@ def _format_orders_text(orders: list[dict]) -> str:
             + "\n\n".join(rows))
 
 
-def _build_orders_keyboard(orders: list[dict], next_cursor: str | None) -> InlineKeyboardMarkup:
+def _build_orders_keyboard(orders: list[dict], next_cursor: str | None,
+                           details: dict | None = None) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for order in orders:
-        d = describe(order)
+        d = _merge(order, details)
         # Номер заказа сам по себе ничего не говорит — на кнопке товар и
         # сумма, номер остаётся внутри карточки.
         label = f"{status_icon(d['status']) or '•'} "
@@ -114,8 +137,9 @@ async def show_orders(callback: CallbackQuery, api: YooMarketAPI) -> None:
         data = await api.get_orders()
         orders: list[dict] = data.get("data") or data.get("items") or []
         next_cursor: str | None = data.get("meta", {}).get("next_cursor")
-        text = _format_orders_text(orders)
-        keyboard = _build_orders_keyboard(orders, next_cursor)
+        details = get_settings(callback.from_user.id).get("known_order_details") or {}
+        text = _format_orders_text(orders, details)
+        keyboard = _build_orders_keyboard(orders, next_cursor, details)
     except Exception as e:
         text = f"❌ Ошибка: {e}"
         keyboard = back_keyboard()
@@ -134,8 +158,9 @@ async def paginate_orders(
         data = await api.get_orders(cursor=callback_data.cursor)
         orders: list[dict] = data.get("data") or data.get("items") or []
         next_cursor: str | None = data.get("meta", {}).get("next_cursor")
-        text = _format_orders_text(orders)
-        keyboard = _build_orders_keyboard(orders, next_cursor)
+        details = get_settings(callback.from_user.id).get("known_order_details") or {}
+        text = _format_orders_text(orders, details)
+        keyboard = _build_orders_keyboard(orders, next_cursor, details)
     except Exception as e:
         text = f"❌ Ошибка: {e}"
         keyboard = back_keyboard()
@@ -152,13 +177,27 @@ async def show_order_detail(
     await callback.message.edit_text("⏳ Загружаю...")
     try:
         order = await api.get_order(callback_data.order_id)
-        d = describe(order)
+        d = _merge(order, get_settings(callback.from_user.id).get(
+            "known_order_details") or {})
         oid = d["id"] or callback_data.order_id
         chat_id = str(order.get("chat_id") or oid)
+
+        # Заказ ссылается на объявление номером, а название лежит в самом
+        # объявлении — дочитываем, вместо того чтобы писать «название не
+        # пришло» там, где его просто не спросили.
+        if not d["title"]:
+            from orderfields import ad_title, order_ad_id
+            ad_id = order_ad_id(order)
+            if ad_id:
+                try:
+                    d["title"] = ad_title(await api.get_ad(ad_id))
+                except Exception as e:
+                    logger.info("ad %s for order %s: %s", ad_id, oid, e)
+
         # Печатаем только то, что пришло: строка «📍 Адрес: —» ничего не
         # сообщает, а места занимает столько же, сколько настоящая.
         rows = [f"📦 <b>{_esc(d['title'])}</b>" if d["title"]
-                else f"📦 <i>название не пришло</i>"]
+                else "📦 <i>товар без названия</i>"]
         if d["price"] is not None:
             rows.append(f"💰 <b>{money(d['price'])} ₽</b>"
                         + (f"   ×{_esc(d['quantity'])}" if d["quantity"]

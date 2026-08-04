@@ -228,7 +228,6 @@ def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None,
         oid = str(order.get("id", ""))
         builder.button(text=_order_label(order, details.get(oid) or {}),
                        callback_data=ChatCallback(chat_id=oid).pack())
-    builder.adjust(1)
     if next_cursor:
         builder.button(text="Следующая →", callback_data=PaginationCallback(entity="chat_orders", cursor=next_cursor).pack())
     # Support and moderation live outside orders, so they get their own entry.
@@ -238,6 +237,10 @@ def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None,
     builder.button(text=f"🛟 Поддержка и модерация{f' · {n}' if n else ''}",
                    callback_data="wchats:list")
     builder.button(text="⬅️ Чаты", callback_data="menu:chats")
+    # Раскладка задаётся в самом конце и на все кнопки сразу. Вызов adjust
+    # посередине относился только к тем, что уже добавлены, а хвост слипался в
+    # одну строку: «Заказ #102… | Поддержка | Чаты» с обрезанными подписями.
+    builder.adjust(1)
     return builder.as_markup()
 
 
