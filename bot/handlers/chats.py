@@ -61,21 +61,68 @@ class ReplyState(StatesGroup):
     waiting_support_reply = State()   # reply to a support/moderation chat via the panel
 
 
+# Предел сообщения в Telegram — 4096 символов. Товар на этом маркетплейсе
+# выдают прямо в чат (ключи, логины, коды), поэтому переписка легко перерастает
+# лимит: экран чата тогда не открывался вовсе.
+_MSG_LIMIT = 3500
+_ONE_MSG_LIMIT = 600
+
+
+def _rows(data) -> list[dict]:
+    """Сообщения из любого конверта, в котором их отдало API.
+
+    Экран разбирал только {"data": [...]}: список, пришедший напрямую, ронял
+    обработчик на .get(), и чат «не открывался». Фоновый опрос это уже умеет —
+    берём ту же функцию, чтобы не разошлись.
+    """
+    from tasks.manager import _msg_rows
+    return _msg_rows(data)
+
+
 def _format_messages(messages: list[dict]) -> str:
     if not messages:
         return "Сообщений пока нет."
     lines: list[str] = []
     for msg in messages:
         sender_type = msg.get("sender_type") or msg.get("sender") or "unknown"
-        text = msg.get("text") or msg.get("message") or "—"
-        if sender_type in ("shop", "seller"):
+        if isinstance(sender_type, dict):
+            sender_type = sender_type.get("type") or sender_type.get("role") or ""
+        text = str(msg.get("text") or msg.get("message") or "—")
+        cut = len(text) > _ONE_MSG_LIMIT
+        if sender_type in ("shop", "seller") or msg.get("is_mine"):
             prefix = "🏪 <b>Вы</b>"
         elif sender_type == "system":
             prefix = "⚙️ <i>Система</i>"
         else:
             prefix = "👤 <b>Покупатель</b>"
-        lines.append(f"{prefix}: {_esc(text)}")
-    return "\n\n".join(lines)
+        lines.append(f"{prefix}: {_esc(text[:_ONE_MSG_LIMIT])}"
+                     + (" <i>…обрезано</i>" if cut else ""))
+    out = "\n\n".join(lines)
+    if len(out) > _MSG_LIMIT:
+        # Режем с начала: свежие сообщения важнее старых.
+        out = "<i>…начало переписки скрыто</i>\n\n" + out[-_MSG_LIMIT:]
+    return out
+
+
+async def _safe_edit(callback: CallbackQuery, text: str, markup=None) -> None:
+    """Показать экран, а если Telegram отказал — сказать почему.
+
+    Правка без защиты — это и есть «кнопка не нажимается»: слишком длинный
+    текст или повторное нажатие роняли обработчик до того, как он успевал
+    ответить на нажатие, и Telegram оставлял кнопку в вечной загрузке.
+    """
+    try:
+        await callback.message.edit_text(text, reply_markup=markup)
+    except Exception as e:
+        reason = str(e)
+        if "not modified" in reason:
+            return                      # экран и так уже такой — это не ошибка
+        try:
+            await callback.message.answer(
+                "⚠️ Не смог показать экран: "
+                f"<code>{_esc(reason[:200])}</code>", reply_markup=markup)
+        except Exception:
+            pass
 
 
 # Состояние чата, в порядке важности. Номер заказа человеку ничего не говорит —
@@ -320,7 +367,7 @@ async def show_chats(callback: CallbackQuery, api: YooMarketAPI) -> None:
         # The order list failing must not hide chats that do not depend on it
         text = f"❌ Заказы не загрузились: {e}"
         keyboard = _build_chat_orders_keyboard([], None, watched, details)
-    await callback.message.edit_text(text, reply_markup=keyboard)
+    await _safe_edit(callback, text, keyboard)
     await callback.answer()
 
 
@@ -347,7 +394,8 @@ async def paginate_chat_orders(
     callback_data: PaginationCallback,
     api: YooMarketAPI,
 ) -> None:
-    await callback.message.edit_text("⏳ Загружаю...")
+    await callback.answer()
+    await _safe_edit(callback, "⏳ Загружаю...")
     try:
         data = await api.get_orders(cursor=callback_data.cursor)
         orders: list[dict] = data.get("data") or data.get("items") or []
@@ -358,10 +406,9 @@ async def paginate_chat_orders(
         keyboard = _build_chat_orders_keyboard(
             orders, next_cursor, s.get("watched_chats") or {}, details)
     except Exception as e:
-        text = f"❌ Ошибка: {e}"
+        text = f"❌ Ошибка: {_esc(str(e)[:200])}"
         keyboard = back_keyboard()
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
+    await _safe_edit(callback, text, keyboard)
 
 
 @router.callback_query(ChatCallback.filter(F.cursor == ""))
@@ -371,11 +418,14 @@ async def show_chat_messages(
     api: YooMarketAPI,
 ) -> None:
     chat_id = callback_data.chat_id
-    await callback.message.edit_text("⏳ Загружаю чат...")
+    # Нажатие подтверждается сразу: если ответить в конце, любая ошибка по пути
+    # оставляет кнопку крутиться, и выглядит это как «чат не кликается».
+    await callback.answer()
+    await _safe_edit(callback, "⏳ Загружаю чат...")
     real_id, det = _resolve_chat(callback.from_user.id, chat_id)
     try:
         data = await api.get_messages(real_id)
-        messages: list[dict] = data.get("data") or data.get("items") or []
+        messages: list[dict] = _rows(data)
         messages = messages[-10:] if len(messages) > 10 else messages
         text = _chat_header(chat_id, det) + "\n\n" + _format_messages(messages)
         settings = get_settings(callback.from_user.id)
@@ -391,10 +441,9 @@ async def show_chat_messages(
         builder.adjust(1, *([1] * n_qr), 2)  # reply, each qr, then nav pair
         keyboard = builder.as_markup()
     except Exception as e:
-        text = f"❌ Ошибка: {e}"
+        text = f"❌ Чат не открылся: {_esc(str(e)[:200])}"
         keyboard = back_keyboard()
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
+    await _safe_edit(callback, text, keyboard)
 
 
 @router.callback_query(F.data.startswith("reply_init:"))
@@ -404,21 +453,26 @@ async def init_reply(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(chat_id=chat_id)
     builder = InlineKeyboardBuilder()
     builder.button(text="❌ Отмена", callback_data=f"reply_cancel:{chat_id}")
-    await callback.message.edit_text(
-        f"✉️ Напишите сообщение для чата #{chat_id}:",
-        reply_markup=builder.as_markup(),
-    )
+    _real, det = _resolve_chat(callback.from_user.id, chat_id)
+    who = str((det or {}).get("buyer") or "").strip()
     await callback.answer()
+    await _safe_edit(
+        callback,
+        f"✉️ Напишите сообщение "
+        + (f"покупателю <b>{_esc(who)}</b>:" if who and who != "—"
+           else f"в чат #{_esc(chat_id)}:"),
+        builder.as_markup())
 
 
 @router.callback_query(F.data.startswith("reply_cancel:"))
 async def cancel_reply(callback: CallbackQuery, state: FSMContext, api: YooMarketAPI) -> None:
     await state.clear()
     chat_id = callback.data.split(":", 1)[1]
+    await callback.answer()
     real_id, det = _resolve_chat(callback.from_user.id, chat_id)
     try:
         data = await api.get_messages(real_id)
-        messages: list[dict] = data.get("data") or data.get("items") or []
+        messages: list[dict] = _rows(data)
         messages = messages[-10:] if len(messages) > 10 else messages
         text = _chat_header(chat_id, det) + "\n\n" + _format_messages(messages)
         builder = InlineKeyboardBuilder()
@@ -427,10 +481,9 @@ async def cancel_reply(callback: CallbackQuery, state: FSMContext, api: YooMarke
         builder.adjust(1)
         keyboard = builder.as_markup()
     except Exception as e:
-        text = f"❌ Ошибка: {e}"
+        text = f"❌ Чат не открылся: {_esc(str(e)[:200])}"
         keyboard = back_keyboard()
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
+    await _safe_edit(callback, text, keyboard)
 
 
 @router.message(ReplyState.waiting_for_text)
@@ -736,7 +789,7 @@ async def wchat_history(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.answer("⏳ Загружаю историю...")
     try:
         data = await api.get_messages(cid)
-        rows = data.get("data") or data.get("items") or []
+        rows = _rows(data)
     except Exception as e:
         await callback.message.answer(f"❌ Не удалось: {_esc(str(e)[:200])}")
         return
