@@ -1182,6 +1182,13 @@ class TaskManager:
                             "", "buyer", "client", "customer", "user"):
                         logger.info("chat %s: unknown sender %r", chat_id, sender)
 
+                    # Жалоба красит чат независимо от того, когда её увидели.
+                    # Вчерашнее «верните деньги» — сегодняшняя проблема, и
+                    # прятать её в сводку пропущенных нельзя.
+                    is_complaint = _is_complaint_text(raw_text)
+                    if is_complaint and order_id in order_details:
+                        order_details[order_id]["problem"] = time.time()
+
                     # Разбор дневного завала не должен превращаться в поток
                     # уведомлений: то, что пришло часы назад, отвечать поздно —
                     # чат просто помечается ждущим, и в конце уходит одна сводка.
@@ -1203,15 +1210,8 @@ class TaskManager:
                     if handled:
                         continue
 
-                    # Complaint detection → distinct high-priority alert
-                    is_complaint = _is_complaint_text(raw_text)
+                    # Жалоба уже отмечена выше — здесь только уведомление.
                     alerted = False
-                    # Красным чат светится независимо от того, включены ли
-                    # уведомления о жалобах: выключенное уведомление — просьба
-                    # не дёргать, а не «считать, что всё хорошо».
-                    if is_complaint and order_id in order_details:
-                        order_details[order_id]["problem"] = time.time()
-
                     cn = settings.get("complaint_notify", {"enabled": True})
                     if cn.get("enabled", True) and is_complaint:
                         seen = cn.setdefault("seen", [])
