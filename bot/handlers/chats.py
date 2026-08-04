@@ -155,14 +155,13 @@ def _order_label(order: dict, det: dict) -> str:
     Раньше здесь стоял номер заказа первым — в списке из десяти чатов все
     кнопки начинались с «💬 #», и различать их приходилось по хвосту.
     """
-    oid = str(order.get("id", ""))
+    from orderfields import order_buyer, order_id, order_title
     det = det or {}
-    title = (order.get("title") or order.get("ad_title")
-             or order.get("product_name") or det.get("title") or "")
-    buyer = (order.get("buyer_name") or (order.get("buyer") or {}).get("name")
-             or det.get("buyer") or "")
-    title = "" if str(title) == "—" else str(title).strip()
-    buyer = "" if str(buyer) == "—" else str(buyer).strip()
+    oid = order_id(order) or str(order.get("id", ""))
+    title = order_title(order) or str(det.get("title") or "")
+    buyer = order_buyer(order) or str(det.get("buyer") or "")
+    title = "" if title.strip() == "—" else title.strip()
+    buyer = "" if buyer.strip() == "—" else buyer.strip()
 
     mark, _ = _chat_state(det)
     if buyer and title:

@@ -262,8 +262,10 @@ def _order_username(order: dict) -> str:
     return u if u.startswith("@") else f"@{u}"
 
 
-_DONE_STATUSES = ("confirmed", "completed", "done")
-_BACK_STATUSES = ("refunded", "cancelled", "returned")
+# Списки статусов — общие с разбором заказа. Здесь не было «success», которым
+# этот маркетплейс помечает выполненный заказ: выручка по таким заказам никуда
+# не попадала.
+from orderfields import BACK as _BACK_STATUSES, DONE as _DONE_STATUSES
 
 
 # Windowed order figures used to live here. They now come from stats_source,
@@ -716,15 +718,20 @@ class TaskManager:
                 if not oid:
                     continue
 
-                status = str(order.get("status", ""))
+                # Разбор общий с экраном заказов: угаданные имена полей
+                # оставляли здесь «—» вместо товара, покупателя и суммы, а на
+                # этих значениях стоит и статистика, и подписи чатов.
+                from orderfields import describe as _describe
+                d = _describe(order)
+                status = d["status"]
                 prev_status = known.get(oid)
-                title = _order_field(order, "title", "ad_title", "product_name", default="—")
-                buyer = _order_field(order, "buyer_name", "buyer.name", default="—")
-                price = _order_field(order, "price", "total", "amount", default="—")
-                time_raw = order.get("created_at") or order.get("date") or order.get("created")
+                title = d["title"] or "—"
+                buyer = d["buyer"] or "—"
+                price = d["price"] if d["price"] is not None else "—"
+                time_raw = d["created"]
                 chat_id = str(order.get("chat_id") or oid)
-                username = _order_username(order)
-                quantity = _order_field(order, "quantity", "count", "qty", "amount_items")
+                username = d["username"] or _order_username(order)
+                quantity = d["quantity"]
                 category = _order_field(order, "category", "category_name", "ad_category")
 
                 prev_det = order_details.get(oid, {})

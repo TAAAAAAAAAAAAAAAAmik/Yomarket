@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
@@ -8,6 +9,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
 from keyboards.main import OrderCallback, PaginationCallback, back_keyboard, order_actions_keyboard
+from orderfields import describe, money, status_icon, status_ru
 from storage import get_settings
 
 router = Router()
@@ -16,6 +18,8 @@ router = Router()
 class OrderSearchState(StatesGroup):
     waiting_query = State()
 
+
+# Оставлено для совместимости: статусы переводит orderfields.status_ru.
 STATUS_EMOJI = {
     "new": "🔄 Новый",
     "working": "✅ В работе",
@@ -26,31 +30,67 @@ STATUS_EMOJI = {
 
 
 def _order_status(raw: str) -> str:
-    return STATUS_EMOJI.get(raw, raw)
+    return status_ru(raw)
+
+
+def _esc(value) -> str:
+    import html
+    return html.escape(str(value), quote=False)
 
 
 def _format_orders_text(orders: list[dict]) -> str:
+    """Список заказов человеческим текстом.
+
+    Раньше каждая строка печаталась по шаблону «товар — покупатель — сумма»,
+    и когда чего-то из этого в ответе не было, на экран уходили прочерки:
+    «#1184186 — — 👤 — 💰 — ₽ created». Теперь печатается только то, что
+    известно, а статусы переведены.
+    """
     if not orders:
         return "🛒 Заказов не найдено."
-    lines = ["🛒 <b>Заказы</b>\n"]
+
+    by_status: dict[str, int] = {}
+    rows: list[str] = []
     for order in orders:
-        oid = order.get("id", "—")
-        title = order.get("title") or order.get("ad_title") or order.get("product_name") or "—"
-        buyer = order.get("buyer_name") or (order.get("buyer") or {}).get("name") or "—"
-        price = order.get("price") or order.get("total") or "—"
-        status = _order_status(order.get("status", ""))
-        lines.append(f"#{oid} — <b>{title}</b>\n👤 {buyer}  💰 {price} ₽  {status}\n")
-    return "\n".join(lines)
+        d = describe(order)
+        by_status[d["status"]] = by_status.get(d["status"], 0) + 1
+
+        head = f"{status_icon(d['status']) or '•'} "
+        head += f"<b>{_esc(d['title'])}</b>" if d["title"] else f"Заказ #{_esc(d['id'])}"
+        if d["quantity"] and str(d["quantity"]) != "1":
+            head += f" ×{_esc(d['quantity'])}"
+
+        tail: list[str] = []
+        if d["price"] is not None:
+            tail.append(f"<b>{money(d['price'])} ₽</b>")
+        if d["buyer"]:
+            tail.append(f"👤 {_esc(d['buyer'])}")
+        tail.append(status_ru(d["status"]))
+        if d["title"]:
+            tail.append(f"<code>#{_esc(d['id'])}</code>")
+
+        rows.append(head + "\n   " + "  ·  ".join(tail))
+
+    summary = "  ·  ".join(f"{status_ru(k)}: <b>{v}</b>"
+                           for k, v in sorted(by_status.items(),
+                                              key=lambda kv: -kv[1])[:4])
+    return (f"🛒 <b>Заказы</b> · {len(orders)}\n{summary}\n\n"
+            + "\n\n".join(rows))
 
 
 def _build_orders_keyboard(orders: list[dict], next_cursor: str | None) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for order in orders:
-        oid = str(order.get("id", ""))
-        title = order.get("title") or order.get("ad_title") or order.get("product_name") or f"Заказ {oid}"
+        d = describe(order)
+        # Номер заказа сам по себе ничего не говорит — на кнопке товар и
+        # сумма, номер остаётся внутри карточки.
+        label = f"{status_icon(d['status']) or '•'} "
+        label += d["title"][:26] if d["title"] else f"Заказ #{d['id']}"
+        if d["price"] is not None:
+            label += f" · {money(d['price'])} ₽"
         builder.button(
-            text=f"#{oid} {title[:30]}",
-            callback_data=OrderCallback(order_id=oid, action="view").pack(),
+            text=label,
+            callback_data=OrderCallback(order_id=d["id"], action="view").pack(),
         )
     builder.adjust(1)
     if next_cursor:
@@ -112,23 +152,27 @@ async def show_order_detail(
     await callback.message.edit_text("⏳ Загружаю...")
     try:
         order = await api.get_order(callback_data.order_id)
-        oid = order.get("id", callback_data.order_id)
-        title = order.get("title") or order.get("ad_title") or order.get("product_name") or "—"
-        buyer = order.get("buyer_name") or (order.get("buyer") or {}).get("name") or "—"
-        price = order.get("price") or order.get("total") or "—"
-        status = _order_status(order.get("status", ""))
-        address = order.get("address") or order.get("delivery_address") or "—"
-        comment = order.get("comment") or "—"
+        d = describe(order)
+        oid = d["id"] or callback_data.order_id
         chat_id = str(order.get("chat_id") or oid)
-        text = (
-            f"🛒 <b>Заказ #{oid}</b>\n\n"
-            f"📦 Товар: {title}\n"
-            f"👤 Покупатель: {buyer}\n"
-            f"💰 Сумма: {price} ₽\n"
-            f"📊 Статус: {status}\n"
-            f"📍 Адрес: {address}\n"
-            f"💬 Комментарий: {comment}"
-        )
+        # Печатаем только то, что пришло: строка «📍 Адрес: —» ничего не
+        # сообщает, а места занимает столько же, сколько настоящая.
+        rows = [f"📦 <b>{_esc(d['title'])}</b>" if d["title"]
+                else f"📦 <i>название не пришло</i>"]
+        if d["price"] is not None:
+            rows.append(f"💰 <b>{money(d['price'])} ₽</b>"
+                        + (f"   ×{_esc(d['quantity'])}" if d["quantity"]
+                           and str(d["quantity"]) != "1" else ""))
+        rows.append(f"📊 {status_ru(d['status'])}")
+        if d["buyer"] or d["username"]:
+            rows.append(f"👤 {_esc(d['buyer'] or '')}"
+                        + (f"  {_esc(d['username'])}" if d["username"] else ""))
+        for label, value in (("📍", order.get("address")
+                              or order.get("delivery_address")),
+                             ("💬", order.get("comment"))):
+            if value and str(value).strip() not in ("", "—"):
+                rows.append(f"{label} {_esc(str(value)[:200])}")
+        text = f"🛒 <b>Заказ #{_esc(oid)}</b>\n\n" + "\n".join(rows)
         keyboard = order_actions_keyboard(str(oid), chat_id)
     except Exception as e:
         text = f"❌ Ошибка: {e}"
@@ -380,3 +424,38 @@ async def filter_orders_refunds(callback: CallbackQuery) -> None:
     b.button(text="⬅️ Заказы", callback_data="menu:orders")
     b.adjust(1)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
+
+
+@router.message(Command("orders_debug"))
+async def orders_debug(message: Message, api: YooMarketAPI) -> None:
+    """Что на самом деле лежит в заказе — только чтение, ничего не меняет.
+
+    Имена полей у этого маркетплейса приходилось угадывать, и именно поэтому
+    список заказов однажды состоял из прочерков. Здесь видно настоящую
+    структуру ответа и то, как её прочитал бот, — если разбор снова промахнётся,
+    это будет видно сразу, а не растворится в «—».
+    """
+    if not api:
+        await message.answer("⚠️ Нет токена — отправьте /start")
+        return
+    status = await message.answer("⏳ Читаю заказы…")
+    try:
+        data = await api.get_orders()
+    except Exception as e:
+        await status.edit_text(f"❌ Заказы не загрузились: <code>{_esc(str(e)[:200])}</code>")
+        return
+
+    from orderfields import shape
+    rows = data.get("data") or data.get("items") or (data if isinstance(data, list) else [])
+    if not rows:
+        await status.edit_text("🛒 Заказов в ответе нет.\n\n"
+                               f"<code>{_esc(shape(data)[:2000])}</code>")
+        return
+
+    first = rows[0]
+    d = describe(first)
+    read = "\n".join(f"{k}: {v!r}" for k, v in d.items())
+    await status.edit_text(
+        f"🛒 <b>Заказов в ответе: {len(rows)}</b>\n\n"
+        f"<b>Как прочитал бот:</b>\n<code>{_esc(read)}</code>\n\n"
+        f"<b>Что прислал маркетплейс:</b>\n<code>{_esc(shape(first)[:2200])}</code>")

@@ -22,8 +22,9 @@ logger = logging.getLogger(__name__)
 _TTL = 120
 _CACHE: dict[int, tuple[float, list, str, str]] = {}
 
-_DONE = ("confirmed", "completed", "done")
-_BACK = ("refunded", "cancelled", "returned")
+# «success» — так этот маркетплейс называет выполненный заказ; без него ни одна
+# продажа не попадала в выручку.
+from orderfields import BACK as _BACK, DONE as _DONE
 
 PANEL = "panel"
 LOCAL = "local"

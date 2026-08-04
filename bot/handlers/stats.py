@@ -21,7 +21,7 @@ from stats_source import (LOCAL, PANEL, day_start, events_for, invalidate,
 router = Router()
 logger = logging.getLogger(__name__)
 
-COMPLETED_STATUSES = ("confirmed", "completed", "done")
+from orderfields import DONE as COMPLETED_STATUSES
 
 
 async def _events(callback_or_uid, force: bool = False) -> tuple[list, str, str]:
