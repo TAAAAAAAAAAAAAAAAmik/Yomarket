@@ -190,6 +190,47 @@ def _ts_of(msg: dict) -> float:
         return 0.0
 
 
+def _msg_text(msg: dict) -> str:
+    """Текст сообщения, как бы поле ни называлось.
+
+    Читались только `text` и `message`. Всё остальное превращалось в пустую
+    цитату «— » в уведомлении, и продавцу приходило «СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ»
+    без сообщения.
+    """
+    for key in ("text", "message", "body", "content", "comment", "value"):
+        value = msg.get(key)
+        if isinstance(value, dict):
+            value = value.get("text") or value.get("value") or value.get("body")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _msg_kind(msg: dict) -> str:
+    """«system» — служебная запись чата, а не письмо покупателя."""
+    for key in ("type", "kind", "message_type", "event"):
+        value = msg.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return ""
+
+
+_SERVICE_KINDS = ("system", "service", "event", "status", "order", "notice",
+                  "info", "bot")
+
+# Сообщение, увиденное с опозданием, отвечать поздно, а уведомлять о нём
+# поштучно — значит завалить продавца утренней перепиской в девять вечера.
+_MSG_FRESH = 6 * 3600
+
+
+def _is_service_message(msg: dict) -> bool:
+    """Отметка маркетплейса о заказе — оплате, выдаче, смене статуса.
+
+    Покупатель их не писал, и уведомлять о них как о его сообщении нельзя.
+    """
+    return any(k in _msg_kind(msg) for k in _SERVICE_KINDS)
+
+
 def _newest_msg(rows: list[dict]) -> dict:
     """Самое свежее сообщение — по номеру, а не по месту в списке."""
     best: dict = {}
@@ -265,12 +306,42 @@ def _order_username(order: dict) -> str:
 # Списки статусов — общие с разбором заказа. Здесь не было «success», которым
 # этот маркетплейс помечает выполненный заказ: выручка по таким заказам никуда
 # не попадала.
-from orderfields import BACK as _BACK_STATUSES, DONE as _DONE_STATUSES
+from orderfields import (BACK as _BACK_STATUSES, DONE as _DONE_STATUSES,
+                         status_ru as _status_ru)
 
 
 # Windowed order figures used to live here. They now come from stats_source,
 # which reads the panel's ledger and falls back to this same local history, so
 # the report and the «Статистика» screen cannot disagree about a day.
+
+
+# Сколько чатов заказов опрашивать за проход. Каждый — отдельный запрос, но
+# проход раз в минуту, так что два десятка вполне посильны.
+_CHAT_POLL_LIMIT = 25
+_CLOSED_QUIET_AFTER = 7 * 86400
+
+
+def _chats_to_poll(known_orders: dict, order_details: dict) -> list[str]:
+    """Чаты каких заказов читать — самые свежие, а не первые попавшиеся.
+
+    Раньше здесь стоял срез `[:15]` по словарю заказов. Словарь хранит порядок
+    добавления, то есть срез брал пятнадцать САМЫХ СТАРЫХ заказов. Выполненные
+    из него не исключались («success» в список закрытых не входил), поэтому у
+    продавца с полутора десятками покупок все места занимали давно закрытые
+    заказы, а свежие чаты бот не читал вообще — и автоответы молчали.
+    """
+    now = time.time()
+    rows: list[tuple[float, str]] = []
+    for oid, status in known_orders.items():
+        det = order_details.get(oid) or {}
+        seen = float(det.get("seen_at") or 0)
+        closed = str(status) in _BACK_STATUSES
+        # Возврат недельной давности писем уже не приносит.
+        if closed and seen and now - seen > _CLOSED_QUIET_AFTER:
+            continue
+        rows.append((seen, str(oid)))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    return [oid for _, oid in rows[:_CHAT_POLL_LIMIT]]
 
 
 def _ar_context(details: dict | None, order_id: str, settings: dict) -> dict:
@@ -403,6 +474,13 @@ def _watched_notify_kb(chat_id: str) -> InlineKeyboardMarkup:
     builder.button(text="🌐 В панели",
                    url=f"https://panel.yoomarket.net/chats/{digits}")
     builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def _missed_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💬 Открыть чаты", callback_data="chats:list")
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -747,7 +825,13 @@ class TaskManager:
                 buyer = d["buyer"] or "—"
                 price = d["price"] if d["price"] is not None else "—"
                 time_raw = d["created"]
-                chat_id = str(order.get("chat_id") or oid)
+                # Номер чата ищется по всем полям, где он бывает, и берётся из
+                # уже дочитанного, если в строке списка его нет. Подставлять
+                # номер заказа «на всякий случай» — это resource_not_found на
+                # каждом втором чате.
+                from orderfields import order_chat_id as _chat_of
+                chat_id = (_chat_of(order) or str(d.get("chat_id") or "")
+                           or str(prev_det.get("chat_id") or "") or oid)
                 username = d["username"] or _order_username(order)
                 quantity = d["quantity"]
                 category = _order_field(order, "category", "category_name", "ad_category")
@@ -798,7 +882,7 @@ class TaskManager:
                             user_id,
                             _card("🚨 <b>СПОР ПО ЗАКАЗУ</b>",
                                   [f"📦 <b>{_esc(title)}</b>",
-                                   f"💰 <b>{_money(price)} ₽</b>   📊 {_esc(status)}",
+                                   f"💰 <b>{_money(price)} ₽</b>   📊 {_status_ru(status)}",
                                    "",
                                    f"👤 {who}",
                                    f"🧾 <code>#{oid}</code>",
@@ -914,7 +998,7 @@ class TaskManager:
                                f"💰 <b>{_money(price)} ₽</b>",
                                "",
                                buyer_line,
-                               f"🧾 <code>#{oid}</code>   📊 {_esc(status)}"]),
+                               f"🧾 <code>#{oid}</code>   📊 {_status_ru(status)}"]),
                         reply_markup=_order_notify_kb(oid, chat_id),
                     )
 
@@ -1014,10 +1098,14 @@ class TaskManager:
         known_messages: dict = settings.setdefault("known_messages", {})
         order_details: dict = settings.get("known_order_details", {})
 
-        active = [
-            oid for oid, st in known_orders.items()
-            if st not in ("refunded", "cancelled", "returned")
-        ][:15]
+        active = _chats_to_poll(known_orders, order_details)
+        # Пульс опроса: по нему видно, читает ли бот чаты вообще. Без этого
+        # «автоответы не работают» невозможно отличить от «до чатов не дошло».
+        poll = {"ts": 0.0, "chats": len(active), "orders": len(known_orders),
+                "new_msgs": 0, "error": ""}
+        # Сообщения, которые бот увидел с опозданием (чат раньше не читался).
+        # Они собираются здесь и уходят одной сводкой, а не пачкой уведомлений.
+        missed: list[tuple[str, str, str]] = []
 
         for order_id in active:
             try:
@@ -1040,7 +1128,12 @@ class TaskManager:
                 # Считается на каждом проходе, даже когда новых сообщений нет:
                 # продавец мог ответить из панели или приложения, и тогда метка
                 # «покупатель ждёт» должна погаснуть сама.
-                newest = _newest_msg(messages)
+                # Считаем только настоящие письма: служебные отметки о заказе
+                # и пустые строки покупатель не писал, и ждать ответа на них
+                # незачем.
+                real = [m for m in messages
+                        if not _is_service_message(m) and _msg_text(m)]
+                newest = _newest_msg(real)
                 if order_id in order_details:
                     det = order_details[order_id]
                     if newest and _is_own_message(newest):
@@ -1069,22 +1162,40 @@ class TaskManager:
                     msg_id = str(msg.get("id", ""))
                     if not _is_newer(msg_id, last_known_id):
                         continue
+                    poll["new_msgs"] += 1
                     # Skip what the shop itself sent; anything else counts as
                     # the buyer. Requiring a known buyer value meant an
                     # unfamiliar wording silently dropped every message.
                     if _is_own_message(msg):
+                        continue
+                    # Отметка маркетплейса о заказе — не письмо покупателя.
+                    if _is_service_message(msg):
+                        continue
+                    raw_text = _msg_text(msg)
+                    if not raw_text:
+                        # Пустая строка — это не сообщение. Раньше о таких
+                        # приходило «СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ» с пустой цитатой,
+                        # хотя покупатель ничего не писал.
                         continue
                     sender = msg.get("sender_type") or msg.get("sender")
                     if isinstance(sender, str) and sender.lower() not in (
                             "", "buyer", "client", "customer", "user"):
                         logger.info("chat %s: unknown sender %r", chat_id, sender)
 
+                    # Разбор дневного завала не должен превращаться в поток
+                    # уведомлений: то, что пришло часы назад, отвечать поздно —
+                    # чат просто помечается ждущим, и в конце уходит одна сводка.
+                    age = time.time() - (_ts_of(msg) or time.time())
+                    stale = age > _MSG_FRESH
+                    if stale:
+                        missed.append((order_id, chat_id, raw_text))
+                        continue
+
                     time_str = _fmt_time(msg.get("created_at") or msg.get("date"))
                     time_part = f"  •  🕐 {time_str}" if time_str else ""
-                    raw_text = msg.get("text") or msg.get("message") or ""
                     # raw_text stays intact for the rules below; only the copy
                     # that goes into an HTML message is escaped
-                    msg_text = _esc(raw_text[:200]) or "—"
+                    msg_text = _esc(raw_text[:200])
 
                     # AutoStars: buyer replied with their @username → deliver
                     handled = await self._maybe_deliver_stars_reply(
@@ -1150,8 +1261,26 @@ class TaskManager:
 
             except Exception as e:
                 logger.warning("Message check for order %s: %s", order_id, e)
+                poll["error"] = f"#{order_id}: {str(e)[:80]}"
 
         settings["known_messages"] = known_messages
+        poll["ts"] = time.time()
+        poll["missed"] = len(missed)
+        settings["_chat_poll"] = poll
+
+        if missed and settings.get("notify_messages", {}).get("enabled", True):
+            chats = {c for _o, c, _t in missed}
+            body = [f"Пока бот не следил за этими чатами, покупатели написали "
+                    f"<b>{len(missed)}</b> раз(а) в <b>{len(chats)}</b> чат(ах)."]
+            for _oid, _cid, text in missed[:5]:
+                body.append(f"• <i>{_esc(text[:70])}</i>")
+            if len(missed) > 5:
+                body.append(f"…и ещё {len(missed) - 5}")
+            body += ["", "Чаты помечены как ждущие ответа — они в начале списка."]
+            await self._notify(
+                user_id,
+                _card("📥 <b>ПРОПУЩЕННЫЕ СООБЩЕНИЯ</b>", body),
+                reply_markup=_missed_kb())
 
     async def _check_reminders(self, user_id: int, settings: dict) -> None:
         rem = settings.get("reminders", {})
@@ -1190,7 +1319,7 @@ class TaskManager:
                 f"🧾 Заказ <code>#{oid}</code>\n"
                 f"📦 {_esc(title)}\n"
                 f"👤 {who}  •  💰 {_esc(price)} ₽\n"
-                f"📊 Статус: {_esc(status)}\n\n"
+                f"📊 Статус: {_status_ru(status)}\n\n"
                 f"⏳ Ждёт подтверждения уже <b>{hours_waiting} ч</b>",
                 reply_markup=_order_notify_kb(oid, chat_id),
             )
@@ -1584,6 +1713,11 @@ class TaskManager:
             for key in ("title", "buyer", "username", "quantity"):
                 if not d.get(key):
                     d[key] = deeper.get(key)
+            # Номер чата есть в карточке заказа, но не в строке списка — ради
+            # него дочитывание и нужно в первую очередь.
+            from orderfields import order_chat_id
+            node = full.get("data") if isinstance(full.get("data"), dict) else full
+            d["chat_id"] = order_chat_id(node) or d.get("chat_id") or ""
             if d.get("price") in (None, "") and deeper.get("price") is not None:
                 d["price"] = deeper["price"]
 
@@ -1626,18 +1760,26 @@ class TaskManager:
         import autoreply as ar
 
         conf = ar.cfg(settings)
+
+        def skip(why: str) -> None:
+            """Записать, почему промолчали. «Ничего не произошло» — худший из
+            возможных ответов на «автоответы не работают»."""
+            conf["last_skip"] = {"ts": time.time(), "chat": str(chat_id),
+                                 "text": (text or "")[:80], "why": why}
+            logger.info("autoreply skipped (chat %s): %s", chat_id, why)
+
         if not conf.get("enabled"):
-            return
+            return skip("автоответы выключены")
         if is_complaint and not conf.get("reply_to_complaints"):
-            return          # на жалобу шаблон отвечать не должен — нужен человек
+            # на жалобу шаблон отвечать не должен — нужен человек
+            return skip("это жалоба, а ответ на жалобы выключен")
 
         rule, matched = ar.pick(conf, text)
         if not rule:
-            return
+            return skip("ни одно правило не совпало, запасной ответ выключен")
         allowed, why = ar.gate(conf, chat_id)
         if not allowed:
-            logger.info("autoreply skipped (chat %s): %s", chat_id, why)
-            return
+            return skip(why)
 
         body = ar.render(rule.get("text", ""),
                          ar.context(details, order_id,

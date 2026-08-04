@@ -530,12 +530,13 @@ def _ar_kb(conf: dict) -> InlineKeyboardMarkup:
     b.button(text=f"📝 Правила ({len(conf.get('rules') or [])})", callback_data="ar:rules")
     b.button(text="✨ Готовые наборы", callback_data="ar:tpl")
     b.button(text="🧪 Проверка", callback_data="ar:test")
+    b.button(text="🔍 Почему молчит", callback_data="ar:why")
     b.button(text="📜 Журнал", callback_data="ar:log")
     b.button(text="⚙️ Когда отвечать", callback_data="ar:opts")
     b.button(text="📦 Ответы на события заказа", callback_data="ar:events")
     b.button(text="🎮 Ответы по товарам", callback_data="resp:cats")
     b.button(text="⬅️ Чаты", callback_data="menu:chats")
-    b.adjust(1, 2, 2, 1, 1, 1, 1)
+    b.adjust(1, 2, 2, 2, 1, 1, 1)
     return b.as_markup()
 
 
@@ -1096,6 +1097,72 @@ async def ar_test_run(message: Message, state: FSMContext) -> None:
 
 
 # ─────────────────────────────── журнал ───────────────────────────────
+
+@router.callback_query(F.data == "ar:why")
+async def ar_why(callback: CallbackQuery) -> None:
+    """Почему бот молчит — по состоянию самого механизма, а не по догадкам.
+
+    «Автоответы не работают» может значить что угодно: выключены, нет правил,
+    фоновый опрос не дошёл до чата, сработала пауза. Здесь показано, что
+    происходит на самом деле.
+    """
+    await callback.answer()
+    s = get_settings(callback.from_user.id)
+    conf = ar.cfg(s)
+    poll = s.get("_chat_poll") or {}
+
+    lines = ["🔍 <b>Почему бот молчит</b>", ""]
+
+    live = [r for r in (conf.get("rules") or []) if r.get("on", True)
+            and (r.get("text") or "").strip()]
+    fb_on = bool((conf.get("fallback") or {}).get("on"))
+    lines.append(f"{_sw(conf.get('enabled'))} Автоответы "
+                 f"{'включены' if conf.get('enabled') else 'выключены'}")
+    lines.append(f"{_sw(bool(live) or fb_on)} Правил: <b>{len(live)}</b>"
+                 + (", есть запасной ответ" if fb_on else ""))
+
+    ts = float(poll.get("ts") or 0)
+    if ts:
+        ago = int((datetime.now().timestamp() - ts) / 60)
+        lines.append(f"{_sw(ago < 5)} Чаты читались "
+                     + ("только что" if ago < 1 else f"{ago} мин назад"))
+        lines.append(f"   под наблюдением: <b>{poll.get('chats', 0)}</b> "
+                     f"из {poll.get('orders', 0)} заказов")
+        if poll.get("new_msgs"):
+            lines.append(f"   новых сообщений в прошлый заход: "
+                         f"<b>{poll['new_msgs']}</b>")
+        if poll.get("error"):
+            lines.append(f"   ⚠️ {_esc(poll['error'])}")
+    else:
+        lines.append("🔴 Чаты ещё ни разу не читались")
+        lines.append("   <i>Фоновый опрос запускается после /start и идёт "
+                     "раз в минуту. Если так и осталось — перезапустите бота.</i>")
+
+    skip = conf.get("last_skip") or {}
+    if skip:
+        when = datetime.fromtimestamp(float(skip.get("ts", 0) or 0)).strftime("%d.%m %H:%M")
+        lines += ["", f"🔇 <b>Последний раз промолчал</b> ({when})",
+                  f"   На сообщение: <i>{_esc(str(skip.get('text', ''))[:70])}</i>",
+                  f"   Причина: <b>{_esc(skip.get('why', ''))}</b>"]
+
+    sent = conf.get("log") or []
+    if sent:
+        last = sent[0]
+        when = datetime.fromtimestamp(float(last.get("ts", 0) or 0)).strftime("%d.%m %H:%M")
+        lines += ["", f"📜 Последняя отправка: {'✅' if last.get('ok') else '❌'} {when}"]
+        if not last.get("ok"):
+            lines.append(f"   {_esc(last.get('err', ''))}")
+    else:
+        lines += ["", "📜 Бот пока ничего не отправлял."]
+
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Обновить", callback_data="ar:why")
+    b.button(text="🧪 Проверить правило", callback_data="ar:test")
+    b.button(text="📜 Журнал", callback_data="ar:log")
+    b.button(text="⬅️ Автоответы", callback_data="ar:menu")
+    b.adjust(2, 2)
+    await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
+
 
 @router.callback_query(F.data == "ar:log")
 async def ar_log(callback: CallbackQuery) -> None:

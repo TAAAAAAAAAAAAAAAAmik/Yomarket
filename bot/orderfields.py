@@ -153,6 +153,25 @@ def order_ad_id(order: dict) -> str:
     return ""
 
 
+def order_chat_id(order: dict) -> str:
+    """Номер чата заказа. Пусто — если в ответе его нет.
+
+    Сообщения лежат под чатом: GET /chats/{chat_id}/messages. У части заказов
+    номер чата совпадает с номером заказа, у части — нет, и подстановка номера
+    заказа «на всякий случай» даёт resource_not_found. Лучше честно вернуть
+    пусто и поискать в карточке заказа, чем стучаться не туда.
+    """
+    for key in ("chat_id", "dialog_id", "conversation_id", "room_id",
+                "chatId", "chat"):
+        node = order.get(key)
+        if isinstance(node, dict):
+            node = node.get("id") or node.get("chat_id")
+        got = _clean(node)
+        if got:
+            return got
+    return ""
+
+
 def ad_title(payload) -> str:
     """Название из ответа /ads/{id} — в конверте или без него."""
     node = payload
