@@ -861,23 +861,43 @@ async def _pos_report(uid: int, idx: int) -> str:
         return f"❌ {_esc(str(res)[:400])}"
 
     offers = res["offers"]
+    total = res.get("total")
     mine = find_position(offers, ad_id=str(w.get("market_id") or ""),
                          title=str(w.get("title") or ""), seller=shop)
+    if not mine:
+        # The shop name is not the only handle we have on our own row, and it
+        # is the weaker one — our ad ids come from the marketplace itself.
+        mine, _ids = await _match_by_own_ads(uid, offers)
     thr = int(w.get("max_position") or 3)
+    scope = f"<b>{len(offers)}</b>" + (f" из {total}" if total else "")
     lines = [f"📍 <b>{_esc((w.get('title') or 'Позиция на витрине')[:40])}</b>\n",
-             f"Предложений на странице: <b>{len(offers)}</b>"]
+             f"Просмотрено предложений: {scope}"]
     if mine:
         w["last_pos"] = int(mine["pos"])
         w["last_check"] = _time.time()
+        if mine.get("id"):
+            w["market_id"] = str(mine["id"])
+        if mine.get("title") and not (w.get("title") or "").strip():
+            w["title"] = mine["title"]
         save_settings(uid, s)
         verdict = "🟢 в пределах порога" if mine["pos"] <= thr else "🔴 ниже порога"
-        lines.append(f"Ваше место: <b>{mine['pos']}</b> из {len(offers)} "
+        lines.append(f"Ваше место: <b>{mine['pos']}</b> "
                      f"(порог {thr}) — {verdict}")
         if mine["price"]:
             lines.append(f"Ваша цена: <b>{float(mine['price']):.0f} ₽</b>")
+    elif res.get("complete"):
+        # The whole listing was read and we are not in it — that is a fact
+        # about the listing, not about how far the bot got.
+        lines.append(f"❔ Вашего товара нет в этом списке целиком "
+                     f"(магазин «{_esc(shop) or '—'}»). Проверьте, что адрес "
+                     f"ведёт в ту же категорию и с тем же поиском, где товар "
+                     f"виден вам.")
     else:
-        lines.append(f"❔ Не нашёл ваш товар в списке "
-                     f"(магазин «{_esc(shop) or '—'}»)")
+        lines.append(f"❔ Не нашёл в первых {len(offers)}"
+                     + (f" из {total}" if total else "")
+                     + f" (магазин «{_esc(shop) or '—'}»). Товар лежит глубже — "
+                       f"сузьте адрес фильтром, чтобы место считалось точнее "
+                       f"и быстрее.")
     others = [o for o in offers if not mine or o["pos"] != mine["pos"]]
     low = cheapest(others or offers)
     if low is not None:

@@ -342,84 +342,217 @@ _API_HEADERS = {
     "Origin": MARKET_URL,
     "Referer": MARKET_URL + "/",
 }
-# 15 offers a page: twenty pages is three hundred places deep. Past that the
-# exact number stops meaning anything — a listing that far down is simply
-# buried, and the walk should stop rather than crawl the whole category.
-API_MAX_PAGES = 20
+# 15 offers a page against a category of ~640, so a cap of twenty pages stopped
+# exactly at 300 and reported "не нашёл" for a listing that was simply deeper.
+# Forty-five covers the whole of such a category; the walk still stops the
+# moment the shop is found, so this costs nothing on a listing near the top and
+# only pays out when the seller really is buried.
+API_MAX_PAGES = 45
+
+
+def listing_path(url: str) -> tuple[list, dict]:
+    """(category slugs, other filters) out of a storefront address.
+
+    /categories/black-russia/virty?keyword=3.000.000
+      → (["black-russia", "virty"], {"keyword": "3.000.000"})
+    """
+    from urllib.parse import parse_qsl, urlparse
+    parts = urlparse(url if url.startswith("http") else MARKET_URL + url)
+    segments = [p for p in parts.path.split("/") if p]
+    filters = {k: v.strip() for k, v in
+               parse_qsl(parts.query, keep_blank_values=True)
+               if k not in ("page",)}
+    slugs = []
+    if "categories" in segments:
+        slugs = segments[segments.index("categories") + 1:]
+    return slugs, filters
+
+
+def category_meta(slugs: list) -> dict:
+    """What the marketplace says about this section of the catalogue.
+
+    /api/categories/black-russia/virty answers with the game and, inside it,
+    its sections. Two things are wanted from it: the id of the *section* — the
+    listing is «вирты в Black Russia», not «вирты вообще» — and how many
+    listings it holds, which is the only independent way to tell a correct
+    query from one that quietly returns a different catalogue.
+    """
+    import requests
+    if not slugs:
+        return {}
+    try:
+        r = requests.get(f"{API_URL}/api/categories/" + "/".join(slugs),
+                         headers=_API_HEADERS, timeout=(6, 20), verify=False)
+        body = r.json() if r.status_code == 200 else {}
+    except Exception as e:
+        logger.warning("category meta %s: %s", slugs, e)
+        return {}
+    if not isinstance(body, dict):
+        return {}
+
+    want = str(slugs[-1])
+    found: dict = {}
+
+    def walk(node):
+        nonlocal found
+        if isinstance(node, list):
+            for x in node:
+                walk(x)
+        elif isinstance(node, dict):
+            if str(node.get("slug") or "") == want and node.get("id") is not None:
+                found = found or node
+            for v in node.values():
+                if isinstance(v, (list, dict)):
+                    walk(v)
+
+    walk(body)
+    # The deepest slug is what the listing is; the response's own root is the
+    # fallback for an address that names only the game.
+    return found or body
 
 
 def listing_query(url: str) -> dict:
     """The API query a storefront address stands for.
 
-    /categories/black-russia/virty?keyword=3.000.000 asks the API for
-    category=virty (the deepest slug — the game above it is not what the
-    listing is filtered by) with the search carried across unchanged.
+    Kept for the simple case and for the tests: the section slug plus whatever
+    filters the address carried. `listing_queries` builds the fuller set.
     """
-    from urllib.parse import parse_qsl, urlparse
-    parts = urlparse(url if url.startswith("http") else MARKET_URL + url)
-    segments = [p for p in parts.path.split("/") if p]
-    query = {k: v for k, v in parse_qsl(parts.query, keep_blank_values=True)
-             if k not in ("page",)}
-    if "categories" in segments:
-        after = segments[segments.index("categories") + 1:]
-        if after:
-            query["category"] = after[-1]
+    slugs, filters = listing_path(url)
+    query = dict(filters)
+    if slugs:
+        query["category"] = slugs[-1]
     return query
+
+
+def listing_queries(url: str, meta: dict | None = None) -> list[dict]:
+    """Every plausible way to ask the API for this listing, best guess first.
+
+    There is no documentation to consult, and the obvious query is wrong in a
+    way that looks right: `category=virty` returns virtual currency across every
+    game, not the Black Russia section the address names. Hundreds of other
+    sellers' offers come back, our own listing is nowhere in the first pages,
+    and the position that would be reported is a number from a different
+    catalogue. So the candidates are tried against the section's own
+    `ads_count` instead of being trusted.
+    """
+    slugs, filters = listing_path(url)
+    if not slugs:
+        return [dict(filters)] if filters else []
+    meta = meta or {}
+    cat_id = meta.get("id")
+    out: list[dict] = []
+
+    def add(extra: dict):
+        cand = {**filters, **extra}
+        if cand not in out:
+            out.append(cand)
+
+    if cat_id is not None:
+        add({"category_id": cat_id})
+        add({"category": cat_id})
+    if len(slugs) > 1:
+        add({"category": slugs[0], "subcategory": slugs[-1]})
+        add({"category": "/".join(slugs)})
+    add({"category": slugs[-1]})
+    return out
+
+
+def _api_get(url: str, params: dict | None) -> tuple[dict | None, str]:
+    """One JSON GET against the storefront API. (body, error)."""
+    import requests
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+    try:
+        r = requests.get(url, params=params or None, headers=_API_HEADERS,
+                         timeout=(6, 20), verify=False)
+    except Exception as e:
+        return None, f"API витрины не ответил: {str(e)[:100]}"
+    if r.status_code != 200:
+        return None, f"API витрины: HTTP {r.status_code}"
+    try:
+        return r.json(), ""
+    except Exception:
+        return None, "API витрины ответил не JSON"
+
+
+def _batch_of(body) -> list:
+    """The offers in one API response, whatever it calls them."""
+    batch = body.get("data") if isinstance(body, dict) else body
+    if isinstance(batch, list):
+        return batch
+    found = _offer_lists(body)
+    return max(found, key=len) if found else []
+
+
+def _pick_query(candidates: list, expected) -> tuple[dict, dict | None, str, str]:
+    """Choose the query that really stands for this section of the catalogue.
+
+    Returns (query, its first page, note, error). A 200 proves nothing here:
+    `category=virty` answers with hundreds of offers — virtual currency across
+    every game — and the position taken from that list would be a number out of
+    a different catalogue. The section's own `ads_count` is the check that
+    cannot be fooled, so each candidate is judged by whether it returns that
+    many. The response is kept, not thrown away and re-fetched.
+    """
+    fallback_query, fallback_body, err = None, None, ""
+    for cand in candidates:
+        body, e = _api_get(f"{API_URL}/api/products", {**cand, "page": 1})
+        if body is None:
+            err = err or e
+            continue
+        if fallback_body is None:
+            fallback_query, fallback_body = cand, body
+        if not expected:
+            return cand, body, "", ""       # nothing to check against
+        got = (body.get("meta") or {}).get("total") if isinstance(body, dict) else None
+        try:
+            if got is not None and int(got) == int(expected):
+                return cand, body, f", запрос: {sorted(cand)}", ""
+        except (TypeError, ValueError):
+            pass
+    if fallback_body is None:
+        return {}, None, "", err or "API витрины не ответил"
+    return (fallback_query, fallback_body,
+            f", ⚠️ ни один запрос не дал {expected} объявлений — "
+            f"список может быть не тем", "")
 
 
 def fetch_offers_api(url: str, shop: str = "",
                      max_pages: int = API_MAX_PAGES) -> tuple[bool, object]:
     """Blocking: the listing straight from the API the storefront calls.
 
-    Walks the pages until the shop is found, and stops the moment it is — a
+    Walks the pages until the shop is found and stops the moment it is, so a
     routine check on a listing near the top costs one request. Returns
-    (True, {"offers": …, "note": …}) or (False, error).
+    (True, {"offers": …, "note": …, "total": …, "complete": …}) or
+    (False, error).
     """
-    import requests
-    from requests.packages.urllib3.exceptions import InsecureRequestWarning
-    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
-
-    query = listing_query(url)
-    if not query:
+    slugs, _filters = listing_path(url)
+    meta_cat = category_meta(slugs) if slugs else {}
+    expected = meta_cat.get("ads_count")
+    candidates = listing_queries(url, meta_cat)
+    if not candidates:
         return False, "не понял адрес — нужна страница категории или поиска"
 
+    query, body, picked_note, err = _pick_query(candidates, expected)
+    if body is None:
+        return False, err
+
     rows: list = []
-    next_url = f"{API_URL}/api/products"
-    params = dict(query)
     pages = 0
     total = None
     seen: set = set()
-    while next_url and pages < max(1, max_pages):
-        try:
-            r = requests.get(next_url, params=params or None,
-                             headers=_API_HEADERS, timeout=(6, 20),
-                             verify=False)
-        except Exception as e:
-            if rows:
-                break                       # keep what the earlier pages gave
-            return False, f"API витрины не ответил: {str(e)[:100]}"
-        if r.status_code != 200:
-            if rows:
-                break
-            return False, f"API витрины: HTTP {r.status_code}"
-        try:
-            body = r.json()
-        except Exception:
-            if rows:
-                break
-            return False, "API витрины ответил не JSON"
-
-        batch = body.get("data") if isinstance(body, dict) else body
-        if not isinstance(batch, list):
-            # Not the shape expected — fall back on the generic search rather
-            # than insisting on a key name that may change.
-            found = _offer_lists(body)
-            batch = max(found, key=len) if found else []
+    # Did the listing run out, or did we merely stop looking? Only the first
+    # makes «не нашёл» a statement about the listing rather than about us.
+    exhausted = False
+    while body is not None and pages < max(1, max_pages):
+        batch = _batch_of(body)
         if not batch:
+            exhausted = True
             break
         sig = _signature(batch)
         if sig in seen:
-            break                           # the same page came back
+            exhausted = True                # the same page came back
+            break
         seen.add(sig)
         rows.extend(batch)
         pages += 1
@@ -429,22 +562,35 @@ def fetch_offers_api(url: str, shop: str = "",
             total = meta.get("total")
         if shop and find_position(_normalize(rows), seller=shop):
             break
+        if pages >= max(1, max_pages):
+            break
         # Laravel hands the next page over in `links.next`; falling back on
         # ?page=N keeps this working if that ever stops being included.
         links = body.get("links") if isinstance(body, dict) else None
         nxt = (links or {}).get("next") if isinstance(links, dict) else None
         if nxt:
-            next_url, params = nxt, None
+            body, e = _api_get(nxt, None)
         else:
-            next_url = f"{API_URL}/api/products"
-            params = {**query, "page": pages + 1}
+            body, e = _api_get(f"{API_URL}/api/products",
+                               {**query, "page": pages + 1})
+        if body is None:
+            break                           # keep what the earlier pages gave
 
     if not rows:
         return False, "API витрины вернул пустой список"
-    note = f"api, офферов: {len(rows)}, страниц: {pages}"
+    if total is None and expected:
+        total = expected
+    note = f"api, офферов: {len(rows)}"
     if total:
         note += f" из {total}"
-    return True, {"offers": _normalize(rows), "note": note}
+    note += f", страниц: {pages}{picked_note}"
+    if total:
+        try:
+            exhausted = exhausted or len(rows) >= int(total)
+        except (TypeError, ValueError):
+            pass
+    return True, {"offers": _normalize(rows), "note": note,
+                  "total": total, "complete": exhausted}
 
 
 def with_page(url: str, n: int) -> str:
@@ -621,5 +767,13 @@ def find_position(offers: list[dict], *, ad_id: str = "",
 
 
 def cheapest(offers: list[dict]) -> float | None:
-    prices = [o["price"] for o in offers if o["price"] is not None]
+    """The lowest price actually being asked.
+
+    Zero is excluded deliberately: it is what a row without a real price
+    reduces to, and one of them among three hundred offers was enough to
+    report «дешевле всех: 0 ₽» — a number that made the undercut guard
+    meaningless and told the seller nothing.
+    """
+    prices = [o["price"] for o in offers
+              if o["price"] is not None and o["price"] > 0]
     return min(prices) if prices else None

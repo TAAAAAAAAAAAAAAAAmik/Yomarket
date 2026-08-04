@@ -12,6 +12,7 @@ money.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import unittest
@@ -20,8 +21,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from automation import market as M          # noqa: E402
 
+# Several cases cut the network on purpose; the warning that follows is the
+# behaviour under test, not something to read in the output.
+logging.getLogger("automation.market").setLevel(logging.CRITICAL)
+
 PAGE_URL = ("https://yoomarket.net/categories/black-russia/virty"
             "?keyword=3.000.000")
+
+
+TOTAL = 638          # what /api/categories says this section holds
+
+
+def body(rows: list, **extra) -> dict:
+    """A response shaped like the real one, and consistent with the section.
+
+    `meta.total` matching the section's ads_count is what tells a correct query
+    from one that returns a different catalogue, so a fixture without it makes
+    the test measure the query search instead of what it means to.
+    """
+    out = {"data": rows, "meta": {"total": TOTAL}}
+    out.update(extra)
+    return out
 
 
 def offer(n: int, shop: str, price: float = 239.0) -> dict:
@@ -51,10 +71,20 @@ class ApiCase(unittest.TestCase):
     def setUp(self):
         import requests
         self._old = requests.get
-        self.calls: list[tuple[str, dict]] = []
+        self.calls: list[tuple[str, dict]] = []       # /api/products only
+        self.meta_calls: list[str] = []
         self.pages: dict[int, dict] = {}
+        # What /api/categories/<slugs> answers. None = no metadata at all,
+        # which is how a listing that is only a search behaves.
+        self.category = {"id": 77, "slug": "black-russia",
+                         "title": "Black Russia", "ads_count": 638,
+                         "children": [{"id": 512, "slug": "virty",
+                                       "title": "Вирты", "ads_count": 638}]}
 
         def fake(url, params=None, **kw):
+            if "/api/categories" in url:
+                self.meta_calls.append(url)
+                return Reply(self.category or {})
             self.calls.append((url, dict(params or {})))
             n = int((params or {}).get("page", 0) or 0)
             if not n:
@@ -106,21 +136,24 @@ class TheQuery(unittest.TestCase):
 
 class Fetching(ApiCase):
     def test_the_first_page_is_asked_for_with_the_pages_own_filters(self):
-        self.pages = {1: {"data": [offer(1, "GigShop")]}}
+        self.pages = {1: body([offer(1, "GigShop")])}
         ok, res = M.fetch_offers_api(PAGE_URL)
         self.assertTrue(ok, res)
         url, params = self.calls[0]
         self.assertEqual(url, "https://api.yoo.market/api/products")
-        self.assertEqual(params, {"category": "virty", "keyword": "3.000.000"})
+        self.assertEqual(params.get("keyword"), "3.000.000",
+                         "the search must reach the API")
+        # The section, not the game and not «вирты вообще»: /api/categories
+        # gave «Вирты в Black Russia» the id 512.
+        self.assertEqual(params.get("category_id"), 512)
+        self.assertIn("запрос:", res["note"])
 
     def test_the_position_runs_across_pages(self):
         self.pages = {
-            1: {"data": [offer(i, f"Продавец{i}") for i in range(15)],
-                "links": {"next": "https://api.yoo.market/api/products?page=2"},
-                "meta": {"total": 638}},
-            2: {"data": [offer(20 + i, f"Другой{i}") for i in range(14)]
-                        + [offer(99, "Spike", 239.99)],
-                "meta": {"total": 638}},
+            1: body([offer(i, f"Продавец{i}") for i in range(15)],
+                    links={"next": "https://api.yoo.market/api/products?page=2"}),
+            2: body([offer(20 + i, f"Другой{i}") for i in range(14)]
+                    + [offer(99, "Spike", 239.99)]),
         }
         ok, res = M.fetch_offers_api(PAGE_URL, shop="Spike")
         self.assertTrue(ok, res)
@@ -130,18 +163,18 @@ class Fetching(ApiCase):
         self.assertIn("из 638", res["note"])
 
     def test_it_stops_the_moment_we_are_found(self):
-        self.pages = {1: {"data": [offer(1, "A"), offer(2, "Spike")]},
-                      2: {"data": [offer(3, "B")]}}
+        self.pages = {1: body([offer(1, "A"), offer(2, "Spike")]),
+                      2: body([offer(3, "B")])}
         M.fetch_offers_api(PAGE_URL, shop="Spike")
         self.assertEqual(len(self.calls), 1,
                          "found on page 1 — the rest is wasted money and time")
 
     def test_the_next_link_is_followed_when_given(self):
         self.pages = {
-            1: {"data": [offer(1, "A")],
-                "links": {"next": "https://api.yoo.market/api/products"
-                                  "?category=virty&page=2"}},
-            2: {"data": [offer(2, "Spike")]},
+            1: body([offer(1, "A")],
+                    links={"next": "https://api.yoo.market/api/products"
+                                   "?category=virty&page=2"}),
+            2: body([offer(2, "Spike")]),
         }
         ok, res = M.fetch_offers_api(PAGE_URL, shop="Spike")
         self.assertTrue(ok)
@@ -149,23 +182,23 @@ class Fetching(ApiCase):
         self.assertEqual(M.find_position(res["offers"], seller="Spike")["pos"], 2)
 
     def test_without_a_next_link_it_falls_back_to_page_numbers(self):
-        self.pages = {1: {"data": [offer(1, "A")]},
-                      2: {"data": [offer(2, "Spike")]}}
+        self.pages = {1: body([offer(1, "A")]),
+                      2: body([offer(2, "Spike")])}
         ok, res = M.fetch_offers_api(PAGE_URL, shop="Spike")
         self.assertTrue(ok)
         self.assertEqual(self.calls[1][1].get("page"), 2)
-        self.assertEqual(self.calls[1][1].get("category"), "virty",
+        self.assertEqual(self.calls[1][1].get("keyword"), "3.000.000",
                          "the filters must survive onto page 2")
 
     def test_a_repeated_page_does_not_double_the_positions(self):
-        same = {"data": [offer(1, "A"), offer(2, "B")]}
+        same = body([offer(1, "A"), offer(2, "B")])
         self.pages = {n: same for n in range(1, 6)}
         ok, res = M.fetch_offers_api(PAGE_URL, shop="Spike")
         self.assertTrue(ok)
         self.assertEqual(len(res["offers"]), 2)
 
     def test_the_walk_is_bounded(self):
-        self.pages = {n: {"data": [offer(n, f"Ш{n}")]} for n in range(1, 60)}
+        self.pages = {n: body([offer(n, f"Ш{n}")]) for n in range(1, 60)}
         ok, res = M.fetch_offers_api(PAGE_URL, shop="Spike", max_pages=5)
         self.assertTrue(ok)
         self.assertEqual(len(self.calls), 5)
@@ -173,11 +206,12 @@ class Fetching(ApiCase):
 
     def test_a_failure_midway_keeps_the_pages_already_read(self):
         import requests
-        self.pages = {1: {"data": [offer(1, "A")]}}
+        self.pages = {1: body([offer(1, "A")])}
         first = requests.get
 
         def flaky(url, params=None, **kw):
-            if (params or {}).get("page"):
+            # Page one is what the query search asks for; the break comes after
+            if int((params or {}).get("page", 1) or 1) > 1 or "page=2" in url:
                 raise OSError("сеть отвалилась")
             return first(url, params=params, **kw)
 
@@ -195,6 +229,7 @@ class Fetching(ApiCase):
 
     def test_an_unexpected_shape_still_yields_the_offers(self):
         """If `data` ever stops being the key, the generic search takes over."""
+        self.category = None
         self.pages = {1: {"result": {"items": [offer(i, f"Ш{i}")
                                                for i in range(4)]}}}
         ok, res = M.fetch_offers_api(PAGE_URL)
@@ -202,9 +237,131 @@ class Fetching(ApiCase):
         self.assertEqual(len(res["offers"]), 4)
 
 
+class TheRightCatalogue(unittest.TestCase):
+    """Choosing the query that means «вирты в Black Russia», not «вирты».
+
+    This is the failure that looked like success: category=virty answers 200
+    with hundreds of offers — virtual currency across every game — and the
+    position taken out of that list is a number from a different catalogue.
+    Our own listing was nowhere in the first three hundred of it.
+    """
+
+    SECTION = {"id": 77, "slug": "black-russia", "ads_count": 638,
+               "children": [{"id": 512, "slug": "virty", "ads_count": 638}]}
+
+    def setUp(self):
+        import requests
+        self._old = requests.get
+        self.asked: list[dict] = []
+        # What each query shape returns: the wrong ones answer perfectly well,
+        # they just answer about something else.
+        self.totals = {"category=virty": 4021,
+                       "category=black-russia": 638,
+                       "category_id=512": 638}
+
+        def fake(url, params=None, **kw):
+            if "/api/categories" in url:
+                return Reply(self.SECTION)
+            p = dict(params or {})
+            self.asked.append(p)
+            key = next((f"{k}={v}" for k, v in p.items()
+                        if k in ("category", "category_id")), "")
+            total = self.totals.get(key, 4021)
+            return Reply({"data": [offer(1, "Кто-то")], "meta": {"total": total}})
+
+        requests.get = fake
+
+    def tearDown(self):
+        import requests
+        requests.get = self._old
+
+    def test_the_section_id_is_taken_from_the_catalogue(self):
+        """/api/categories answers about the game; the section is inside it."""
+        meta = M.category_meta(["black-russia", "virty"])
+        self.assertEqual(meta["id"], 512, "took the game, not the section")
+        self.assertEqual(meta["ads_count"], 638)
+
+    def test_the_query_matching_the_sections_own_count_is_chosen(self):
+        ok, res = M.fetch_offers_api(PAGE_URL)
+        self.assertTrue(ok, res)
+        chosen = self.asked[-1]
+        self.assertEqual(chosen.get("category_id"), 512)
+        self.assertIn("запрос:", res["note"])
+
+    def test_a_query_returning_another_catalogue_is_rejected(self):
+        """Even though it answers 200 with a full page of offers."""
+        M.fetch_offers_api(PAGE_URL)
+        wrong = [p for p in self.asked if p.get("category") == "virty"]
+        chosen = self.asked[-1]
+        self.assertNotEqual(chosen.get("category"), "virty",
+                            f"settled for the mixed listing: {wrong}")
+
+    def test_when_nothing_matches_it_says_so_instead_of_pretending(self):
+        self.totals = {}                       # every shape answers 4021
+        ok, res = M.fetch_offers_api(PAGE_URL)
+        self.assertTrue(ok, "an answer is still returned")
+        self.assertIn("⚠️", res["note"])
+        self.assertIn("638", res["note"])
+
+    def test_without_a_count_to_check_against_it_does_not_thrash(self):
+        self.SECTION = {"slug": "virty"}       # no ads_count
+        ok, res = M.fetch_offers_api(PAGE_URL, max_pages=1)
+        self.assertTrue(ok)
+        self.assertEqual(len(self.asked), 1,
+                         "nothing to verify against — trying every shape would "
+                         "be requests spent on a question that cannot be "
+                         "answered")
+
+
+class Completeness(ApiCase):
+    """Whether the whole listing was seen changes what "не нашёл" means."""
+
+    def test_running_out_of_pages_is_not_a_complete_read(self):
+        self.pages = {n: body([offer(n, f"Ш{n}")]) for n in range(1, 60)}
+        ok, res = M.fetch_offers_api(PAGE_URL, shop="Spike", max_pages=4)
+        self.assertTrue(ok)
+        self.assertFalse(res["complete"])
+        self.assertEqual(res["total"], 638)
+        self.assertIn("из 638", res["note"])
+
+    def test_reaching_the_end_of_the_listing_is(self):
+        self.category = {"id": 7, "slug": "virty", "ads_count": 2}
+        self.pages = {1: {"data": [offer(1, "A")], "meta": {"total": 2}},
+                      2: {"data": [offer(2, "B")], "meta": {"total": 2}}}
+        ok, res = M.fetch_offers_api(PAGE_URL, shop="Spike", max_pages=9)
+        self.assertTrue(res["complete"], "the listing ran out — we saw it all")
+
+    def test_an_empty_page_ends_the_listing(self):
+        self.category = None
+        self.pages = {1: {"data": [offer(1, "A")]}}      # page 2 comes back []
+        ok, res = M.fetch_offers_api(PAGE_URL, shop="Spike", max_pages=9)
+        self.assertTrue(res["complete"])
+
+    def test_the_default_depth_covers_a_whole_category(self):
+        """A category of ~640 at fifteen a page needs more than twenty pages.
+
+        Twenty stopped at exactly 300 and called a deeper listing "не найден".
+        """
+        self.assertGreaterEqual(M.API_MAX_PAGES * 15, 640)
+
+
+class Cheapest(unittest.TestCase):
+    def test_a_zero_is_not_the_cheapest_offer(self):
+        """One priceless row among three hundred read as «дешевле всех: 0 ₽».
+
+        That number made the undercut guard meaningless — every real price is
+        more than nothing, so the guard would block every promotion.
+        """
+        rows = [{"price": 0.0}, {"price": 239.0}, {"price": 1449.0}]
+        self.assertEqual(M.cheapest(rows), 239.0)
+
+    def test_all_zero_is_no_price_at_all(self):
+        self.assertIsNone(M.cheapest([{"price": 0.0}, {"price": None}]))
+
+
 class Preference(ApiCase):
     def test_fetch_listing_uses_the_api_and_never_touches_the_page(self):
-        self.pages = {1: {"data": [offer(1, "A"), offer(2, "Spike")]}}
+        self.pages = {1: body([offer(1, "A"), offer(2, "Spike")])}
         ok, res = M.fetch_listing(PAGE_URL, "Spike")
         self.assertTrue(ok)
         self.assertIn("api", res["note"])
