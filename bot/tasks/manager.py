@@ -206,6 +206,44 @@ def _msg_text(msg: dict) -> str:
     return ""
 
 
+def _fingerprint(text: str) -> str:
+    """Отпечаток текста — чтобы узнать своё сообщение, вернувшееся из чата."""
+    import hashlib
+    norm = " ".join(str(text or "").lower().split())[:400]
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:12]
+
+
+_SENT_PER_CHAT = 20
+_SENT_CHATS = 100
+
+
+def _note_sent_text(settings: dict, chat_id: str, text: str) -> None:
+    """Запомнить, что это писали мы.
+
+    API не помечает сообщения магазина ничем надёжным, и бот принимал
+    собственный вопрос за ответ покупателя: из «отправьте ваш @username
+    (например @durov)» он доставал «username» и шёл покупать звёзды
+    несуществующему человеку. Отпечаток отправленного — то, по чему своё
+    узнаётся точно.
+    """
+    if not text:
+        return
+    book: dict = settings.setdefault("_sent_fp", {})
+    row: list = book.setdefault(str(chat_id), [])
+    row.insert(0, _fingerprint(text))
+    del row[_SENT_PER_CHAT:]
+    if len(book) > _SENT_CHATS:
+        for key in list(book)[_SENT_CHATS:]:
+            book.pop(key, None)
+
+
+def _is_our_text(settings: dict, chat_id: str, text: str) -> bool:
+    if not text:
+        return False
+    row = (settings.get("_sent_fp") or {}).get(str(chat_id)) or []
+    return _fingerprint(text) in row
+
+
 def _msg_kind(msg: dict) -> str:
     """«system» — служебная запись чата, а не письмо покупателя."""
     for key in ("type", "kind", "message_type", "event"):
@@ -246,18 +284,26 @@ def _newest_msg(rows: list[dict]) -> dict:
 
 _USERNAME_RE = re.compile(r"@?([a-zA-Z][a-zA-Z0-9_]{3,31})")
 
+# Слова-заполнители из подсказок: это не ники, а место, куда ник вписывают.
+# Бот доставал «username» из собственного вопроса и шёл покупать звёзды
+# несуществующему человеку. Настоящие ники сюда не попадают — «durov» это
+# живой аккаунт, и запрещать его нельзя.
+_NOT_A_USERNAME = frozenset({
+    "username", "юзернейм", "nickname", "example", "yourname",
+})
+
 
 def _extract_username(text: str) -> str:
     """Pull a Telegram @username out of free-form buyer text."""
     if not text:
         return ""
     # Prefer an explicit @mention
-    m = re.search(r"@([a-zA-Z][a-zA-Z0-9_]{3,31})", text)
-    if m:
-        return m.group(1)
+    for m in re.finditer(r"@([a-zA-Z][a-zA-Z0-9_]{3,31})", text):
+        if m.group(1).lower() not in _NOT_A_USERNAME:
+            return m.group(1)
     stripped = text.strip()
     m = _USERNAME_RE.fullmatch(stripped)
-    if m:
+    if m and m.group(1).lower() not in _NOT_A_USERNAME:
         return m.group(1)
     return ""
 
@@ -951,7 +997,7 @@ class TaskManager:
                             title, ar.get("message", "Спасибо за заказ!"),
                             rules, responders_map,
                             _ar_context(order_details.get(oid), oid, settings))
-                        ok, err = await self._send_chat(api, chat_id, msg)
+                        ok, err = await self._send_chat(api, chat_id, msg, settings)
                         _ar_log(settings, chat_id, msg, ok, err, "новый заказ")
                     # AutoStars: ask the buyer for their @username in chat
                     await self._maybe_ask_stars_username(
@@ -964,7 +1010,7 @@ class TaskManager:
                             title, ev.get("message", "Заказ подтверждён!"),
                             rules, responders_map,
                             _ar_context(order_details.get(oid), oid, settings))
-                        ok, err = await self._send_chat(api, chat_id, msg)
+                        ok, err = await self._send_chat(api, chat_id, msg, settings)
                         _ar_log(settings, chat_id, msg, ok, err, "заказ выполнен")
                     cnt_today, rev_today = _today_stats(order_details, known)
                     buyer_line = _esc(f"👤 {buyer}" + (f" ({username})" if username else ""))
@@ -988,7 +1034,7 @@ class TaskManager:
                             title, ev.get("message", "Возврат оформлен."),
                             rules, responders_map,
                             _ar_context(order_details.get(oid), oid, settings))
-                        ok, err = await self._send_chat(api, chat_id, msg)
+                        ok, err = await self._send_chat(api, chat_id, msg, settings)
                         _ar_log(settings, chat_id, msg, ok, err, "возврат")
                     buyer_line = _esc(f"👤 {buyer}" + (f" ({username})" if username else ""))
                     await self._notify(
@@ -1132,7 +1178,8 @@ class TaskManager:
                 # и пустые строки покупатель не писал, и ждать ответа на них
                 # незачем.
                 real = [m for m in messages
-                        if not _is_service_message(m) and _msg_text(m)]
+                        if not _is_service_message(m) and _msg_text(m)
+                        and not _is_our_text(settings, chat_id, _msg_text(m))]
                 newest = _newest_msg(real)
                 if order_id in order_details:
                     det = order_details[order_id]
@@ -1176,6 +1223,11 @@ class TaskManager:
                         # Пустая строка — это не сообщение. Раньше о таких
                         # приходило «СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ» с пустой цитатой,
                         # хотя покупатель ничего не писал.
+                        continue
+                    if _is_our_text(settings, chat_id, raw_text):
+                        # Наше же сообщение, вернувшееся из чата. Бот отвечал
+                        # сам себе и доставал «@username» из собственного
+                        # вопроса — с этого начинался круг покупок в пустоту.
                         continue
                     sender = msg.get("sender_type") or msg.get("sender")
                     if isinstance(sender, str) and sender.lower() not in (
@@ -1445,8 +1497,9 @@ class TaskManager:
                              "reminded": 0}
         await self._send_chat(
             api, chat_id,
-            "⭐ Для выдачи звёзд отправьте, пожалуйста, ваш Telegram "
-            "@username (например @durov). Звёзды придут автоматически.",
+            "⭐ Для выдачи звёзд отправьте, пожалуйста, ваш ник в Telegram — "
+            "одним сообщением, например: durov\n"
+            "Звёзды придут автоматически.", settings,
         )
         logger.info("AutoStars: asked username for order %s (qty=%s)", order_id, qty)
 
@@ -1468,8 +1521,8 @@ class TaskManager:
         if not username:
             await self._send_chat(
                 api, chat_id,
-                "Не разобрал username. Пришлите его в формате @username "
-                "(латиница, минимум 5 символов).",
+                "Не разобрал ник. Пришлите его одним сообщением: латиница, "
+                "минимум 5 символов, например durov", settings,
             )
             return True
 
@@ -1521,7 +1574,7 @@ class TaskManager:
             return True
 
         await self._send_chat(
-            api, chat_id, f"⏳ Отправляю {qty}⭐ на @{username}…")
+            api, chat_id, f"⏳ Отправляю {qty}⭐ на @{username}…", settings)
 
         try:
             ok, result = await asyncio.wait_for(
@@ -1542,7 +1595,7 @@ class TaskManager:
             p.setdefault("delivered", []).append(order_id)
             await self._send_chat(
                 api, chat_id,
-                f"✅ Готово! {qty}⭐ отправлены на @{username}. Спасибо за заказ!",
+                f"✅ Готово! {qty}⭐ отправлены на @{username}. Спасибо за заказ!", settings,
             )
             # try to confirm the order automatically
             try:
@@ -1555,20 +1608,39 @@ class TaskManager:
                 f"(заказ #{order_id})\n{result}",
             )
         else:
-            # keep pending so the seller can retry / buyer can resend
-            pending[order_id] = {"quantity": qty, "asked_at": time.time()}
-            await self._send_chat(
-                api, chat_id,
-                "⚠️ Не удалось отправить звёзды автоматически. "
-                "Продавец скоро выдаст их вручную.",
-            )
-            await self._notify(
-                user_id,
-                f"❌ <b>AutoStars</b>: заказ #{order_id}, @{username}, {qty}⭐ — "
-                f"не удалось.\n{result}\n\n"
-                "Выдайте вручную: Плагины → AutoStars → 🚀 Ручная выдача",
-            )
+            # Три попытки — и хватит. Раньше заказ возвращался в ожидание без
+            # счёта, и каждая новая попытка приносила продавцу ещё одно
+            # одинаковое «не удалось»: в ленте их было с десяток подряд.
+            tries = int(entry.get("tries", 0) or 0) + 1
+            if tries < self._STARS_MAX_TRIES:
+                pending[order_id] = {**entry, "quantity": qty,
+                                     "asked_at": time.time(), "tries": tries}
+                await self._send_chat(
+                    api, chat_id,
+                    "⚠️ Не удалось отправить звёзды автоматически. "
+                    "Продавец скоро выдаст их вручную.", settings,
+                )
+            else:
+                p.setdefault("stuck", {})[order_id] = {
+                    "username": username, "quantity": qty,
+                    "reason": str(result)[:200], "ts": time.time()}
+            # Уведомление — только о первой неудаче и о том, что попытки
+            # кончились. Промежуточные продавцу ничего не добавляют.
+            if tries == 1 or tries >= self._STARS_MAX_TRIES:
+                tail = ("\n\n<b>Попытки исчерпаны</b> — заказ ждёт вас."
+                        if tries >= self._STARS_MAX_TRIES else "")
+                await self._notify(
+                    user_id,
+                    f"❌ <b>AutoStars</b>: заказ #{order_id}, @{username}, {qty}⭐ — "
+                    f"не удалось (попытка {tries}).\n{result}{tail}\n\n"
+                    "Выдайте вручную: Плагины → AutoStars → 🚀 Ручная выдача",
+                )
         return True
+
+    # Сколько раз пытаться выдать звёзды по одному заказу, прежде чем оставить
+    # его продавцу. Без счёта каждая неудача возвращала заказ в очередь, и
+    # неудачи шли подряд одинаковыми уведомлениями.
+    _STARS_MAX_TRIES = 3
 
     # How long a buyer is given to send their username before being nudged, and
     # how long before the seller is told the order is stuck. A paid order left
@@ -1731,16 +1803,23 @@ class TaskManager:
         d["enriched"] = True
         return d
 
-    async def _send_chat(self, api: YooMarketAPI, chat_id: str,
-                         text: str) -> tuple[bool, str]:
+    async def _send_chat(self, api: YooMarketAPI, chat_id: str, text: str,
+                         settings: dict | None = None) -> tuple[bool, str]:
         """Отправить сообщение в чат заказа → (получилось, причина).
 
         Раньше провал уходил только в логи контейнера: покупатель не получал
         ничего, а продавец был уверен, что автоответ работает. Результат
         возвращается, и вызывающий его показывает.
+
+        Отправленное запоминается отпечатком: следующим проходом оно вернётся
+        из чата, и без этого бот принимает своё сообщение за письмо покупателя.
         """
         if not (text or "").strip():
             return False, "пустой текст"
+        if settings is not None:
+            # Отметка ставится до отправки: сообщение может уйти и вернуться
+            # быстрее, чем сюда дойдёт ответ API.
+            _note_sent_text(settings, chat_id, text)
         try:
             await api.send_message(chat_id, text)
             return True, ""
@@ -1784,7 +1863,7 @@ class TaskManager:
         body = ar.render(rule.get("text", ""),
                          ar.context(details, order_id,
                                     settings.get("shop_name", "")))
-        ok, err = await self._send_chat(api, chat_id, body)
+        ok, err = await self._send_chat(api, chat_id, body, settings)
         ar.log(conf, chat_id=chat_id, text=body, ok=ok, err=err,
                rule=matched or ("запасной" if rule.get("id") == "fallback" else ""))
         if ok:
