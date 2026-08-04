@@ -207,6 +207,151 @@ class AddingAWatch(FlowCase):
         self.assertEqual(len(self.watches()), P.MAX_WATCHES)
 
 
+class AddingFromOwnListings(FlowCase):
+    """Picking a listing instead of copying an address for each of fifteen.
+
+    The bot has to do three things the seller would otherwise do by hand: find
+    the page the item is on, check it is really there, and bind the panel
+    record a promotion is charged against.
+    """
+
+    ADS = {"data": [{"id": 220075, "title": "Аккаунт Steam"},
+                    {"id": 330099, "title": "Другой товар"}]}
+    # The card names its section and its game, inside-out.
+    CARD = {"id": 220075, "slug": "akkaunt-steam",
+            "category": {"slug": "virty", "parent": {"slug": "black-russia"}}}
+
+    def setUp(self):
+        super().setUp()
+        S._MY_ADS_CACHE.clear()
+        self.patch(storage, "get_token", lambda uid: "tok")
+        self.patch(storage, "get_panel_creds", lambda uid: {"cookies": "c=1"})
+        self.fetched: list[str] = []
+
+        ads = self.ADS
+
+        class FakeApi:
+            def __init__(self, token):
+                pass
+
+            async def start(self):
+                pass
+
+            async def close(self):
+                pass
+
+            async def get_ads(self, *a, **kw):
+                return ads
+
+        import api.yoomarket as Y
+        self.patch(Y, "YooMarketAPI", FakeApi)
+        self.patch(M, "product_card", lambda mid: self.CARD)
+
+        # Only the right way round has our listing in it.
+        right = "https://yoomarket.net/categories/black-russia/virty"
+
+        def fetch(url, shop=""):
+            self.fetched.append(url)
+            if url == right:
+                return True, PAGE
+            return True, {"offers": M._normalize(
+                [{"title": "Чужое", "price": 10, "shop": {"name": "Кто-то"}},
+                 {"title": "Чужое", "price": 20, "shop": {"name": "Ещё"}}]),
+                "note": ""}
+
+        self.patch(M, "fetch_listing", fetch)
+
+        import automation.panel as P_
+        self.patch(P_, "panel_list_items_sync",
+                   lambda cookies: (True, [{"id": 5150,
+                                            "title": "Аккаунт Steam"}]))
+
+    def pick(self, i=0):
+        cb = FakeCallback(f"pos:addpick:{i}")
+        self.run_(S.pos_add_pick(cb))
+        return cb
+
+    def test_the_page_is_found_without_the_seller_copying_anything(self):
+        cb = self.pick()
+        ws = self.watches()
+        self.assertEqual(len(ws), 1)
+        self.assertEqual(ws[0]["url"],
+                         "https://yoomarket.net/categories/black-russia/virty")
+        self.assertEqual(ws[0]["market_id"], "220075")
+        self.assertEqual(ws[0]["last_pos"], 2)
+        self.assertTrue(any("2-м месте" in t for t in cb.message.sent),
+                        cb.message.sent)
+
+    def test_the_likeliest_order_is_tried_first_and_costs_one_request(self):
+        """A card points at its parent, so the chain arrives inside-out.
+
+        Turning it round is right often enough that it goes first — and when it
+        works, nothing else is fetched.
+        """
+        self.pick()
+        self.assertEqual(self.fetched,
+                         ["https://yoomarket.net/categories/black-russia/virty"])
+
+    def test_a_candidate_without_our_listing_is_dropped_for_the_next(self):
+        """Which slug is the game is not stated anywhere — the listing settles it.
+
+        Guessing and keeping the guess would count the position in the wrong
+        catalogue, which is the number the seller pays against.
+        """
+        right = "https://yoomarket.net/categories/virty/black-russia"
+
+        def fetch(url, shop=""):
+            self.fetched.append(url)
+            if url == right:
+                return True, PAGE
+            return True, {"offers": M._normalize(
+                [{"title": "Чужое", "price": 10, "shop": {"name": "Кто-то"}},
+                 {"title": "Чужое", "price": 20, "shop": {"name": "Ещё"}}]),
+                "note": ""}
+
+        self.patch(M, "fetch_listing", fetch)
+        self.pick()
+        self.assertEqual(self.watches()[0]["url"], right)
+        self.assertGreater(len(self.fetched), 1,
+                           "the first candidate had to be rejected")
+
+    def test_the_panel_record_is_bound_in_the_same_step(self):
+        cb = self.pick()
+        self.assertEqual(self.watches()[0]["item_id"], "5150")
+        self.assertTrue(any("привязан" in t for t in cb.message.sent))
+
+    def test_a_listing_missing_from_the_panel_is_said_so_not_faked(self):
+        import automation.panel as P_
+        self.patch(P_, "panel_list_items_sync", lambda c: (True, []))
+        cb = self.pick()
+        self.assertEqual(self.watches()[0]["item_id"], "")
+        self.assertTrue(any("привяжите вручную" in t for t in cb.message.sent))
+
+    def test_when_no_page_has_it_the_manual_route_is_offered(self):
+        self.patch(M, "fetch_listing",
+                   lambda url, shop="": (True, {"offers": [], "note": ""}))
+        cb = self.pick()
+        self.assertEqual(self.watches(), [], "nothing unverified is saved")
+        said = "\n".join(cb.message.sent)
+        self.assertIn("Не смог сам определить", said)
+        kb = cb.message.markups[-1]
+        self.assertIn("pos:addurl",
+                      [b.callback_data for row in kb.inline_keyboard
+                       for b in row])
+
+    def test_a_card_the_marketplace_will_not_give_is_not_a_crash(self):
+        self.patch(M, "product_card", lambda mid: {})
+        cb = self.pick()
+        self.assertEqual(self.watches(), [])
+        self.assertTrue(any("Не смог" in t for t in cb.message.sent))
+
+    def test_a_stale_list_is_refused_rather_than_picking_the_wrong_item(self):
+        cb = FakeCallback("pos:addpick:99")
+        self.run_(S.pos_add_pick(cb))
+        self.assertEqual(self.watches(), [])
+        self.assertTrue(cb.answers[0][1], "should alert, not silently pass")
+
+
 class EditingAWatch(FlowCase):
     def setUp(self):
         super().setUp()

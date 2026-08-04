@@ -591,16 +591,242 @@ async def pos_undercut(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "pos:add")
 async def pos_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Two ways in, and the one that needs no copying is offered first."""
+    await state.clear()
+    b = InlineKeyboardBuilder()
+    b.button(text="📦 Выбрать из моих товаров", callback_data="pos:addlist")
+    b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
+    b.button(text="⬅️ Назад", callback_data="pos:menu")
+    b.adjust(1)
+    await _pos_edit(
+        callback.message,
+        "➕ <b>Добавить товар под наблюдение</b>\n\n"
+        "Проще выбрать из своих объявлений — бот сам найдёт страницу витрины, "
+        "где этот товар стоит в списке предложений, и проверит, что видит его "
+        "там.\n\n"
+        "<i>Адрес вручную нужен, только если товара нет в списке или следить "
+        "надо за конкретной выдачей с фильтром.</i>",
+        b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "pos:addurl")
+async def pos_add_url(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SeleniumState.waiting_pos_url)
-    await callback.message.edit_text(
+    await _pos_edit(
+        callback.message,
         "🔗 <b>Какую страницу смотреть</b>\n\n"
         "Откройте свой товар так, как его видит покупатель — на странице, где "
         "виден <b>список предложений</b> от разных продавцов — и пришлите её "
         "адрес.\n\n"
-        "<i>Место считается именно по этому списку. Для каждого товара нужна "
-        "своя страница.</i>",
-        reply_markup=_cancel_kb("pos:menu"))
+        "<i>Место считается именно по этому списку.</i>",
+        _cancel_kb("pos:menu"))
     await callback.answer()
+
+
+_MY_ADS_CACHE: dict[int, list] = {}
+
+
+async def _my_ads(uid: int, reload: bool = False) -> list:
+    """The shop's own listings, as the marketplace reports them."""
+    from api.yoomarket import YooMarketAPI
+    from storage import get_token
+
+    if not reload and _MY_ADS_CACHE.get(uid):
+        return _MY_ADS_CACHE[uid]
+    token = get_token(uid)
+    if not token:
+        return []
+    api = YooMarketAPI(token)
+    try:
+        await api.start()
+        data = await api.get_ads()
+    except Exception as e:
+        logger.warning("my ads for %s: %s", uid, e)
+        return []
+    finally:
+        try:
+            await api.close()
+        except Exception:
+            pass
+    ads = [{"id": str(a.get("id")), "title": str(a.get("title")
+                                                 or a.get("name") or a.get("id"))}
+           for a in (data.get("data") or data.get("items") or []) if a.get("id")]
+    _MY_ADS_CACHE[uid] = ads
+    return ads
+
+
+@router.callback_query(F.data == "pos:addlist")
+async def pos_add_list(callback: CallbackQuery) -> None:
+    await callback.answer("⏳ Загружаю ваши товары...")
+    ads = await _my_ads(callback.from_user.id, reload=True)
+    if not ads:
+        await _pos_edit(
+            callback.message,
+            "❌ Не получил список ваших объявлений. Проверьте токен "
+            "(/start) или добавьте наблюдение по адресу.",
+            _cancel_kb("pos:add"))
+        return
+    from automation.position import MAX_WATCHES, watches
+    s = get_settings(callback.from_user.id)
+    known = {str(w.get("market_id") or "")
+             for w in watches(s.setdefault("promo_position", {}))}
+    b = InlineKeyboardBuilder()
+    for i, ad in enumerate(ads[:40]):
+        mark = "✅ " if ad["id"] in known else ""
+        b.button(text=f"{mark}{ad['title'][:36]}", callback_data=f"pos:addpick:{i}")
+    b.button(text="⬅️ Назад", callback_data="pos:add")
+    b.adjust(1)
+    await _pos_edit(
+        callback.message,
+        f"📦 <b>За каким товаром следить</b>\n\n"
+        f"Ваших объявлений: <b>{len(ads)}</b>"
+        + (f", уже под наблюдением: {len(known & {a['id'] for a in ads})}"
+           if known else "")
+        + f"\nМожно добавить ещё {MAX_WATCHES - len(known)}.\n\n"
+          f"<i>Бот сам найдёт страницу витрины для выбранного товара.</i>",
+        b.as_markup())
+
+
+@router.callback_query(F.data.startswith("pos:addpick:"))
+async def pos_add_pick(callback: CallbackQuery) -> None:
+    """Set a watch up from one of our own listings, end to end.
+
+    Finds the page it appears on, checks that it is really there, and binds the
+    panel record that a promotion will be charged against — the three steps the
+    seller would otherwise do by hand for every listing.
+    """
+    import asyncio
+
+    from automation.market import fetch_listing, find_position, listing_urls_for
+    from automation.position import MAX_WATCHES, new_watch, watches
+    from storage import get_shop_name
+
+    try:
+        idx = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Список устарел", show_alert=True)
+        return
+    ads = await _my_ads(callback.from_user.id)
+    if idx >= len(ads):
+        await callback.answer("Список устарел — откройте заново", show_alert=True)
+        return
+    ad = ads[idx]
+
+    s = get_settings(callback.from_user.id)
+    pp = s.setdefault("promo_position", {})
+    ws = watches(pp)
+    if len(ws) >= MAX_WATCHES:
+        await callback.answer(f"Больше {MAX_WATCHES} товаров не отслеживаю",
+                              show_alert=True)
+        return
+
+    await callback.answer("⏳ Ищу страницу...")
+    await _pos_edit(callback.message,
+                    f"⏳ Ищу, на какой странице витрины стоит "
+                    f"«{_esc(ad['title'][:40])}»...", _cancel_kb("pos:menu"))
+
+    loop = asyncio.get_event_loop()
+    shop = get_shop_name(callback.from_user.id) or ""
+    try:
+        urls = await asyncio.wait_for(
+            loop.run_in_executor(None, listing_urls_for, ad["id"]), timeout=60)
+    except Exception as e:
+        urls = []
+        logger.warning("listing urls for %s: %s", ad["id"], e)
+
+    # Each candidate is asked whether our listing is actually in it — the card
+    # names its game and its section without saying which is which, and a wrong
+    # guess would count the position in the wrong catalogue.
+    chosen, pos, seen = "", 0, 0
+    for url in urls[:4]:
+        try:
+            ok, res = await asyncio.wait_for(
+                loop.run_in_executor(None, fetch_listing, url, shop),
+                timeout=120)
+        except Exception:
+            continue
+        if not ok:
+            continue
+        mine = find_position(res["offers"], ad_id=ad["id"],
+                             title=ad["title"], seller=shop)
+        if mine:
+            chosen, pos, seen = url, int(mine["pos"]), len(res["offers"])
+            break
+
+    if not chosen:
+        b = InlineKeyboardBuilder()
+        b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
+        b.button(text="⬅️ Назад", callback_data="pos:add")
+        b.adjust(1)
+        await _pos_edit(
+            callback.message,
+            f"❔ Не смог сам определить страницу для "
+            f"«{_esc(ad['title'][:40])}».\n\n"
+            + (f"Проверил: {len(urls)} вариант(ов).\n\n" if urls else "")
+            + "Откройте товар на витрине как покупатель и пришлите адрес "
+              "страницы со списком предложений.",
+            b.as_markup())
+        return
+
+    w = new_watch(chosen, title=ad["title"], market_id=ad["id"])
+    w["last_pos"] = pos
+    ws.append(w)
+    pp["watches"] = ws
+    save_settings(callback.from_user.id, s)
+    idx_new = len(ws) - 1
+    bound = await _bind_panel_item(callback.from_user.id, idx_new, ad["title"])
+    s = get_settings(callback.from_user.id)
+    note = (f"✅ Нашёл на <b>{pos}-м месте</b> из {seen}\n"
+            f"Страница: <code>{_esc(_short_url(chosen))}</code>\n{bound}")
+    await _pos_edit(callback.message, _watch_text(s, idx_new, note),
+                    _watch_kb(s, idx_new))
+
+
+async def _bind_panel_item(uid: int, idx: int, title: str) -> str:
+    """Match the watch to the panel record a promotion is charged against.
+
+    The panel's ids are not the marketplace's, so this is a separate lookup;
+    doing it here means the seller does not have to walk a second list to make
+    the watch able to spend.
+    """
+    import asyncio
+
+    from automation.panel import panel_list_items_sync
+    from automation.position import watches
+    from storage import get_panel_creds
+
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
+        return "⚠️ Товар в панели не привязан — нужен вход в «Панель продавца»"
+    loop = asyncio.get_event_loop()
+    try:
+        ok, res = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_list_items_sync, creds["cookies"]),
+            timeout=60)
+    except Exception as e:
+        return f"⚠️ Панель не ответила: {_esc(str(e)[:60])}"
+    if not ok:
+        return f"⚠️ {_esc(str(res)[:100])}"
+
+    def _norm(t):
+        import re as _re
+        return _re.sub(r"[^\w]+", "", str(t or "")).lower()
+
+    want = _norm(title)
+    hit = next((i for i in res if _norm(i.get("title")) == want), None)
+    if hit is None:
+        hit = next((i for i in res
+                    if want and want[:24] in _norm(i.get("title"))), None)
+    if hit is None:
+        return ("⚠️ В панели такого товара не нашёл — привяжите вручную "
+                "кнопкой «🔗 Привязать товар»")
+    s = get_settings(uid)
+    ws = watches(s.setdefault("promo_position", {}))
+    if idx < len(ws):
+        ws[idx]["item_id"] = str(hit.get("id"))
+        save_settings(uid, s)
+    return "🔗 Товар в панели привязан — поднимать есть что"
 
 
 @router.message(SeleniumState.waiting_pos_url)

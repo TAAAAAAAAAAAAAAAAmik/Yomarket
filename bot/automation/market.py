@@ -411,6 +411,75 @@ def category_meta(slugs: list) -> dict:
     return found or body
 
 
+def product_card(market_id: str | int) -> dict:
+    """One listing as the storefront serves it, by its marketplace id."""
+    import requests
+    try:
+        r = requests.get(f"{API_URL}/api/products/{market_id}",
+                         headers=_API_HEADERS, timeout=(6, 20), verify=False)
+        body = r.json() if r.status_code == 200 else {}
+    except Exception as e:
+        logger.info("product card %s: %s", market_id, e)
+        return {}
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        body = body["data"]
+    return body if isinstance(body, dict) else {}
+
+
+def _slug_chain(node, depth: int = 0) -> list:
+    """Category slugs found in a payload, outermost first.
+
+    A card names its section and, inside or beside it, the game it belongs to.
+    Which key holds which is not fixed, so the tree is walked and the slugs are
+    collected in the order they nest.
+    """
+    out: list = []
+    if depth > 6 or not isinstance(node, (dict, list)):
+        return out
+    if isinstance(node, list):
+        for x in node:
+            out.extend(_slug_chain(x, depth + 1))
+        return out
+    slug = node.get("slug")
+    if isinstance(slug, str) and slug and not slug.startswith("http"):
+        out.append(slug)
+    for key in ("parent", "category", "categories", "section", "game",
+                "breadcrumbs", "path", "ancestors"):
+        if key in node:
+            out.extend(_slug_chain(node[key], depth + 1))
+    return out
+
+
+def listing_urls_for(market_id: str | int, card: dict | None = None) -> list:
+    """Storefront addresses a listing of ours could live at, likeliest first.
+
+    Saves the seller from opening the marketplace, finding their own item and
+    copying the address for every listing they want watched — the same work
+    fifteen times over, and the step most easily got wrong.
+
+    Candidates rather than one answer, because the card names its section and
+    its game without saying which is which: a card points at its parent, so the
+    chain usually arrives inside-out, while a breadcrumb arrives the right way
+    round. Guessing would be a coin toss; the caller settles it by asking each
+    address whether our listing is actually in it.
+    """
+    card = card if card is not None else product_card(market_id)
+    if not card:
+        return []
+    own = str(card.get("slug") or "")
+    slugs = [s for s in dict.fromkeys(_slug_chain(card)) if s != own]
+    if not slugs:
+        return []
+    out = []
+    pair = slugs[:2]
+    if len(pair) == 2:
+        out.append(f"{MARKET_URL}/categories/" + "/".join(reversed(pair)))
+        out.append(f"{MARKET_URL}/categories/" + "/".join(pair))
+    for one in slugs[:2]:
+        out.append(f"{MARKET_URL}/categories/{one}")
+    return list(dict.fromkeys(out))
+
+
 def listing_query(url: str) -> dict:
     """The API query a storefront address stands for.
 
