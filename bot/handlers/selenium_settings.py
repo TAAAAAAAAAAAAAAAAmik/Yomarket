@@ -616,7 +616,7 @@ async def _pos_probe(uid: int, idx: int, message=None) -> str:
     """
     import asyncio
 
-    from automation.market import fetch_offers_sync, find_position
+    from automation.market import fetch_listing, find_position
     from automation.position import watches
     from storage import get_shop_name
 
@@ -625,6 +625,7 @@ async def _pos_probe(uid: int, idx: int, message=None) -> str:
     if idx >= len(ws):
         return ""
     w = ws[idx]
+    shop = get_shop_name(uid) or ""
     if message:
         try:
             await message.answer("⏳ Открываю страницу...")
@@ -633,14 +634,14 @@ async def _pos_probe(uid: int, idx: int, message=None) -> str:
     loop = asyncio.get_event_loop()
     try:
         ok, res = await asyncio.wait_for(
-            loop.run_in_executor(None, fetch_offers_sync, w["url"]), timeout=60)
+            loop.run_in_executor(None, fetch_listing, w["url"], shop),
+            timeout=120)
     except Exception as e:
         return f"⚠️ Страница не открылась: {_esc(str(e)[:120])}"
     if not ok:
         return f"⚠️ {_esc(str(res)[:200])}"
 
     offers = res["offers"]
-    shop = get_shop_name(uid) or ""
     mine = find_position(offers, seller=shop) if shop else None
     if not mine:
         return (f"⚠️ Нашёл {len(offers)} предложений, но вашего магазина "
@@ -792,7 +793,7 @@ async def _pos_report(uid: int, idx: int) -> str:
     """The standings on one watched page, as the seller sees them."""
     import asyncio
 
-    from automation.market import cheapest, fetch_offers_sync, find_position
+    from automation.market import cheapest, fetch_listing, find_position
     from automation.position import watches
     from storage import get_shop_name
 
@@ -801,17 +802,18 @@ async def _pos_report(uid: int, idx: int) -> str:
     if idx >= len(ws):
         return "Наблюдение удалено."
     w = ws[idx]
+    shop = get_shop_name(uid) or ""
     loop = asyncio.get_event_loop()
     try:
         ok, res = await asyncio.wait_for(
-            loop.run_in_executor(None, fetch_offers_sync, w["url"]), timeout=60)
+            loop.run_in_executor(None, fetch_listing, w["url"], shop),
+            timeout=120)
     except Exception as e:
         return f"❌ Страница не открылась: {_esc(str(e)[:200])}"
     if not ok:
         return f"❌ {_esc(str(res)[:400])}"
 
     offers = res["offers"]
-    shop = get_shop_name(uid) or ""
     mine = find_position(offers, ad_id=str(w.get("market_id") or ""),
                          title=str(w.get("title") or ""), seller=shop)
     thr = int(w.get("max_position") or 3)

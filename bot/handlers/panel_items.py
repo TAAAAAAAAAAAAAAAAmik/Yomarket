@@ -1254,8 +1254,9 @@ def _pos_raw_sync(url: str, shop: str) -> str:
     from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
     from automation.market import (MARKET_URL, _json_blobs, _normalize,
-                                   _offer_lists, _offers_from_text,
-                                   _visible_text, find_position)
+                                   _offer_lists, _offers_from_text, _offers_in,
+                                   _seller_of, _visible_text, find_position,
+                                   get_page, with_page)
 
     requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
     if not url.startswith("http"):
@@ -1313,6 +1314,23 @@ def _pos_raw_sync(url: str, shop: str) -> str:
         r'|infinite|IntersectionObserver|useInfiniteQuery|hasNextPage)', html)))
     out.append("признаки подгрузки порциями: "
                + (", ".join(lazy[:8]) if lazy else "не вижу"))
+
+    # Does ?page=2 actually give a different listing? If it comes back
+    # identical, positions past the first screen have to be reached some other
+    # way, and no amount of parsing the first page would tell us that.
+    ok2, html2 = get_page(with_page(url, 2))
+    if ok2:
+        rows2, _ = (_offers_in(html2) if lists else
+                    (_offers_from_text(html2), ""))
+        first_of = lambda rr: ", ".join(  # noqa: E731
+            (_seller_of(x) if isinstance(x, dict) else "")[:12] for x in rr[:4])
+        out.append(f"страница 2: {len(html2)}б, карточек: {len(rows2)}, "
+                   f"начало: {first_of(rows2) or '—'}")
+        out.append("  → " + ("та же страница, page= не работает"
+                             if first_of(rows2) == first_of(rows)
+                             else "другая — постраничное чтение работает"))
+    else:
+        out.append(f"страница 2: {html2[:80]}")
 
     # 4. What the payload around our shop looks like — the shape to parse
     if shop and shop in html:
@@ -1374,7 +1392,7 @@ async def _pos_debug_watches(message: Message) -> None:
     import html as _html
     import time as _time
 
-    from automation.market import fetch_offers_sync
+    from automation.market import fetch_listing
     from automation.position import evaluate, is_due, watches
     from storage import get_settings, get_shop_name
 
@@ -1406,8 +1424,9 @@ async def _pos_debug_watches(message: Message) -> None:
                    f"по расписанию: {'да' if is_due(w, pp, now) else 'ещё рано'}")
         try:
             ok, res = await asyncio.wait_for(
-                loop.run_in_executor(None, fetch_offers_sync, w.get("url", "")),
-                timeout=60)
+                loop.run_in_executor(None, fetch_listing, w.get("url", ""),
+                                     shop),
+                timeout=120)
         except Exception as e:
             ok, res = False, str(e)[:120]
         if not ok:
@@ -1449,7 +1468,7 @@ async def pos_debug(message: Message) -> None:
 
     import html as _html
 
-    from automation.market import cheapest, fetch_offers_sync, find_position
+    from automation.market import cheapest, fetch_listing, find_position
     from storage import get_shop_name
 
     shop = get_shop_name(message.from_user.id) or ""
@@ -1457,7 +1476,7 @@ async def pos_debug(message: Message) -> None:
     try:
         loop = asyncio.get_event_loop()
         ok, res = await asyncio.wait_for(
-            loop.run_in_executor(None, fetch_offers_sync, url), timeout=60)
+            loop.run_in_executor(None, fetch_listing, url, shop), timeout=120)
     except Exception as e:
         ok, res = False, str(e)[:200]
     if not ok:

@@ -203,9 +203,12 @@ def _seller_of(node) -> str:
 _STRIP_TAGS = re.compile(r"<(script|style|noscript)\b.*?</\1>", re.S | re.I)
 _TAG = re.compile(r"<[^>]+>")
 # «GadjiSeller 4.97 · 1 620 отзывов» — name, rating, review count.
+# The star is excluded from the name rather than merely allowed to precede it:
+# a one-character shop name used to come back as «★», because the lazy capture
+# had to give its minimum of two characters to something.
 _CARD_TAIL = re.compile(
-    r"([^\n·•|]{2,40}?)\s*★?\s*(\d(?:[.,]\d+)?)\s*[·•]\s*([\d\s  ]+)\s*отзыв",
-    re.I)
+    r"([^\n·•|★☆]{1,40}?)\s*[★☆]?\s*(\d(?:[.,]\d+)?)"
+    r"\s*[·•]\s*([\d\s  ]+)\s*отзыв", re.I)
 _PRICE_TEXT = re.compile(r"(\d[\d\s  ]*(?:[.,]\d{1,2})?)\s*₽")
 
 
@@ -292,12 +295,16 @@ def _normalize(offers: list) -> list[dict]:
     return rows
 
 
-def fetch_offers_sync(url: str) -> tuple[bool, object]:
-    """Blocking: the offers on a storefront page, in the order shown.
+_BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+}
 
-    Returns (True, {"offers": [{pos,id,title,price,seller}], "note": str}) or
-    (False, error). Read-only and unauthenticated — this is the public page.
-    """
+
+def get_page(url: str) -> tuple[bool, str]:
+    """Blocking: fetch one storefront page. (True, html) or (False, error)."""
     import requests
     from requests.packages.urllib3.exceptions import InsecureRequestWarning
     requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
@@ -305,43 +312,124 @@ def fetch_offers_sync(url: str) -> tuple[bool, object]:
     if not url.startswith("http"):
         url = MARKET_URL + ("" if url.startswith("/") else "/") + url
     try:
-        r = requests.get(url, timeout=(6, 20), verify=False, headers={
-            "User-Agent": ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
-                           "(KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"),
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "ru-RU,ru;q=0.9",
-        })
+        r = requests.get(url, timeout=(6, 20), verify=False,
+                         headers=_BROWSER_HEADERS)
     except Exception as e:
         return False, f"страница не открылась: {str(e)[:100]}"
     if r.status_code != 200:
         return False, f"HTTP {r.status_code}"
+    return True, r.text
 
-    html = r.text
-    blobs = _json_blobs(html)
+
+def with_page(url: str, n: int) -> str:
+    """The same listing, page n — keeping every filter already in the address.
+
+    The seller's own address carries a search: …/virty?keyword=3.000.000. Naive
+    string concatenation would either drop that or produce a second '?', and
+    either way the page that comes back is a different listing than the one
+    being watched.
+    """
+    from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+    parts = urlparse(url if url.startswith("http") else MARKET_URL + url)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if k != "page"]
+    query.append(("page", str(n)))
+    return urlunparse(parts._replace(query=urlencode(query)))
+
+
+def _offers_in(html: str) -> tuple[list, str]:
+    """(raw offer rows, how they were found) for one page's HTML."""
     lists = []
-    for blob in blobs:
+    for blob in _json_blobs(html):
         lists.extend(_offer_lists(blob))
     if lists:
         # The longest list is the page's own listing; shorter ones are usually
         # "similar" or "recommended" blocks.
-        best = max(lists, key=len)
-        return True, {"offers": _normalize(best),
-                      "note": f"json, {len(html)}б, кандидатов: {len(lists)}"}
+        return max(lists, key=len), "json"
+    return _offers_from_text(html), "разметка"
 
-    # No usable payload — read what the page actually shows instead.
-    rows = _offers_from_text(html)
-    if rows:
-        return True, {"offers": _normalize(rows),
-                      "note": f"разметка, {len(html)}б, карточек: {len(rows)}"}
 
-    # Say which of the two ways failed and how far it got: "не нашёл список"
-    # alone gave nothing to act on, and the page cannot be looked at from here.
-    return False, (
-        f"на странице не нашёл список предложений. "
-        f"HTML {len(html)}б, JSON-блоков: {len(blobs)}, "
-        f"списков в них: 0, карточек в разметке: 0. "
-        f"Пришлите вывод /pos_raw для этого адреса — покажет, где лежат данные.")
+def _signature(rows: list) -> tuple:
+    """Enough of a page to tell it apart from the one before it."""
+    out = []
+    for o in rows[:6]:
+        if isinstance(o, dict):
+            out.append((_seller_of(o)[:20], str(_num(o.get("price")))))
+    return tuple(out)
 
+
+def fetch_offers_sync(url: str, *, max_pages: int = 1,
+                      want_seller: str = "") -> tuple[bool, object]:
+    """Blocking: the offers on a storefront listing, in the order shown.
+
+    Returns (True, {"offers": [{pos,id,title,price,seller}], "note": str}) or
+    (False, error). Read-only and unauthenticated — this is the public page.
+
+    With `max_pages` > 1 the following pages are read too and the positions run
+    straight through them. That is the difference between a real answer and a
+    reassuring one: the seller had to scroll past the first screen to find their
+    own card, so a listing read one page deep would either miss them or — worse
+    — report a place counted within a fragment. Reading stops as soon as
+    `want_seller` is found, so the usual check is still a single request.
+    """
+    ok, first = get_page(url)
+    if not ok:
+        return False, first
+    html = first
+    rows, how = _offers_in(html)
+    if not rows:
+        # Say which of the two ways failed and how far it got: "не нашёл
+        # список" alone gave nothing to act on, and the page cannot be looked
+        # at from here.
+        return False, (
+            f"на странице не нашёл список предложений. "
+            f"HTML {len(html)}б, JSON-блоков: {len(_json_blobs(html))}, "
+            f"списков в них: 0, карточек в разметке: 0. "
+            f"Пришлите вывод /pos_raw для этого адреса — покажет, где данные.")
+
+    all_rows = list(rows)
+    seen = {_signature(rows)}
+    pages_read = 1
+    per_page = len(rows)
+    while (max_pages > 1 and pages_read < max_pages
+           and want_seller
+           and not find_position(_normalize(all_rows), seller=want_seller)):
+        ok, more_html = get_page(with_page(url, pages_read + 1))
+        if not ok:
+            break
+        more, _how = _offers_in(more_html)
+        if not more:
+            break
+        sig = _signature(more)
+        if sig in seen:
+            # The page parameter did nothing — the same listing came back.
+            # Continuing would count the first page twice and inflate every
+            # position below it.
+            break
+        seen.add(sig)
+        all_rows.extend(more)
+        pages_read += 1
+        if len(more) < per_page:
+            break                       # a short page is the last one
+
+    note = f"{how}, {len(html)}б, карточек: {len(all_rows)}"
+    if pages_read > 1:
+        note += f", страниц: {pages_read}"
+    return True, {"offers": _normalize(all_rows), "note": note}
+
+
+
+# How many pages of a listing to read before giving up on finding ourselves.
+# The seller's own address is a search inside a category and their card sits
+# well past the first screen, so one page is not an answer — but each page is a
+# request, so the walk stops the moment the shop is found.
+MAX_LIST_PAGES = 6
+
+
+def fetch_listing(url: str, shop: str = ""):
+    """fetch_offers_sync tuned for finding one shop in a long listing."""
+    return fetch_offers_sync(url, max_pages=MAX_LIST_PAGES if shop else 1,
+                             want_seller=shop)
 
 def _norm(s: str) -> str:
     return re.sub(r"[^\w]+", "", str(s or "")).lower()

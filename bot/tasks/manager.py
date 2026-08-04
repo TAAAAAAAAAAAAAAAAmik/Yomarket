@@ -1362,7 +1362,7 @@ class TaskManager:
         switched that on — and even then the cooldown and the daily cap in
         automation/position.py stand between a bad day and an empty card.
         """
-        from automation.market import fetch_offers_sync
+        from automation.market import fetch_listing
         from automation.position import (evaluate, is_due, note_promotion,
                                          watches)
         from storage import get_shop_name
@@ -1385,8 +1385,8 @@ class TaskManager:
             checked += 1
             try:
                 ok, res = await asyncio.wait_for(
-                    loop.run_in_executor(None, fetch_offers_sync, url),
-                    timeout=60)
+                    loop.run_in_executor(None, fetch_listing, url, shop),
+                    timeout=120)
             except Exception as e:
                 logger.warning("position check for %s: %s", user_id, e)
                 ok, res = False, str(e)[:120]

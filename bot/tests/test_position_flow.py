@@ -88,7 +88,7 @@ class FlowCase(unittest.TestCase):
         self.patch(storage, "get_shop_name", lambda uid: "Спайк")
         self.patch(S, "get_settings", self._load)
         self.patch(S, "save_settings", self._save)
-        self.patch(M, "fetch_offers_sync", lambda url: (True, PAGE))
+        self.patch(M, "fetch_listing", lambda url, shop="": (True, PAGE))
 
     # Copies on the way in and out, like the real store: settings live in the
     # database, so a handler that mutates its dict and forgets to save changes
@@ -139,7 +139,7 @@ class AddingAWatch(FlowCase):
                         msg.sent)
 
     def test_an_unreadable_page_still_saves_the_watch_with_the_reason(self):
-        self.patch(M, "fetch_offers_sync", lambda url: (False, "HTTP 503"))
+        self.patch(M, "fetch_listing", lambda url, shop="": (False, "HTTP 503"))
         msg = FakeMessage("https://yoomarket.net/p/1")
         self.run_(S.pos_url_save(msg, FakeState()))
         self.assertEqual(len(self.watches()), 1)

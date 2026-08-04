@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import unittest
 
@@ -281,6 +282,120 @@ class TheRealListing(unittest.TestCase):
 def find_position_(rows, **kw):
     from automation.market import find_position
     return find_position(rows, **kw)
+
+
+class Paging(unittest.TestCase):
+    """Reading past the first screen — where a wrong number costs money.
+
+    The seller's own address is a search inside a category
+    (…/virty?keyword=3.000.000), and their card is far enough down that the
+    first page may not contain it at all.
+    """
+
+    def setUp(self):
+        import requests
+        self.requested: list[str] = []
+        self._old = requests.get
+        self.pages: dict[int, str] = {}
+
+        class R:
+            status_code = 200
+            headers = {"content-type": "text/html"}
+
+            def __init__(self, text):
+                self.text = text
+
+        def fake(url, **kw):
+            self.requested.append(url)
+            n = 1
+            if "page=" in url:
+                n = int(re.search(r"page=(\d+)", url).group(1))
+            return R(self.pages.get(n, self.pages[max(self.pages)]))
+
+        requests.get = fake
+
+    def tearDown(self):
+        import requests
+        requests.get = self._old
+
+    @staticmethod
+    def _page(shops: list[str]) -> str:
+        return ("<html><body>" + "".join(
+            CARD.format(id=i, title=f"Лот {s}", badge="", price=str(200 + i),
+                        old="", shop=s, rating="4.8", reviews=str(50 + i))
+            for i, s in enumerate(shops)) + "</body></html>")
+
+    URL = "https://yoomarket.net/categories/black-russia/virty?keyword=3.000.000"
+
+    def test_the_search_in_the_address_survives_paging(self):
+        self.assertEqual(
+            M.with_page(self.URL, 3),
+            "https://yoomarket.net/categories/black-russia/virty"
+            "?keyword=3.000.000&page=3")
+
+    def test_an_existing_page_parameter_is_replaced_not_repeated(self):
+        self.assertEqual(M.with_page(self.URL + "&page=2", 5).count("page="), 1)
+
+    def test_position_runs_through_the_pages(self):
+        self.pages = {1: self._page(["A", "B", "C", "D"]),
+                      2: self._page(["E", "F", "Spike", "G"])}
+        ok, res = M.fetch_offers_sync(self.URL, max_pages=4,
+                                      want_seller="Spike")
+        self.assertTrue(ok)
+        spike = find_position_(res["offers"], seller="Spike")
+        self.assertEqual(spike["pos"], 7, "position must not restart per page")
+        self.assertIn("страниц: 2", res["note"])
+
+    def test_reading_stops_as_soon_as_we_are_found(self):
+        self.pages = {1: self._page(["A", "Spike", "C", "D"]),
+                      2: self._page(["E", "F", "G", "H"])}
+        M.fetch_offers_sync(self.URL, max_pages=5, want_seller="Spike")
+        self.assertEqual(len(self.requested), 1,
+                         "found on page 1 — must not fetch more")
+
+    def test_a_page_parameter_the_site_ignores_does_not_double_count(self):
+        """If ?page=2 returns page 1 again, positions would inflate forever."""
+        same = self._page(["A", "B", "C", "D"])
+        self.pages = {1: same, 2: same, 3: same}
+        ok, res = M.fetch_offers_sync(self.URL, max_pages=5,
+                                      want_seller="Spike")
+        self.assertTrue(ok)
+        self.assertEqual(len(res["offers"]), 4)
+        self.assertNotIn("страниц", res["note"])
+
+    def test_a_short_page_ends_the_walk(self):
+        self.pages = {1: self._page(["A", "B", "C", "D"]),
+                      2: self._page(["E", "F", "G"]),
+                      3: self._page(["H", "I", "J"])}
+        ok, res = M.fetch_offers_sync(self.URL, max_pages=9,
+                                      want_seller="Spike")
+        self.assertEqual(len(res["offers"]), 7)
+        self.assertEqual(len(self.requested), 2)
+
+    def test_one_page_by_default(self):
+        self.pages = {1: self._page(["A", "B", "C", "D"]),
+                      2: self._page(["E", "F", "Spike", "G"])}
+        ok, res = M.fetch_offers_sync(self.URL)
+        self.assertEqual(len(self.requested), 1)
+        self.assertIsNone(find_position_(res["offers"], seller="Spike"))
+
+    def test_a_failure_on_page_two_keeps_what_page_one_gave(self):
+        import requests
+        self.pages = {1: self._page(["A", "B", "C", "D"])}
+        calls = {"n": 0}
+        old = requests.get
+
+        def flaky(url, **kw):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise OSError("сеть отвалилась")
+            return old(url, **kw)
+
+        requests.get = flaky
+        ok, res = M.fetch_offers_sync(self.URL, max_pages=3,
+                                      want_seller="Spike")
+        self.assertTrue(ok, "one good page is still an answer")
+        self.assertEqual(len(res["offers"]), 4)
 
 
 class Balanced(unittest.TestCase):
