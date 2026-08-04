@@ -80,10 +80,13 @@ class Harness:
         tm._notify = notify
         return tm
 
-    def ask(self, order_id, title, chat_id="c1"):
+    def ask(self, order_id, title, chat_id="c1", status="paid"):
+        # Статус по умолчанию — оплаченный: эти проверки о том, узнаёт ли бот
+        # заказ со звёздами, а не о том, дошли ли деньги. Отказ выдавать
+        # неоплаченный заказ проверяется отдельно.
         tm = self.manager()
         return asyncio.run(tm._maybe_ask_stars_username(
-            None, self.settings, order_id, title, chat_id))
+            None, self.settings, order_id, title, chat_id, status))
 
     def reply(self, order_id, text, chat_id="c1"):
         tm = self.manager()

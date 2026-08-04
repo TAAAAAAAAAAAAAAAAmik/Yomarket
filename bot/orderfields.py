@@ -252,6 +252,28 @@ def status_icon(raw: str) -> str:
 
 DONE = ("success", "completed", "complete", "done", "confirmed", "closed",
         "delivered")
+
+# Деньги за заказ уже у маркетплейса — товар выдавать можно.
+PAID = ("paid", "work", "working", "processing", "delivered", "success",
+        "completed", "complete", "done", "confirmed", "closed")
+# Заказ создан, но не оплачен. Панель на такой прямо предупреждает: «Не
+# выдавайте товар — дождитесь оплаты».
+UNPAID = ("new", "created", "pending", "hold", "cart", "draft", "unpaid",
+          "await", "awaiting", "wait")
+
+
+def is_paid(status) -> bool:
+    """Оплачен ли заказ. Незнакомый статус оплаченным не считается.
+
+    Выдавать товар по догадке нельзя: ошибка в эту сторону — подарок за счёт
+    продавца, ошибка в другую — всего лишь задержка до следующего прохода.
+    """
+    key = str(status or "").strip().lower()
+    if not key:
+        return False
+    if key in UNPAID:
+        return False
+    return key in PAID
 BACK = ("refunded", "returned", "refund", "cancelled", "canceled", "rejected",
         "failed", "expired")
 

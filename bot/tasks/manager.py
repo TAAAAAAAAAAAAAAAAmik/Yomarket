@@ -1001,7 +1001,7 @@ class TaskManager:
                         _ar_log(settings, chat_id, msg, ok, err, "новый заказ")
                     # AutoStars: ask the buyer for their @username in chat
                     await self._maybe_ask_stars_username(
-                        api, settings, oid, title, chat_id)
+                        api, settings, oid, title, chat_id, status)
 
                 elif prev_status != status and status in ("confirmed", "completed", "done"):
                     ev = ae.get("on_confirmed", {})
@@ -1047,6 +1047,14 @@ class TaskManager:
                                f"🧾 <code>#{oid}</code>   📊 {_status_ru(status)}"]),
                         reply_markup=_order_notify_kb(oid, chat_id),
                     )
+
+                # Оплата могла прийти позже создания заказа: заказ увидели
+                # неоплаченным, выдачу не начинали, а теперь деньги дошли.
+                if prev_status is not None and prev_status != status:
+                    from orderfields import is_paid as _is_paid
+                    if _is_paid(status) and not _is_paid(prev_status):
+                        await self._maybe_ask_stars_username(
+                            api, settings, oid, title, chat_id, status)
 
                 known[oid] = status
 
@@ -1478,14 +1486,22 @@ class TaskManager:
 
     async def _maybe_ask_stars_username(
         self, api: YooMarketAPI, settings: dict,
-        order_id: str, title: str, chat_id: str,
+        order_id: str, title: str, chat_id: str, status: str = "",
     ) -> None:
         from automation.stars import is_stars_order, star_quantity
+        from orderfields import is_paid
 
         p = settings.get("plugins", {}).get("auto_stars", {})
         if not p.get("enabled") or not p.get("ask_username", True):
             return
         if not is_stars_order(title, p.get("keyword") or ""):
+            return
+        # Заказ «Создан (не оплачен)» — деньги ещё не пришли. Панель на такой
+        # прямо предупреждает «не выдавайте товар», а бот начинал выдачу с
+        # первого же появления заказа, независимо от статуса. Спросим ник,
+        # когда оплата дойдёт: статус меняется — проход это увидит.
+        if not is_paid(status):
+            logger.info("AutoStars: order %s not paid yet (%s)", order_id, status)
             return
         pending: dict = p.setdefault("pending", {})
         delivered: list = p.setdefault("delivered", [])
@@ -1527,6 +1543,33 @@ class TaskManager:
             return True
 
         qty = int(entry.get("quantity", p.get("amount", 50)))
+
+        # Последняя проверка оплаты — прямо перед тем, как тратить деньги.
+        # Между вопросом и ответом покупателя заказ могли отменить или он мог
+        # так и остаться неоплаченным; звёзды после этого уже не вернуть.
+        from orderfields import describe as _describe, is_paid
+        try:
+            fresh = await api.get_order(order_id)
+            node = (fresh.get("data") if isinstance(fresh, dict)
+                    and isinstance(fresh.get("data"), dict) else fresh)
+            status_now = _describe(node if isinstance(node, dict) else {})["status"]
+        except Exception as e:
+            logger.warning("AutoStars: order %s status check: %s", order_id, e)
+            status_now = ""
+        if status_now and not is_paid(status_now):
+            await self._send_chat(
+                api, chat_id,
+                "⏳ Заказ ещё не оплачен. Как только оплата пройдёт, "
+                "звёзды придут автоматически.", settings)
+            await self._notify(
+                user_id,
+                _card("⭐ <b>ЗВЁЗДЫ НЕ ВЫДАНЫ</b>",
+                      [f"Заказ #{_esc(order_id)}, @{_esc(username)}, {qty}⭐",
+                       "",
+                       f"Статус заказа: <b>{_status_ru(status_now)}</b>.",
+                       "Выдача не запускалась — деньги за заказ не поступили."]))
+            return True
+
         # Deliver via Fragment in a thread
         from automation.fragment import buy_stars_sync
         from storage import get_fragment_creds
