@@ -216,6 +216,24 @@ _BACK_STATUSES = ("refunded", "cancelled", "returned")
 # the report and the «Статистика» screen cannot disagree about a day.
 
 
+def _ar_context(details: dict | None, order_id: str, settings: dict) -> dict:
+    """Данные заказа для подстановок вида {товар} в автоответе."""
+    from autoreply import context
+    return context(details, order_id, settings.get("shop_name", ""))
+
+
+def _ar_log(settings: dict, chat_id: str, text: str, ok: bool, err: str,
+            rule: str) -> None:
+    """Записать отправку автоответа в журнал, который видно в боте.
+
+    Событийные автоответы (новый заказ, выполнен, возврат) отправлялись «в
+    никуда»: провал попадал только в логи контейнера. Журнал у них общий с
+    ответами на сообщения — продавцу неважно, какой механизм промолчал.
+    """
+    from autoreply import cfg, log
+    log(cfg(settings), chat_id=chat_id, text=text, ok=ok, err=err, rule=rule)
+
+
 def _today_stats(order_details: dict, known_orders: dict) -> tuple[int, int]:
     """(orders today, revenue today ₽) from locally tracked order details.
 
@@ -754,8 +772,12 @@ class TaskManager:
                             reply_markup=_order_notify_kb(oid, chat_id),
                         )
                     if ar.get("enabled"):
-                        msg = self._pick_message(title, ar.get("message", "Спасибо за заказ!"), rules, responders_map)
-                        await self._send_chat(api, chat_id, msg)
+                        msg = self._pick_message(
+                            title, ar.get("message", "Спасибо за заказ!"),
+                            rules, responders_map,
+                            _ar_context(order_details.get(oid), oid, settings))
+                        ok, err = await self._send_chat(api, chat_id, msg)
+                        _ar_log(settings, chat_id, msg, ok, err, "новый заказ")
                     # AutoStars: ask the buyer for their @username in chat
                     await self._maybe_ask_stars_username(
                         api, settings, oid, title, chat_id)
@@ -763,8 +785,12 @@ class TaskManager:
                 elif prev_status != status and status in ("confirmed", "completed", "done"):
                     ev = ae.get("on_confirmed", {})
                     if ev.get("enabled"):
-                        msg = self._pick_message(title, ev.get("message", "Заказ подтверждён!"), rules, responders_map)
-                        await self._send_chat(api, chat_id, msg)
+                        msg = self._pick_message(
+                            title, ev.get("message", "Заказ подтверждён!"),
+                            rules, responders_map,
+                            _ar_context(order_details.get(oid), oid, settings))
+                        ok, err = await self._send_chat(api, chat_id, msg)
+                        _ar_log(settings, chat_id, msg, ok, err, "заказ выполнен")
                     cnt_today, rev_today = _today_stats(order_details, known)
                     buyer_line = _esc(f"👤 {buyer}" + (f" ({username})" if username else ""))
                     await self._notify(
@@ -783,8 +809,12 @@ class TaskManager:
                 elif prev_status != status and status in ("refunded", "cancelled", "returned"):
                     ev = ae.get("on_refunded", {})
                     if ev.get("enabled"):
-                        msg = self._pick_message(title, ev.get("message", "Возврат оформлен."), rules, responders_map)
-                        await self._send_chat(api, chat_id, msg)
+                        msg = self._pick_message(
+                            title, ev.get("message", "Возврат оформлен."),
+                            rules, responders_map,
+                            _ar_context(order_details.get(oid), oid, settings))
+                        ok, err = await self._send_chat(api, chat_id, msg)
+                        _ar_log(settings, chat_id, msg, ok, err, "возврат")
                     buyer_line = _esc(f"👤 {buyer}" + (f" ({username})" if username else ""))
                     await self._notify(
                         user_id,
@@ -960,8 +990,10 @@ class TaskManager:
                         continue
 
                     # Complaint detection → distinct high-priority alert
+                    is_complaint = _is_complaint_text(raw_text)
+                    alerted = False
                     cn = settings.get("complaint_notify", {"enabled": True})
-                    if cn.get("enabled", True) and _is_complaint_text(raw_text):
+                    if cn.get("enabled", True) and is_complaint:
                         seen = cn.setdefault("seen", [])
                         mark = f"{order_id}:{msg_id}"
                         if mark not in seen:
@@ -969,6 +1001,7 @@ class TaskManager:
                             if len(seen) > 500:
                                 del seen[:250]
                             settings["complaint_notify"] = cn
+                            alerted = True
                             await self._notify(
                                 user_id,
                                 _card("🚨 <b>ЖАЛОБА КЛИЕНТА</b>",
@@ -980,12 +1013,12 @@ class TaskManager:
                                       f"{order_line}\n🧾 <code>#{order_id}</code>"),
                                 reply_markup=_message_notify_kb(chat_id, order_id),
                             )
-                            continue
 
                     # A complaint is an alert, not chat traffic, and is sent
                     # above regardless — this switch only silences ordinary
                     # buyer messages.
-                    if settings.get("notify_messages", {}).get("enabled", True):
+                    if not alerted and settings.get(
+                            "notify_messages", {}).get("enabled", True):
                         await self._notify(
                             user_id,
                             _card("💬 <b>СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ</b>",
@@ -995,6 +1028,14 @@ class TaskManager:
                                   f"{order_line}\n🧾 <code>#{order_id}</code>"),
                             reply_markup=_message_notify_kb(chat_id, order_id),
                         )
+
+                    # Уведомить продавца — половина дела; покупателю нужен
+                    # ответ. Отправляется после уведомления, чтобы продавец
+                    # видел и вопрос, и то, что бот на него ответил.
+                    await self._auto_answer(
+                        user_id, api, settings, chat_id=chat_id,
+                        order_id=order_id, text=raw_text, details=details,
+                        is_complaint=is_complaint)
 
                 known_messages[order_id] = newest_id
 
@@ -1256,23 +1297,95 @@ class TaskManager:
             )
         return True
 
-    def _pick_message(self, title: str, default: str, rules: list[dict], responders: dict | None = None) -> str:
-        title_lower = title.lower()
-        if responders:
-            for game_name, message in responders.items():
-                if game_name.lower() in title_lower:
-                    return message
-        for rule in rules:
-            kw = rule.get("keyword", "").lower()
-            if kw and kw in title_lower:
-                return rule.get("message", default)
-        return default
+    def _pick_message(self, title: str, default: str, rules: list[dict],
+                      responders: dict | None = None,
+                      ctx: dict | None = None) -> str:
+        """Текст автоответа для товара с таким заголовком.
 
-    async def _send_chat(self, api: YooMarketAPI, chat_id: str, text: str) -> None:
+        Побеждает самое длинное совпадение, а не первое по порядку словаря:
+        автоответчик для «Steam» перехватывал заказы «Steam Deck», хотя для них
+        был заведён свой, — просто потому, что его добавили раньше.
+        """
+        from autoreply import render
+        title_lower = (title or "").lower()
+        best: tuple[int, str] | None = None
+        for game_name, message in (responders or {}).items():
+            key = str(game_name).lower()
+            if key and key in title_lower and (best is None or len(key) > best[0]):
+                best = (len(key), str(message))
+        for rule in rules or []:
+            kw = str(rule.get("keyword", "")).lower()
+            if kw and kw in title_lower and (best is None or len(kw) > best[0]):
+                best = (len(kw), str(rule.get("message", default)))
+        return render(best[1] if best else default, ctx)
+
+    async def _send_chat(self, api: YooMarketAPI, chat_id: str,
+                         text: str) -> tuple[bool, str]:
+        """Отправить сообщение в чат заказа → (получилось, причина).
+
+        Раньше провал уходил только в логи контейнера: покупатель не получал
+        ничего, а продавец был уверен, что автоответ работает. Результат
+        возвращается, и вызывающий его показывает.
+        """
+        if not (text or "").strip():
+            return False, "пустой текст"
         try:
             await api.send_message(chat_id, text)
+            return True, ""
         except Exception as e:
             logger.warning("Auto chat send failed (chat %s): %s", chat_id, e)
+            return False, str(e)[:150] or type(e).__name__
+
+    async def _auto_answer(self, user_id: int, api: YooMarketAPI, settings: dict,
+                           *, chat_id: str, order_id: str, text: str,
+                           details: dict, is_complaint: bool) -> None:
+        """Ответить покупателю на его сообщение, если есть чем и можно.
+
+        Бот присылал продавцу уведомление и молчал в чате — ночью покупатель
+        ждал до утра. Здесь тот же подбор правил, что показывает экран
+        «🧪 Проверка», так что настроенное и отправленное совпадают.
+        """
+        import autoreply as ar
+
+        conf = ar.cfg(settings)
+        if not conf.get("enabled"):
+            return
+        if is_complaint and not conf.get("reply_to_complaints"):
+            return          # на жалобу шаблон отвечать не должен — нужен человек
+
+        rule, matched = ar.pick(conf, text)
+        if not rule:
+            return
+        allowed, why = ar.gate(conf, chat_id)
+        if not allowed:
+            logger.info("autoreply skipped (chat %s): %s", chat_id, why)
+            return
+
+        body = ar.render(rule.get("text", ""),
+                         ar.context(details, order_id,
+                                    settings.get("shop_name", "")))
+        ok, err = await self._send_chat(api, chat_id, body)
+        ar.log(conf, chat_id=chat_id, text=body, ok=ok, err=err,
+               rule=matched or ("запасной" if rule.get("id") == "fallback" else ""))
+        if ok:
+            ar.note_sent(conf, chat_id)
+            if rule.get("id") != "fallback":
+                rule["hits"] = int(rule.get("hits", 0) or 0) + 1
+        else:
+            # Молчаливый провал — худший исход: продавец считает, что покупателю
+            # ответили. Сообщаем, но не чаще раза в час, чтобы упавшее API не
+            # превратилось в поток уведомлений.
+            now = time.time()
+            if now - float(conf.get("last_fail_notice", 0) or 0) > 3600:
+                conf["last_fail_notice"] = now
+                await self._notify(
+                    user_id,
+                    _card("⚠️ <b>АВТООТВЕТ НЕ ДОШЁЛ</b>",
+                          [f"💬 Чат <code>{_esc(chat_id)}</code>",
+                           f"❌ {_esc(err)}",
+                           "",
+                           "Покупателю ничего не отправлено — ответьте вручную."]),
+                    reply_markup=_message_notify_kb(chat_id, order_id))
 
     async def _panel_bump(self, user_id: int, api: YooMarketAPI | None = None,
                           ) -> tuple[int, str]:

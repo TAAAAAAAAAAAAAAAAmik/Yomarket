@@ -34,8 +34,21 @@ def _auto_text(s: dict) -> str:
 
     lines = ["⚙️ <b>Авто-функции</b>\n"]
 
+    # Ответы на сообщения покупателя — то, ради чего продавцы включают бота
+    # ночью; показываем первыми и с числом правил, чтобы включённый, но пустой
+    # автоответчик не выглядел работающим.
+    conf = s.get("autoreplies", {})
+    ans_on = conf.get("enabled", False)
+    live = [r for r in (conf.get("rules") or []) if r.get("on", True)]
+    lines.append(f"💬 <b>Ответы на сообщения</b> — {_st(ans_on)}")
+    if ans_on:
+        if live or (conf.get("fallback") or {}).get("on"):
+            lines.append(f"   Правил: <b>{len(live)}</b>")
+        else:
+            lines.append("   ⚠️ <i>правил нет — бот молчит</i>")
+
     on = ar.get("enabled", False)
-    lines.append(f"📩 <b>Автоответчик (новый заказ)</b> — {_st(on)}")
+    lines.append(f"\n📩 <b>Автоответчик (новый заказ)</b> — {_st(on)}")
     if on:
         lines.append(f'   <i>"{ar.get("message","")[:50]}"</i>')
 
@@ -75,7 +88,7 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     builder.button(text="⚡ Автопилот (всё сразу)", callback_data="ap:menu")
-    builder.button(text="📩 Автоответчики", callback_data="resp:cats")
+    builder.button(text="📩 Автоответы", callback_data="ar:menu")
 
     ar_on = ar.get("enabled", False)
     builder.button(text=f"{'🔴 Выкл' if ar_on else '🟢 Вкл'} новый заказ", callback_data="auto:toggle:reply")

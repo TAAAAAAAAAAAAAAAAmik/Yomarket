@@ -130,6 +130,10 @@ _DEFAULT_SETTINGS = {
         "last_result": "",
     },
     "responders": {},  # {"GameName": "message text"} - keyed by ad title/name
+    # Ответы на сообщения покупателя. Полный набор полей и значения по
+    # умолчанию живут в autoreply.DEFAULTS — здесь ключ заведён, чтобы он был
+    # виден среди настроек; autoreply.cfg() дополняет недостающее.
+    "autoreplies": {"enabled": False, "rules": [], "log": [], "state": {}},
     "known_orders": {},  # {order_id: status}
     "known_order_ids": [],
     "known_order_details": {},  # {order_id: {title, buyer, price, chat_id, seen_at}}

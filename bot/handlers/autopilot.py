@@ -55,8 +55,29 @@ def _no_showcase_url(s: dict) -> tuple[str, str]:
     return "", ""
 
 
+def _no_autoreply_rules(s: dict) -> tuple[str, str]:
+    """Включённые автоответы без единого правила молчат — это надо сказать."""
+    conf = s.get("autoreplies", {}) or {}
+    rules = [r for r in (conf.get("rules") or []) if r.get("on", True)]
+    if not rules and not (conf.get("fallback") or {}).get("on"):
+        return "нет ни одного правила", "ar:tpl"
+    return "", ""
+
+
 AUTOMATIONS: list[dict] = [
     # --- общение с покупателем ---
+    {
+        "key": "answer", "group": "💬 Общение с покупателем",
+        "title": "Отвечать на сообщения покупателя",
+        "short": "Ответы в чате",
+        "path": ("autoreplies", "enabled"),
+        "note": lambda s: (
+            f"правил: {len([r for r in (s.get('autoreplies', {}).get('rules') or []) if r.get('on', True)])}"
+            + (", вне рабочего времени" if s.get("autoreplies", {}).get("quiet_only") else "")
+        ),
+        "warn": _no_autoreply_rules,
+        "tune": "ar:menu",
+    },
     {
         "key": "reply", "group": "💬 Общение с покупателем",
         "title": "Ответ на новый заказ",
