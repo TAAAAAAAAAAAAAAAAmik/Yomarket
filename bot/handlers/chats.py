@@ -426,13 +426,18 @@ async def paginate_chat_orders(
     await _safe_edit(callback, text, keyboard)
 
 
-@router.callback_query(ChatCallback.filter(F.cursor == ""))
-async def show_chat_messages(
-    callback: CallbackQuery,
-    callback_data: ChatCallback,
-    api: YooMarketAPI,
-) -> None:
-    chat_id = callback_data.chat_id
+@router.callback_query(F.data.startswith("chat:"))
+async def show_chat_messages(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    """Открыть переписку по заказу.
+
+    Фильтр — простое сравнение начала строки, а не фабрика CallbackData.
+    Фабрика разбирает данные кнопки на поля и при малейшем расхождении просто
+    не срабатывает: нажатие уходит в никуда, и снаружи это неотличимо от
+    сломанной кнопки. Здесь номер берётся из строки напрямую — совпасть или не
+    совпасть тут нечему.
+    """
+    parts = str(callback.data or "").split(":")
+    chat_id = parts[1] if len(parts) > 1 else ""
     # Нажатие подтверждается сразу: если ответить в конце, любая ошибка по пути
     # оставляет кнопку крутиться, и выглядит это как «чат не кликается».
     await callback.answer()

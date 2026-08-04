@@ -24,13 +24,20 @@ async def unhandled_callback(callback: CallbackQuery) -> None:
     logger.warning("unhandled callback: %r", data)
     await callback.answer()
 
+    from handlers.start import BOT_VERSION
+
     b = InlineKeyboardBuilder()
+    if data.startswith("chat:"):
+        b.button(text="💬 Открыть чаты", callback_data="chats:list")
     b.button(text="🏠 Главное меню", callback_data="menu:main")
     b.adjust(1)
     try:
         await callback.message.answer(
             "🤷 <b>Эта кнопка ничего не делает</b>\n\n"
-            f"Действие: <code>{data[:60]}</code>\n\n"
+            f"Действие: <code>{data[:60]}</code>\n"
+            # Версия здесь не для красоты: «кнопка не работает» и «в контейнере
+            # старый код» выглядят одинаково, а различаются только этим.
+            f"Версия бота: <code>{BOT_VERSION}</code>\n\n"
             "Обычно так бывает с кнопкой из старого сообщения — бот обновился, "
             "а сообщение осталось прежним. Откройте раздел заново.",
             reply_markup=b.as_markup())
