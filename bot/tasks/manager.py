@@ -273,6 +273,35 @@ from orderfields import BACK as _BACK_STATUSES, DONE as _DONE_STATUSES
 # the report and the «Статистика» screen cannot disagree about a day.
 
 
+# Сколько чатов заказов опрашивать за проход. Каждый — отдельный запрос, но
+# проход раз в минуту, так что два десятка вполне посильны.
+_CHAT_POLL_LIMIT = 25
+_CLOSED_QUIET_AFTER = 7 * 86400
+
+
+def _chats_to_poll(known_orders: dict, order_details: dict) -> list[str]:
+    """Чаты каких заказов читать — самые свежие, а не первые попавшиеся.
+
+    Раньше здесь стоял срез `[:15]` по словарю заказов. Словарь хранит порядок
+    добавления, то есть срез брал пятнадцать САМЫХ СТАРЫХ заказов. Выполненные
+    из него не исключались («success» в список закрытых не входил), поэтому у
+    продавца с полутора десятками покупок все места занимали давно закрытые
+    заказы, а свежие чаты бот не читал вообще — и автоответы молчали.
+    """
+    now = time.time()
+    rows: list[tuple[float, str]] = []
+    for oid, status in known_orders.items():
+        det = order_details.get(oid) or {}
+        seen = float(det.get("seen_at") or 0)
+        closed = str(status) in _BACK_STATUSES
+        # Возврат недельной давности писем уже не приносит.
+        if closed and seen and now - seen > _CLOSED_QUIET_AFTER:
+            continue
+        rows.append((seen, str(oid)))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    return [oid for _, oid in rows[:_CHAT_POLL_LIMIT]]
+
+
 def _ar_context(details: dict | None, order_id: str, settings: dict) -> dict:
     """Данные заказа для подстановок вида {товар} в автоответе."""
     from autoreply import context
@@ -1014,10 +1043,11 @@ class TaskManager:
         known_messages: dict = settings.setdefault("known_messages", {})
         order_details: dict = settings.get("known_order_details", {})
 
-        active = [
-            oid for oid, st in known_orders.items()
-            if st not in ("refunded", "cancelled", "returned")
-        ][:15]
+        active = _chats_to_poll(known_orders, order_details)
+        # Пульс опроса: по нему видно, читает ли бот чаты вообще. Без этого
+        # «автоответы не работают» невозможно отличить от «до чатов не дошло».
+        poll = {"ts": 0.0, "chats": len(active), "orders": len(known_orders),
+                "new_msgs": 0, "error": ""}
 
         for order_id in active:
             try:
@@ -1069,6 +1099,7 @@ class TaskManager:
                     msg_id = str(msg.get("id", ""))
                     if not _is_newer(msg_id, last_known_id):
                         continue
+                    poll["new_msgs"] += 1
                     # Skip what the shop itself sent; anything else counts as
                     # the buyer. Requiring a known buyer value meant an
                     # unfamiliar wording silently dropped every message.
@@ -1150,8 +1181,11 @@ class TaskManager:
 
             except Exception as e:
                 logger.warning("Message check for order %s: %s", order_id, e)
+                poll["error"] = f"#{order_id}: {str(e)[:80]}"
 
         settings["known_messages"] = known_messages
+        poll["ts"] = time.time()
+        settings["_chat_poll"] = poll
 
     async def _check_reminders(self, user_id: int, settings: dict) -> None:
         rem = settings.get("reminders", {})
@@ -1492,18 +1526,26 @@ class TaskManager:
         import autoreply as ar
 
         conf = ar.cfg(settings)
+
+        def skip(why: str) -> None:
+            """Записать, почему промолчали. «Ничего не произошло» — худший из
+            возможных ответов на «автоответы не работают»."""
+            conf["last_skip"] = {"ts": time.time(), "chat": str(chat_id),
+                                 "text": (text or "")[:80], "why": why}
+            logger.info("autoreply skipped (chat %s): %s", chat_id, why)
+
         if not conf.get("enabled"):
-            return
+            return skip("автоответы выключены")
         if is_complaint and not conf.get("reply_to_complaints"):
-            return          # на жалобу шаблон отвечать не должен — нужен человек
+            # на жалобу шаблон отвечать не должен — нужен человек
+            return skip("это жалоба, а ответ на жалобы выключен")
 
         rule, matched = ar.pick(conf, text)
         if not rule:
-            return
+            return skip("ни одно правило не совпало, запасной ответ выключен")
         allowed, why = ar.gate(conf, chat_id)
         if not allowed:
-            logger.info("autoreply skipped (chat %s): %s", chat_id, why)
-            return
+            return skip(why)
 
         body = ar.render(rule.get("text", ""),
                          ar.context(details, order_id,
