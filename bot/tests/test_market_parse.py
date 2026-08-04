@@ -120,6 +120,129 @@ class PriceShapes(unittest.TestCase):
         self.assertIsNone(M.cheapest([]))
 
 
+# The page the seller actually sent: a category listing of Black Russia
+# currency, cards with a discount, a seller and a rating. Their shop is Spike,
+# third from the top — so "3" is the only right answer here, and anything else
+# is the parser finding some other list.
+CARD = """
+<div class="card"><a href="/o/{id}"><h3>{title}</h3>
+{badge}<span class="cat">Black Russia / Вирты</span>
+<span class="price">{price}&nbsp;₽</span><span class="bonus">+11.95</span>
+{old}<div class="foot"><span class="shop">{shop}</span>
+<span class="rating">★ {rating} · {reviews} отзывов</span></div></a></div>
+"""
+
+REAL_CARDS = [
+    dict(id=1, title="АВТОВЫДАЧА 3.000.000 Все серверы", badge="",
+         price="230", old="", shop="GigShop", rating="5", reviews="11"),
+    dict(id=2, title="АВТОВЫДАЧА 3.000.000 + БОНУС Все серверы БЫСТРО",
+         badge='<span class="sale">-88%</span>', price="239",
+         old='<s class="old">2&nbsp;112&nbsp;₽</s>', shop="GadjiSeller",
+         rating="4.97", reviews="1 620"),
+    dict(id=3, title="3.000.000р Бонусы Любой сервер Быстро",
+         badge='<span class="sale">-51%</span>', price="239,99",
+         old='<s class="old">490&nbsp;₽</s>', shop="Spike",
+         rating="4.84", reviews="1 242"),
+    dict(id=4, title="АВТОВЫДАЧА 3.000.000 БОНУСЫ ВСЕ СЕРВЕРА",
+         badge="", price="239", old="", shop="BlackMarket",
+         rating="4.89", reviews="168"),
+]
+
+
+def rendered_page() -> str:
+    """The listing as markup only — no payload embedded anywhere."""
+    return ("<!DOCTYPE html><html><head><title>Black Russia</title>"
+            "<script>window.x=1</script></head><body><main>"
+            + "".join(CARD.format(**c) for c in REAL_CARDS)
+            + "</main></body></html>")
+
+
+class TheRealListing(unittest.TestCase):
+    def test_markup_only_page_still_yields_the_right_order(self):
+        rows = M._normalize(M._offers_from_text(rendered_page()))
+        self.assertEqual(len(rows), 4)
+        self.assertEqual([r["seller"] for r in rows],
+                         ["GigShop", "GadjiSeller", "Spike", "BlackMarket"])
+        self.assertEqual([r["pos"] for r in rows], [1, 2, 3, 4])
+
+    def test_our_shop_is_third_not_first(self):
+        rows = M._normalize(M._offers_from_text(rendered_page()))
+        self.assertEqual(find_position_(rows, seller="Spike")["pos"], 3)
+
+    def test_the_sale_price_is_read_not_the_struck_through_one(self):
+        rows = M._normalize(M._offers_from_text(rendered_page()))
+        spike = find_position_(rows, seller="Spike")
+        self.assertEqual(spike["price"], 239.99, "took the crossed-out 490")
+
+    def test_a_review_count_is_never_taken_for_a_price(self):
+        rows = M._normalize(M._offers_from_text(rendered_page()))
+        self.assertNotIn(1620.0, [r["price"] for r in rows])
+        self.assertIsNone(M._num("1 620 отзывов"))
+        self.assertIsNone(M._num("4.97 · 168 отзывов"))
+
+    def test_the_same_listing_as_json_reads_the_same_way(self):
+        offers = [{"id": c["id"], "title": c["title"],
+                   "price": {"current": c["price"].replace(",", "."),
+                             "old_price": 490},
+                   "shop": {"name": c["shop"]},
+                   "rating": c["rating"]} for c in REAL_CARDS]
+        html = next_data_page({"props": {"pageProps": {"offers": offers}}})
+        lists = []
+        for blob in M._json_blobs(html):
+            lists.extend(M._offer_lists(blob))
+        rows = M._normalize(max(lists, key=len))
+        self.assertEqual(find_position_(rows, seller="Spike")["pos"], 3)
+        self.assertEqual(find_position_(rows, seller="Spike")["price"], 239.99)
+
+    def test_a_card_whose_name_is_nested_is_still_an_offer(self):
+        """Price + seller + rating is an offer even with no title field."""
+        node = {"price": 239, "shop": {"name": "Spike"}, "rating": 4.84}
+        self.assertTrue(M._looks_like_offer(node))
+        self.assertFalse(M._looks_like_offer({"shop": {"name": "Spike"}}))
+
+    def test_too_few_cards_is_not_a_listing(self):
+        one = ("<html><body>" + CARD.format(**REAL_CARDS[0])
+               + "</body></html>")
+        self.assertEqual(M._offers_from_text(one), [])
+
+    def test_a_page_header_full_of_prices_does_not_shift_the_first_card(self):
+        """The real page has a header, banners and a «похожие» block.
+
+        The first card's window used to reach back to the top of the document
+        and pick up whatever price it found there.
+        """
+        noise = "<header>" + "<span>от 99&nbsp;₽</span>" * 20 + "</header>"
+        page = ("<html><body>" + noise
+                + "".join(CARD.format(**c) for c in REAL_CARDS)
+                + "<aside>Похожие: <span>1&nbsp;₽</span></aside></body></html>")
+        rows = M._normalize(M._offers_from_text(page))
+        self.assertEqual([r["seller"] for r in rows],
+                         ["GigShop", "GadjiSeller", "Spike", "BlackMarket"])
+        self.assertEqual(rows[0]["price"], 230.0, "took a price from the header")
+        self.assertEqual(find_position_(rows, seller="Spike")["price"], 239.99)
+
+    def test_a_seller_with_no_reviews_does_not_shift_the_ones_below(self):
+        """A new seller has no rating, so their card has no tail to find.
+
+        They are missed — nothing can be done about that from the markup — but
+        the cards below must keep their own prices rather than inherit theirs.
+        """
+        no_rating = ('<div class="card"><h3>Новый продавец</h3>'
+                     '<span class="price">100&nbsp;₽</span>'
+                     '<span class="shop">Новичок</span></div>')
+        page = ("<html><body>" + CARD.format(**REAL_CARDS[0]) + no_rating
+                + "".join(CARD.format(**c) for c in REAL_CARDS[1:])
+                + "</body></html>")
+        rows = M._normalize(M._offers_from_text(page))
+        spike = find_position_(rows, seller="Spike")
+        self.assertEqual(spike["price"], 239.99)
+
+
+def find_position_(rows, **kw):
+    from automation.market import find_position
+    return find_position(rows, **kw)
+
+
 class Balanced(unittest.TestCase):
     def test_extracts_one_complete_object(self):
         text = 'prefix{"a":{"b":[1,2]},"c":"}"}suffix'

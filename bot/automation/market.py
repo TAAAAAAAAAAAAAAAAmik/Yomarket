@@ -21,10 +21,26 @@ logger = logging.getLogger(__name__)
 
 MARKET_URL = "https://yoomarket.net"
 
-_PRICE_KEYS = ("price", "amount", "cost", "base_amount", "price_rub", "value")
+# A discounted card shows two prices — «239,99 ₽» next to a struck-through
+# «490 ₽» — and the payload names them in whatever way the storefront likes, so
+# the sale price is looked for first and the crossed-out one only as a fallback.
+_PRICE_KEYS = ("price", "amount", "cost", "base_amount", "price_rub", "value",
+               "current", "current_price", "final_price", "discount_price",
+               "price_with_discount", "new_price", "sale_price", "min_price",
+               "old_price", "base_price", "price_old")
 _TITLE_KEYS = ("title", "name", "ad_title", "product_name", "label")
 _SELLER_KEYS = ("shop", "seller", "store", "shop_name", "seller_name",
                 "merchant", "user")
+# Not a title and not a price, but only offers carry them — enough to recognise
+# a card whose name sits in a nested node this code would not think to open.
+_RATING_KEYS = ("rating", "reviews_count", "reviews", "rate", "stars",
+                "review_count", "feedback_count")
+
+# A price is a price, not a review counter. «1 620 отзывов» reduces to 1620 once
+# the non-digits are stripped, and that used to look like a perfectly good
+# number — the guard is the units, not the digits.
+_NOT_PRICE = re.compile(
+    r"отзыв|оцен|продаж|шт\.?|штук|рейтинг|review|sold|pcs", re.I)
 
 
 def _num(value) -> float | None:
@@ -32,14 +48,25 @@ def _num(value) -> float | None:
     if isinstance(value, dict):
         for k in _PRICE_KEYS:
             if k in value:
-                return _num(value[k])
+                got = _num(value[k])
+                if got is not None:
+                    return got
         return None
+    if isinstance(value, bool):
+        return None                     # True is 1.0 to float(), and not a price
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str):
-        digits = re.sub(r"[^\d.,]", "", value).replace(",", ".")
+        if _NOT_PRICE.search(value):
+            return None
+        digits = re.sub(r"[^\d.,]", "", value.replace(" ", "")
+                        .replace(" ", "")).replace(",", ".")
+        # «1.299.50» and other multi-separator forms are not a number we can
+        # trust; guessing at the decimal point would invent a price.
+        if digits.count(".") > 1:
+            digits = digits.replace(".", "", digits.count(".") - 1)
         try:
-            return float(digits) if digits else None
+            return float(digits) if digits.strip(".") else None
         except ValueError:
             return None
     return None
@@ -55,12 +82,22 @@ def _text(value) -> str:
 
 
 def _looks_like_offer(node) -> bool:
+    """A price plus one other thing only an offer would carry.
+
+    Demanding a price *and* a title was too strict: the storefront keeps the
+    name in a nested product node on some payloads, and the card is still
+    unmistakably an offer because it has a seller and a rating. Requiring the
+    price stays — a row without one is not something a buyer chooses between.
+    """
     if not isinstance(node, dict):
         return False
-    has_price = any(_num(node.get(k)) is not None for k in _PRICE_KEYS)
+    if not any(_num(node.get(k)) is not None for k in _PRICE_KEYS):
+        return False
     has_title = any(isinstance(node.get(k), (str, dict)) and _text(node.get(k))
                     for k in _TITLE_KEYS)
-    return has_price and has_title
+    has_seller = bool(_seller_of(node))
+    has_rating = any(node.get(k) is not None for k in _RATING_KEYS)
+    return has_title or has_seller or has_rating
 
 
 def _offer_lists(node, depth: int = 0, out: list | None = None) -> list:
@@ -155,6 +192,83 @@ def _seller_of(node) -> str:
     return ""
 
 
+# --- reading the rendered page, when the payload is not in the HTML ---------
+#
+# The last resort, and deliberately a narrow one. A card on the offers list ends
+# with the seller and their rating — «GadjiSeller ★ 4.97 · 1 620 отзывов» — and
+# that tail is a far steadier landmark than any class name, which a redesign
+# renames. Everything between two tails is one card, and the first price in it
+# is what the buyer pays.
+
+_STRIP_TAGS = re.compile(r"<(script|style|noscript)\b.*?</\1>", re.S | re.I)
+_TAG = re.compile(r"<[^>]+>")
+# «GadjiSeller 4.97 · 1 620 отзывов» — name, rating, review count.
+_CARD_TAIL = re.compile(
+    r"([^\n·•|]{2,40}?)\s*★?\s*(\d(?:[.,]\d+)?)\s*[·•]\s*([\d\s  ]+)\s*отзыв",
+    re.I)
+_PRICE_TEXT = re.compile(r"(\d[\d\s  ]*(?:[.,]\d{1,2})?)\s*₽")
+
+
+def _visible_text(html: str) -> str:
+    import html as _htmlmod
+    text = _STRIP_TAGS.sub(" ", html)
+    text = _TAG.sub("\n", text)
+    text = _htmlmod.unescape(text)
+    return re.sub(r"[ \t ]+", " ", text)
+
+
+# How far back from the rating a card can reasonably reach. Bounded on purpose:
+# taking everything since the previous card would swallow the page header on
+# the first one, and its prices with it.
+_CARD_WINDOW = 400
+# A sale price and its struck-through original sit together — «239,99 ₽ +12
+# 490 ₽». Two prices further apart than this are not a pair, they are this
+# card's price and something the page happened to print above it.
+_PAIR_GAP = 45
+
+
+def _card_price(chunk: str) -> float | None:
+    """This card's price out of everything priced in its window.
+
+    Taking the last price finds the struck-through original on a discounted
+    card; taking the second-to-last finds a banner on a card with no discount.
+    Neither is a rule — the rule is that the two prices of one card are printed
+    next to each other, and the buyer pays the first of them.
+    """
+    hits = [(m.start(), m.end(), _num(m.group(1)))
+            for m in _PRICE_TEXT.finditer(chunk)]
+    hits = [h for h in hits if h[2]]
+    if not hits:
+        return None
+    if len(hits) >= 2 and hits[-1][0] - hits[-2][1] <= _PAIR_GAP:
+        return hits[-2][2]
+    return hits[-1][2]
+
+
+def _offers_from_text(html: str) -> list[dict]:
+    """Offers recovered from the rendered markup. [] when it does not fit."""
+    text = _visible_text(html)
+    tails = list(_CARD_TAIL.finditer(text))
+    if len(tails) < 3:
+        return []
+    rows, prev_end = [], 0
+    for t in tails:
+        chunk = text[max(prev_end, t.start() - _CARD_WINDOW):t.start()]
+        prev_end = t.end()
+        price = _card_price(chunk)
+        # The title is the longest line of the card — the name always outweighs
+        # the badges («-88%», «Black Russia / Вирты») around it.
+        lines = [l.strip() for l in chunk.split("\n") if l.strip()]
+        title = max(lines, key=len) if lines else ""
+        rows.append({
+            "price": price,
+            "title": title[:80],
+            "seller": t.group(1).strip()[:40],
+            "id": "",
+        })
+    return rows
+
+
 def _normalize(offers: list) -> list[dict]:
     rows = []
     for i, o in enumerate(offers, 1):
@@ -203,19 +317,30 @@ def fetch_offers_sync(url: str) -> tuple[bool, object]:
         return False, f"HTTP {r.status_code}"
 
     html = r.text
+    blobs = _json_blobs(html)
     lists = []
-    for blob in _json_blobs(html):
+    for blob in blobs:
         lists.extend(_offer_lists(blob))
-    if not lists:
-        return False, (f"на странице не нашёл список предложений "
-                       f"({len(html)}б). Пришлите адрес страницы, где видно "
-                       f"именно список офферов.")
+    if lists:
+        # The longest list is the page's own listing; shorter ones are usually
+        # "similar" or "recommended" blocks.
+        best = max(lists, key=len)
+        return True, {"offers": _normalize(best),
+                      "note": f"json, {len(html)}б, кандидатов: {len(lists)}"}
 
-    # The longest list is the page's own listing; shorter ones are usually
-    # "similar" or "recommended" blocks.
-    best = max(lists, key=len)
-    return True, {"offers": _normalize(best), "note": f"{len(html)}б, "
-                  f"списков-кандидатов: {len(lists)}"}
+    # No usable payload — read what the page actually shows instead.
+    rows = _offers_from_text(html)
+    if rows:
+        return True, {"offers": _normalize(rows),
+                      "note": f"разметка, {len(html)}б, карточек: {len(rows)}"}
+
+    # Say which of the two ways failed and how far it got: "не нашёл список"
+    # alone gave nothing to act on, and the page cannot be looked at from here.
+    return False, (
+        f"на странице не нашёл список предложений. "
+        f"HTML {len(html)}б, JSON-блоков: {len(blobs)}, "
+        f"списков в них: 0, карточек в разметке: 0. "
+        f"Пришлите вывод /pos_raw для этого адреса — покажет, где лежат данные.")
 
 
 def _norm(s: str) -> str:

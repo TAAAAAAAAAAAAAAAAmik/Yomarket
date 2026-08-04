@@ -1241,6 +1241,109 @@ async def promo_debug(message: Message) -> None:
     await status.delete()
 
 
+def _pos_raw_sync(url: str, shop: str) -> str:
+    """Blocking: report where a storefront page keeps its offers.
+
+    Read-only and unauthenticated. Answers the one question that cannot be
+    answered from the outside: is the listing inside the HTML at all? If the
+    shop name is in the bytes, the data is there and the parser is at fault; if
+    it is not, the page fills itself in later and the HTML is the wrong thing
+    to read no matter how the parser is written.
+    """
+    import requests
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+    from automation.market import (MARKET_URL, _json_blobs, _offer_lists,
+                                   _offers_from_text, _visible_text)
+
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+    if not url.startswith("http"):
+        url = MARKET_URL + ("" if url.startswith("/") else "/") + url
+    try:
+        r = requests.get(url, timeout=(6, 25), verify=False, headers={
+            "User-Agent": ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"),
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+        })
+    except Exception as e:
+        return f"запрос не прошёл: {str(e)[:200]}"
+    html = r.text
+    out = [f"HTTP {r.status_code}, {len(html)}б, "
+           f"тип: {r.headers.get('content-type', '?')[:40]}"]
+
+    # 1. Where a Next.js page could be keeping it
+    nd = re.search(r'id="__NEXT_DATA__"', html)
+    chunks = re.findall(r'__next_f\.push\(\[\d+,\s*"((?:[^"\\]|\\.)*)"\]\)', html)
+    out.append(f"__NEXT_DATA__: {'есть' if nd else 'нет'}; "
+               f"RSC-чанков: {len(chunks)}, в них {sum(len(c) for c in chunks)}б")
+    blobs = _json_blobs(html)
+    lists = []
+    for b in blobs:
+        lists.extend(_offer_lists(b))
+    out.append(f"распознано JSON-блоков: {len(blobs)}, "
+               f"списков-офферов: {len(lists)}"
+               + (f", длиннейший: {max(len(x) for x in lists)}" if lists else ""))
+    out.append(f"карточек по разметке: {len(_offers_from_text(html))}")
+
+    # 2. Is the listing in the bytes at all?
+    text = _visible_text(html)
+    marks = [m for m in (shop, "отзыв", "₽", "Spike", "GadjiSeller", "GigShop")
+             if m]
+    found = {m: (m in html) for m in marks}
+    out.append("в HTML: " + ", ".join(f"{k}={'да' if v else 'НЕТ'}"
+                                      for k, v in found.items()))
+    out.append(f"видимого текста: {len(text.strip())}б")
+
+    # 3. What the payload around our shop looks like — the shape to parse
+    if shop and shop in html:
+        i = html.index(shop)
+        out.append("")
+        out.append(f"--- окрестности «{shop}» ---")
+        out.append(html[max(0, i - 300):i + 300])
+
+    # 4. A JSON endpoint would beat parsing any markup
+    apis = sorted(set(re.findall(
+        r'["\'](/api/[\w/\-.]+|https?://[\w.\-]*(?:api|graphql)[\w/\-.]*)["\']',
+        html)))
+    if apis:
+        out.append("")
+        out.append("адреса API на странице: " + ", ".join(apis[:12]))
+    return "\n".join(out)
+
+
+@router.message(Command("pos_raw"))
+async def pos_raw(message: Message) -> None:
+    """/pos_raw <ссылка> — показать, где на странице витрины лежат предложения.
+
+    Read-only. Существует потому, что страницу нельзя посмотреть из среды
+    разработки — вывод этой команды заменяет взгляд на реальную разметку.
+    """
+    import html as _html
+
+    from storage import get_shop_name
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Укажите страницу витрины:\n"
+            "<code>/pos_raw https://yoomarket.net/categories/...</code>")
+        return
+    shop = get_shop_name(message.from_user.id) or ""
+    status = await message.answer("⏳ Смотрю, что отдаёт страница...")
+    loop = asyncio.get_event_loop()
+    try:
+        report = await asyncio.wait_for(
+            loop.run_in_executor(None, _pos_raw_sync, parts[1].strip(), shop),
+            timeout=90)
+    except Exception as e:
+        report = f"не удалось: {str(e)[:200]}"
+    text = _html.escape(report)
+    for i in range(0, min(len(text), 10500), 3500):
+        await message.answer(f"<code>{text[i:i + 3500]}</code>")
+    await status.delete()
+
+
 async def _pos_debug_watches(message: Message) -> None:
     """Dry-run every watch: position, thresholds and the decision — no charge.
 
