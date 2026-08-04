@@ -917,3 +917,46 @@ async def chats_debug(message: Message, api: YooMarketAPI) -> None:
             body = str(m.get("text") or m.get("message") or "")[:40]
             out.append(f"  • id={m.get('id')} от={sender} «{body}»")
     await message.answer(f"<code>{_esc(chr(10).join(out))[:3500]}</code>")
+
+
+@router.message(Command("chat_debug"))
+async def chat_debug(message: Message, api: YooMarketAPI) -> None:
+    """/chat_debug 1184796 — открыть чат командой, минуя кнопки.
+
+    Если через кнопку чат «не открывается», а командой открывается, значит дело
+    не в чтении переписки, а в том, что нажатие не доходит до бота. Это
+    единственный способ различить два случая, не читая логи контейнера.
+    """
+    from handlers.start import BOT_VERSION
+    arg = (message.text or "").partition(" ")[2].strip()
+    if not arg:
+        s = get_settings(message.from_user.id)
+        det = s.get("known_order_details") or {}
+        sample = ", ".join(list(det)[:5]) or "нет"
+        await message.answer(
+            f"💬 <b>Проверка чата</b>  <code>{BOT_VERSION}</code>\n\n"
+            f"Отправьте <code>/chat_debug НОМЕР</code>.\n"
+            f"Известные заказы: <code>{_esc(sample)}</code>")
+        return
+
+    real_id, det = _resolve_chat(message.from_user.id, arg)
+    lines = [f"💬 <b>Проверка чата</b>  <code>{BOT_VERSION}</code>", "",
+             f"Заказ: <code>{_esc(arg)}</code>",
+             f"Чат для запроса: <code>{_esc(real_id)}</code>",
+             f"Известно о заказе: {'да' if det else 'нет'}"]
+    if not api:
+        lines.append("❌ Нет токена — отправьте /start")
+        await message.answer("\n".join(lines))
+        return
+    try:
+        data = await api.get_messages(real_id)
+        rows = _rows(data)
+        lines.append(f"Ответ API: <b>{len(rows)}</b> сообщений")
+        for m in rows[-3:]:
+            who = "🏪" if (m.get("sender_type") in ("shop", "seller")
+                           or m.get("is_mine")) else "👤"
+            body = str(m.get("text") or m.get("message") or "").strip()
+            lines.append(f"{who} <i>{_esc(body[:60]) or '(пусто)'}</i>")
+    except Exception as e:
+        lines.append(f"❌ API: <code>{_esc(str(e)[:200])}</code>")
+    await message.answer("\n".join(lines))

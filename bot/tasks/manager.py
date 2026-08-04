@@ -190,6 +190,47 @@ def _ts_of(msg: dict) -> float:
         return 0.0
 
 
+def _msg_text(msg: dict) -> str:
+    """Текст сообщения, как бы поле ни называлось.
+
+    Читались только `text` и `message`. Всё остальное превращалось в пустую
+    цитату «— » в уведомлении, и продавцу приходило «СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ»
+    без сообщения.
+    """
+    for key in ("text", "message", "body", "content", "comment", "value"):
+        value = msg.get(key)
+        if isinstance(value, dict):
+            value = value.get("text") or value.get("value") or value.get("body")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _msg_kind(msg: dict) -> str:
+    """«system» — служебная запись чата, а не письмо покупателя."""
+    for key in ("type", "kind", "message_type", "event"):
+        value = msg.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return ""
+
+
+_SERVICE_KINDS = ("system", "service", "event", "status", "order", "notice",
+                  "info", "bot")
+
+# Сообщение, увиденное с опозданием, отвечать поздно, а уведомлять о нём
+# поштучно — значит завалить продавца утренней перепиской в девять вечера.
+_MSG_FRESH = 6 * 3600
+
+
+def _is_service_message(msg: dict) -> bool:
+    """Отметка маркетплейса о заказе — оплате, выдаче, смене статуса.
+
+    Покупатель их не писал, и уведомлять о них как о его сообщении нельзя.
+    """
+    return any(k in _msg_kind(msg) for k in _SERVICE_KINDS)
+
+
 def _newest_msg(rows: list[dict]) -> dict:
     """Самое свежее сообщение — по номеру, а не по месту в списке."""
     best: dict = {}
@@ -265,7 +306,8 @@ def _order_username(order: dict) -> str:
 # Списки статусов — общие с разбором заказа. Здесь не было «success», которым
 # этот маркетплейс помечает выполненный заказ: выручка по таким заказам никуда
 # не попадала.
-from orderfields import BACK as _BACK_STATUSES, DONE as _DONE_STATUSES
+from orderfields import (BACK as _BACK_STATUSES, DONE as _DONE_STATUSES,
+                         status_ru as _status_ru)
 
 
 # Windowed order figures used to live here. They now come from stats_source,
@@ -432,6 +474,13 @@ def _watched_notify_kb(chat_id: str) -> InlineKeyboardMarkup:
     builder.button(text="🌐 В панели",
                    url=f"https://panel.yoomarket.net/chats/{digits}")
     builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def _missed_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💬 Открыть чаты", callback_data="chats:list")
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -827,7 +876,7 @@ class TaskManager:
                             user_id,
                             _card("🚨 <b>СПОР ПО ЗАКАЗУ</b>",
                                   [f"📦 <b>{_esc(title)}</b>",
-                                   f"💰 <b>{_money(price)} ₽</b>   📊 {_esc(status)}",
+                                   f"💰 <b>{_money(price)} ₽</b>   📊 {_status_ru(status)}",
                                    "",
                                    f"👤 {who}",
                                    f"🧾 <code>#{oid}</code>",
@@ -943,7 +992,7 @@ class TaskManager:
                                f"💰 <b>{_money(price)} ₽</b>",
                                "",
                                buyer_line,
-                               f"🧾 <code>#{oid}</code>   📊 {_esc(status)}"]),
+                               f"🧾 <code>#{oid}</code>   📊 {_status_ru(status)}"]),
                         reply_markup=_order_notify_kb(oid, chat_id),
                     )
 
@@ -1048,6 +1097,9 @@ class TaskManager:
         # «автоответы не работают» невозможно отличить от «до чатов не дошло».
         poll = {"ts": 0.0, "chats": len(active), "orders": len(known_orders),
                 "new_msgs": 0, "error": ""}
+        # Сообщения, которые бот увидел с опозданием (чат раньше не читался).
+        # Они собираются здесь и уходят одной сводкой, а не пачкой уведомлений.
+        missed: list[tuple[str, str, str]] = []
 
         for order_id in active:
             try:
@@ -1070,7 +1122,12 @@ class TaskManager:
                 # Считается на каждом проходе, даже когда новых сообщений нет:
                 # продавец мог ответить из панели или приложения, и тогда метка
                 # «покупатель ждёт» должна погаснуть сама.
-                newest = _newest_msg(messages)
+                # Считаем только настоящие письма: служебные отметки о заказе
+                # и пустые строки покупатель не писал, и ждать ответа на них
+                # незачем.
+                real = [m for m in messages
+                        if not _is_service_message(m) and _msg_text(m)]
+                newest = _newest_msg(real)
                 if order_id in order_details:
                     det = order_details[order_id]
                     if newest and _is_own_message(newest):
@@ -1105,17 +1162,34 @@ class TaskManager:
                     # unfamiliar wording silently dropped every message.
                     if _is_own_message(msg):
                         continue
+                    # Отметка маркетплейса о заказе — не письмо покупателя.
+                    if _is_service_message(msg):
+                        continue
+                    raw_text = _msg_text(msg)
+                    if not raw_text:
+                        # Пустая строка — это не сообщение. Раньше о таких
+                        # приходило «СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ» с пустой цитатой,
+                        # хотя покупатель ничего не писал.
+                        continue
                     sender = msg.get("sender_type") or msg.get("sender")
                     if isinstance(sender, str) and sender.lower() not in (
                             "", "buyer", "client", "customer", "user"):
                         logger.info("chat %s: unknown sender %r", chat_id, sender)
 
+                    # Разбор дневного завала не должен превращаться в поток
+                    # уведомлений: то, что пришло часы назад, отвечать поздно —
+                    # чат просто помечается ждущим, и в конце уходит одна сводка.
+                    age = time.time() - (_ts_of(msg) or time.time())
+                    stale = age > _MSG_FRESH
+                    if stale:
+                        missed.append((order_id, chat_id, raw_text))
+                        continue
+
                     time_str = _fmt_time(msg.get("created_at") or msg.get("date"))
                     time_part = f"  •  🕐 {time_str}" if time_str else ""
-                    raw_text = msg.get("text") or msg.get("message") or ""
                     # raw_text stays intact for the rules below; only the copy
                     # that goes into an HTML message is escaped
-                    msg_text = _esc(raw_text[:200]) or "—"
+                    msg_text = _esc(raw_text[:200])
 
                     # AutoStars: buyer replied with their @username → deliver
                     handled = await self._maybe_deliver_stars_reply(
@@ -1185,7 +1259,22 @@ class TaskManager:
 
         settings["known_messages"] = known_messages
         poll["ts"] = time.time()
+        poll["missed"] = len(missed)
         settings["_chat_poll"] = poll
+
+        if missed and settings.get("notify_messages", {}).get("enabled", True):
+            chats = {c for _o, c, _t in missed}
+            body = [f"Пока бот не следил за этими чатами, покупатели написали "
+                    f"<b>{len(missed)}</b> раз(а) в <b>{len(chats)}</b> чат(ах)."]
+            for _oid, _cid, text in missed[:5]:
+                body.append(f"• <i>{_esc(text[:70])}</i>")
+            if len(missed) > 5:
+                body.append(f"…и ещё {len(missed) - 5}")
+            body += ["", "Чаты помечены как ждущие ответа — они в начале списка."]
+            await self._notify(
+                user_id,
+                _card("📥 <b>ПРОПУЩЕННЫЕ СООБЩЕНИЯ</b>", body),
+                reply_markup=_missed_kb())
 
     async def _check_reminders(self, user_id: int, settings: dict) -> None:
         rem = settings.get("reminders", {})
@@ -1224,7 +1313,7 @@ class TaskManager:
                 f"🧾 Заказ <code>#{oid}</code>\n"
                 f"📦 {_esc(title)}\n"
                 f"👤 {who}  •  💰 {_esc(price)} ₽\n"
-                f"📊 Статус: {_esc(status)}\n\n"
+                f"📊 Статус: {_status_ru(status)}\n\n"
                 f"⏳ Ждёт подтверждения уже <b>{hours_waiting} ч</b>",
                 reply_markup=_order_notify_kb(oid, chat_id),
             )
