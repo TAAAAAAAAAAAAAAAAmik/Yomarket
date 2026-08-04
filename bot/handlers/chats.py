@@ -182,6 +182,58 @@ def _order_label(order: dict, det: dict) -> str:
     return f"{mark} {buyer[:40] or title[:40] or f'Заказ #{oid}'}"
 
 
+async def _find_chat_id(uid: int, order_key: str, api) -> str:
+    """Спросить у маркетплейса, какой у заказа чат, и запомнить ответ.
+
+    Номера чата нет в списке заказов, поэтому бот подставлял номер заказа — для
+    части заказов это верно, для остальных API отвечает resource_not_found.
+    Карточка заказа номер знает; спрашиваем один раз и сохраняем.
+    """
+    if not api:
+        return ""
+    from orderfields import order_chat_id
+    try:
+        full = await api.get_order(order_key)
+    except Exception as e:
+        logger.info("order %s detail for chat: %s", order_key, e)
+        return ""
+    node = full.get("data") if isinstance(full, dict) and isinstance(
+        full.get("data"), dict) else full
+    found = order_chat_id(node if isinstance(node, dict) else {})
+    if not found:
+        return ""
+    s = get_settings(uid)
+    det = (s.setdefault("known_order_details", {})
+           .setdefault(str(order_key), {}))
+    det["chat_id"] = found
+    save_settings(uid, s)
+    return found
+
+
+async def _load_messages(uid: int, order_key: str, api
+                         ) -> tuple[list[dict], str, dict]:
+    """Переписка заказа → (сообщения, номер чата, что известно о заказе).
+
+    Если API отвечает resource_not_found, значит номер чата не равен номеру
+    заказа — спрашиваем настоящий и пробуем ещё раз. Один раз: найденный номер
+    сохраняется, и следующее открытие идёт сразу по нему.
+    """
+    real_id, det = _resolve_chat(uid, order_key)
+    try:
+        return _rows(await api.get_messages(real_id)), real_id, det
+    except Exception as first:
+        reason = str(first).lower()
+        if "not_found" not in reason and "not found" not in reason:
+            raise
+    found = await _find_chat_id(uid, order_key, api)
+    if not found or found == real_id:
+        raise RuntimeError(
+            "Юмаркет не нашёл этот чат. Обычно так бывает у заказов, "
+            "созданных до подключения бота, — переписка открывается в панели.")
+    real_id, det = _resolve_chat(uid, order_key)
+    return _rows(await api.get_messages(found)), found, det
+
+
 def _resolve_chat(uid: int, key: str) -> tuple[str, dict]:
     """(номер чата для API, что бот знает о заказе).
 
@@ -442,10 +494,9 @@ async def show_chat_messages(callback: CallbackQuery, api: YooMarketAPI) -> None
     # оставляет кнопку крутиться, и выглядит это как «чат не кликается».
     await callback.answer()
     await _safe_edit(callback, "⏳ Загружаю чат...")
-    real_id, det = _resolve_chat(callback.from_user.id, chat_id)
     try:
-        data = await api.get_messages(real_id)
-        messages: list[dict] = _rows(data)
+        messages, real_id, det = await _load_messages(
+            callback.from_user.id, chat_id, api)
         messages = messages[-10:] if len(messages) > 10 else messages
         text = _chat_header(chat_id, det) + "\n\n" + _format_messages(messages)
         settings = get_settings(callback.from_user.id)
@@ -489,10 +540,9 @@ async def cancel_reply(callback: CallbackQuery, state: FSMContext, api: YooMarke
     await state.clear()
     chat_id = callback.data.split(":", 1)[1]
     await callback.answer()
-    real_id, det = _resolve_chat(callback.from_user.id, chat_id)
     try:
-        data = await api.get_messages(real_id)
-        messages: list[dict] = _rows(data)
+        messages, _real, det = await _load_messages(
+            callback.from_user.id, chat_id, api)
         messages = messages[-10:] if len(messages) > 10 else messages
         text = _chat_header(chat_id, det) + "\n\n" + _format_messages(messages)
         builder = InlineKeyboardBuilder()

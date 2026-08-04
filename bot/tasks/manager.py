@@ -825,7 +825,13 @@ class TaskManager:
                 buyer = d["buyer"] or "—"
                 price = d["price"] if d["price"] is not None else "—"
                 time_raw = d["created"]
-                chat_id = str(order.get("chat_id") or oid)
+                # Номер чата ищется по всем полям, где он бывает, и берётся из
+                # уже дочитанного, если в строке списка его нет. Подставлять
+                # номер заказа «на всякий случай» — это resource_not_found на
+                # каждом втором чате.
+                from orderfields import order_chat_id as _chat_of
+                chat_id = (_chat_of(order) or str(d.get("chat_id") or "")
+                           or str(prev_det.get("chat_id") or "") or oid)
                 username = d["username"] or _order_username(order)
                 quantity = d["quantity"]
                 category = _order_field(order, "category", "category_name", "ad_category")
@@ -1573,6 +1579,11 @@ class TaskManager:
             for key in ("title", "buyer", "username", "quantity"):
                 if not d.get(key):
                     d[key] = deeper.get(key)
+            # Номер чата есть в карточке заказа, но не в строке списка — ради
+            # него дочитывание и нужно в первую очередь.
+            from orderfields import order_chat_id
+            node = full.get("data") if isinstance(full.get("data"), dict) else full
+            d["chat_id"] = order_chat_id(node) or d.get("chat_id") or ""
             if d.get("price") in (None, "") and deeper.get("price") is not None:
                 d["price"] = deeper["price"]
 
