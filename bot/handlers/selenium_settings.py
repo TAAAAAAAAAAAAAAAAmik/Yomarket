@@ -730,42 +730,70 @@ async def pos_add_pick(callback: CallbackQuery) -> None:
     shop = get_shop_name(callback.from_user.id) or ""
     try:
         urls = await asyncio.wait_for(
-            loop.run_in_executor(None, listing_urls_for, ad["id"]), timeout=60)
+            loop.run_in_executor(None, listing_urls_for, ad["id"], None,
+                                 ad["title"]),
+            timeout=90)
     except Exception as e:
         urls = []
         logger.warning("listing urls for %s: %s", ad["id"], e)
 
-    # Each candidate is asked whether our listing is actually in it — the card
-    # names its game and its section without saying which is which, and a wrong
-    # guess would count the position in the wrong catalogue.
-    chosen, pos, seen = "", 0, 0
+    # Which slug is the game and which is the section is not stated anywhere,
+    # so the candidates are checked against the catalogue: an address whose
+    # deepest slug the marketplace knows as a section is the real one. One
+    # light request each — reading every candidate's whole listing instead
+    # would be up to forty-five pages apiece.
+    from automation.market import category_meta, listing_path
+    chosen = ""
     for url in urls[:4]:
+        slugs, _f = listing_path(url)
         try:
-            ok, res = await asyncio.wait_for(
-                loop.run_in_executor(None, fetch_listing, url, shop),
-                timeout=120)
+            meta = await asyncio.wait_for(
+                loop.run_in_executor(None, category_meta, slugs), timeout=30)
         except Exception:
             continue
-        if not ok:
-            continue
-        mine = find_position(res["offers"], ad_id=ad["id"],
-                             title=ad["title"], seller=shop)
-        if mine:
-            chosen, pos, seen = url, int(mine["pos"]), len(res["offers"])
+        if meta and str(meta.get("slug") or "") == (slugs[-1] if slugs else ""):
+            chosen = url
             break
 
+    # Then read it once, and only accept it if our listing is really in there:
+    # a section that exists is not yet proof that this is where we stand.
+    pos, seen = 0, 0
+    if chosen:
+        try:
+            ok, res = await asyncio.wait_for(
+                loop.run_in_executor(None, fetch_listing, chosen, shop),
+                timeout=180)
+        except Exception:
+            ok, res = False, ""
+        mine = find_position(res["offers"], ad_id=ad["id"],
+                             title=ad["title"], seller=shop) if ok else None
+        if mine:
+            pos, seen = int(mine["pos"]), len(res["offers"])
+        else:
+            chosen = ""
+
     if not chosen:
+        # Say which of the two steps failed. "Не смог" alone left nothing to
+        # act on — and the two causes need different things from the seller.
+        from automation.market import search_key
+        if urls:
+            why = (f"Нашёл товар на витрине, но ни одна из {len(urls)} "
+                   f"страниц-кандидатов его не показала:\n"
+                   + "\n".join(f"• <code>{_esc(_short_url(u))}</code>"
+                               for u in urls[:4]))
+        else:
+            why = (f"Не нашёл этот товар на витрине поиском по «"
+                   f"{_esc(search_key(ad['title']) or ad['title'][:30])}». "
+                   f"Возможно, он снят с публикации или называется иначе.")
         b = InlineKeyboardBuilder()
         b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
         b.button(text="⬅️ Назад", callback_data="pos:add")
         b.adjust(1)
         await _pos_edit(
             callback.message,
-            f"❔ Не смог сам определить страницу для "
-            f"«{_esc(ad['title'][:40])}».\n\n"
-            + (f"Проверил: {len(urls)} вариант(ов).\n\n" if urls else "")
-            + "Откройте товар на витрине как покупатель и пришлите адрес "
-              "страницы со списком предложений.",
+            f"❔ <b>{_esc(ad['title'][:40])}</b>\n\n{why}\n\n"
+            f"Откройте товар на витрине как покупатель и пришлите адрес "
+            f"страницы со списком предложений.",
             b.as_markup())
         return
 

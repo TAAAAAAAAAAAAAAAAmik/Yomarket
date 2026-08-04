@@ -313,6 +313,64 @@ class TheRightCatalogue(unittest.TestCase):
                          "answered")
 
 
+class FindingOurOwn(unittest.TestCase):
+    """Locating our listing on the storefront without being handed its page.
+
+    /api/products/{id} is not something this marketplace answers, so the id
+    alone gets us nowhere; the search does work, and the row it returns carries
+    the category the address is built from.
+    """
+
+    def setUp(self):
+        import requests
+        self._old = requests.get
+        self.asked: list[dict] = []
+        self.pages = {1: [{"id": 1, "title": "Чужое"}],
+                      2: [{"id": 196439, "title": "🏮АВТОВЫДАЧА🏮 100 ЗВЁЗД",
+                           "category": {"slug": "zvezdy",
+                                        "parent": {"slug": "telegram"}}}]}
+
+        def fake(url, params=None, **kw):
+            if f"/api/products/" in url and not url.endswith("/products"):
+                return Reply({}, 404)          # no card endpoint here
+            p = dict(params or {})
+            self.asked.append(p)
+            return Reply({"data": self.pages.get(int(p.get("page", 1)), [])})
+
+        requests.get = fake
+
+    def tearDown(self):
+        import requests
+        requests.get = self._old
+
+    def test_a_decorated_title_still_yields_something_searchable(self):
+        self.assertEqual(M.search_key("🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫"),
+                         "АВТОВЫДАЧА ЗВЁЗД")
+        self.assertEqual(M.search_key("⭐⭐⭐"), "")
+
+    def test_our_row_is_found_past_the_first_page_of_results(self):
+        row = M.find_own_listing(196439, "🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫")
+        self.assertEqual(str(row.get("id")), "196439")
+        self.assertGreater(len(self.asked), 1, "gave up after one page")
+
+    def test_the_search_uses_the_words_out_of_the_title(self):
+        M.find_own_listing(196439, "🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫")
+        self.assertEqual(self.asked[0].get("keyword"), "АВТОВЫДАЧА ЗВЁЗД")
+
+    def test_the_address_is_built_from_the_row_we_found(self):
+        urls = M.listing_urls_for(196439, title="🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫")
+        self.assertIn("https://yoomarket.net/categories/telegram/zvezdy", urls)
+        self.assertIn("https://yoomarket.net/categories/zvezdy/telegram", urls)
+
+    def test_a_listing_that_is_nowhere_is_reported_as_nothing(self):
+        self.assertEqual(M.find_own_listing(999999, "Нет такого товара"), {})
+        self.assertEqual(M.listing_urls_for(999999, title="Нет такого"), [])
+
+    def test_a_title_with_nothing_searchable_is_not_a_blind_search(self):
+        self.assertEqual(M.find_own_listing(1, "⭐⭐⭐"), {})
+        self.assertEqual(self.asked, [], "must not query with an empty keyword")
+
+
 class Completeness(ApiCase):
     """Whether the whole listing was seen changes what "не нашёл" means."""
 

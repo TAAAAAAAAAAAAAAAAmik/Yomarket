@@ -245,7 +245,14 @@ class AddingFromOwnListings(FlowCase):
 
         import api.yoomarket as Y
         self.patch(Y, "YooMarketAPI", FakeApi)
-        self.patch(M, "product_card", lambda mid: self.CARD)
+        self.patch(M, "find_own_listing",
+                   lambda mid, title="": self.CARD)
+        # The catalogue knows «virty» as a section of black-russia,
+        # and knows nothing about the reverse.
+        self.patch(M, "category_meta",
+                   lambda slugs: {"id": 512, "slug": "virty",
+                                  "ads_count": 161}
+                   if slugs[-1:] == ["virty"] else {})
 
         # Only the right way round has our listing in it.
         right = "https://yoomarket.net/categories/black-russia/virty"
@@ -282,38 +289,43 @@ class AddingFromOwnListings(FlowCase):
         self.assertTrue(any("2-м месте" in t for t in cb.message.sent),
                         cb.message.sent)
 
-    def test_the_likeliest_order_is_tried_first_and_costs_one_request(self):
-        """A card points at its parent, so the chain arrives inside-out.
+    def test_only_the_chosen_address_is_read_in_full(self):
+        """Candidates are settled against the catalogue, not by reading each.
 
-        Turning it round is right often enough that it goes first — and when it
-        works, nothing else is fetched.
+        Reading every candidate's listing would be up to forty-five pages
+        apiece — minutes of requests to answer a question one lookup settles.
         """
         self.pick()
         self.assertEqual(self.fetched,
                          ["https://yoomarket.net/categories/black-russia/virty"])
 
-    def test_a_candidate_without_our_listing_is_dropped_for_the_next(self):
-        """Which slug is the game is not stated anywhere — the listing settles it.
+    def test_the_slug_order_is_settled_by_the_catalogue(self):
+        """Which slug is the game is not stated anywhere on the card.
 
         Guessing and keeping the guess would count the position in the wrong
-        catalogue, which is the number the seller pays against.
+        catalogue — the number the seller pays against.
         """
-        right = "https://yoomarket.net/categories/virty/black-russia"
-
-        def fetch(url, shop=""):
-            self.fetched.append(url)
-            if url == right:
-                return True, PAGE
-            return True, {"offers": M._normalize(
-                [{"title": "Чужое", "price": 10, "shop": {"name": "Кто-то"}},
-                 {"title": "Чужое", "price": 20, "shop": {"name": "Ещё"}}]),
-                "note": ""}
-
-        self.patch(M, "fetch_listing", fetch)
+        # Here the catalogue says the *other* order is the real section, and
+        # our listing is on whichever page is read.
+        self.patch(M, "category_meta",
+                   lambda slugs: {"id": 77, "slug": "black-russia",
+                                  "ads_count": 638}
+                   if slugs[-1:] == ["black-russia"] else {})
+        self.patch(M, "fetch_listing", lambda url, shop="": (True, PAGE))
         self.pick()
-        self.assertEqual(self.watches()[0]["url"], right)
-        self.assertGreater(len(self.fetched), 1,
-                           "the first candidate had to be rejected")
+        self.assertEqual(self.watches()[0]["url"],
+                         "https://yoomarket.net/categories/virty/black-russia")
+
+    def test_a_section_that_exists_but_lacks_our_listing_is_not_accepted(self):
+        """Existing is not the same as being where we stand."""
+        self.patch(M, "fetch_listing",
+                   lambda url, shop="": (True, {"offers": M._normalize(
+                       [{"title": "Чужое", "price": 10,
+                         "shop": {"name": "Кто-то"}}]), "note": ""}))
+        cb = self.pick()
+        self.assertEqual(self.watches(), [])
+        self.assertTrue(any("не показала" in t for t in cb.message.sent),
+                        cb.message.sent)
 
     def test_the_panel_record_is_bound_in_the_same_step(self):
         cb = self.pick()
@@ -333,17 +345,21 @@ class AddingFromOwnListings(FlowCase):
         cb = self.pick()
         self.assertEqual(self.watches(), [], "nothing unverified is saved")
         said = "\n".join(cb.message.sent)
-        self.assertIn("Не смог сам определить", said)
+        self.assertIn("не показала", said)
         kb = cb.message.markups[-1]
         self.assertIn("pos:addurl",
                       [b.callback_data for row in kb.inline_keyboard
                        for b in row])
 
-    def test_a_card_the_marketplace_will_not_give_is_not_a_crash(self):
-        self.patch(M, "product_card", lambda mid: {})
+    def test_a_listing_the_search_cannot_find_says_so_specifically(self):
+        """A different failure from «the page did not show it», and it needs a
+        different thing from the seller — so it must not read the same."""
+        self.patch(M, "find_own_listing", lambda mid, title="": {})
         cb = self.pick()
         self.assertEqual(self.watches(), [])
-        self.assertTrue(any("Не смог" in t for t in cb.message.sent))
+        said = "\n".join(cb.message.sent)
+        self.assertIn("Не нашёл этот товар на витрине", said)
+        self.assertNotIn("не показала", said)
 
     def test_a_stale_list_is_refused_rather_than_picking_the_wrong_item(self):
         cb = FakeCallback("pos:addpick:99")

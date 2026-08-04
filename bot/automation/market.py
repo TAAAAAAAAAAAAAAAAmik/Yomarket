@@ -426,6 +426,61 @@ def product_card(market_id: str | int) -> dict:
     return body if isinstance(body, dict) else {}
 
 
+def search_key(title: str) -> str:
+    """A piece of a title worth searching on.
+
+    Titles are written to catch the eye — «🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫» — and
+    the decorations are not searchable. What is left are the words a buyer
+    would actually type.
+    """
+    words = re.findall(r"[\w.]+", str(title or ""), re.UNICODE)
+    words = [w for w in words if len(w) > 1 and not w.isdigit() or
+             (w.isdigit() and len(w) >= 2)]
+    if not words:
+        return ""
+    # Two longest words, in the order they appear: enough to be specific,
+    # short enough that a decorated title still matches.
+    best = sorted(words, key=len, reverse=True)[:2]
+    return " ".join(w for w in words if w in best)[:60]
+
+
+def find_own_listing(market_id: str | int, title: str = "") -> dict:
+    """Our listing as it appears on the storefront, found by searching for it.
+
+    `/api/products/{id}` is not something this marketplace answers, so the id
+    alone gets us nowhere. The search does work — it is the same endpoint the
+    listing pages use — so the title finds the row and the row carries the
+    category the address is built from.
+    """
+    import requests
+    card = product_card(market_id)
+    if card:
+        return card
+    key = search_key(title)
+    if not key:
+        return {}
+    want = str(market_id)
+    # A few pages, because the words that survive a decorated title are not
+    # always distinctive — «Быстрая выдача» matches half a category.
+    for page in range(1, 4):
+        try:
+            r = requests.get(f"{API_URL}/api/products",
+                             params={"keyword": key, "page": page},
+                             headers=_API_HEADERS, timeout=(6, 20),
+                             verify=False)
+            body = r.json() if r.status_code == 200 else {}
+        except Exception as e:
+            logger.info("search for own listing %s: %s", market_id, e)
+            return {}
+        rows = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(rows, list) or not rows:
+            return {}
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("id")) == want:
+                return row
+    return {}
+
+
 def _slug_chain(node, depth: int = 0) -> list:
     """Category slugs found in a payload, outermost first.
 
@@ -450,7 +505,8 @@ def _slug_chain(node, depth: int = 0) -> list:
     return out
 
 
-def listing_urls_for(market_id: str | int, card: dict | None = None) -> list:
+def listing_urls_for(market_id: str | int, card: dict | None = None,
+                     title: str = "") -> list:
     """Storefront addresses a listing of ours could live at, likeliest first.
 
     Saves the seller from opening the marketplace, finding their own item and
@@ -463,7 +519,7 @@ def listing_urls_for(market_id: str | int, card: dict | None = None) -> list:
     round. Guessing would be a coin toss; the caller settles it by asking each
     address whether our listing is actually in it.
     """
-    card = card if card is not None else product_card(market_id)
+    card = card if card is not None else find_own_listing(market_id, title)
     if not card:
         return []
     own = str(card.get("slug") or "")
