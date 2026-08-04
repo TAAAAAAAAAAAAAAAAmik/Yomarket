@@ -120,10 +120,14 @@ class PriceShapes(unittest.TestCase):
         self.assertIsNone(M.cheapest([]))
 
 
-# The page the seller actually sent: a category listing of Black Russia
-# currency, cards with a discount, a seller and a rating. Their shop is Spike,
-# third from the top — so "3" is the only right answer here, and anything else
-# is the parser finding some other list.
+# Modelled on the page the seller sent: a category listing of Black Russia
+# currency — cards with a discount, a seller and a rating.
+#
+# Their shop, Spike, appeared third *on the screenshot*, but only because they
+# had scrolled down to it. The real listing is long and their card sits well
+# below the fold, so the fixture puts Spike deep in the list on purpose: a
+# parser that latches onto the top of the page passes a four-card fixture and
+# fails on the real one.
 CARD = """
 <div class="card"><a href="/o/{id}"><h3>{title}</h3>
 {badge}<span class="cat">Black Russia / Вирты</span>
@@ -149,11 +153,37 @@ REAL_CARDS = [
 ]
 
 
-def rendered_page() -> str:
-    """The listing as markup only — no payload embedded anywhere."""
-    return ("<!DOCTYPE html><html><head><title>Black Russia</title>"
-            "<script>window.x=1</script></head><body><main>"
+# Where Spike really sits: far enough down that only a parser reading the whole
+# list finds it.
+SPIKE_POS = 17
+FILLER_BEFORE = SPIKE_POS - 3          # Spike is 3rd among REAL_CARDS
+FILLER_AFTER = 9
+
+
+def _filler(n: int, start: int) -> str:
+    return "".join(
+        CARD.format(id=900 + start + i, title=f"АВТОВЫДАЧА вирты лот {i}",
+                    badge="", price=str(220 + i), old="",
+                    shop=f"Продавец{start + i}", rating="4.8",
+                    reviews=str(100 + i))
+        for i in range(n))
+
+
+def rendered_page(long: bool = False) -> str:
+    """The listing as markup only — no payload embedded anywhere.
+
+    `long=True` buries Spike where it actually is, past the fold.
+    """
+    if not long:
+        return ("<!DOCTYPE html><html><head><title>Black Russia</title>"
+                "<script>window.x=1</script></head><body><main>"
+                + "".join(CARD.format(**c) for c in REAL_CARDS)
+                + "</main></body></html>")
+    return ("<!DOCTYPE html><html><head><title>Black Russia</title></head>"
+            "<body><main>"
+            + _filler(FILLER_BEFORE, 1)
             + "".join(CARD.format(**c) for c in REAL_CARDS)
+            + _filler(FILLER_AFTER, 500)
             + "</main></body></html>")
 
 
@@ -165,9 +195,19 @@ class TheRealListing(unittest.TestCase):
                          ["GigShop", "GadjiSeller", "Spike", "BlackMarket"])
         self.assertEqual([r["pos"] for r in rows], [1, 2, 3, 4])
 
-    def test_our_shop_is_third_not_first(self):
-        rows = M._normalize(M._offers_from_text(rendered_page()))
-        self.assertEqual(find_position_(rows, seller="Spike")["pos"], 3)
+    def test_a_shop_below_the_fold_is_found_where_it_actually_is(self):
+        """The whole point of the feature: the position nobody scrolled to."""
+        rows = M._normalize(M._offers_from_text(rendered_page(long=True)))
+        self.assertEqual(len(rows), FILLER_BEFORE + 4 + FILLER_AFTER)
+        spike = find_position_(rows, seller="Spike")
+        self.assertEqual(spike["pos"], SPIKE_POS)
+        self.assertEqual(spike["price"], 239.99,
+                         "found some other card that far down")
+
+    def test_a_long_list_does_not_collapse_to_the_top_of_the_page(self):
+        rows = M._normalize(M._offers_from_text(rendered_page(long=True)))
+        self.assertNotEqual(find_position_(rows, seller="Spike")["pos"], 1)
+        self.assertEqual(rows[0]["seller"], "Продавец1")
 
     def test_the_sale_price_is_read_not_the_struck_through_one(self):
         rows = M._normalize(M._offers_from_text(rendered_page()))

@@ -1253,8 +1253,9 @@ def _pos_raw_sync(url: str, shop: str) -> str:
     import requests
     from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-    from automation.market import (MARKET_URL, _json_blobs, _offer_lists,
-                                   _offers_from_text, _visible_text)
+    from automation.market import (MARKET_URL, _json_blobs, _normalize,
+                                   _offer_lists, _offers_from_text,
+                                   _visible_text, find_position)
 
     requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
     if not url.startswith("http"):
@@ -1288,21 +1289,39 @@ def _pos_raw_sync(url: str, shop: str) -> str:
 
     # 2. Is the listing in the bytes at all?
     text = _visible_text(html)
-    marks = [m for m in (shop, "отзыв", "₽", "Spike", "GadjiSeller", "GigShop")
-             if m]
+    marks = [m for m in (shop, "отзыв", "₽") if m]
     found = {m: (m in html) for m in marks}
     out.append("в HTML: " + ", ".join(f"{k}={'да' if v else 'НЕТ'}"
                                       for k, v in found.items()))
     out.append(f"видимого текста: {len(text.strip())}б")
 
-    # 3. What the payload around our shop looks like — the shape to parse
+    # 3. How much of the list came in one response, and where we are in it.
+    # The seller had to scroll to reach their own card, so the question is not
+    # only "did it parse" but "did the whole list arrive" — a listing that
+    # loads in batches would put them past the end of what we can see.
+    rows = _normalize(_offers_from_text(html)) if not lists else \
+        _normalize(max(lists, key=len))
+    if rows:
+        mine = find_position(rows, seller=shop) if shop else None
+        out.append(f"разобрано карточек: {len(rows)}; "
+                   f"наше место: {mine['pos'] if mine else 'НЕ НАЙДЕНО'}")
+        out.append("продавцы: " + ", ".join(r["seller"][:14] or "?"
+                                            for r in rows[:12])
+                   + (" …" if len(rows) > 12 else ""))
+    lazy = sorted(set(re.findall(
+        r'(?i)(page=\d+|[?&]offset=|показать ещё|показать еще|load[_-]?more'
+        r'|infinite|IntersectionObserver|useInfiniteQuery|hasNextPage)', html)))
+    out.append("признаки подгрузки порциями: "
+               + (", ".join(lazy[:8]) if lazy else "не вижу"))
+
+    # 4. What the payload around our shop looks like — the shape to parse
     if shop and shop in html:
         i = html.index(shop)
         out.append("")
         out.append(f"--- окрестности «{shop}» ---")
         out.append(html[max(0, i - 300):i + 300])
 
-    # 4. A JSON endpoint would beat parsing any markup
+    # 5. A JSON endpoint would beat parsing any markup
     apis = sorted(set(re.findall(
         r'["\'](/api/[\w/\-.]+|https?://[\w.\-]*(?:api|graphql)[\w/\-.]*)["\']',
         html)))
