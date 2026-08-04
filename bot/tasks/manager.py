@@ -148,6 +148,61 @@ def _newest_id(rows: list[dict]) -> str:
     return best
 
 
+# Кто отправил сообщение. Подстрока ищется только у отличительных слов: короткое
+# «me» встречается внутри «customer».
+_OWN_PARTS = ("shop", "seller", "store", "merchant", "продав", "магаз",
+              "support", "админ")
+_OWN_EXACT = frozenset({"me", "self", "own", "admin", "bot", "system"})
+
+
+def _is_own_message(msg: dict, in_support_chat: bool = False) -> bool:
+    """Сообщение написано магазином, а не собеседником.
+
+    В чате с поддержкой «support» и «админ» — это как раз собеседник, а не мы;
+    записав их в свои, бот считал бы такой чат всегда отвеченным.
+    """
+    if msg.get("is_mine") or msg.get("is_own"):
+        return True
+    sender = msg.get("sender_type") or msg.get("sender") or ""
+    if isinstance(sender, dict):
+        sender = (sender.get("type") or sender.get("role")
+                  or sender.get("name") or "")
+    sender = str(sender).lower()
+    parts = (tuple(p for p in _OWN_PARTS if p not in ("support", "админ"))
+             if in_support_chat else _OWN_PARTS)
+    exact = _OWN_EXACT - {"admin"} if in_support_chat else _OWN_EXACT
+    return sender in exact or any(k in sender for k in parts)
+
+
+def _ts_of(msg: dict) -> float:
+    """Время сообщения в секундах эпохи, 0 — если разобрать не вышло."""
+    raw = (msg.get("created_at") or msg.get("date") or msg.get("time")
+           or msg.get("timestamp"))
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return float(raw) / 1000 if float(raw) > 1e11 else float(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return 0.0
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _newest_msg(rows: list[dict]) -> dict:
+    """Самое свежее сообщение — по номеру, а не по месту в списке."""
+    best: dict = {}
+    best_id = ""
+    for m in rows:
+        mid = str(m.get("id", ""))
+        if not mid:
+            continue
+        if not best_id or _is_newer(mid, best_id):
+            best_id, best = mid, m
+    return best
+
+
 _USERNAME_RE = re.compile(r"@?([a-zA-Z][a-zA-Z0-9_]{3,31})")
 
 
@@ -676,6 +731,10 @@ class TaskManager:
                 work_at = prev_det.get("work_at")
                 if status in ("work", "working", "processing") and prev_status not in ("work", "working", "processing"):
                     work_at = time.time()
+                # Спорный статус — это проблема сам по себе, ещё до того, как
+                # покупатель что-то написал.
+                disputed = any(cs in str(status).lower()
+                               for cs in _COMPLAINT_STATUSES)
                 order_details[oid] = {
                     "title": title,
                     "buyer": buyer,
@@ -686,6 +745,12 @@ class TaskManager:
                     "category": category,
                     "seen_at": prev_det.get("seen_at") or time.time(),
                     "work_at": work_at,
+                    "status": status,
+                    # Метки подсветки чата переживают пересборку записи — иначе
+                    # красный чат гас на следующем же проходе опроса.
+                    "waiting": prev_det.get("waiting", 0),
+                    "problem": (time.time() if disputed
+                                else prev_det.get("problem", 0)),
                 }
 
                 # If order moved to a terminal/changed status, clear its reminder record
@@ -872,6 +937,17 @@ class TaskManager:
 
                 newest_id = _newest_id(messages)
                 last_known = info.get("last_msg")
+
+                # Тот же признак, что и у чатов заказов: последним написал
+                # покупатель — чат ждёт ответа. Считается всегда, чтобы метка
+                # гасла, когда продавец ответил из панели.
+                newest = _newest_msg(messages)
+                if newest and _is_own_message(newest, in_support_chat=True):
+                    info["waiting"] = 0
+                    info["problem"] = 0
+                elif newest and not info.get("waiting"):
+                    info["waiting"] = _ts_of(newest) or time.time()
+
                 if last_known is None:
                     info["last_msg"] = newest_id      # baseline, stay quiet
                     continue
@@ -883,13 +959,10 @@ class TaskManager:
                     msg_id = str(msg.get("id", ""))
                     if not _is_newer(msg_id, last_known):
                         continue
-                    sender = msg.get("sender_type") or msg.get("sender") or ""
-                    if isinstance(sender, dict):
-                        sender = sender.get("type") or sender.get("role") or ""
-                    sender = str(sender).lower()
-                    if msg.get("is_mine") or msg.get("is_own") or sender in (
-                            "me", "self", "own", "shop", "seller"):
+                    if _is_own_message(msg, in_support_chat=True):
                         continue
+                    if _is_complaint_text(msg.get("text") or msg.get("message") or ""):
+                        info["problem"] = time.time()
 
                     if not announce:
                         continue
@@ -937,6 +1010,21 @@ class TaskManager:
                 newest_id = _newest_id(messages)
                 last_known_id = known_messages.get(order_id)
 
+                # Кто написал последним — этим и подсвечивается чат в списке.
+                # Считается на каждом проходе, даже когда новых сообщений нет:
+                # продавец мог ответить из панели или приложения, и тогда метка
+                # «покупатель ждёт» должна погаснуть сама.
+                newest = _newest_msg(messages)
+                if order_id in order_details:
+                    det = order_details[order_id]
+                    if newest and _is_own_message(newest):
+                        det["waiting"] = 0
+                        det["problem"] = 0
+                    elif newest:
+                        det.setdefault("waiting", 0)
+                        if not det["waiting"]:
+                            det["waiting"] = (_ts_of(newest) or time.time())
+
                 if last_known_id is None:
                     known_messages[order_id] = newest_id
                     continue
@@ -958,22 +1046,11 @@ class TaskManager:
                     # Skip what the shop itself sent; anything else counts as
                     # the buyer. Requiring a known buyer value meant an
                     # unfamiliar wording silently dropped every message.
-                    sender = msg.get("sender_type") or msg.get("sender") or ""
-                    if isinstance(sender, dict):
-                        sender = (sender.get("type") or sender.get("role")
-                                  or sender.get("name") or "")
-                    sender = str(sender).lower()
-                    if msg.get("is_mine") or msg.get("is_own"):
+                    if _is_own_message(msg):
                         continue
-                    # Substring match only for distinctive words: short ones
-                    # like "me" also occur inside "customer".
-                    _OWN_PARTS = ("shop", "seller", "store", "merchant",
-                                  "продав", "магаз", "support", "админ")
-                    _OWN_EXACT = {"me", "self", "own", "admin", "bot", "system"}
-                    if sender in _OWN_EXACT or any(k in sender for k in _OWN_PARTS):
-                        continue
-                    if sender and sender not in (
-                            "buyer", "client", "customer", "user"):
+                    sender = msg.get("sender_type") or msg.get("sender")
+                    if isinstance(sender, str) and sender.lower() not in (
+                            "", "buyer", "client", "customer", "user"):
                         logger.info("chat %s: unknown sender %r", chat_id, sender)
 
                     time_str = _fmt_time(msg.get("created_at") or msg.get("date"))
@@ -992,6 +1069,12 @@ class TaskManager:
                     # Complaint detection → distinct high-priority alert
                     is_complaint = _is_complaint_text(raw_text)
                     alerted = False
+                    # Красным чат светится независимо от того, включены ли
+                    # уведомления о жалобах: выключенное уведомление — просьба
+                    # не дёргать, а не «считать, что всё хорошо».
+                    if is_complaint and order_id in order_details:
+                        order_details[order_id]["problem"] = time.time()
+
                     cn = settings.get("complaint_notify", {"enabled": True})
                     if cn.get("enabled", True) and is_complaint:
                         seen = cn.setdefault("seen", [])

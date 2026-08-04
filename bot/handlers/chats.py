@@ -78,15 +78,97 @@ def _format_messages(messages: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+# Состояние чата, в порядке важности. Номер заказа человеку ничего не говорит —
+# он узнаёт переписку по покупателю и по товару, поэтому номер ушёл внутрь
+# карточки чата, а на кнопке остались имя и название.
+MARK_PROBLEM = "🔴"      # жалоба или спор — сюда нужно вмешаться
+MARK_WAITING = "🟠"      # покупатель написал, ответа от человека не было
+MARK_PLAIN = "💬"
+
+# Через сколько «покупатель ждёт» превращается в проблему: полдня молчания по
+# заказу — это уже повод для спора, а не просто непрочитанное.
+_WAIT_ALARM = 12 * 3600
+
+
+def _chat_state(det: dict, now: float = 0.0) -> tuple[str, int]:
+    """(значок, вес для сортировки) по тому, что бот знает о чате."""
+    import time as _t
+    now = now or _t.time()
+    waiting = float((det or {}).get("waiting", 0) or 0)
+    if (det or {}).get("problem") or (waiting and now - waiting > _WAIT_ALARM):
+        return MARK_PROBLEM, 2
+    if waiting:
+        return MARK_WAITING, 1
+    return MARK_PLAIN, 0
+
+
+def _order_label(order: dict, det: dict) -> str:
+    """Подпись кнопки чата: кто и по какому товару.
+
+    Раньше здесь стоял номер заказа первым — в списке из десяти чатов все
+    кнопки начинались с «💬 #», и различать их приходилось по хвосту.
+    """
+    oid = str(order.get("id", ""))
+    det = det or {}
+    title = (order.get("title") or order.get("ad_title")
+             or order.get("product_name") or det.get("title") or "")
+    buyer = (order.get("buyer_name") or (order.get("buyer") or {}).get("name")
+             or det.get("buyer") or "")
+    title = "" if str(title) == "—" else str(title).strip()
+    buyer = "" if str(buyer) == "—" else str(buyer).strip()
+
+    mark, _ = _chat_state(det)
+    if buyer and title:
+        return f"{mark} {buyer[:16]} · {title[:24]}"
+    return f"{mark} {buyer[:40] or title[:40] or f'Заказ #{oid}'}"
+
+
+def _resolve_chat(uid: int, key: str) -> tuple[str, dict]:
+    """(номер чата для API, что бот знает о заказе).
+
+    Сообщения лежат под чатом, а не под заказом: GET /chats/{chat_id}/messages.
+    Кнопки списка несут номер заказа — по нему находятся имя и товар, — а у
+    заказа может быть свой номер чата. Фоновый опрос это уже учитывал, экран
+    чата — нет, и там, где номера различаются, переписка не открывалась.
+    """
+    det = (get_settings(uid).get("known_order_details") or {}).get(str(key)) or {}
+    return str(det.get("chat_id") or key), det
+
+
+def _chat_header(key: str, det: dict) -> str:
+    """Заголовок экрана чата: покупатель и товар, номер — мелким шрифтом."""
+    buyer = str((det or {}).get("buyer") or "").strip()
+    title = str((det or {}).get("title") or "").strip()
+    who = " · ".join(p for p in (buyer, title) if p and p != "—")
+    mark, _ = _chat_state(det)
+    head = f"{mark} <b>{_esc(who)}</b>" if who else f"{mark} <b>Чат по заказу</b>"
+    return f"{head}\n<code>#{_esc(key)}</code>"
+
+
+def _mark_answered(uid: int, key: str) -> None:
+    """Продавец ответил — гасим подсветку чата."""
+    s = get_settings(uid)
+    det = (s.get("known_order_details") or {}).get(str(key))
+    if not det or not (det.get("waiting") or det.get("problem")):
+        return
+    det["waiting"] = 0
+    det["problem"] = 0
+    save_settings(uid, s)
+
+
 def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None,
-                                watched: dict | None = None) -> InlineKeyboardMarkup:
+                                watched: dict | None = None,
+                                details: dict | None = None) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for order in orders:
+    details = details or {}
+    # Проблемные — наверх: в списке на две страницы красный чат внизу второй
+    # страницы виден не лучше, чем не помеченный вовсе.
+    ordered = sorted(orders,
+                     key=lambda o: -_chat_state(details.get(str(o.get("id", ""))) or {})[1])
+    for order in ordered:
         oid = str(order.get("id", ""))
-        title = order.get("title") or order.get("ad_title") or order.get("product_name") or f"Заказ {oid}"
-        buyer = order.get("buyer_name") or (order.get("buyer") or {}).get("name") or ""
-        label = f"💬 #{oid} {title[:25]}" + (f" ({buyer})" if buyer else "")
-        builder.button(text=label, callback_data=ChatCallback(chat_id=oid).pack())
+        builder.button(text=_order_label(order, details.get(oid) or {}),
+                       callback_data=ChatCallback(chat_id=oid).pack())
     builder.adjust(1)
     if next_cursor:
         builder.button(text="Следующая →", callback_data=PaginationCallback(entity="chat_orders", cursor=next_cursor).pack())
@@ -150,11 +232,28 @@ async def chats_hub(callback: CallbackQuery, state: FSMContext) -> None:
     ar_on = bool(conf.get("enabled"))
     live = [r for r in (conf.get("rules") or []) if r.get("on", True)]
 
+    details = s.get("known_order_details") or {}
+    problem = waiting = 0
+    for det in details.values():
+        mark, _ = _chat_state(det or {})
+        problem += mark == MARK_PROBLEM
+        waiting += mark == MARK_WAITING
+
     lines = ["💬 <b>Чаты</b>", ""]
-    lines.append("📋 Переписка по заказам — в «Списке чатов».")
+    if problem or waiting:
+        parts = []
+        if problem:
+            parts.append(f"{MARK_PROBLEM} требуют внимания: <b>{problem}</b>")
+        if waiting:
+            parts.append(f"{MARK_WAITING} ждут ответа: <b>{waiting}</b>")
+        lines.append("📋 " + " · ".join(parts))
+    else:
+        lines.append("📋 Переписка по заказам — в «Списке чатов».")
     for kind, meta in _WELL_KNOWN.items():
         cid = _find_well_known(watched, kind)
-        lines.append(f"{meta['icon']} {meta['title']}: "
+        mark, _ = _chat_state(watched.get(cid) or {}) if cid else (MARK_PLAIN, 0)
+        icon = mark if mark != MARK_PLAIN else meta["icon"]
+        lines.append(f"{icon} {meta['title']}: "
                      + (f"<code>#{_esc(cid)}</code>" if cid else "<i>не добавлен</i>"))
     if ar_on:
         extra = (f"правил: {len(live)}" if live or (conf.get("fallback") or {}).get("on")
@@ -203,24 +302,43 @@ async def chats_well_known(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "chats:list")
 async def show_chats(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.message.edit_text("⏳ Загружаю чаты...")
-    watched = get_settings(callback.from_user.id).get("watched_chats") or {}
+    s = get_settings(callback.from_user.id)
+    watched = s.get("watched_chats") or {}
+    details = s.get("known_order_details") or {}
     try:
         data = await api.get_orders()
         orders: list[dict] = data.get("data") or data.get("items") or []
         next_cursor: str | None = data.get("meta", {}).get("next_cursor")
         if orders:
-            text = "💬 <b>Чаты</b>\nВыберите заказ:"
+            text = "💬 <b>Чаты</b>\n" + _legend(orders, details)
         else:
             text = ("💬 <b>Чаты</b>\n\nПо заказам чатов пока нет."
                     + (f"\nОтслеживаемых чатов вне заказов: <b>{len(watched)}</b>."
                        if watched else ""))
-        keyboard = _build_chat_orders_keyboard(orders, next_cursor, watched)
+        keyboard = _build_chat_orders_keyboard(orders, next_cursor, watched, details)
     except Exception as e:
         # The order list failing must not hide chats that do not depend on it
         text = f"❌ Заказы не загрузились: {e}"
-        keyboard = _build_chat_orders_keyboard([], None, watched)
+        keyboard = _build_chat_orders_keyboard([], None, watched, details)
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
+
+
+def _legend(orders: list[dict], details: dict) -> str:
+    """Что означают цвета — но только те, которые сейчас есть в списке."""
+    problem = waiting = 0
+    for o in orders:
+        mark, _ = _chat_state(details.get(str(o.get("id", ""))) or {})
+        problem += mark == MARK_PROBLEM
+        waiting += mark == MARK_WAITING
+    if not problem and not waiting:
+        return "Все отвечены. Выберите чат:"
+    parts = []
+    if problem:
+        parts.append(f"{MARK_PROBLEM} требует внимания: <b>{problem}</b>")
+    if waiting:
+        parts.append(f"{MARK_WAITING} ждут ответа: <b>{waiting}</b>")
+    return " · ".join(parts)
 
 
 @router.callback_query(PaginationCallback.filter(F.entity == "chat_orders"))
@@ -234,10 +352,11 @@ async def paginate_chat_orders(
         data = await api.get_orders(cursor=callback_data.cursor)
         orders: list[dict] = data.get("data") or data.get("items") or []
         next_cursor: str | None = data.get("meta", {}).get("next_cursor")
-        text = "💬 <b>Чаты</b>\nВыберите заказ:"
+        s = get_settings(callback.from_user.id)
+        details = s.get("known_order_details") or {}
+        text = "💬 <b>Чаты</b>\n" + _legend(orders, details)
         keyboard = _build_chat_orders_keyboard(
-            orders, next_cursor,
-            get_settings(callback.from_user.id).get("watched_chats") or {})
+            orders, next_cursor, s.get("watched_chats") or {}, details)
     except Exception as e:
         text = f"❌ Ошибка: {e}"
         keyboard = back_keyboard()
@@ -252,12 +371,13 @@ async def show_chat_messages(
     api: YooMarketAPI,
 ) -> None:
     chat_id = callback_data.chat_id
-    await callback.message.edit_text(f"⏳ Загружаю чат #{chat_id}...")
+    await callback.message.edit_text("⏳ Загружаю чат...")
+    real_id, det = _resolve_chat(callback.from_user.id, chat_id)
     try:
-        data = await api.get_messages(chat_id)
+        data = await api.get_messages(real_id)
         messages: list[dict] = data.get("data") or data.get("items") or []
         messages = messages[-10:] if len(messages) > 10 else messages
-        text = f"💬 <b>Чат по заказу #{chat_id}</b>\n\n" + _format_messages(messages)
+        text = _chat_header(chat_id, det) + "\n\n" + _format_messages(messages)
         settings = get_settings(callback.from_user.id)
         quick_replies: list = settings.get("quick_replies", [])
         builder = InlineKeyboardBuilder()
@@ -295,11 +415,12 @@ async def init_reply(callback: CallbackQuery, state: FSMContext) -> None:
 async def cancel_reply(callback: CallbackQuery, state: FSMContext, api: YooMarketAPI) -> None:
     await state.clear()
     chat_id = callback.data.split(":", 1)[1]
+    real_id, det = _resolve_chat(callback.from_user.id, chat_id)
     try:
-        data = await api.get_messages(chat_id)
+        data = await api.get_messages(real_id)
         messages: list[dict] = data.get("data") or data.get("items") or []
         messages = messages[-10:] if len(messages) > 10 else messages
-        text = f"💬 <b>Чат по заказу #{chat_id}</b>\n\n" + _format_messages(messages)
+        text = _chat_header(chat_id, det) + "\n\n" + _format_messages(messages)
         builder = InlineKeyboardBuilder()
         builder.button(text="✉️ Ответить", callback_data=f"reply_init:{chat_id}")
         builder.button(text="⬅️ Чаты", callback_data="menu:chats")
@@ -323,9 +444,13 @@ async def send_reply(message: Message, state: FSMContext, api: YooMarketAPI) -> 
         await message.answer("❌ Ошибка.", reply_markup=back_keyboard())
         return
 
+    real_id, det = _resolve_chat(message.from_user.id, chat_id)
     try:
-        await api.send_message(chat_id, text_to_send)
-        text = f"✅ Сообщение отправлено в чат #{chat_id}"
+        await api.send_message(real_id, text_to_send)
+        who = str((det or {}).get("buyer") or "").strip()
+        text = "✅ Отправлено" + (f" покупателю {_esc(who)}" if who and who != "—"
+                                 else f" в чат #{_esc(chat_id)}")
+        _mark_answered(message.from_user.id, chat_id)
     except Exception as e:
         text = _send_error(e)
 
@@ -354,8 +479,10 @@ async def send_quick_reply(callback: CallbackQuery, api: YooMarketAPI) -> None:
         await callback.answer("❌ Шаблон не найден", show_alert=True)
         return
     text = quick_replies[idx]
+    real_id, _det = _resolve_chat(callback.from_user.id, chat_id)
     try:
-        await api.send_message(chat_id, text)
+        await api.send_message(real_id, text)
+        _mark_answered(callback.from_user.id, chat_id)
         await callback.answer("✅ Отправлено!", show_alert=True)
     except Exception as e:
         # Alerts are short and plain-text; strip the HTML the helper adds
@@ -424,8 +551,11 @@ def _wchats_text(watched: dict) -> str:
 
 def _wchats_kb(watched: dict) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    for cid, info in list(watched.items())[:20]:
-        b.button(text=f"🛟 {(info.get('label') or 'Чат')[:24]}",
+    rows = sorted(watched.items(), key=lambda kv: -_chat_state(kv[1] or {})[1])
+    for cid, info in rows[:20]:
+        mark, _ = _chat_state(info or {})
+        b.button(text=f"{mark if mark != MARK_PLAIN else '🛟'} "
+                      f"{(info.get('label') or 'Чат')[:24]}",
                  callback_data=f"wchat:{cid}")
     b.adjust(1)
     b.button(text="➕ Добавить чат", callback_data="wchats:add")
@@ -565,6 +695,14 @@ async def support_reply_send(message: Message, state: FSMContext) -> None:
             timeout=60)
     except Exception as e:
         ok, msg = False, str(e)[:150]
+    if ok:
+        # Ответ отправлен — чат больше не ждёт нас.
+        s = get_settings(message.from_user.id)
+        info = (s.get("watched_chats") or {}).get(cid)
+        if info and (info.get("waiting") or info.get("problem")):
+            info["waiting"] = 0
+            info["problem"] = 0
+            save_settings(message.from_user.id, s)
     b = InlineKeyboardBuilder()
     b.button(text="💬 К чату", callback_data=f"wchat:{cid}")
     b.button(text="⬅️ Чаты", callback_data="menu:chats")
