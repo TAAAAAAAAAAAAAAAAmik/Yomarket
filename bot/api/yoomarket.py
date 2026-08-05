@@ -736,48 +736,6 @@ class YooMarketAPI:
         logger.info("categories loaded: %d (parent=%s)", len(out), parent_id)
         return out
 
-    async def update_price(self, ad_id: int | str, price: int,
-                           discount: int | None = None) -> dict:
-        """Update price (and optional discount) — PATCH /ads/{ad_id}/price.
-
-        There is no PATCH /ads/{ad_id} in the spec; the old update_ad() posted
-        to that non-existent path, so every price change failed.
-
-        The price comes back as an object — {"amount": 129, "base_amount": 129,
-        "currency": "RUB"} — so a plain number may not be what the endpoint
-        wants either. The documented shape is tried first; only a refusal makes
-        it try the others, and the refusal it earned is what gets reported if
-        none of them are accepted.
-        """
-        shapes: list[dict] = [{"price": int(price)},
-                              {"amount": int(price)},
-                              {"price": {"amount": int(price),
-                                         "currency": "RUB"}}]
-        if discount is not None:
-            shapes[0]["discount"] = discount
-
-        first_error: Exception | None = None
-        for payload in shapes:
-            try:
-                return await self._patch(f"/ads/{ad_id}/price", json=payload)
-            except Exception as e:
-                # Only the shape of the body is in question here. A refusal that
-                # is not about the body — no rights, no such listing — repeats
-                # identically for every shape, so retrying it is just noise.
-                if first_error is None:
-                    first_error = e
-                if not self._is_bad_payload(e):
-                    raise
-        raise first_error or RuntimeError("цена не принята")
-
-    @staticmethod
-    def _is_bad_payload(e: Exception) -> bool:
-        """Похоже ли, что дело в форме тела запроса, а не в правах."""
-        said = str(e).lower()
-        return any(k in said for k in (
-            "422", "400", "valid", "валид", "обязательн", "required",
-            "поле", "field"))
-
     async def get_reviews(self) -> dict:
         """Fetch reviews/feedback. Tries common endpoint names."""
         for path in ("/reviews", "/feedback", "/ratings"):

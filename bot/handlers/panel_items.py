@@ -56,7 +56,6 @@ def _is_gone(ad: dict) -> bool:
 
 
 class PanelItemState(StatesGroup):
-    waiting_price = State()
     waiting_title = State()
     waiting_stock = State()
 
@@ -232,7 +231,6 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
 
 def _item_kb(item_id: str):
     b = InlineKeyboardBuilder()
-    b.button(text="✏️ Цена", callback_data=f"pitem_price:{item_id}")
     b.button(text="✏️ Название", callback_data=f"pitem_title:{item_id}")
     b.button(text="📦 Остатки", callback_data=f"pitem_stock:{item_id}")
     b.button(text="🚀 На модерацию", callback_data=f"pitem_show:{item_id}")
@@ -242,7 +240,7 @@ def _item_kb(item_id: str):
     # «📦 Товары» had no way to reach it
     b.button(text="⭐ Премиум продвижение", callback_data=f"ad_bump:{item_id}")
     b.button(text="⬅️ К товарам", callback_data="pitems:list")
-    b.adjust(2, 2, 2, 1, 1)
+    b.adjust(2, 2, 1, 1, 1)
     return b.as_markup()
 
 
@@ -325,98 +323,7 @@ async def _safe_edit_item(callback: CallbackQuery, text: str, markup) -> None:
             logger.exception("item message could not be sent")
 
 
-# ── Цена / Название ─────────────────────────────────────────────────────────
-
-@router.callback_query(F.data.startswith("pitem_price:"))
-async def edit_price_start(callback: CallbackQuery, state: FSMContext) -> None:
-    item_id = callback.data.split(":", 1)[1]
-    await state.set_state(PanelItemState.waiting_price)
-    await state.update_data(item_id=item_id)
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data=f"pitem:{item_id}")
-    await callback.message.edit_text(
-        f"✏️ Товар #{item_id} — введите новую цену (₽):",
-        reply_markup=b.as_markup(),
-    )
-    await callback.answer()
-
-
-@router.message(PanelItemState.waiting_price)
-async def edit_price_save(message: Message, state: FSMContext) -> None:
-    from automation.panel import panel_update_item_sync
-
-    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
-    try:
-        price = int(float(raw))
-        if price <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите цену числом, например: <b>500</b>")
-        return
-    data = await state.get_data()
-    item_id = data.get("item_id", "")
-    await state.clear()
-    uid = message.from_user.id
-
-    status = await message.answer("⏳ Меняю цену...")
-    result, err = await _run(uid, panel_update_item_sync, item_id,
-                             {"price": price}, uid)
-    if result and result[0]:
-        await status.edit_text(
-            f"✅ Цена товара #{item_id} обновлена: <b>{price} ₽</b>",
-            reply_markup=_item_kb(item_id),
-        )
-    else:
-        detail = result[1] if result else err
-        await status.edit_text(
-            f"❌ Не удалось изменить цену:\n{detail}",
-            reply_markup=_item_kb(item_id),
-        )
-
-
-@router.message(Command("item_debug"))
-async def item_debug(message: Message, api: YooMarketAPI = None) -> None:
-    """/item_debug 223960 — что панель знает об этом товаре.
-
-    Появилась потому, что «✅ Цена обновлена» и старая цена на сайте
-    объясняются тремя разными причинами, и различить их можно только
-    посмотрев, что панель отдаёт на самом деле.
-    """
-    from automation.panel import panel_item_fields_probe_sync
-
-    parts = (message.text or "").split()
-    if len(parts) < 2 or not parts[1].strip().lstrip("#").isdigit():
-        await message.answer("Укажите номер товара: <code>/item_debug 223960</code>")
-        return
-    item_id = parts[1].strip().lstrip("#")
-    status = await message.answer("⏳ Смотрю, что отдаёт панель…")
-    lines, err = await _run(message.from_user.id, panel_item_fields_probe_sync,
-                            item_id, message.from_user.id)
-    lines = list(lines or [])
-    if err and not lines:
-        lines = [f"панель: {err}"]
-
-    # И вторая сторона. Цену можно менять двумя путями — через панель и через
-    # API маркетплейса, — а номера у них могут быть из разных пространств.
-    # Пока обе стороны не видно рядом, «цена не меняется» неразличимо с
-    # «правим не тот товар».
-    lines.append("")
-    if api is None:
-        lines.append("api: токен не подключён")
-    else:
-        try:
-            ad = await api.get_ad(item_id)
-            ad = ad.get("data") if isinstance(ad.get("data"), dict) else ad
-            lines.append(f"api /ads/{item_id}: цена «{ad.get('price')}», "
-                         f"статус «{ad.get('status')}», "
-                         f"«{str(ad.get('title') or '')[:40]}»")
-        except Exception as e:
-            lines.append(f"api /ads/{item_id}: {str(e)[:120]}")
-
-    import html as _html
-    body = "\n".join(_html.escape(str(x)) for x in lines)[:3500]
-    await status.edit_text(f"🔍 <b>Товар #{item_id}</b>\n<code>{body}</code>")
-
+# ── Название ───────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("pitem_title:"))
 async def edit_title_start(callback: CallbackQuery, state: FSMContext) -> None:

@@ -168,14 +168,6 @@ _DEFAULT_SETTINGS = {
     },
     "ad_packs": {},  # {"Пак имя": [ad_id, ...]} — группы объявлений
     "complaint_notify": {"enabled": True, "seen": []},  # уведомления о жалобах
-    "price_schedule": {
-        "enabled": False,
-        "from_hour": 22,   # начало окна (напр. ночь с 22:00)
-        "to_hour": 8,      # конец окна (до 8:00)
-        "percent": -10.0,  # изменение цены в окне
-        "night_active": False,
-        "base_prices": {},  # {ad_id: базовая цена} для восстановления
-    },
     "reviews_monitor": {"enabled": False, "known_review_ids": []},
     "ad_templates": [],
     "plugins": {

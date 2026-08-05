@@ -173,22 +173,6 @@ AUTOMATIONS: list[dict] = [
         "warn": _no_tariff,
         "tune": "selenium:bump:set_interval",
     },
-    {
-        "key": "price_sched", "group": "🛒 Товары",
-        "title": "Ночные скидки",
-        "short": "Ночные скидки",
-        "path": ("price_schedule", "enabled"),
-        "defaults": {("price_schedule", "from_hour"): 22,
-                     ("price_schedule", "to_hour"): 8,
-                     ("price_schedule", "percent"): -10.0},
-        "note": lambda s: (
-            f"{s.get('price_schedule', {}).get('from_hour', 22)}:00–"
-            f"{s.get('price_schedule', {}).get('to_hour', 8)}:00, "
-            f"{s.get('price_schedule', {}).get('percent', -10):+.0f}%"
-        ),
-        "costs": True,
-        "tune": "pricesched:menu",
-    },
     # --- уведомления ---
     {
         "key": "notify_orders", "group": "🔔 Уведомления",

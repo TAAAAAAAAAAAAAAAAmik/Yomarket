@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -45,10 +44,6 @@ def _manual_only(raw: str) -> bool:
 
 def _can_unpublish(raw: str) -> bool:
     return str(raw).lower() in ("publish", "published", "active")
-
-
-class AdEditState(StatesGroup):
-    waiting_new_price = State()
 
 
 def _status(raw: str) -> str:
@@ -177,7 +172,7 @@ async def ads_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
         b.button(text="📦 Товары (панель)", callback_data="pitems:cats")
         b.button(text="➕ Добавить товар", callback_data="create_ad:start")
         b.button(text="⬅️ Главное меню", callback_data="menu:main")
-        b.adjust(2, 1, 1)
+        b.adjust(1, 1)
         keyboard = b.as_markup()
     await _safe_edit(callback.message, text, keyboard)
 
@@ -211,7 +206,7 @@ async def show_ad_detail(
     api: YooMarketAPI,
     state: FSMContext,
 ) -> None:
-    await state.clear()  # "Отмена" из ввода цены ведёт сюда
+    await state.clear()  # сюда возвращаются из других экранов
     await callback.message.edit_text("⏳ Загружаю...")
     try:
         ad = await api.get_ad(callback_data.ad_id)
@@ -234,13 +229,12 @@ async def show_ad_detail(
             + f"📝 <b>Описание:</b>\n{description}"
         )
         b = InlineKeyboardBuilder()
-        b.button(text="✏️ Изменить цену", callback_data=f"ad_price:{callback_data.ad_id}")
         if _can_unpublish(status_raw):
             b.button(text="⏸ Снять с продажи", callback_data=f"ad_pause:{callback_data.ad_id}")
         elif _can_publish(status_raw):
             b.button(text="▶️ Вернуть в продажу", callback_data=f"ad_activate:{callback_data.ad_id}")
         b.button(text="⬅️ К товарам", callback_data="ads_load")
-        b.adjust(2, 1, 1)
+        b.adjust(1, 1)
         keyboard = b.as_markup()
     except Exception as e:
         text = f"❌ Ошибка: {e}"
@@ -327,44 +321,6 @@ async def bump_ad_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
         await callback.message.edit_text(f"❌ Ошибка: {str(e)[:200]}")
 
 
-@router.callback_query(F.data.startswith("ad_price:"))
-async def ad_price_start(callback: CallbackQuery, state: FSMContext) -> None:
-    ad_id = callback.data.split(":", 1)[1]
-    await state.set_state(AdEditState.waiting_new_price)
-    await state.update_data(ad_id=ad_id)
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data=f"ad:{ad_id}")
-    await callback.message.edit_text(
-        "✏️ Введите новую цену (₽):",
-        reply_markup=b.as_markup(),
-    )
-    await callback.answer()
-
-
-@router.message(AdEditState.waiting_new_price)
-async def ad_price_save(message: Message, state: FSMContext, api: YooMarketAPI) -> None:
-    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
-    try:
-        price = int(float(raw))
-        if price <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите цену числом, например: <b>500</b>")
-        return
-    data = await state.get_data()
-    ad_id = data.get("ad_id", "")
-    await state.clear()
-    try:
-        await api.update_price(ad_id, price)
-        b = InlineKeyboardBuilder()
-        b.button(text="📦 К товару", callback_data=f"ad:{ad_id}")
-        b.button(text="⬅️ Все товары", callback_data="ads_load")
-        b.adjust(2)
-        await message.answer(f"✅ Цена обновлена: <b>{price} ₽</b>", reply_markup=b.as_markup())
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}", reply_markup=back_keyboard())
-
-
 @router.callback_query(F.data.startswith("ad_pause:"))
 async def ad_pause(callback: CallbackQuery, api: YooMarketAPI) -> None:
     ad_id = callback.data.split(":", 1)[1]
@@ -386,11 +342,10 @@ async def ad_pause(callback: CallbackQuery, api: YooMarketAPI) -> None:
         )
         b = InlineKeyboardBuilder()
         b.button(text="⬆️ Поднять товар", callback_data=f"ad_bump:{ad_id}")
-        b.button(text="✏️ Изменить цену", callback_data=f"ad_price:{ad_id}")
         if _can_publish(status_raw):
             b.button(text="▶️ Вернуть в продажу", callback_data=f"ad_activate:{ad_id}")
         b.button(text="⬅️ К товарам", callback_data="ads_load")
-        b.adjust(1, 1, 1)
+        b.adjust(1, 1)
         await callback.message.edit_text(text, reply_markup=b.as_markup())
     except Exception:
         await callback.message.edit_text("✅ Статус обновлён", reply_markup=back_keyboard())
@@ -417,11 +372,10 @@ async def ad_activate(callback: CallbackQuery, api: YooMarketAPI) -> None:
         )
         b = InlineKeyboardBuilder()
         b.button(text="⬆️ Поднять товар", callback_data=f"ad_bump:{ad_id}")
-        b.button(text="✏️ Изменить цену", callback_data=f"ad_price:{ad_id}")
         if _can_unpublish(status_raw):
             b.button(text="⏸ Снять с продажи", callback_data=f"ad_pause:{ad_id}")
         b.button(text="⬅️ К товарам", callback_data="ads_load")
-        b.adjust(1, 1, 1)
+        b.adjust(1, 1)
         await callback.message.edit_text(text, reply_markup=b.as_markup())
     except Exception:
         await callback.message.edit_text("✅ Статус обновлён", reply_markup=back_keyboard())

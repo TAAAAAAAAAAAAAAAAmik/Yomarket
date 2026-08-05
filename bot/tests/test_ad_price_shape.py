@@ -1,13 +1,11 @@
 """Цена объявления приходит объектом, а не числом.
 
 `GET /ads/223960` отвечает ценой {"amount": 129, "base_amount": 129,
-"currency": "RUB"}. Всё, что читало её как скаляр, получало 0 или «—»:
-экран цен показывал «цена не указана», карточка товара — словарь, а ночное
-расписание молча пропускало каждый товар, ни разу ничего не изменив.
+"currency": "RUB"}. Прочитанная как скаляр, она превращалась в 0 или «—»:
+прайс показывал «цена не указана», а карточка товара — словарь.
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 import unittest
@@ -59,79 +57,6 @@ class ShowingIt(unittest.TestCase):
         text = P._list_text([REAL], 0)
         self.assertIn("129 ₽", text)
         self.assertNotIn("цена не указана", text)
-
-
-class ChangingIt(unittest.TestCase):
-    """Раз цена читается объектом, число в запросе могло не подойти."""
-
-    class Client:
-        _is_bad_payload = staticmethod(
-            lambda e: any(k in str(e).lower() for k in ("422", "valid")))
-
-        def __init__(self, accept):
-            self.accept = accept          # какая форма тела принимается
-            self.tried: list[dict] = []
-
-        async def _patch(self, path, json=None):
-            self.tried.append(dict(json or {}))
-            if not self.accept(json or {}):
-                raise RuntimeError("422: The price field is not valid")
-            return {"ok": True}
-
-    def _run(self, accept):
-        from api.yoomarket import YooMarketAPI
-        client = self.Client(accept)
-        coro = YooMarketAPI.update_price(client, "1", 139)
-        try:
-            asyncio.run(coro)
-            ok = True
-        except Exception:
-            ok = False
-        return ok, client.tried
-
-    def test_the_documented_shape_is_tried_first_and_alone(self):
-        ok, tried = self._run(lambda p: "price" in p and not isinstance(
-            p["price"], dict))
-        self.assertTrue(ok)
-        self.assertEqual(tried, [{"price": 139}], "лишние запросы ни к чему")
-
-    def test_an_object_is_tried_when_a_number_is_refused(self):
-        ok, tried = self._run(lambda p: isinstance(p.get("price"), dict))
-        self.assertTrue(ok, tried)
-        self.assertEqual(tried[-1]["price"], {"amount": 139, "currency": "RUB"})
-
-    def test_a_bare_amount_is_tried_too(self):
-        ok, tried = self._run(lambda p: "amount" in p)
-        self.assertTrue(ok, tried)
-
-    def test_a_refusal_that_is_not_about_the_body_is_not_retried(self):
-        """«Нет прав» повторится одинаково на любую форму — это просто шум."""
-        from api.yoomarket import YooMarketAPI
-
-        class Denying(self.Client):
-            async def _patch(self, path, json=None):
-                self.tried.append(dict(json or {}))
-                raise RuntimeError("403: нет прав на это объявление")
-
-        client = Denying(lambda p: False)
-        with self.assertRaises(Exception):
-            asyncio.run(YooMarketAPI.update_price(client, "1", 139))
-        self.assertEqual(len(client.tried), 1, client.tried)
-
-    def test_when_nothing_is_accepted_the_first_refusal_is_what_is_reported(self):
-        ok, tried = self._run(lambda p: False)
-        self.assertFalse(ok)
-        self.assertEqual(len(tried), 3, tried)
-
-
-class TheNightSchedule(unittest.TestCase):
-    """Расписание считало цену через int(float(str(...))) — на объекте оно
-    спотыкалось и пропускало товар. Ни одна ночная скидка не применялась."""
-
-    def test_it_can_compute_a_new_price_from_the_real_shape(self):
-        value = ad_price(REAL)
-        self.assertIsNotNone(value, "иначе расписание пропустит товар")
-        self.assertEqual(max(1, round(int(round(value)) * 0.9)), 116)
 
 
 if __name__ == "__main__":
