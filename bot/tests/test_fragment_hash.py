@@ -46,6 +46,7 @@ class FakeFragment:
         self.page_code = 200
         self.good_hash = good_hash
         self.posts: list = []
+        self.bodies: list = []
         self.gets: list = []
 
     def session(self):
@@ -59,12 +60,20 @@ class FakeFragment:
                 outer.gets.append(url)
                 return Reply(None, outer.page_code, outer.page)
 
-            def post(self, url, params=None, **kw):
-                p = dict(params or {})
-                outer.posts.append(p)
-                if p.get("hash") != outer.good_hash:
+            def post(self, url, params=None, data=None, **kw):
+                # Как настоящий Fragment: хеш он берёт из строки запроса, а
+                # метод и аргументы — только из тела. Аргумент, уехавший в
+                # строку запроса, для него не существует.
+                body = dict(data or {})
+                outer.posts.append({**dict(params or {}), **body})
+                outer.bodies.append(body)
+                if (params or {}).get("hash") != outer.good_hash:
                     return Reply({"ok": False, "error": "Bad request"})
-                if p.get("method") == "searchStarsRecipient":
+                if body.get("method") == "searchStarsRecipient":
+                    if not body.get("query"):
+                        return Reply({"ok": False, "error":
+                                      "Please enter a username assigned "
+                                      "to a user."})
                     return Reply({"ok": True, "found": {"recipient": "R1"}})
                 return Reply({"ok": True})
 
@@ -123,6 +132,76 @@ class CheckingTheSession(Case):
         self.assertFalse(ok)
         self.assertIn("Bad request", str(res))
         self.assertIn("how", res, "must say what to do about it")
+
+
+class HowTheRequestIsSent(Case):
+    """Хеш — в строке запроса, аргументы — в теле.
+
+    Пока всё уходило в строку запроса, Fragment видел хеш и не видел `query`:
+    на живой ник он отвечал «Please enter a username assigned to a user», и
+    покупка умирала на первом же шаге — поиске получателя.
+    """
+
+    def test_arguments_go_into_the_body(self):
+        F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
+                         api_hash=REAL_HASH)
+        first = self.fake.bodies[0]
+        self.assertEqual(first.get("query"), "durov", first)
+        self.assertEqual(first.get("method"), "searchStarsRecipient", first)
+
+    def test_the_hash_stays_in_the_query_string(self):
+        F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
+                         api_hash=REAL_HASH)
+        self.assertNotIn("hash", self.fake.bodies[0], self.fake.bodies[0])
+
+    def test_the_recipient_search_carries_the_quantity(self):
+        """Форма Fragment шлёт его вместе с ником."""
+        F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
+                         api_hash=REAL_HASH)
+        self.assertEqual(str(self.fake.bodies[0].get("quantity")), "100")
+
+    def test_the_check_reaches_fragment_the_same_way(self):
+        ok, res = F.check_fragment_session_sync(COOKIES, REAL_HASH)
+        self.assertTrue(ok, res)
+        self.assertEqual(self.fake.bodies[0].get("query"), "durov",
+                         self.fake.bodies[0])
+
+
+class AnAnswerOnTheMerits(Case):
+    """Ответ по существу — не повод показывать продавцу «⚠️»."""
+
+    def _picky(self):
+        outer = self.fake
+
+        class Picky(type(outer)):
+            pass
+
+        # Fragment принял запрос, но пробный ник ему не понравился.
+        def post(url, params=None, data=None, **kw):
+            body = dict(data or {})
+            outer.posts.append(body)
+            outer.bodies.append(body)
+            if (params or {}).get("hash") != outer.good_hash:
+                return Reply({"ok": False, "error": "Bad request"})
+            return Reply({"ok": False, "error":
+                          "Please enter a username assigned to a user."})
+
+        sess = outer.session()
+        sess.post = post
+        F._make_session = lambda cookies: sess
+
+    def test_a_live_session_is_not_called_broken(self):
+        self._picky()
+        ok, res = F.check_fragment_session_sync(COOKIES, REAL_HASH)
+        self.assertTrue(ok, res)
+        self.assertIn("работает", str(res))
+
+    def test_but_a_guest_page_still_fails_the_check(self):
+        self._picky()
+        self.fake.page = "<html>Log in / Connect TON</html>"
+        ok, res = F.check_fragment_session_sync(COOKIES, "stale")
+        self.assertFalse(ok, res)
+        self.assertIn("куки", str(res).lower())
 
 
 class WhenItCannotBeFound(Case):

@@ -51,6 +51,22 @@ def _make_session(cookies: dict) -> requests.Session:
     return s
 
 
+def _api_call(session: requests.Session, api_hash: str, method: str,
+              extra: dict):
+    """Один запрос к Fragment API.
+
+    Хеш — в строке запроса (`/api?hash=…`), метод и аргументы — в теле,
+    form-urlencoded. Fragment читает их именно оттуда, и это не мелочь: пока
+    всё уходило в строку запроса, хеш он видел, а `query` — нет, и на живой
+    ник отвечал «Please enter a username assigned to a user». Поиск получателя
+    — первый шаг покупки, так что дальше него дело не доходило никогда.
+    """
+    return session.post(FRAGMENT_API_URL,
+                        params={"hash": api_hash},
+                        data={"method": method, **extra},
+                        timeout=20)
+
+
 def _extract_recipient(resp: dict) -> str:
     """Pull the recipient id out of a searchStarsRecipient response."""
     if not isinstance(resp, dict):
@@ -189,9 +205,8 @@ def buy_stars_sync(
     state = {"hash": api_hash or DEFAULT_HASH, "refreshed": False}
 
     def _raw(method: str, extra: dict) -> dict:
-        params = {"method": method, "hash": state["hash"], **extra}
         try:
-            r = session.post(FRAGMENT_API_URL, params=params, timeout=20)
+            r = _api_call(session, state["hash"], method, extra)
             r.raise_for_status()
             return r.json()
         except requests.exceptions.RequestException as e:
@@ -219,7 +234,10 @@ def buy_stars_sync(
         return out
 
     # 1. find recipient
-    search = _post("searchStarsRecipient", {"query": username})
+    # quantity здесь не лишний: форма поиска на Fragment отправляет его вместе
+    # с ником, и без него ответ приходит не тот.
+    search = _post("searchStarsRecipient", {"query": username,
+                                            "quantity": quantity})
     recipient = _extract_recipient(search)
     if not recipient:
         err = search.get("error") or search.get("error_message") or "получатель не найден"
@@ -435,10 +453,8 @@ def check_fragment_session_sync(cookies: dict,
 
     def _try(h: str):
         try:
-            r = session.post(FRAGMENT_API_URL,
-                             params={"method": "searchStarsRecipient",
-                                     "hash": h, "query": "durov"},
-                             timeout=15)
+            r = _api_call(session, h, "searchStarsRecipient",
+                          {"query": "durov", "quantity": 50})
         except Exception as e:
             return None, f"ошибка сети: {str(e)[:80]}"
         if r.status_code != 200:
@@ -480,4 +496,20 @@ def check_fragment_session_sync(cookies: dict,
                     "«🍪 Cookies» — там написано, как достать их с телефона."),
             "report": report,
         }
-    return False, f"Fragment ответил: {said}"
+    # Fragment ответил по существу — значит и хеш принят, и запрос дошёл
+    # целиком. Ругаться на такой ответ нельзя: пробный ник тут ни при чём, а
+    # продавец видел «⚠️» там, где всё в порядке. Осталось понять, от чьего
+    # имени с нами говорят — гостю Fragment отвечает так же охотно.
+    if any("не видно входа" in line for line in report):
+        return False, {
+            "message": "Куки Fragment больше не действуют — страница "
+                       "отдаётся как гостю.",
+            "how": ("Обновите куки: «🔑 Данные Fragment» → «🍪 Cookies» — "
+                    "там написано, как достать их с телефона."),
+            "report": report,
+        }
+    out: dict = {"message": f"сессия работает (Fragment на пробный запрос "
+                            f"ответил «{said}» — это нормально)"}
+    if fresh and fresh != (api_hash or DEFAULT_HASH):
+        out["api_hash"] = fresh
+    return True, out
