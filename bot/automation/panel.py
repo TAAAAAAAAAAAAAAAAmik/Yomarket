@@ -753,6 +753,55 @@ def _same_value(want, got) -> bool:
     return str(want).strip().lower() == str(got).strip().lower()
 
 
+def _locate_fields(session, hdrs, item_id: str, wanted: set[str]
+                   ) -> tuple[str, str, list[dict]]:
+    """Найти запись, у которой правда есть нужные поля.
+
+    Позиция в `items` — это единица товара: название, остаток, связь с
+    объявлением. Цены среди её полей нет вовсе, и PUT с ценой Nova принимала,
+    ничего не меняя. Поэтому сначала ищем, у кого поле есть, и правим уже
+    того. Возвращает (ресурс, номер записи, поля); пустой ресурс — не нашли.
+    """
+    fields, _err = _get_update_fields(session, hdrs, item_id)
+    have = {str(f.get("attribute")) for f in fields}
+    if fields and wanted <= have:
+        return "items", str(item_id), fields
+
+    resources = [r for r in dict.fromkeys(
+        list(panel_discover_resources_sync(_cookie_of(session)))
+        + list(_ITEM_RESOURCES)) if r not in _NOT_A_LISTING]
+
+    # Сама запись могла найтись в другом ресурсе — «unlimited» товары в
+    # `items` отвечают 404.
+    for resource in resources[:12]:
+        if resource == "items":
+            continue
+        code, other = _probe_one(session, hdrs, resource, item_id)
+        if code == 200 and other and wanted <= {
+                str(f.get("attribute")) for f in other}:
+            return resource, str(item_id), other
+
+    # Иначе — вверх по связи: цена стоит у объявления, а не у его единицы.
+    for f in fields:
+        rid = _looks_like_link(f)
+        if not rid or rid == str(item_id):
+            continue
+        for resource in resources[:12]:
+            code, parent = _probe_one(session, hdrs, resource, rid)
+            if code == 200 and parent and wanted <= {
+                    str(pf.get("attribute")) for pf in parent}:
+                return resource, rid, parent
+    return "", str(item_id), fields
+
+
+def _cookie_of(session) -> str:
+    """Строка cookie этой сессии — для функций, которые берут её, а не сессию."""
+    try:
+        return "; ".join(f"{c.name}={c.value}" for c in session.cookies)
+    except Exception:
+        return ""
+
+
 def panel_update_item_sync(
     cookie_string: str, item_id: str, overrides: dict, uid: int | None = None,
 ) -> tuple[bool, str]:
@@ -766,19 +815,27 @@ def panel_update_item_sync(
     """
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
-    fields, err = _get_update_fields(session, hdrs, item_id)
+    wanted = {str(k) for k in overrides}
+    resource, rec_id, fields = _locate_fields(session, hdrs, item_id, wanted)
     if not fields:
-        return False, f"не получил поля товара: {err}"
+        return False, "не получил поля товара"
+    if not resource:
+        have = ", ".join(sorted({str(f.get("attribute")) for f in fields})[:10])
+        return False, (f"панель не хранит {', '.join(sorted(wanted))} у этого "
+                       f"товара. Есть поля: {have}")
+    where = "" if (resource == "items" and rec_id == str(item_id)) \
+        else f" ({resource} #{rec_id})"
+
     form = _build_update_form(fields, overrides)
     try:
-        resp = _put_item(session, hdrs, item_id, form)
+        resp = _put_item(session, hdrs, rec_id, form, resource)
     except Exception as e:
         return False, f"ошибка запроса: {str(e)[:60]}"
     _save_refreshed_cookies(uid, cookie_string, session)
     if resp.status_code not in (200, 201, 204):
         return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
 
-    after, read_err = _get_update_fields(session, hdrs, item_id)
+    after, read_err = _get_update_fields(session, hdrs, rec_id, resource)
     if not after:
         # Перечитать не вышло — не выдаём это за успех и не выдаём за провал.
         return True, f"панель приняла запрос (проверить не удалось: {read_err})"
@@ -792,7 +849,7 @@ def panel_update_item_sync(
             stuck.append(f"{attr}: осталось «{_strip_html(got)}», просили «{want}»")
 
     if not unknown and not stuck:
-        return True, "обновлено"
+        return True, f"обновлено{where}"
 
     why = ["панель приняла запрос, но значение не изменилось."]
     if stuck:
@@ -807,45 +864,104 @@ def panel_update_item_sync(
     return False, " ".join(why)
 
 
+_MONEY_HINTS = ("price", "cost", "sum", "amount", "цен")
+
+
+def _looks_like_link(f: dict) -> str:
+    """Номер связанной записи, если это поле — ссылка на другую сущность.
+
+    Позиция товара обычно принадлежит объявлению, а цена стоит у объявления.
+    Пока связь не видна, «в items цены нет» — тупик: неизвестно, где искать.
+    """
+    comp = str(f.get("component") or "").lower()
+    val = f.get("value")
+    if isinstance(val, dict):
+        rid = val.get("id") or val.get("value")
+        if rid is not None:
+            return str(rid)
+    if "belongs-to" in comp or "belongsto" in comp:
+        rid = f.get("belongsToId") or f.get("value")
+        if rid is not None and not isinstance(rid, (dict, list)):
+            return str(rid)
+    return ""
+
+
+def _probe_one(session, hdrs, resource: str, rec_id: str) -> tuple[int, list[dict]]:
+    """update-fields одной записи: (код ответа, поля)."""
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/{resource}/{rec_id}/update-fields"
+            f"?editing=true&editMode=update",
+            headers=hdrs, timeout=(6, 10), allow_redirects=False)
+    except Exception:
+        return 0, []
+    if r.status_code != 200:
+        return r.status_code, []
+    try:
+        return 200, _parse_nova_fields_payload(r.json())
+    except Exception:
+        return 200, []
+
+
 def panel_item_fields_probe_sync(cookie_string: str, item_id: str,
                                  uid: int | None = None) -> list[str]:
-    """Что панель на самом деле знает об этом товаре — только чтение.
+    """Где у этого товара лежит цена — только чтение.
 
-    Когда «цена не меняется», гадать бесполезно: поле может называться иначе,
-    товар — лежать в другом ресурсе, а панель — просто не давать прав. Здесь
-    видно, какой из трёх это случай.
+    «Цена не меняется» и «в этой сущности цены вообще нет» — разные вещи, а
+    выглядят одинаково. Здесь перебираются все ресурсы панели, показываются
+    все поля найденной записи и прослеживаются связи: если позиция
+    принадлежит объявлению, цена почти наверняка у него.
     """
     out: list[str] = []
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
-    for resource in ("items", "ad-groups", "ads", "unlimiteds"):
-        try:
-            r = session.get(
-                f"{PANEL_URL}/nova-api/{resource}/{item_id}/update-fields"
-                f"?editing=true&editMode=update",
-                headers=hdrs, timeout=(6, 10), allow_redirects=False)
-        except Exception as e:
-            out.append(f"{resource}: ошибка сети {str(e)[:40]}")
+
+    resources = [r for r in dict.fromkeys(
+        list(panel_discover_resources_sync(cookie_string)) + list(_ITEM_RESOURCES))
+        if r not in _NOT_A_LISTING]
+
+    missing: list[str] = []
+    links: list[tuple[str, str]] = []      # (имя поля, номер записи)
+    for resource in resources[:20]:
+        code, fields = _probe_one(session, hdrs, resource, item_id)
+        if code != 200 or not fields:
+            missing.append(f"{resource}:{code or 'сеть'}")
             continue
-        if r.status_code != 200:
-            out.append(f"{resource}: HTTP {r.status_code}")
-            continue
-        try:
-            fields = _parse_nova_fields_payload(r.json())
-        except Exception:
-            out.append(f"{resource}: ответ не JSON")
-            continue
-        out.append(f"{resource}: HTTP 200, полей {len(fields)}")
+        out.append(f"✔ {resource}: полей {len(fields)}")
         for f in fields:
             attr = str(f.get("attribute") or "")
             if not attr:
                 continue
-            low = attr.lower()
-            if any(k in low for k in ("price", "cost", "sum", "amount", "цен")):
-                ro = " (только чтение)" if f.get("readonly") else ""
-                out.append(f"  · {attr} = «{_strip_html(f.get('value'))}»{ro}")
-        if len(out) > 40:
+            comp = str(f.get("component") or "").replace("-field", "")
+            value = _field_text(f)[:40]
+            mark = " 💰" if any(k in attr.lower() for k in _MONEY_HINTS) else ""
+            out.append(f"   {attr} [{comp}] = «{value}»{mark}")
+            rid = _looks_like_link(f)
+            if rid and rid != str(item_id):
+                links.append((attr, rid))
+        if len(out) > 45:
             break
+
+    if missing:
+        out.append("✘ нет записи: " + ", ".join(missing[:12]))
+
+    # По связям — туда, где цена и должна быть.
+    for attr, rid in links[:3]:
+        out.append(f"↳ связь {attr} → #{rid}")
+        for resource in resources[:20]:
+            code, fields = _probe_one(session, hdrs, resource, rid)
+            if code != 200 or not fields:
+                continue
+            money = [f for f in fields
+                     if any(k in str(f.get("attribute", "")).lower()
+                            for k in _MONEY_HINTS)]
+            out.append(f"   ✔ {resource}/{rid}: полей {len(fields)}"
+                       + ("" if money else " — денежных полей нет"))
+            for f in money[:4]:
+                out.append(f"      {f.get('attribute')} = "
+                           f"«{_field_text(f)[:30]}» 💰")
+            break
+
     return out
 
 

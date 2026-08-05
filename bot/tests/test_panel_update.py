@@ -7,6 +7,7 @@ Nova отвечает 200 и на форму, часть которой молч
 from __future__ import annotations
 
 import os
+import re
 import sys
 import unittest
 
@@ -117,7 +118,8 @@ class WhenTheChangeDoesNotStick(Case):
         self.nova = FakeNova(fields={"cost": "450", "title": "Товар"})
         ok, msg = self.update({"price": 139})
         self.assertFalse(ok)
-        self.assertIn("нет", msg, msg)
+        self.assertIn("не хранит price", msg, msg)
+        self.assertIn("title", msg, "должны быть названы поля, которые есть")
 
     def test_and_it_points_at_the_field_that_looks_like_the_price(self):
         """Иначе «поля price нет» — тупик: как оно называется, неизвестно."""
@@ -146,6 +148,78 @@ class WhenTheChangeDoesNotStick(Case):
         ok, msg = self.update({"price": 139})
         self.assertTrue(ok)
         self.assertIn("проверить не удалось", msg)
+
+
+class MultiNova:
+    """Панель из нескольких ресурсов: позиция и объявление, которому она
+    принадлежит. Цена стоит у объявления — как и оказалось на самом деле."""
+
+    def __init__(self):
+        self.records = {
+            ("items", "223960"): {
+                "title": "Аккаунт", "count": "3",
+                "ad_group": {"id": 8811, "title": "3.000.000 виртов"}},
+            ("ad-groups", "8811"): {"title": "3.000.000 виртов", "price": "450"},
+        }
+        self.puts: list[tuple[str, str, dict]] = []
+
+    def _key(self, url):
+        m = re.search(r"/nova-api/([^/?]+)/([^/?]+)", url)
+        return (m.group(1), m.group(2)) if m else None
+
+    def get(self, url, **kw):
+        key = self._key(url)
+        rec = self.records.get(key) if key else None
+        if rec is None:
+            return Reply(None, 404)
+        return Reply({"fields": [{"attribute": k, "value": v,
+                                  "component": ("belongs-to-field"
+                                                if isinstance(v, dict)
+                                                else "text-field")}
+                                 for k, v in rec.items()]})
+
+    def post(self, url, data=None, **kw):
+        key = self._key(url)
+        form = dict(data or {})
+        if key is None or key not in self.records:
+            return Reply(None, 404)
+        self.puts.append((key[0], key[1], form))
+        for k, v in form.items():
+            if k in self.records[key] and not k.startswith("_"):
+                self.records[key][k] = v
+        return Reply({"ok": True})
+
+
+class WhereThePriceActuallyLives(Case):
+    """#223960 в `items` — единица товара: название, остаток, связь. Цены
+    среди её полей нет вовсе, и PUT с ценой панель принимала вхолостую."""
+
+    def setUp(self):
+        super().setUp()
+        self.nova = MultiNova()
+        P._RESOURCE_CACHE.clear()
+
+    def test_the_price_is_written_to_the_listing_not_the_unit(self):
+        ok, msg = self.update({"price": 139})
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.nova.records[("ad-groups", "8811")]["price"],
+                         "139")
+
+    def test_the_unit_itself_is_left_alone(self):
+        self.update({"price": 139})
+        touched = {res for res, _rid, _form in self.nova.puts}
+        self.assertNotIn("items", touched, self.nova.puts)
+
+    def test_it_says_where_the_change_landed(self):
+        """Цена у объявления общая — продавец должен видеть, что правит."""
+        _ok, msg = self.update({"price": 139})
+        self.assertIn("8811", msg, msg)
+
+    def test_a_field_the_unit_does_have_is_still_changed_in_place(self):
+        ok, msg = self.update({"title": "Новое имя"})
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.nova.records[("items", "223960")]["title"],
+                         "Новое имя")
 
 
 class ComparingValues(unittest.TestCase):
