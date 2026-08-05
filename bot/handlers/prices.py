@@ -261,7 +261,7 @@ _page_of: dict[int, int] = {}
 
 
 async def _show_card(message, uid: int, api: YooMarketAPI, ad_id: str,
-                     note: str = "") -> None:
+                     note: str = "", expect: int | None = None) -> None:
     try:
         ad = await api.get_ad(ad_id)
     except Exception as e:
@@ -272,6 +272,13 @@ async def _show_card(message, uid: int, api: YooMarketAPI, ad_id: str,
                                  f"<code>{html.escape(str(e)[:150])}</code>")
             return
     ad = ad.get("data") if isinstance(ad.get("data"), dict) else ad
+    # Галочку ставим по факту, а не по намерению: маркетплейс отвечает «ок» и
+    # на цену, которую потом не применяет, а «✅ обновлено» при старой цене на
+    # сайте — худшее, что бот может сказать.
+    if expect is not None and _price_of(ad) != expect:
+        note = (f"⚠️ <b>Цена не изменилась.</b> Просили {expect} ₽, "
+                f"у товара осталось {_price_of(ad)} ₽ — маркетплейс принял "
+                f"запрос, но цену не применил.")
     was = _undo_price(uid, ad_id)
     await _edit(message, _card_text(ad, was, note),
                 _card_kb(ad_id, was, _page_of.get(uid, 0)))
@@ -391,7 +398,7 @@ async def undo_price(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.answer(f"↩️ Вернул {was} ₽")
     note = (f"↩️ Вернул прежнюю цену: <b>{was} ₽</b>"
             + (f" (было {current} ₽)" if current and current != was else ""))
-    await _show_card(callback.message, uid, api, ad_id, note)
+    await _show_card(callback.message, uid, api, ad_id, note, expect=was)
 
 
 @router.callback_query(F.data.startswith("prices:set:"))
@@ -475,7 +482,7 @@ async def exact_save(message: Message, state: FSMContext,
     _invalidate(uid)
     sent = await message.answer("⏳ Сохраняю…")
     note = f"✅ Новая цена: <b>{price} ₽</b>"
-    await _show_card(sent, uid, api, ad_id, note)
+    await _show_card(sent, uid, api, ad_id, note, expect=price)
 
 
 async def _apply(callback: CallbackQuery, api: YooMarketAPI, uid: int,
@@ -489,4 +496,4 @@ async def _apply(callback: CallbackQuery, api: YooMarketAPI, uid: int,
     _invalidate(uid)
     await callback.answer(f"{current} ₽ → {new_price} ₽")
     await _show_card(callback.message, uid, api, ad_id,
-                     f"✅ {current} ₽ → <b>{new_price} ₽</b>")
+                     f"✅ {current} ₽ → <b>{new_price} ₽</b>", expect=new_price)

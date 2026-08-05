@@ -374,6 +374,32 @@ async def edit_price_save(message: Message, state: FSMContext) -> None:
         )
 
 
+@router.message(Command("item_debug"))
+async def item_debug(message: Message) -> None:
+    """/item_debug 223960 — что панель знает об этом товаре.
+
+    Появилась потому, что «✅ Цена обновлена» и старая цена на сайте
+    объясняются тремя разными причинами, и различить их можно только
+    посмотрев, что панель отдаёт на самом деле.
+    """
+    from automation.panel import panel_item_fields_probe_sync
+
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].strip().lstrip("#").isdigit():
+        await message.answer("Укажите номер товара: <code>/item_debug 223960</code>")
+        return
+    item_id = parts[1].strip().lstrip("#")
+    status = await message.answer("⏳ Смотрю, что отдаёт панель…")
+    lines, err = await _run(message.from_user.id, panel_item_fields_probe_sync,
+                            item_id, message.from_user.id)
+    if not lines:
+        await status.edit_text(f"❌ {err or 'панель ничего не ответила'}")
+        return
+    import html as _html
+    body = "\n".join(_html.escape(str(x)) for x in lines)[:3500]
+    await status.edit_text(f"🔍 <b>Товар #{item_id}</b>\n<code>{body}</code>")
+
+
 @router.callback_query(F.data.startswith("pitem_title:"))
 async def edit_title_start(callback: CallbackQuery, state: FSMContext) -> None:
     item_id = callback.data.split(":", 1)[1]

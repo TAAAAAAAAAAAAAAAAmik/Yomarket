@@ -191,6 +191,19 @@ class OneProductAtATime(Base):
         self.run_(P.step_price(cb, api))
         self.assertIn("500 ₽", cb.message.last, cb.message.last)
 
+    def test_a_price_that_did_not_stick_is_not_called_done(self):
+        """«✅ обновлено» при старой цене на сайте — худшее, что бот скажет."""
+        class Ignoring(FakeAPI):
+            async def update_price(self, ad_id, price, discount=None):
+                self.updates.append((str(ad_id), int(price)))
+                return {"ok": True}          # согласился и ничего не сделал
+
+        api = Ignoring()
+        cb = CB("prices:p:1:10")
+        self.run_(P.step_price(cb, api))
+        self.assertIn("не изменилась", cb.message.last, cb.message.last)
+        self.assertNotIn("✅", cb.message.last, cb.message.last)
+
     def test_a_step_too_small_to_reach_a_rouble_says_so(self):
         api = FakeAPI([{"id": "9", "title": "Мелочь", "price": 3}])
         cb = CB("prices:p:9:5")           # 3 ₽ + 5% = 3 ₽

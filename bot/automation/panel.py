@@ -735,11 +735,35 @@ def _put_item(session, hdrs, item_id: str, form: dict, resource: str = "items"):
     )
 
 
+def _value_of_attr(fields: list[dict], attr: str):
+    """Текущее значение поля по имени атрибута, или None если такого нет."""
+    for f in fields:
+        if f.get("attribute") == attr:
+            return f.get("value")
+    return None
+
+
+def _same_value(want, got) -> bool:
+    """Одно ли это значение. Панель возвращает «139.00» на отправленные 139."""
+    if got is None:
+        return False
+    a, b = _num(want), _num(got)
+    if a is not None and b is not None:
+        return abs(a - b) < 0.005
+    return str(want).strip().lower() == str(got).strip().lower()
+
+
 def panel_update_item_sync(
     cookie_string: str, item_id: str, overrides: dict, uid: int | None = None,
 ) -> tuple[bool, str]:
     """Blocking: change item fields (e.g. {'price': 199, 'title': ...}),
-    preserving everything else including photos."""
+    preserving everything else including photos.
+
+    «Обновлено» здесь значит «в панели теперь так», а не «запрос принят».
+    Nova отвечает 200 и на форму, часть которой молча выбросила, — продавцу
+    приходило «✅ Цена обновлена», а на сайте оставалась старая цена, и
+    поверить боту после такого нельзя ни в чём.
+    """
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
     fields, err = _get_update_fields(session, hdrs, item_id)
@@ -751,9 +775,78 @@ def panel_update_item_sync(
     except Exception as e:
         return False, f"ошибка запроса: {str(e)[:60]}"
     _save_refreshed_cookies(uid, cookie_string, session)
-    if resp.status_code in (200, 201, 204):
+    if resp.status_code not in (200, 201, 204):
+        return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
+
+    after, read_err = _get_update_fields(session, hdrs, item_id)
+    if not after:
+        # Перечитать не вышло — не выдаём это за успех и не выдаём за провал.
+        return True, f"панель приняла запрос (проверить не удалось: {read_err})"
+
+    unknown, stuck = [], []
+    for attr, want in overrides.items():
+        got = _value_of_attr(after, attr)
+        if got is None and not any(f.get("attribute") == attr for f in after):
+            unknown.append(attr)
+        elif not _same_value(want, got):
+            stuck.append(f"{attr}: осталось «{_strip_html(got)}», просили «{want}»")
+
+    if not unknown and not stuck:
         return True, "обновлено"
-    return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
+
+    why = ["панель приняла запрос, но значение не изменилось."]
+    if stuck:
+        why.append("; ".join(stuck))
+    if unknown:
+        near = [f.get("attribute") for f in after
+                if any(k in str(f.get("attribute", "")).lower()
+                       for k in ("price", "cost", "sum", "amount", "цен"))]
+        why.append(f"поля {', '.join(unknown)} у товара нет"
+                   + (f"; похожие: {', '.join(str(n) for n in near[:6])}"
+                      if near else ""))
+    return False, " ".join(why)
+
+
+def panel_item_fields_probe_sync(cookie_string: str, item_id: str,
+                                 uid: int | None = None) -> list[str]:
+    """Что панель на самом деле знает об этом товаре — только чтение.
+
+    Когда «цена не меняется», гадать бесполезно: поле может называться иначе,
+    товар — лежать в другом ресурсе, а панель — просто не давать прав. Здесь
+    видно, какой из трёх это случай.
+    """
+    out: list[str] = []
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    for resource in ("items", "ad-groups", "ads", "unlimiteds"):
+        try:
+            r = session.get(
+                f"{PANEL_URL}/nova-api/{resource}/{item_id}/update-fields"
+                f"?editing=true&editMode=update",
+                headers=hdrs, timeout=(6, 10), allow_redirects=False)
+        except Exception as e:
+            out.append(f"{resource}: ошибка сети {str(e)[:40]}")
+            continue
+        if r.status_code != 200:
+            out.append(f"{resource}: HTTP {r.status_code}")
+            continue
+        try:
+            fields = _parse_nova_fields_payload(r.json())
+        except Exception:
+            out.append(f"{resource}: ответ не JSON")
+            continue
+        out.append(f"{resource}: HTTP 200, полей {len(fields)}")
+        for f in fields:
+            attr = str(f.get("attribute") or "")
+            if not attr:
+                continue
+            low = attr.lower()
+            if any(k in low for k in ("price", "cost", "sum", "amount", "цен")):
+                ro = " (только чтение)" if f.get("readonly") else ""
+                out.append(f"  · {attr} = «{_strip_html(f.get('value'))}»{ro}")
+        if len(out) > 40:
+            break
+    return out
 
 
 # Nova resources a listing might live under. The panel exposes no resource
