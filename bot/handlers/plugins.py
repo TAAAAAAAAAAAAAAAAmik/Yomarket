@@ -1141,13 +1141,17 @@ def _roblox_text(settings: dict, shop_name: str = "") -> str:
     enabled = p.get("enabled", False)
     note = p.get("note") or "—"
     name_part = f" • {shop_name}" if shop_name else ""
-    status = "🟢 Автовыдача включена" if enabled else "🔴 Автовыдача выключена"
+    # Тумблер ничего не включает: выдачи Robux ещё нет, и фоновый цикл этот
+    # раздел не читает. «🟢 Автовыдача включена» на таком экране — обещание,
+    # которого никто не выполнит.
+    status = ("🟢 Настройки сохранены" if enabled
+              else "🔴 Настройки не сохранены")
     return (
         f"🎮 <b>Roblox — Robux{name_part}</b>\n\n"
+        f"🚧 <b>Раздел готовится.</b> Выдача Robux появится в следующем "
+        f"обновлении — сейчас можно только сохранить настройки.\n\n"
         f"{status}\n"
-        f"{note}\n\n"
-        "Раздел управления плагином.\n"
-        "Контроль, настройки, ручная выдача — всё здесь."
+        f"{note}"
     )
 
 
@@ -1315,13 +1319,14 @@ def _gifts_text(settings: dict, shop_name: str = "") -> str:
     enabled = p.get("enabled", False)
     note = p.get("note") or "—"
     name_part = f" • {shop_name}" if shop_name else ""
-    status = "🟢 Автовыдача включена" if enabled else "🔴 Автовыдача выключена"
+    status = ("🟢 Настройки сохранены" if enabled
+              else "🔴 Настройки не сохранены")
     return (
         f"🎁 <b>Telegram — Подарки{name_part}</b>\n\n"
+        f"🚧 <b>Раздел готовится.</b> Отправка подарков появится в следующем "
+        f"обновлении — сейчас можно только сохранить настройки.\n\n"
         f"{status}\n"
-        f"{note}\n\n"
-        "Раздел управления плагином.\n"
-        "Контроль, настройки, ручная выдача — всё здесь."
+        f"{note}"
     )
 
 
