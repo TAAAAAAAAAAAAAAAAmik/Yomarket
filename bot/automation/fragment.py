@@ -340,30 +340,85 @@ def _extract_messages(link: dict) -> list[dict]:
     return []
 
 
-def fetch_api_hash_sync(cookies: dict) -> str:
+def _page_session(cookies: dict) -> requests.Session:
+    """Сессия для обычной страницы, а не для API.
+
+    У API-сессии стоит `X-Requested-With: XMLHttpRequest` — с ним Fragment
+    отвечает как на XHR, и разметки со скриптами в ответе может не оказаться.
+    А хеш лежит именно в скриптах страницы.
+    """
+    s = requests.Session()
+    s.cookies.update(cookies or {})
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru,en;q=0.9",
+    })
+    return s
+
+
+_HASH_PATTERNS = (
+    r'ajInit\(\s*\{[^{}]*?"hash"\s*:\s*"([0-9a-zA-Z]{8,64})"',
+    r'api\?hash=([0-9a-zA-Z]{8,64})',
+    r'"apiHash"\s*:\s*"([0-9a-zA-Z]{8,64})"',
+    r'"hash"\s*:\s*"([0-9a-zA-Z]{8,64})"',
+    r"hash['\"]?\s*[:=]\s*['\"]([0-9a-f]{12,64})['\"]",
+)
+
+_HASH_PAGES = ("https://fragment.com/stars",
+               "https://fragment.com/stars/buy",
+               "https://fragment.com/",
+               "https://fragment.com/premium")
+
+
+def fetch_api_hash_sync(cookies: dict, report: list | None = None) -> str:
     """The api hash Fragment issued to this session, read off its own page.
 
     Fragment stamps every request with a per-session hash, and a hash from
     somebody else's session is answered with «Bad request» — which is what a
     hardcoded one produced. It sits in the page's own JavaScript, so there is
-    no reason to make a seller find it by hand.
+    no reason to make a seller find it by hand, let alone open developer tools
+    on a phone.
+
+    `report` собирает, что ответила каждая страница: без этого «не нашёл» —
+    это тупик, а с ним видно, истекли ли куки или изменилась разметка.
     """
-    session = _make_session(cookies or {})
-    for url in ("https://fragment.com/stars/buy", "https://fragment.com/"):
+    session = _page_session(cookies or {})
+    for url in _HASH_PAGES:
         try:
             r = session.get(url, timeout=20)
         except Exception as e:
-            logger.info("fragment hash from %s: %s", url, e)
+            if report is not None:
+                report.append(f"{url}: {str(e)[:60]}")
             continue
+        body = r.text or ""
+        if report is not None:
+            signed = "не видно входа" if _looks_logged_out(body) else "вход есть"
+            report.append(f"{url}: HTTP {r.status_code}, "
+                          f"{len(body)} символов, {signed}")
         if r.status_code != 200:
             continue
-        for pattern in (r'api\?hash=([0-9a-f]{8,32})',
-                        r'"apiHash"\s*:\s*"([0-9a-f]{8,32})"',
-                        r'hash["\']?\s*[:=]\s*["\']([0-9a-f]{16,32})["\']'):
-            m = re.search(pattern, r.text)
+        for pattern in _HASH_PATTERNS:
+            m = re.search(pattern, body)
             if m:
+                if report is not None:
+                    report.append(f"хеш найден на {url}")
                 return m.group(1)
     return ""
+
+
+def _looks_logged_out(html: str) -> bool:
+    """Похоже ли, что страница отдана гостю. Куки живут недолго, и «хеш не
+    найден» чаще всего означает именно это."""
+    low = (html or "").lower()
+    if not low:
+        return True
+    signed_in = ("logout" in low or "ton-auth" in low or "my assets" in low
+                 or "аккаунт" in low)
+    guest = "connect ton" in low or "log in" in low or "sign in" in low
+    return guest and not signed_in
 
 
 def check_fragment_session_sync(cookies: dict,
@@ -399,7 +454,8 @@ def check_fragment_session_sync(cookies: dict,
 
     # «Bad request» is what a hash from another session earns. Fetch this
     # session's own and try once more before blaming the cookies.
-    fresh = fetch_api_hash_sync(cookies)
+    report: list[str] = []
+    fresh = fetch_api_hash_sync(cookies, report)
     if fresh and fresh != (api_hash or DEFAULT_HASH):
         data2, err2 = _try(fresh)
         if data2 is not None and (data2.get("ok") or data2.get("found")):
@@ -411,7 +467,17 @@ def check_fragment_session_sync(cookies: dict,
         return False, err
     said = str((data or {}).get("error") or data)[:120]
     if "bad request" in said.lower():
-        return False, ("Fragment: «Bad request» — не подошёл api-hash. "
-                       "Задайте его вручную: F12 → Network → любой запрос "
-                       "к fragment.com/api?hash=… → скопируйте hash.")
+        # Отправлять человека в F12 — плохой ответ: с телефона это невозможно,
+        # а причина почти всегда одна и та же. Говорим, что увидели сами.
+        guest = any("не видно входа" in line for line in report)
+        why = ("Куки Fragment больше не действуют — страница отдаётся как "
+               "гостю." if guest else
+               "Хеш сессии со страницы Fragment прочитать не удалось.")
+        return False, {
+            "message": f"Fragment: «Bad request». {why}",
+            "how": ("Хеш вводить руками не нужно — бот читает его сам. "
+                    "Нужно обновить куки: «🔑 Данные Fragment» → "
+                    "«🍪 Cookies» — там написано, как достать их с телефона."),
+            "report": report,
+        }
     return False, f"Fragment ответил: {said}"

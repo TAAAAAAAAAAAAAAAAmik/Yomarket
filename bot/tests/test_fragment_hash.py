@@ -43,6 +43,7 @@ class FakeFragment:
 
     def __init__(self, page=PAGE, good_hash=REAL_HASH):
         self.page = page
+        self.page_code = 200
         self.good_hash = good_hash
         self.posts: list = []
         self.gets: list = []
@@ -56,7 +57,7 @@ class FakeFragment:
 
             def get(self, url, **kw):
                 outer.gets.append(url)
-                return Reply(None, 200, outer.page)
+                return Reply(None, outer.page_code, outer.page)
 
             def post(self, url, params=None, **kw):
                 p = dict(params or {})
@@ -74,10 +75,15 @@ class Case(unittest.TestCase):
     def setUp(self):
         self.fake = FakeFragment()
         self._old = F._make_session
+        # The page is fetched with its own session — without the XHR header, or
+        # Fragment answers as XHR and the scripts holding the hash are absent.
+        self._old_page = F._page_session
         F._make_session = lambda cookies: self.fake.session()
+        F._page_session = lambda cookies: self.fake.session()
 
     def tearDown(self):
         F._make_session = self._old
+        F._page_session = self._old_page
 
 
 class FindingIt(Case):
@@ -116,7 +122,44 @@ class CheckingTheSession(Case):
         ok, res = F.check_fragment_session_sync(COOKIES, "whatever")
         self.assertFalse(ok)
         self.assertIn("Bad request", str(res))
-        self.assertIn("hash", str(res), "must say what to do about it")
+        self.assertIn("how", res, "must say what to do about it")
+
+
+class WhenItCannotBeFound(Case):
+    """The seller has a phone and no computer. F12 is not an instruction."""
+
+    def _fail(self, page="<html>no hash here</html>"):
+        self.fake.good_hash = "\\x00nothing-matches"
+        self.fake.page = page
+        ok, res = F.check_fragment_session_sync(COOKIES, "whatever")
+        self.assertFalse(ok)
+        self.assertIsInstance(res, dict, res)
+        return res
+
+    def test_it_never_sends_anyone_to_developer_tools(self):
+        res = self._fail()
+        said = f"{res.get('message')} {res.get('how')}"
+        for word in ("F12", "Network", "devtools"):
+            self.assertNotIn(word, said, said)
+
+    def test_it_points_at_the_cookies_instead(self):
+        self.assertIn("куки", self._fail()["how"].lower())
+
+    def test_expired_cookies_are_named_as_the_reason(self):
+        """A guest page is the usual cause — say so instead of guessing."""
+        res = self._fail("<html>Log in to Fragment / Connect TON</html>")
+        self.assertIn("гост", res["message"].lower(), res["message"])
+
+    def test_it_shows_what_each_page_actually_answered(self):
+        """«Не нашёл» with nothing behind it is a dead end."""
+        report = self._fail()["report"]
+        self.assertTrue(report, "no evidence collected")
+        self.assertTrue(any("fragment.com" in line for line in report), report)
+        self.assertTrue(any("200" in line for line in report), report)
+
+    def test_an_unreachable_page_lands_in_the_report_too(self):
+        self.fake.page_code = 502
+        self.assertTrue(any("502" in line for line in self._fail()["report"]))
 
     def test_no_cookies_is_said_plainly(self):
         ok, res = F.check_fragment_session_sync({}, "")

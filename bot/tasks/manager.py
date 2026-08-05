@@ -488,6 +488,27 @@ def _card(title: str, body: list[str], footer: str = "") -> str:
     return "\n".join(parts)
 
 
+def _stars_failure_hint(result) -> str:
+    """Что делать с этой конкретной неудачей — одной строкой.
+
+    «Bad request» и «получатель не найден» лечатся совершенно по-разному, а
+    выглядят одинаково: голый текст ошибки, из которого продавцу непонятно
+    ничего. Ни одна подсказка не должна упираться в F12 — телефона это не
+    касается.
+    """
+    said = str(result or "").lower()
+    if "bad request" in said or "api-hash" in said or "api hash" in said:
+        return ("🔑 Похоже, истекли куки Fragment — сессия отдаётся как гостю. "
+                "Обновите их: Плагины → AutoStars → 🔑 Данные Fragment "
+                "→ «🧪 Проверить вход» покажет, что именно отвалилось.\n\n")
+    if "не найден" in said or "not found" in said:
+        return ("👤 Fragment не нашёл такой ник. Уточните его у покупателя — "
+                "возможно, аккаунт скрыт или ник написан с ошибкой.\n\n")
+    if "ton" in said and ("баланс" in said or "недостат" in said):
+        return "💎 Пополните TON-кошелёк — на покупку не хватило.\n\n"
+    return ""
+
+
 def _order_notify_kb(order_id: str, chat_id: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     # Quick actions straight from the notification (no need to open the order)
@@ -1625,7 +1646,9 @@ class TaskManager:
                     None, buy_stars_sync,
                     creds["cookies"], creds["mnemonic"], username, qty,
                     creds.get("wallet_version", "v4r2"),
-                    creds.get("api_hash", "af142ec36cafbbfa89"),
+                    # Пусто — значит бот подберёт хеш сам. Прописывать сюда
+                    # чужой хеш нельзя: Fragment отвечает на него «Bad request».
+                    creds.get("api_hash", ""),
                 ),
                 timeout=180,
             )
@@ -1676,7 +1699,8 @@ class TaskManager:
                     user_id,
                     f"❌ <b>AutoStars</b>: заказ #{order_id}, @{username}, {qty}⭐ — "
                     f"не удалось (попытка {tries}).\n{result}{tail}\n\n"
-                    "Выдайте вручную: Плагины → AutoStars → 🚀 Ручная выдача",
+                    + _stars_failure_hint(result)
+                    + "Выдайте вручную: Плагины → AutoStars → 🚀 Ручная выдача",
                 )
         return True
 

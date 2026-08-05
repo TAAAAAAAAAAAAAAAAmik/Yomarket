@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import re
 
@@ -280,6 +281,20 @@ async def stars_creds(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+# Куки Fragment — HttpOnly, и без инструментов разработчика их не прочитать.
+# «Возьмите на компьютере» — не ответ тому, у кого компьютера нет, поэтому
+# здесь названы браузеры, в которых это делается с телефона.
+_PHONE_HELP = (
+    "📱 <b>Если компьютера нет</b>\n"
+    "Нужны инструменты разработчика — они есть в мобильных браузерах:\n"
+    "• <b>Kiwi Browser</b> (Android) — меню → «Инструменты разработчика»\n"
+    "• <b>Яндекс Браузер</b> (Android) — адрес вида "
+    "<code>view-source:</code> и расширения из Chrome Web Store\n"
+    "• iPhone — <b>Safari</b> + Mac по кабелю, либо приложение "
+    "<b>Web Inspector</b>\n"
+    "Дальше — как на компьютере: Application → Cookies → fragment.com."
+)
+
 # Where each cookie is found, because two of them are HttpOnly and the console
 # trick does not reveal them.
 _COOKIE_HELP = {
@@ -320,6 +335,7 @@ async def stars_set_one_cookie_prompt(callback: CallbackQuery,
         f"{label}\n\n"
         + (f"Сейчас: <b>задан</b> ({len(str(have))} символов)\n\n" if have else "")
         + _COOKIE_HELP.get(name, "Пришлите значение этой cookie.")
+        + "\n\n" + _PHONE_HELP
         + "\n\nПришлите <b>только значение</b> — без названия и без "
           "<code>=</code>. Сообщение сразу удалится.",
         reply_markup=_cancel_kb("plugins:stars:creds"),
@@ -376,7 +392,10 @@ async def stars_set_cookies_prompt(callback: CallbackQuery, state: FSMContext) -
         "1. Войдите на <b>fragment.com</b> через TON-кошелёк\n"
         "2. F12 → Console → введите <code>document.cookie</code> → Enter\n"
         "3. Скопируйте результат и пришлите сюда\n\n"
-        "<i>Формат: stel_token=...; stel_ssid=...; ...</i>",
+        "<i>Формат: stel_token=...; stel_ssid=...; ...</i>\n\n"
+        "⚠️ <code>document.cookie</code> не покажет <b>stel_token</b> и "
+        "<b>stel_ssid</b> — они HttpOnly. Их берут по одной кнопкой выше "
+        "(Application → Cookies → fragment.com).\n\n" + _PHONE_HELP,
         reply_markup=_cancel_kb("plugins:stars:creds"),
     )
     await callback.answer()
@@ -487,10 +506,22 @@ async def stars_check_creds(callback: CallbackQuery) -> None:
         )
     except Exception as e:
         ok, msg = False, str(e)[:80]
-    if ok and isinstance(msg, dict):
+    if isinstance(msg, dict):
         if msg.get("api_hash"):
             save_fragment_creds(uid, {"api_hash": msg["api_hash"]})
-        msg = msg.get("message", "сессия работает")
+        text = ("✅ " if ok else "⚠️ ") + str(msg.get("message", ""))
+        # Что делать — по-человечески и без devtools: с телефона F12 не нажать,
+        # а именно этим заканчивался прошлый ответ.
+        if msg.get("how"):
+            text += f"\n\n{msg['how']}"
+        # Что бот увидел своими глазами. Без этого «не подошёл хеш» — тупик:
+        # непонятно, истекли куки или изменилась страница.
+        report = [str(line) for line in (msg.get("report") or [])]
+        if report:
+            body = "\n".join(html.escape(line) for line in report[:6])
+            text += f"\n\n<b>Что увидел бот:</b>\n<code>{body}</code>"
+        await callback.message.answer(text)
+        return
     await callback.message.answer(("✅ " if ok else "⚠️ ") + f"Fragment: {msg}")
 
 
@@ -504,7 +535,11 @@ async def stars_set_hash_prompt(callback: CallbackQuery, state: FSMContext) -> N
         + (f"Сейчас: <code>{cur}</code>\n\n" if cur else "")
         + "Fragment помечает этим хешем каждый запрос, и у каждой сессии он "
           "свой — чужой отвечает «Bad request».\n\n"
-          "Бот пробует найти его сам при проверке входа. Если не вышло:\n"
+          "<b>Вручную это заполнять не нужно.</b> Бот сам читает хеш со "
+          "страницы Fragment перед каждой покупкой. Если он не читается — "
+          "дело почти всегда в куках: они истекли, и страница отдаётся как "
+          "гостю. Тогда помогает не хеш, а свежие куки.\n\n"
+          "<i>Если всё же хотите задать вручную и есть компьютер:</i> "
           "F12 → вкладка <b>Network</b> → на fragment.com сделайте любое "
           "действие → найдите запрос <code>api?hash=…</code> → скопируйте "
           "значение после <code>hash=</code>.",
