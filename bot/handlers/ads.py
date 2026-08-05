@@ -134,6 +134,7 @@ def _ads_keyboard(ads: list[dict], next_cursor: str | None):
     """
     b = InlineKeyboardBuilder()
     b.button(text="📦 Товары", callback_data="pitems:cats")
+    b.button(text="💰 Цены", callback_data="prices:menu")
     b.button(text="➕ Добавить товар", callback_data="create_ad:start")
     b.button(text="📦 Паки", callback_data="packs:menu")
     # Listing automation lives here rather than in the auto-settings menu:
@@ -142,7 +143,7 @@ def _ads_keyboard(ads: list[dict], next_cursor: str | None):
     b.button(text="🔄 Авто-восстановление", callback_data="selenium:restore:menu")
     b.button(text="🔄 Обновить", callback_data="ads_load")
     b.button(text="⬅️ Меню", callback_data="menu:main")
-    b.adjust(2, 2, 2, 1)
+    b.adjust(2, 2, 2, 2, 1)
     return b.as_markup()
 
 
