@@ -72,7 +72,9 @@ def ads_list_keyboard(
     for ad in ads:
         ad_id = str(ad.get("id", ""))
         title = ad.get("title") or ad.get("name") or f"Товар {ad_id}"
-        price = ad.get("price", "")
+        from orderfields import ad_price, money
+        value = ad_price(ad)
+        price = money(value) if value is not None else ""
         label = f"{title[:28]} — {price} ₽" if price else title[:35]
         builder.button(text=label, callback_data=AdCallback(ad_id=ad_id).pack())
     builder.adjust(1)

@@ -61,15 +61,14 @@ def _round(value: float) -> int:
 
 
 def _price_of(ad: dict) -> int:
-    for key in ("price", "cost", "amount"):
-        raw = ad.get(key)
-        if raw in (None, ""):
-            continue
-        try:
-            return int(float(str(raw).replace(",", ".").replace(" ", "")))
-        except (TypeError, ValueError):
-            continue
-    return 0
+    """Цена объявления числом. 0 — если её в ответе нет.
+
+    Маркетплейс присылает её объектом {"amount": …, "currency": …}, так что
+    разбор общий с заказами — свой бы отстал от первого же изменения формата.
+    """
+    from orderfields import ad_price
+    value = ad_price(ad)
+    return int(round(value)) if value is not None else 0
 
 
 def _title_of(ad: dict) -> str:

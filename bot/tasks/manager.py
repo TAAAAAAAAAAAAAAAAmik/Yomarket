@@ -1465,10 +1465,14 @@ class TaskManager:
             changed = 0
             for ad in ads:
                 ad_id = ad.get("id")
-                try:
-                    price = int(float(str(ad.get("price", 0))))
-                except (TypeError, ValueError):
+                # Цена приходит объектом {"amount": …}; прочитанная как
+                # скаляр, она роняла разбор — и расписание тихо пропускало
+                # каждый товар, ни разу ничего не изменив.
+                from orderfields import ad_price
+                raw_price = ad_price(ad)
+                if raw_price is None:
                     continue
+                price = int(round(raw_price))
                 if not ad_id or price <= 0:
                     continue
                 new_price = max(1, round(price * (1 + percent / 100)))

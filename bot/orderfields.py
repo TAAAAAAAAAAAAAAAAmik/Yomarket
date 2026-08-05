@@ -116,6 +116,17 @@ def order_price(order: dict) -> float | None:
     return _to_number(got)
 
 
+def ad_price(ad: dict) -> float | None:
+    """Цена объявления числом, или None — если её в ответе нет.
+
+    Маркетплейс отдаёт её объектом: {"amount": 129, "base_amount": 129,
+    "currency": "RUB"}. Прочитанная как скаляр, она превращалась в 0 или в
+    «—»: экраны показывали «цена не указана», а ночное расписание молча
+    пропускало каждый товар — на dict его int(float(str(…))) спотыкался.
+    """
+    return order_price(ad)
+
+
 def _to_number(value) -> float | None:
     if isinstance(value, bool) or value is None:
         return None

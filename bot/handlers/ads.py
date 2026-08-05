@@ -55,6 +55,15 @@ def _status(raw: str) -> str:
     return STATUS_EMOJI.get(raw, f"⚪ {raw}")
 
 
+def _price_text(ad: dict) -> str:
+    """Цена объявления для показа. Маркетплейс присылает её объектом
+    {"amount": …, "currency": …} — выведенная как есть, она была видна
+    продавцу словарём."""
+    from orderfields import ad_price, money
+    value = ad_price(ad)
+    return money(value) if value is not None else "—"
+
+
 def _load_error(e: Exception) -> str:
     """Say what actually went wrong loading listings.
 
@@ -207,7 +216,7 @@ async def show_ad_detail(
     try:
         ad = await api.get_ad(callback_data.ad_id)
         title = ad.get("title") or ad.get("name") or "—"
-        price = ad.get("price", "—")
+        price = _price_text(ad)
         status_raw = ad.get("status", "")
         status = _status(status_raw)
         description = ad.get("description") or "Нет описания"
@@ -367,7 +376,7 @@ async def ad_pause(callback: CallbackQuery, api: YooMarketAPI) -> None:
     try:
         ad = await api.get_ad(ad_id)
         title = ad.get("title") or ad.get("name") or "—"
-        price = ad.get("price", "—")
+        price = _price_text(ad)
         status_raw = ad.get("status", "")
         status = _status(status_raw)
         text = (
@@ -398,7 +407,7 @@ async def ad_activate(callback: CallbackQuery, api: YooMarketAPI) -> None:
     try:
         ad = await api.get_ad(ad_id)
         title = ad.get("title") or ad.get("name") or "—"
-        price = ad.get("price", "—")
+        price = _price_text(ad)
         status_raw = ad.get("status", "")
         status = _status(status_raw)
         text = (
