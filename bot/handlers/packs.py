@@ -12,6 +12,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from api.yoomarket import YooMarketAPI
 from storage import get_settings, save_settings
 
+
+def _esc(value) -> str:
+    """Название пака придумывает продавец — '<' в нём сломал бы всё сообщение."""
+    import html
+    return html.escape(str(value or ""))
+
 router = Router()
 logger = logging.getLogger(__name__)
 
@@ -229,7 +235,16 @@ async def pack_del(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("pack:bump:"))
-async def pack_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
+async def pack_bump_ask(callback: CallbackQuery) -> None:
+    """Спросить, прежде чем тратить: «Премиум» платный, и за каждый товар.
+
+    Раньше эта кнопка дёргала поднятие через API, которого у Юмаркета нет.
+    Каждое объявление падало, а экран рисовал «✅ Пак поднят · Поднято: 0» —
+    заголовок утверждал успех, которого не было.
+    """
+    from handlers.selenium_settings import promo_params, promo_price
+    from storage import get_panel_creds
+
     uid = callback.from_user.id
     try:
         idx = int(callback.data.split(":")[-1])
@@ -244,27 +259,104 @@ async def pack_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
     if not ids:
         await callback.answer("Пак пуст", show_alert=True)
         return
-    if not api:
-        await callback.answer("Нужен API-токен", show_alert=True)
+
+    if not get_panel_creds(uid):
+        await callback.answer(
+            "Продвижение идёт через панель — сначала войдите в неё: "
+            "Настройки → 🌐 Панель продавца", show_alert=True)
         return
-    await callback.message.edit_text(f"⏳ Поднимаю пак «{name}» ({len(ids)} шт.)…")
-    ok = fail = 0
-    last_err = ""
+
+    s = get_settings(uid)
+    if not promo_params(s):
+        b = InlineKeyboardBuilder()
+        b.button(text="⚙️ Выбрать тариф", callback_data="promo:setup")
+        b.button(text="⬅️ К паку", callback_data=f"pack:view:{idx}")
+        b.adjust(1)
+        await callback.message.edit_text(
+            "⚙️ <b>Сначала выберите тариф</b>\n\n"
+            "«Премиум» требует услугу, срок и способ оплаты — сроки стоят "
+            "по-разному, поэтому бот не подставляет их сам.",
+            reply_markup=b.as_markup())
+        await callback.answer()
+        return
+
+    price = promo_price(s)
+    total = f" — ориентировочно <b>{price * len(ids)} ₽</b>" if price else ""
+    b = InlineKeyboardBuilder()
+    b.button(text=f"💵 Поднять {len(ids)} шт.", callback_data=f"pack:bumpok:{idx}")
+    b.button(text="❌ Отмена", callback_data=f"pack:view:{idx}")
+    b.adjust(1)
+    await callback.message.edit_text(
+        f"⭐ <b>Премиум для пака «{_esc(name)}»</b>\n\n"
+        f"Товаров: <b>{len(ids)}</b>{total}\n\n"
+        "Это платная услуга Юмаркета, и оплачивается она за каждый товар "
+        "отдельно.",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pack:bumpok:"))
+async def pack_bump(callback: CallbackQuery) -> None:
+    """Поднять пак — через панель, по одному товару, с честным итогом."""
+    import asyncio
+
+    from automation.panel import panel_bump_item_sync
+    from handlers.selenium_settings import promo_params
+    from storage import get_panel_creds
+
+    uid = callback.from_user.id
+    try:
+        idx = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    name = _pack_by_index(uid, idx)
+    ids = _packs(uid).get(name or "", [])
+    if not ids:
+        await callback.answer("Пак пуст", show_alert=True)
+        return
+    creds = get_panel_creds(uid)
+    params = promo_params(get_settings(uid))
+    if not creds or not params:
+        await callback.answer("Нужен вход в панель и выбранный тариф",
+                              show_alert=True)
+        return
+
+    await callback.answer("⏳ Продвигаю…")
+    await callback.message.edit_text(
+        f"⏳ Поднимаю пак «{_esc(name)}» ({len(ids)} шт.)…")
+    loop = asyncio.get_event_loop()
+    done, failed = [], []
     for ad_id in ids:
         try:
-            await api.bump_ad(ad_id)
-            ok += 1
+            ok, msg = await asyncio.wait_for(
+                loop.run_in_executor(None, panel_bump_item_sync,
+                                     creds["cookies"], str(ad_id), uid, True,
+                                     params),
+                timeout=60)
         except Exception as e:
-            fail += 1
-            last_err = str(e)
+            ok, msg = False, str(e)[:80]
+        (done if ok else failed).append((ad_id, str(msg)[:80]))
+
     b = InlineKeyboardBuilder()
     b.button(text="📦 К паку", callback_data=f"pack:view:{idx}")
     b.button(text="⬅️ Паки", callback_data="packs:menu")
     b.adjust(2)
-    text = f"⬆️ <b>Пак «{name}» поднят</b>\n\n✅ Поднято: <b>{ok}</b>"
-    if fail:
-        text += f"\n❌ Ошибок: <b>{fail}</b>"
-        if last_err:
-            text += f"\n<i>{last_err[:80]}</i>"
-    await callback.message.edit_text(text, reply_markup=b.as_markup())
-    await callback.answer()
+    # Заголовок по факту: «поднят» при нуле поднятых — это ложь, за которую
+    # продавец платит вниманием, а иногда и деньгами.
+    if done and not failed:
+        head = f"⬆️ <b>Пак «{_esc(name)}» поднят</b>"
+    elif done:
+        head = f"⚠️ <b>Пак «{_esc(name)}» поднят частично</b>"
+    else:
+        head = f"❌ <b>Пак «{_esc(name)}» не поднят</b>"
+    lines = [head, "", f"✅ Поднято: <b>{len(done)}</b> из {len(ids)}"]
+    if failed:
+        lines.append(f"❌ Не вышло: <b>{len(failed)}</b>")
+        seen = []
+        for _ad, why in failed:
+            if why not in seen:
+                seen.append(why)
+        for why in seen[:3]:
+            lines.append(f"<i>{_esc(why)}</i>")
+    await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())

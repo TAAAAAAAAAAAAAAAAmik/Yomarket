@@ -140,24 +140,6 @@ class YooMarketAPI:
     async def get_ad(self, ad_id: int | str) -> dict:
         return await self._get(f"/ads/{ad_id}")
 
-    async def bump_ad(self, ad_id: int | str) -> dict:
-        """Not available: the Integration API v1.4 has no bump endpoint.
-
-        The spec lists only publish / unpublish / price / items / value for an
-        ad — nothing that raises it in the listing. Previous code guessed
-        /up, /bump and /raise, which simply 404.
-        """
-        raise RuntimeError(
-            "Интеграционное API не поддерживает поднятие объявлений — "
-            "такого метода нет в спецификации v1.4"
-        )
-
-    async def bump_all_ads(self) -> tuple[int, str]:
-        """Not available — see bump_ad(). Fails fast instead of walking every
-        ad only to 404 on each one."""
-        return 0, ("⚠️ Поднятие недоступно: в Интеграционном API нет такого "
-                   "метода. Поднимайте объявления в панели.")
-
     async def restore_ad(self, ad_id: int | str) -> dict:
         """Put an ad back on sale — POST /ads/{ad_id}/publish (per the spec)."""
         return await self._post(f"/ads/{ad_id}/publish")
@@ -392,29 +374,6 @@ class YooMarketAPI:
         # probing paths that are guaranteed to 404.
         logger.warning("Balance not found in /check response")
         return 0.0, "—"
-
-    async def withdraw_balance(self, min_amount: float = 0, amount: float | None = None) -> tuple[bool, str]:
-        """Request a withdrawal. If `amount` is None, withdraws the full balance.
-        Returns (success, message)."""
-        balance, balance_str = await self.get_balance()
-        if balance_str == "—":
-            return False, "❌ Не удалось получить баланс через API"
-        want = balance if amount is None else float(amount)
-        if want <= 0:
-            return False, "ℹ️ Нечего выводить (баланс 0)"
-        if want > balance:
-            return False, f"ℹ️ Запрошено {want:.0f} ₽, а на балансе {balance:.0f} ₽"
-        if balance < min_amount:
-            return False, f"ℹ️ Баланс {balance:.0f} ₽ ниже порога {min_amount:.0f} ₽"
-        for path in ("/withdraw", "/wallet/withdraw", "/balance/withdraw", "/finance/withdraw"):
-            try:
-                await self._post(path, json={"amount": int(want)})
-                return True, f"✅ Вывод {want:.0f} ₽ выполнен"
-            except RuntimeError as e:
-                if "404" in str(e) or "not found" in str(e).lower():
-                    continue
-                return False, f"❌ Ошибка: {e}"
-        return False, "⚠️ API не поддерживает вывод средств"
 
     async def get_withdrawals(self) -> list[dict]:
         """Fetch withdrawal list from the API (tries common endpoints).
@@ -736,13 +695,3 @@ class YooMarketAPI:
         logger.info("categories loaded: %d (parent=%s)", len(out), parent_id)
         return out
 
-    async def get_reviews(self) -> dict:
-        """Fetch reviews/feedback. Tries common endpoint names."""
-        for path in ("/reviews", "/feedback", "/ratings"):
-            try:
-                return await self._get(path)
-            except RuntimeError as e:
-                if "404" in str(e) or "not found" in str(e).lower() or "405" in str(e):
-                    continue
-                raise
-        return {"data": []}

@@ -244,7 +244,7 @@ def _kb() -> InlineKeyboardMarkup:
     b.button(text="📜 История выводов", callback_data="balance:history")
     b.button(text="📊 Статистика", callback_data="menu:stats")
     b.button(text="🔔 Порог уведомления", callback_data="balance:threshold")
-    b.button(text="🤖 Автовывод", callback_data="balance:auto")
+    b.button(text="💳 Реквизиты вывода", callback_data="balance:auto")
     b.button(text="🔄 Обновить", callback_data="menu:balance")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     b.adjust(2, 2, 1, 2)
@@ -350,23 +350,52 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
 
 # ── Вывод средств ───────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "balance:withdraw")
-async def withdraw_start(callback: CallbackQuery, state: FSMContext, api: YooMarketAPI) -> None:
-    # The panel is where the money is: the API has no balance, so reading it
-    # here printed «Доступно: — ₽» on the very screen that asks how much to
-    # take out.
+def _payout_ready(uid: int) -> bool:
+    """Настроен ли способ выплаты. Без него выводить нечем."""
+    aw = get_settings(uid).get("auto_withdraw", {})
+    return bool(aw.get("panel_balance_id") and aw.get("panel_values"))
+
+
+def _setup_first_kb():
+    b = InlineKeyboardBuilder()
+    b.button(text="⚙️ Настроить вывод", callback_data="balance:auto")
+    b.button(text="⬅️ Баланс", callback_data="menu:balance")
+    b.adjust(1)
+    return b.as_markup()
+
+
+async def _ask_amount(message, uid: int, api: YooMarketAPI,
+                      state: FSMContext) -> None:
+    """Экран «сколько вывести». Деньги уходят через панель — в API вывода нет.
+
+    Прежние кнопки ходили в /withdraw, /wallet/withdraw и ещё три пути,
+    которых у Юмаркета не существует: вывод всегда заканчивался ошибкой,
+    хотя рядом, в мастере, тот же вывод работал через панель.
+    """
     from tasks.manager import shop_balance
-    amount, bal_str = await shop_balance(callback.from_user.id, api)
-    await state.set_state(WithdrawState.waiting_amount)
+    if not _payout_ready(uid):
+        await message.edit_text(
+            "💸 <b>Вывод средств</b>\n\n"
+            "Сначала нужно указать, <b>куда</b> выводить: способ выплаты и "
+            "реквизиты. Бот прочитает форму вывода прямо из панели.",
+            reply_markup=_setup_first_kb())
+        return
+    _amount, bal_str = await shop_balance(uid, api)
+    await state.set_state(WithdrawState.waiting_panel_amount)
     b = InlineKeyboardBuilder()
     b.button(text="💸 Вывести всё", callback_data="balance:withdraw_all")
     b.button(text="❌ Отмена", callback_data="menu:balance")
     b.adjust(1)
-    await callback.message.edit_text(
+    await message.edit_text(
         f"💸 <b>Вывод средств</b>\n\nДоступно: <b>{bal_str} ₽</b>\n\n"
-        "Введите сумму для вывода или нажмите «Вывести всё»:",
-        reply_markup=b.as_markup(),
-    )
+        "Пришлите сумму в ₽ или нажмите «Вывести всё»:",
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "balance:withdraw")
+async def withdraw_start(callback: CallbackQuery, state: FSMContext,
+                         api: YooMarketAPI) -> None:
+    await _ask_amount(callback.message, callback.from_user.id, api, state)
     await callback.answer()
 
 
@@ -381,48 +410,32 @@ def _log_withdrawal(uid: int, amount: float, wtype: str, ok: bool) -> None:
     save_settings(uid, s)
 
 
-async def _do_withdraw(msg, uid: int, api: YooMarketAPI, amount: float | None) -> None:
-    if not api:
-        await msg.answer("❌ Нужен API-токен.")
-        return
-    status = await msg.answer("⏳ Оформляю вывод…")
-    try:
-        ok, result = await api.withdraw_balance(amount=amount)
-    except Exception as e:
-        ok, result = False, f"Ошибка: {str(e)[:120]}"
-    # log the requested amount (0 = full — we log the balance if known)
-    log_amt = amount if amount is not None else 0.0
-    _log_withdrawal(uid, log_amt, "manual", ok)
-    b = InlineKeyboardBuilder()
-    b.button(text="📜 История", callback_data="balance:history")
-    b.button(text="⬅️ Баланс", callback_data="menu:balance")
-    b.adjust(2)
-    await status.edit_text(
-        (f"✅ {result}" if ok else f"❌ {result}"), reply_markup=b.as_markup())
-
-
 @router.callback_query(F.data == "balance:withdraw_all")
-async def withdraw_all(callback: CallbackQuery, state: FSMContext, api: YooMarketAPI) -> None:
+async def withdraw_all(callback: CallbackQuery, state: FSMContext,
+                       api: YooMarketAPI) -> None:
+    """«Всё» — это столько, сколько панель показывает на счету."""
+    from tasks.manager import shop_balance
     await state.clear()
-    await callback.answer()
-    await _do_withdraw(callback.message, callback.from_user.id, api, None)
-
-
-@router.message(WithdrawState.waiting_amount)
-async def withdraw_amount(message: Message, state: FSMContext, api: YooMarketAPI) -> None:
-    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
-    try:
-        amount = float(raw)
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите сумму числом, например: <b>500</b>")
+    uid = callback.from_user.id
+    if not _payout_ready(uid):
+        await callback.message.edit_text(
+            "💸 <b>Вывод средств</b>\n\nСначала настройте способ выплаты.",
+            reply_markup=_setup_first_kb())
+        await callback.answer()
         return
-    await state.clear()
-    await _do_withdraw(message, message.from_user.id, api, amount)
+    await callback.answer("⏳ Смотрю баланс…")
+    amount, bal_str = await shop_balance(uid, api)
+    if not amount or amount < 1:
+        # Ноль на экране подтверждения — заявка в никуда.
+        await callback.message.edit_text(
+            f"💸 <b>Вывод средств</b>\n\nНа счету <b>{bal_str} ₽</b> — "
+            "выводить нечего.",
+            reply_markup=_setup_first_kb())
+        return
+    await _confirm_payout(callback.message, uid, int(amount))
 
 
-# ── Порог уведомления о балансе ──────────────────────────────────────────────
+# ── Порог уведомления о балансе ─# ── Порог уведомления о балансе ──────────────────────────────────────────────
 
 @router.callback_query(F.data == "balance:threshold")
 async def threshold_start(callback: CallbackQuery, state: FSMContext) -> None:
@@ -481,29 +494,48 @@ async def threshold_save(message: Message, state: FSMContext) -> None:
         reply_markup=b.as_markup())
 
 
-# ── Автовывод ────────────────────────────────────────────────────────────────
+# ── Реквизиты вывода ─────────────────────────────────────────────────────────
+#
+# Автовывод убран: деньги переводит человек, а не расписание. Здесь остаётся
+# то, без чего ручной вывод невозможен, — способ выплаты и реквизиты,
+# прочитанные из формы самой панели.
 
 def _auto_text(s: dict) -> str:
     aw = s.get("auto_withdraw", {})
-    on = aw.get("enabled", False)
-    method = aw.get("method") or "panel"
-    lines = [
-        "🤖 <b>Автовывод</b>\n",
-        f"Статус: {'🟢 ВКЛ' if on else '🔴 ВЫКЛ'}",
-        f"Порог: от <b>{_RUB(float(aw.get('min_amount', 500) or 0))} ₽</b>",
-        f"Проверка: раз в {aw.get('interval_hours', 24)} ч",
-    ]
-    if method == "panel":
-        vals = aw.get("panel_values") or {}
-        lines.append("Способ: <b>через панель</b>")
-        lines.append("Реквизиты: " + ("настроены" if vals else "не заданы"))
+    vals = aw.get("panel_values") or {}
+    ready = bool(aw.get("panel_balance_id") and vals)
+    lines = ["💳 <b>Реквизиты вывода</b>\n"]
+    if ready:
+        masked = ", ".join(
+            f"{k}={_mask(v) if k in ('card', 'wallet', 'phone', 'steam_wallet') else v}"
+            for k, v in vals.items() if k != "system")
+        lines.append("Статус: 🟢 настроены")
+        lines.append(f"Куда: {_esc(masked) or '—'}")
     else:
+        lines.append("Статус: 🔴 не настроены")
         lines.append("")
-        lines.append("⚠️ <b>Не настроен.</b> Вывод идёт только через панель — "
-                     "у Юмаркета нет вывода через API. Настройте кнопкой ниже.")
+        lines.append("Вывод идёт через панель — у Юмаркета нет вывода через "
+                     "API. Бот прочитает форму выплаты прямо из панели и "
+                     "спросит только то, что в ней есть.")
+    lim = aw.get("limits") or {}
+    if lim.get("max"):
+        lines.append(f"Потолок одной выплаты: {_RUB(float(lim['max']))} ₽")
     if aw.get("last_result"):
         lines.append(f"\nПоследнее: {_esc(aw['last_result'])}")
+    lines.append("\n<i>Автоматического вывода нет: заявку отправляете вы.</i>")
     return "\n".join(lines)
+
+
+def _mask(value) -> str:
+    """Показать реквизит, не показывая его целиком.
+
+    Экран подтверждения выплаты нужен, чтобы заметить чужую карту, а не
+    чтобы светить свою в переписке.
+    """
+    s = str(value or "")
+    if len(s) <= 6:
+        return s
+    return f"{s[:4]}…{s[-4:]}"
 
 
 def _esc(t) -> str:
@@ -512,14 +544,14 @@ def _esc(t) -> str:
 
 def _auto_kb(s: dict) -> InlineKeyboardMarkup:
     aw = s.get("auto_withdraw", {})
-    on = aw.get("enabled", False)
+    ready = bool(aw.get("panel_balance_id") and aw.get("panel_values"))
     b = InlineKeyboardBuilder()
-    b.button(text="🔴 Выключить" if on else "🟢 Включить",
-             callback_data="balance:auto_toggle")
-    b.button(text="🎯 Порог суммы", callback_data="balance:auto_min")
-    b.button(text="⚙️ Настроить вывод через панель", callback_data="balance:auto_setup")
+    b.button(text="⚙️ Настроить вывод через панель",
+             callback_data="balance:auto_setup")
+    if ready:
+        b.button(text="💸 Вывести сейчас", callback_data="wd:manual")
     b.button(text="⬅️ Баланс", callback_data="menu:balance")
-    b.adjust(2, 1, 1)
+    b.adjust(1)
     return b.as_markup()
 
 
@@ -529,115 +561,6 @@ async def auto_menu(callback: CallbackQuery, state: FSMContext) -> None:
     s = get_settings(callback.from_user.id)
     await callback.message.edit_text(_auto_text(s), reply_markup=_auto_kb(s))
     await callback.answer()
-
-
-@router.callback_query(F.data == "balance:auto_toggle")
-async def auto_toggle(callback: CallbackQuery) -> None:
-    s = get_settings(callback.from_user.id)
-    aw = s.setdefault("auto_withdraw", {})
-    turning_on = not aw.get("enabled", False)
-    if turning_on and aw.get("method", "api") != "panel":
-        await callback.answer(
-            "Сначала настройте вывод через панель — через API Юмаркет вывод "
-            "не поддерживает.", show_alert=True)
-        return
-    if turning_on and not (aw.get("panel_balance_id")
-                           and aw.get("panel_action_key")
-                           and aw.get("panel_values")):
-        await callback.answer("Сначала настройте способ вывода", show_alert=True)
-        return
-    aw["enabled"] = turning_on
-    if turning_on:
-        aw["last_run"] = 0
-    save_settings(callback.from_user.id, s)
-    await callback.message.edit_text(_auto_text(s), reply_markup=_auto_kb(s))
-    await callback.answer("Включено" if turning_on else "Выключено")
-
-
-@router.callback_query(F.data == "balance:auto_min")
-async def auto_min_start(callback: CallbackQuery, state: FSMContext) -> None:
-    cur = get_settings(callback.from_user.id).get(
-        "auto_withdraw", {}).get("min_amount", 500)
-    await state.set_state(WithdrawState.waiting_auto_min)
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data="balance:auto")
-    await callback.message.edit_text(
-        f"🎯 <b>Порог автовывода</b>\n\nСейчас: {cur} ₽\n\n"
-        f"Выводить, когда баланс дорастёт до этой суммы. Пришлите число:",
-        reply_markup=b.as_markup())
-    await callback.answer()
-
-
-@router.message(WithdrawState.waiting_auto_min)
-async def auto_min_save(message: Message, state: FSMContext) -> None:
-    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
-    try:
-        amount = float(raw)
-        if amount <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите сумму числом, например: <b>1000</b>")
-        return
-    await state.clear()
-    s = get_settings(message.from_user.id)
-    s.setdefault("auto_withdraw", {})["min_amount"] = amount
-    save_settings(message.from_user.id, s)
-
-    # The commission has a floor: on this marketplace 3%, but never below 30 ₽.
-    # At the form's own minimum of 40 ₽ that flat part takes three quarters of
-    # the payout, and a threshold set low would repeat that on every run. The
-    # figures come from the panel where they are known, so the warning matches
-    # whatever it actually charges.
-    warn = ""
-    lim = s.get("auto_withdraw", {}).get("limits") or {}
-    fee_min, fee_pct = float(lim.get("fee_min") or 30), float(lim.get("fee_pct") or 3)
-    fee = max(amount * fee_pct / 100, fee_min)
-    if amount > 0 and fee / amount >= 0.1:
-        warn = (f"\n\n⚠️ При {amount:.0f} ₽ комиссия составит {fee:.0f} ₽ — "
-                f"{fee / amount * 100:.0f}% от суммы, на руки "
-                f"{amount - fee:.0f} ₽. Комиссия не бывает меньше "
-                f"{fee_min:.0f} ₽, поэтому редкие крупные выводы выгоднее "
-                f"частых мелких.")
-    if warn:
-        await message.answer(f"✅ Порог: <b>{amount:.0f} ₽</b>{warn}")
-    await message.answer(_auto_text(s), reply_markup=_auto_kb(s))
-
-
-def _mask(value: str) -> str:
-    """Show requisites as •••• 1234 — enough to recognise, not to leak."""
-    v = str(value or "")
-    digits = "".join(ch for ch in v if ch.isdigit())
-    if len(digits) >= 4:
-        return "•••• " + digits[-4:]
-    return v[:2] + "…" if len(v) > 3 else v
-
-
-async def _run_panel(uid, fn, *args):
-    """Run a blocking panel function and unpack its (ok, payload) result.
-
-    The panel_* functions all return (ok, data). Returning that tuple verbatim
-    made callers test isinstance(res, list) against a tuple — the check failed
-    and the whole raw payload was dumped into a message that overflowed
-    Telegram's limit, so the "loading…" text never got replaced and looked hung.
-    """
-    import asyncio
-    from storage import get_panel_creds
-    creds = get_panel_creds(uid)
-    if not creds or not creds.get("cookies"):
-        return None, "нужен вход в панель продавца"
-    loop = asyncio.get_event_loop()
-    try:
-        result = await asyncio.wait_for(
-            loop.run_in_executor(None, fn, creds["cookies"], *args), timeout=60)
-    except asyncio.TimeoutError:
-        return None, "панель не ответила за 60 секунд"
-    except Exception as e:
-        return None, str(e)[:150] or type(e).__name__
-    if (isinstance(result, tuple) and len(result) == 2
-            and isinstance(result[0], bool)):
-        ok, payload = result
-        return (payload, "") if ok else (None, str(payload)[:250])
-    return result, ""
 
 
 @router.callback_query(F.data == "balance:auto_setup")
@@ -995,6 +918,26 @@ async def wd_manual_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+async def _confirm_payout(message, uid: int, amount: int) -> None:
+    """Последний экран перед реальными деньгами: сумма и куда."""
+    aw = get_settings(uid).get("auto_withdraw", {})
+    vals = aw.get("panel_values") or {}
+    masked = ", ".join(
+        f"{k}={_mask(v) if k in ('card', 'wallet', 'phone', 'steam_wallet') else v}"
+        for k, v in vals.items() if k != "system")
+    b = InlineKeyboardBuilder()
+    b.button(text=f"✅ Вывести {amount} ₽", callback_data=f"wd:go:{amount}")
+    b.button(text="❌ Отмена", callback_data="menu:balance")
+    b.adjust(1)
+    send = getattr(message, "edit_text", None) or message.answer
+    await send(
+        f"⚠️ <b>Подтвердите вывод</b>\n\n"
+        f"Сумма: <b>{amount} ₽</b>\n"
+        f"Реквизиты: {_esc(masked) or '—'}\n\n"
+        f"Заявка уйдёт в панель. Проверьте реквизиты — ошибку не отменить.",
+        reply_markup=b.as_markup())
+
+
 @router.message(WithdrawState.waiting_panel_amount)
 async def wd_manual_amount(message: Message, state: FSMContext) -> None:
     raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
@@ -1006,24 +949,7 @@ async def wd_manual_amount(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Введите сумму числом, например: <b>500</b>")
         return
     await state.clear()
-    s = get_settings(message.from_user.id)
-    aw = s.get("auto_withdraw", {})
-    label = "выбранным способом"
-    vals = aw.get("panel_values") or {}
-    b = InlineKeyboardBuilder()
-    b.button(text=f"✅ Вывести {amount} ₽", callback_data=f"wd:go:{amount}")
-    b.button(text="❌ Отмена", callback_data="balance:auto")
-    b.adjust(1)
-    masked = ", ".join(
-        f"{k}={_mask(v) if k in ('card','wallet','phone','steam_wallet') else v}"
-        for k, v in vals.items() if k != "system")
-    await message.answer(
-        f"⚠️ <b>Подтвердите вывод</b>\n\n"
-        f"Сумма: <b>{amount} ₽</b>\n"
-        f"Реквизиты: {_esc(masked) or '—'}\n\n"
-        f"Деньги уйдут по авто-выплате. Проверьте реквизиты — ошибку не "
-        f"отменить.",
-        reply_markup=b.as_markup())
+    await _confirm_payout(message, message.from_user.id, amount)
 
 
 @router.callback_query(F.data.startswith("wd:go:"))

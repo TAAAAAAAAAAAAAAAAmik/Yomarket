@@ -2040,6 +2040,70 @@ class TaskManager:
             return False, str(e)[:120]
         return bool(ok), str(msg)
 
+    async def _check_reviews(self, user_id: int, settings: dict) -> str:
+        """Новые отзывы — из панели.
+
+        В Integration API отзывов нет вовсе: прежний код перебирал /reviews,
+        /feedback и /ratings, получал 404 и возвращал пустой список. Тумблер
+        включался, и не происходило ничего — ни отзывов, ни объяснения.
+        """
+        from storage import get_panel_creds
+        from automation.panel import panel_reviews_sync
+
+        rm = settings.setdefault("reviews_monitor", {})
+        creds = get_panel_creds(user_id)
+        if not creds or not creds.get("cookies"):
+            # Молча возвращать пусто — это и была прежняя болезнь. Говорим
+            # один раз, а не на каждом проходе.
+            if not rm.get("warned_no_panel"):
+                rm["warned_no_panel"] = True
+                return ("⭐ Отзывы читаются из панели, а вход в неё не "
+                        "выполнен: Настройки → 🌐 Панель продавца.")
+            return ""
+        rm.pop("warned_no_panel", None)
+
+        loop = asyncio.get_event_loop()
+        try:
+            ok, got = await asyncio.wait_for(
+                loop.run_in_executor(None, functools.partial(
+                    panel_reviews_sync, creds["cookies"],
+                    rm.get("resource", ""))),
+                timeout=60)
+        except Exception as e:
+            logger.warning("Reviews: %s", e)
+            return ""
+        if not ok or not isinstance(got, dict):
+            if not rm.get("warned_not_found"):
+                rm["warned_not_found"] = True
+                return (f"⭐ Отзывы в панели найти не удалось. "
+                        f"<i>{_esc(str(got)[:200])}</i>")
+            return ""
+        rm.pop("warned_not_found", None)
+        rm["resource"] = got.get("resource", "")
+
+        reviews = [r for r in got.get("reviews", []) if r.get("id") is not None]
+        known = {str(x) for x in (rm.get("known_review_ids") or [])}
+        fresh = [r for r in reviews if str(r["id"]) not in known]
+        # Первый проход только запоминает: иначе продавец получил бы пачку
+        # уведомлений обо всех отзывах за всю историю магазина.
+        rm["known_review_ids"] = [str(r["id"]) for r in reviews][:500]
+        if not known or not fresh:
+            return ""
+
+        for rev in fresh[:5]:
+            rating = rev.get("rating")
+            stars = ("⭐" * int(rating)) if isinstance(rating, (int, float)) \
+                and 1 <= rating <= 5 else "—"
+            body = [f"👤 {_esc(rev.get('author') or 'Покупатель')}  {stars}"]
+            if rev.get("title"):
+                body.append(f"📦 {_esc(rev['title'])}")
+            if rev.get("text"):
+                body += ["", f"<i>«{_esc(rev['text'][:300])}»</i>"]
+            await self._notify(user_id, _card("⭐ <b>НОВЫЙ ОТЗЫВ</b>", body))
+        if len(fresh) > 5:
+            return f"⭐ Ещё {len(fresh) - 5} новых отзывов"
+        return ""
+
     async def _check_position(self, user_id: int, settings: dict, now: float,
                               api: YooMarketAPI | None = None) -> str:
         """Walk the watched listings; act on the ones that slipped.
@@ -2140,128 +2204,6 @@ class TaskManager:
             used += len(block)
         return _card("📍 <b>ПОЗИЦИЯ НА ВИТРИНЕ</b>", kept,
                      f"🏪 {_esc(shop)}   ·   проверено: {checked}")
-
-    async def _auto_withdraw(self, user_id: int, api: YooMarketAPI,
-                             settings: dict, now: float) -> str:
-        """One scheduled withdrawal attempt. Returns a notification, or ''.
-
-        Two routes: the Integration API (which has no withdrawal endpoint, so
-        this only works if one ever appears), and the panel (where withdrawal
-        actually lives). The panel route runs only with a method and values the
-        seller configured — this moves money out, so nothing is guessed.
-        """
-        aw = settings.setdefault("auto_withdraw", {})
-        min_amount = float(aw.get("min_amount", 500) or 0)
-
-        try:
-            balance, balance_str = await shop_balance(user_id, api)
-        except Exception as e:
-            logger.warning("Auto-withdraw balance for %s: %s", user_id, e)
-            return ""
-        if balance_str == "—":
-            return ""                                   # unknown balance, skip
-        if balance < min_amount:
-            return ""                                   # below threshold, quiet
-
-        sent_amount = float(int(balance))
-        more_left = False
-        # The panel is the only route: the Integration API has no withdrawal
-        # endpoint, and the screen says so. Defaulting to "api" meant the
-        # automatic run reported «не удалось получить баланс через API» — an
-        # error about a road that does not exist.
-        method = aw.get("method") or "panel"
-        if method == "panel":
-            balance_id = aw.get("panel_balance_id") or ""
-            action_key = aw.get("panel_action_key") or ""
-            values = dict(aw.get("panel_values") or {})
-            if not balance_id or not action_key or not values:
-                aw["enabled"] = False                   # misconfigured; stop
-                return ("💸 Авто-вывод выключен: не настроен способ вывода "
-                        "через панель. Откройте «Баланс» → «Автовывод».")
-            from storage import get_panel_creds
-            from automation.panel import panel_withdraw_sync
-            creds = get_panel_creds(user_id)
-            if not creds or not creds.get("cookies"):
-                return "💸 Авто-вывод: нужен вход в панель продавца."
-            # The wizard stores the method and requisites without an amount.
-            # The whole balance used to be submitted, which a shop holding more
-            # than the per-payout ceiling can never pass — the panel states
-            # «Максимальная сумма: 75 000 ₽» and rejects anything above it. The
-            # limits are read from the form rather than hardcoded, so a change
-            # on their side follows along.
-            from automation.panel import panel_withdraw_limits_sync
-            loop = asyncio.get_event_loop()
-            lim = {}
-            # With the stored payment system, so the form reshapes and states
-            # its limits — without it «Сумма» is not even visible yet.
-            chosen = {k: v for k, v in values.items() if k == "system"}
-            try:
-                lim_ok, got = await asyncio.wait_for(
-                    loop.run_in_executor(None, panel_withdraw_limits_sync,
-                                         creds["cookies"], balance_id, chosen),
-                    timeout=45)
-                if lim_ok and isinstance(got, dict):
-                    lim = got
-            except Exception as e:
-                logger.info("Withdraw limits for %s: %s", user_id, e)
-
-            cap = float(lim.get("max") or 0)
-            floor = float(lim.get("min") or 0)
-            amount = int(min(balance, cap) if cap else balance)
-            if floor and amount < floor:
-                return (f"💸 Авто-вывод: на счёте {balance:.0f} ₽, а минимум "
-                        f"для выплаты — {floor:.0f} ₽. Жду накопления.")
-            left = balance - amount
-
-            values = {**values, "amount": amount}
-            ok, msg = await asyncio.wait_for(
-                loop.run_in_executor(None, panel_withdraw_sync,
-                                     creds["cookies"], balance_id, action_key,
-                                     values, user_id, True),
-                timeout=60)
-            if ok:
-                fee = max(amount * float(lim.get("fee_pct") or 0) / 100,
-                          float(lim.get("fee_min") or 0))
-                # The panel's own words are kept, not replaced. Accepting a
-                # payout is not the same as paying it: the answer can be
-                # «ссылка для подтверждения реквизитов отправлена на почту»,
-                # and reporting «выведено» over that would claim money moved
-                # when it is waiting on the seller's inbox.
-                msg = (f"заявка на {amount:.0f} ₽"
-                       + (f" (придёт ≈{amount - fee:.0f} ₽ после комиссии)"
-                          if fee else "")
-                       + f" — {msg}" if msg else f"заявка на {amount:.0f} ₽")
-                if left >= 1:
-                    msg += (f". Остаток {left:.0f} ₽ — за раз не больше "
-                            f"{cap:.0f} ₽, продолжу в следующий заход")
-                sent_amount = float(amount)
-                # More than one payout's worth is left: come back next tick
-                # instead of waiting out the interval.
-                more_left = left >= max(floor, 1)
-        else:
-            # An explicitly stored "api" method from before this was known.
-            aw["enabled"] = False
-            aw["last_run"] = now
-            aw["last_result"] = "вывода через API нет"
-            return ("💸 Авто-вывод выключен: у Юмаркета нет вывода через API. "
-                    "Настройте его через панель: «Баланс» → «Автовывод» → "
-                    "«Настроить вывод через панель».")
-
-        # Zero, not `now`, when a payout ceiling left money behind: the next
-        # tick should continue rather than wait out the whole interval.
-        aw["last_run"] = 0 if more_left else now
-        aw["last_result"] = msg
-        hist = settings.setdefault("withdrawal_history", [])
-        # What was actually sent, not what the balance happened to be — the
-        # ceiling means those differ, and the history is what the seller
-        # reconciles against.
-        hist.insert(0, {"amount": sent_amount, "ts": now,
-                        "type": "auto",
-                        "status": "requested" if ok else "failed"})
-        del hist[100:]
-        return _card("💸 <b>АВТО-ВЫВОД</b>",
-                     [f"💰 Баланс был: <b>{balance_str}</b>", "",
-                      ("✅ " if ok else "⚠️ ") + _esc(msg)])
 
     async def _daily_report_text(self, user_id: int, api: YooMarketAPI,
                                  settings: dict) -> str:
@@ -2725,17 +2667,6 @@ class TaskManager:
                         messages.append(note)
 
             # --- Auto-withdraw ---
-            aw = settings.get("auto_withdraw", {})
-            if aw.get("enabled"):
-                interval = float(aw.get("interval_hours", 24) or 24)
-                # A withdrawal must not fire on every 30-minute tick: without
-                # this guard a balance above the threshold was re-submitted
-                # every half hour.
-                if (now - float(aw.get("last_run", 0) or 0)) / 3600 >= interval:
-                    note = await self._auto_withdraw(user_id, api, settings, now)
-                    if note:
-                        messages.append(note)
-
             # --- Panel session health ---
             # Panel operations (product creation, item management) run on
             # cookies that expire silently; without this the user only finds
@@ -2796,35 +2727,12 @@ class TaskManager:
             rm = settings.get("reviews_monitor", {})
             if rm.get("enabled"):
                 try:
-                    data = await api.get_reviews()
-                    reviews = data.get("data") or data.get("items") or []
-                    known_ids: list = rm.get("known_review_ids", [])
-                    known_set = set(str(r) for r in known_ids)
-                    new_reviews = []
-                    for rev in reviews:
-                        rid = str(rev.get("id", ""))
-                        if rid and rid not in known_set:
-                            new_reviews.append(rev)
-                            known_set.add(rid)
-                    if new_reviews:
-                        settings["reviews_monitor"]["known_review_ids"] = list(known_set)
-                        for rev in new_reviews:
-                            author = rev.get("author") or rev.get("buyer_name") or "Покупатель"
-                            rating = rev.get("rating") or rev.get("stars") or "?"
-                            text = (rev.get("text") or rev.get("comment") or "—")[:300]
-                            stars = "⭐" * int(rating) if str(rating).isdigit() else f"★{rating}"
-                            await self._notify(
-                                user_id,
-                                f"⭐ <b>Новый отзыв</b>\n\n"
-                                f"👤 {author}  {stars}\n\n"
-                                f"<i>«{text}»</i>",
-                            )
-                    elif not known_ids:
-                        settings["reviews_monitor"]["known_review_ids"] = [
-                            str(r.get("id", "")) for r in reviews if r.get("id")
-                        ]
+                    note = await self._check_reviews(user_id, settings)
+                    if note:
+                        messages.append(note)
                 except Exception as e:
-                    logger.warning("Reviews monitor error for user %s: %s", user_id, e)
+                    logger.warning("Reviews monitor error for user %s: %s",
+                                   user_id, e)
 
             # --- Bump scheduler ---
             # Moved to the fast 60s loop (_maybe_bump_schedule) so slots fire at

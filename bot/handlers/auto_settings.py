@@ -15,7 +15,6 @@ class AutoState(StatesGroup):
     waiting_reply_msg = State()
     waiting_confirmed_msg = State()
     waiting_refunded_msg = State()
-    waiting_withdraw_amount = State()
     waiting_rule_keyword = State()
     waiting_rule_message = State()
     waiting_confirm_hours = State()
@@ -101,7 +100,6 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
         builder.button(text="✏️ Текст возврата", callback_data="auto:set:refunded_msg")
 
     # Ad automation (premium promotion, auto-restore) now lives in «Объявления»
-    builder.button(text="💸 Авто-вывод", callback_data="selenium:withdraw:menu")
 
     aa = s.get("auto_accept", {})
     aa_on = aa.get("enabled", False)
@@ -200,20 +198,6 @@ async def toggle_bump(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data == "auto:toggle:withdraw")
-async def toggle_withdraw(callback: CallbackQuery) -> None:
-    s = get_settings(callback.from_user.id)
-    s["auto_withdraw"]["enabled"] = not s["auto_withdraw"].get("enabled", False)
-    save_settings(callback.from_user.id, s)
-    await _refresh(callback)
-
-
-def _cancel_kb(back: str = "auto:menu") -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data=back)
-    return b.as_markup()
-
-
 @router.callback_query(F.data == "auto:set:reply_msg")
 async def set_reply_msg(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AutoState.waiting_reply_msg)
@@ -275,31 +259,6 @@ async def save_refunded_msg(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("✅ Сохранено")
     await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
-
-
-@router.callback_query(F.data == "auto:set:withdraw_amount")
-async def set_withdraw_amount(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AutoState.waiting_withdraw_amount)
-    cur = get_settings(callback.from_user.id)["auto_withdraw"].get("min_amount", 500)
-    await callback.message.edit_text(
-        f"✏️ Минимальная сумма для автовывода (сейчас: {cur} ₽)\n\nВведите число:",
-        reply_markup=_cancel_kb()
-    )
-    await callback.answer()
-
-
-@router.message(AutoState.waiting_withdraw_amount)
-async def save_withdraw_amount(message: Message, state: FSMContext) -> None:
-    try:
-        amount = int((message.text or "").strip())
-        s = get_settings(message.from_user.id)
-        s["auto_withdraw"]["min_amount"] = amount
-        save_settings(message.from_user.id, s)
-        await state.clear()
-        await message.answer(f"✅ Мин. сумма: <b>{amount} ₽</b>")
-        await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
-    except ValueError:
-        await message.answer("❌ Введите число, например: 500")
 
 
 @router.callback_query(F.data == "auto:rule:add")

@@ -4072,6 +4072,108 @@ def panel_operations_sync(cookie_string: str, resource: str = "operations",
     return True, ops
 
 
+# Где панель держит отзывы. Как и с книгой операций, имя ресурса угадать
+# нельзя — оно у каждой панели своё, поэтому кандидаты перебираются.
+_REVIEW_RESOURCES = ("reviews", "review", "feedbacks", "feedback",
+                     "comments", "ratings", "shop-reviews", "otzyvy")
+
+_RATING_KEYS = ("rating", "stars", "score", "mark", "ball", "оценк")
+_TEXT_KEYS = ("text", "comment", "body", "message", "content", "отзыв")
+_AUTHOR_KEYS = ("user", "author", "buyer", "customer", "client", "покупател")
+
+
+def _parse_review(row: dict) -> dict:
+    """Одна строка отзыва: оценка, текст, автор, дата, товар."""
+    out = {"id": _row_id(row), "rating": None, "text": "", "author": "",
+           "ts": None, "title": ""}
+    for f in _fields_of(row):
+        attr = str(f.get("attribute") or "").lower()
+        value = _field_text(f)
+        if out["rating"] is None and any(k in attr for k in _RATING_KEYS):
+            num = _num(value)
+            # Оценка — это 1..5. Число из поля «rating_count» ею не является.
+            if num is not None and 0 <= num <= 5:
+                out["rating"] = num
+                continue
+        if not out["ts"]:
+            ts = _ts(value) if any(k in attr for k in
+                                   ("created", "date", "time", "дата")) else None
+            if ts:
+                out["ts"] = ts
+                continue
+        if not out["author"] and any(k in attr for k in _AUTHOR_KEYS):
+            out["author"] = value[:40]
+            continue
+        if not out["title"] and any(k in attr for k in ("ad", "item", "product",
+                                                        "lot", "товар")):
+            out["title"] = value[:60]
+            continue
+        if not out["text"] and any(k in attr for k in _TEXT_KEYS):
+            out["text"] = value[:400]
+    return out
+
+
+def panel_reviews_sync(cookie_string: str, resource: str = "",
+                       pages: int = 2, per_page: int = 50,
+                       ) -> tuple[bool, object]:
+    """Blocking: отзывы магазина из панели, новые первыми.
+
+    В Integration API отзывов нет — прежний код перебирал /reviews, /feedback
+    и /ratings, получал 404 и молча возвращал пустой список. Тумблер
+    «Новые отзывы» при этом включался и не делал ничего.
+
+    Returns (True, {"resource": …, "reviews": [...]}) или (False, почему).
+    """
+    try:
+        session = _make_panel_requests_session(cookie_string)
+        hdrs = _panel_xsrf_headers(session, cookie_string)
+    except Exception as e:
+        return False, f"сессия панели: {str(e)[:80]}"
+
+    candidates = [resource] if resource else list(_REVIEW_RESOURCES)
+    tried: list[str] = []
+    for res in candidates:
+        rows: list[dict] = []
+        for page in range(1, max(1, pages) + 1):
+            try:
+                r = session.get(
+                    f"{PANEL_URL}/nova-api/{res}",
+                    params={"perPage": str(per_page), "page": str(page),
+                            "orderBy": "id", "orderByDirection": "desc"},
+                    headers=hdrs, timeout=(6, 20), allow_redirects=False)
+            except Exception as e:
+                tried.append(f"{res}: {str(e)[:40]}")
+                break
+            if r.status_code == 401:
+                return False, "401: сессия панели истекла — войдите снова"
+            if r.status_code != 200:
+                tried.append(f"{res}: HTTP {r.status_code}")
+                break
+            try:
+                chunk = [x for x in ((r.json() or {}).get("resources") or [])
+                         if isinstance(x, dict)]
+            except Exception:
+                tried.append(f"{res}: ответ не разобран")
+                break
+            if not chunk:
+                break
+            rows.extend(chunk)
+            if len(chunk) < per_page:
+                break
+        if not rows:
+            if not any(res in x for x in tried):
+                tried.append(f"{res}: пусто")
+            continue
+        reviews = [_parse_review(x) for x in rows]
+        # Ресурс с оценками или текстами — отзывы. Иначе это что-то другое,
+        # что просто откликнулось на похожее имя.
+        real = [x for x in reviews if x["rating"] is not None or x["text"]]
+        tried.append(f"{res}: {len(rows)} строк, похожих на отзыв {len(real)}")
+        if real:
+            return True, {"resource": res, "reviews": real}
+    return False, "; ".join(tried)[:400] or "ни один ресурс не ответил"
+
+
 def panel_find_ledger_sync(cookie_string: str) -> tuple[bool, object]:
     """Blocking: which panel resource actually holds dated money rows.
 

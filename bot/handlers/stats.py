@@ -448,24 +448,48 @@ async def reviews_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
         await callback.answer()
         return
 
+    # Отзывов в Integration API нет — читаем из панели, как и статистику.
+    from storage import get_panel_creds
+    from automation.panel import panel_reviews_sync
+    creds = get_panel_creds(callback.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await callback.message.edit_text(
+            "⭐ <b>Отзывы</b>\n\n"
+            "Отзывы бот читает из панели, а вход в неё не выполнен.\n"
+            "Настройки → 🌐 Панель продавца.",
+            reply_markup=b.as_markup())
+        await callback.answer()
+        return
+
     try:
-        data = await api.get_reviews()
-        reviews: list[dict] = data.get("data") or data.get("items") or []
-        if not reviews:
-            text = "⭐ <b>Отзывы</b>\n\nОтзывов пока нет."
+        import asyncio as _aio
+        loop = _aio.get_event_loop()
+        ok, got = await _aio.wait_for(
+            loop.run_in_executor(None, panel_reviews_sync, creds["cookies"]),
+            timeout=60)
+        if not ok or not isinstance(got, dict):
+            # Что именно не нашлось — видно, а не «отзывов пока нет».
+            text = ("⭐ <b>Отзывы</b>\n\nНе нашёл отзывы в панели.\n"
+                    f"<code>{_esc(str(got)[:300])}</code>")
         else:
-            lines = [f"⭐ <b>Отзывы</b> (последние {min(len(reviews), 10)})\n"]
-            for r in reviews[:10]:
-                rating = r.get("rating") or r.get("score") or 0
-                author = r.get("author") or r.get("buyer_name") or "Покупатель"
-                comment = (r.get("text") or r.get("comment") or "—")[:120]
-                try:
-                    stars = "⭐" * int(rating)
-                except (TypeError, ValueError):
-                    stars = str(rating)
-                lines.append(f"{stars or '—'} <b>{author}</b>")
-                lines.append(f"   <i>{comment}</i>\n")
-            text = "\n".join(lines)
+            reviews = got.get("reviews") or []
+            if not reviews:
+                text = "⭐ <b>Отзывы</b>\n\nОтзывов пока нет."
+            else:
+                lines = [f"⭐ <b>Отзывы</b> (последние "
+                         f"{min(len(reviews), 10)} из {len(reviews)})\n"]
+                for r in reviews[:10]:
+                    rating = r.get("rating")
+                    stars = ("⭐" * int(rating)
+                             if isinstance(rating, (int, float))
+                             and 1 <= rating <= 5 else "—")
+                    lines.append(f"{stars} <b>{_esc(r.get('author') or 'Покупатель')}</b>")
+                    if r.get("title"):
+                        lines.append(f"   📦 {_esc(r['title'])}")
+                    if r.get("text"):
+                        lines.append(f"   <i>{_esc(r['text'][:150])}</i>")
+                    lines.append("")
+                text = "\n".join(lines)
     except Exception as e:
         text = f"⭐ <b>Отзывы</b>\n\n❌ Ошибка: {e}"
 

@@ -217,17 +217,6 @@ AUTOMATIONS: list[dict] = [
         "tune": "notif:set:report_hour",
     },
     # --- деньги ---
-    {
-        "key": "withdraw", "group": "💰 Баланс",
-        "title": "Выводить баланс",
-        "short": "Вывод денег",
-        "path": ("auto_withdraw", "enabled"),
-        "defaults": {("auto_withdraw", "min_amount"): 500,
-                     ("auto_withdraw", "interval_hours"): 24},
-        "note": lambda s: f"от {s.get('auto_withdraw', {}).get('min_amount', 500):.0f} ₽",
-        "costs": True,
-        "tune": "selenium:withdraw:menu",
-    },
 ]
 
 _BY_KEY = {a["key"]: a for a in AUTOMATIONS}
