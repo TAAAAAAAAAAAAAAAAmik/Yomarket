@@ -182,10 +182,15 @@ def buy_stars_sync(
     wallet_version: str = "v4r2",
     api_hash: str = DEFAULT_HASH,
     wait_confirm: bool = True,
+    report: dict | None = None,
 ) -> tuple[bool, str]:
     """
     Buy `quantity` Telegram Stars for `username`. Returns (ok, human_message).
     Blocking — run in an executor. Secrets are never logged.
+
+    `report` собирает то, что иначе теряется в тексте: сколько TON реально
+    ушло. Без этого «прибыль» считалась бы по курсу из головы, а не по
+    сумме, которую подписал кошелёк.
     """
     username = (username or "").strip().lstrip("@")
     if not username:
@@ -299,6 +304,12 @@ def buy_stars_sync(
         _post("confirmReq", {"id": req_id, "boc": boc,
                              "account": _json_account(raw_addr)})
         sent += 1
+        if report is not None:
+            try:
+                report["nano"] = int(report.get("nano", 0)) + int(msg["amount"])
+                report["ton"] = report["nano"] / 1_000_000_000
+            except (TypeError, ValueError):
+                pass
         # Wait for this tx to land (seqno advances) before sending the next
         if wait_confirm or i < len(valid_msgs) - 1:
             confirmed = _wait_seqno_advance(bounce_addr, seqno)

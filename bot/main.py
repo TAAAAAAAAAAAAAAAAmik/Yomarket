@@ -17,7 +17,7 @@ from aiogram.types import TelegramObject
 from config import BOT_TOKEN
 from api.yoomarket import YooMarketAPI
 from storage import get_token
-from handlers import accounts, admin, ads, auto_settings, autopilot, balance, chats, create_ad, fallback, notifications, orders, packs, panel, panel_items, plugins, prices, responders, selenium_settings, settings, start, stats, tools
+from handlers import accounts, admin, ads, auto_settings, autopilot, balance, chats, create_ad, fallback, notifications, orders, packs, panel, panel_items, plugins, prices, responders, selenium_settings, settings, start, stats
 from tasks import TaskManager
 
 logging.basicConfig(
@@ -208,7 +208,6 @@ async def main() -> None:
     dp.include_router(responders.router)
     dp.include_router(plugins.router)
     dp.include_router(stats.router)
-    dp.include_router(tools.router)
     dp.include_router(panel.router)
     # Последним: ловит нажатия, которые не разобрал никто. Без него такое
     # нажатие молча пропадает, и это неотличимо от сломанной кнопки.

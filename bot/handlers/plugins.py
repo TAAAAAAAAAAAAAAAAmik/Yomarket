@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import html
 import logging
 import re
+import time
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -46,7 +48,8 @@ async def deliver_stars(uid: int, username: str, quantity: int) -> tuple[bool, s
                 None, buy_stars_sync,
                 creds["cookies"], creds["mnemonic"], username, quantity,
                 creds.get("wallet_version", "v4r2"),
-                creds.get("api_hash", "af142ec36cafbbfa89"),
+                # Пусто — бот подберёт хеш сам; чужой даёт «Bad request».
+                creds.get("api_hash", ""),
             ),
             timeout=180,
         )
@@ -67,6 +70,7 @@ class PluginState(StatesGroup):
     stars_set_hash = State()
     stars_set_mnemonic = State()
     stars_set_keyword = State()
+    stars_set_reply = State()
     # AutoRoblox
     roblox_manual_buyer = State()
     roblox_manual_amount = State()
@@ -745,14 +749,192 @@ async def stars_manual_amount_input(message: Message, state: FSMContext) -> None
             f"❌ <b>Не удалось выдать</b>\n\n{msg}", reply_markup=b.as_markup())
 
 
+def _pending_text(p: dict) -> str:
+    """Заказы, по которым звёзды ещё не ушли, и почему.
+
+    Ждущий ника и сорвавшийся — разные беды: первому надо написать
+    покупателю, второго можно выдать прямо сейчас. Одним списком их
+    показывать бессмысленно.
+    """
+    pending = p.get("pending") or {}
+    stuck = p.get("stuck") or {}
+    if not pending and not stuck:
+        return ("📦 <b>Накопленные заказы</b>\n\n"
+                "Пусто — всё выдано.\n\n"
+                "<i>Сюда попадают заказы, которые ждут ник покупателя или "
+                "сорвались при выдаче.</i>")
+    lines = ["📦 <b>Накопленные заказы</b>", ""]
+    if stuck:
+        lines.append(f"⛔ <b>Сорвались ({len(stuck)})</b> — можно выдать сейчас:")
+        for oid, s in list(stuck.items())[:10]:
+            when = _ago(s.get("ts"))
+            lines.append(f"· #{html.escape(str(oid))} — {int(s.get('quantity') or 0)}⭐ "
+                         f"на @{html.escape(str(s.get('username') or '—'))}{when}")
+            reason = str(s.get("reason") or "")[:80]
+            if reason:
+                lines.append(f"  <i>{html.escape(reason)}</i>")
+        lines.append("")
+    if pending:
+        lines.append(f"⏳ <b>Ждут ник ({len(pending)})</b>:")
+        for oid, s in list(pending.items())[:10]:
+            asked = _ago(s.get("asked_at"))
+            tries = int(s.get("tries") or 0)
+            tail = f", попыток {tries}" if tries else ""
+            lines.append(f"· #{html.escape(str(oid))} — "
+                         f"{int(s.get('quantity') or 0)}⭐{asked}{tail}")
+        lines.append("")
+        lines.append("<i>Бот сам напомнит покупателю и выдаст, как только "
+                     "получит ник.</i>")
+    return "\n".join(lines)
+
+
+def _ago(ts) -> str:
+    try:
+        delta = time.time() - float(ts or 0)
+    except (TypeError, ValueError):
+        return ""
+    if delta < 0 or not ts:
+        return ""
+    hours = int(delta // 3600)
+    if hours < 1:
+        return f", {max(1, int(delta // 60))} мин назад"
+    if hours < 48:
+        return f", {hours} ч назад"
+    return f", {hours // 24} дн назад"
+
+
+def _pending_kb(p: dict) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for oid, s in list((p.get("stuck") or {}).items())[:6]:
+        qty = int(s.get("quantity") or 0)
+        who = str(s.get("username") or "")
+        b.button(text=f"🚀 Выдать #{oid} — {qty}⭐",
+                 callback_data=f"plugins:stars:retry:{oid}")
+        if not who:
+            break
+    b.adjust(1)
+    b.button(text="🔄 Обновить", callback_data="plugins:stars:accumulated")
+    b.button(text="⬅️ Назад", callback_data="plugins:auto_stars")
+    b.adjust(1, *([1] * 5), 2)
+    return b.as_markup()
+
+
 @router.callback_query(F.data == "plugins:stars:accumulated")
 async def stars_accumulated(callback: CallbackQuery) -> None:
-    await callback.answer("⚠️ Функция появится в следующем обновлении", show_alert=True)
+    p = get_settings(callback.from_user.id)["plugins"]["auto_stars"]
+    await callback.message.edit_text(_pending_text(p), reply_markup=_pending_kb(p))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("plugins:stars:retry:"))
+async def stars_retry(callback: CallbackQuery) -> None:
+    """Выдать сорвавшийся заказ ещё раз — руками, из накопленных."""
+    from automation.fragment import buy_stars_sync
+
+    uid = callback.from_user.id
+    order_id = callback.data.rsplit(":", 1)[1]
+    s = get_settings(uid)
+    p = s["plugins"]["auto_stars"]
+    entry = (p.get("stuck") or {}).get(order_id)
+    if not entry:
+        await callback.answer("Этого заказа уже нет в списке", show_alert=True)
+        await stars_accumulated(callback)
+        return
+    creds = get_fragment_creds(uid) or {}
+    if not creds.get("cookies") or not creds.get("mnemonic"):
+        await callback.answer("Сначала заполните «🔑 Данные Fragment»",
+                              show_alert=True)
+        return
+
+    username = str(entry.get("username") or "").lstrip("@")
+    qty = int(entry.get("quantity") or 0)
+    await callback.answer("⏳ Отправляю…")
+    status = await callback.message.answer(
+        f"⏳ Выдаю {qty}⭐ на @{username} по заказу #{order_id}…")
+    spend: dict = {}
+    loop = asyncio.get_event_loop()
+    try:
+        ok, msg = await asyncio.wait_for(
+            loop.run_in_executor(None, functools.partial(
+                buy_stars_sync, creds["cookies"], creds["mnemonic"],
+                username, qty, creds.get("wallet_version", "v4r2"),
+                creds.get("api_hash", ""), report=spend)),
+            timeout=200)
+    except Exception as e:
+        ok, msg = False, str(e)[:150]
+
+    s = get_settings(uid)          # перечитываем: фон мог тронуть настройки
+    p = s["plugins"]["auto_stars"]
+    if ok:
+        p.get("stuck", {}).pop(order_id, None)
+        p.setdefault("delivered", []).append(order_id)
+        from tasks.manager import _log_delivery
+        _log_delivery(s, order_id, qty, username, float(spend.get("ton") or 0))
+        save_settings(uid, s)
+        await status.edit_text(f"✅ <b>Выдано</b>\n\n{html.escape(str(msg)[:600])}",
+                               reply_markup=_pending_kb(p))
+    else:
+        # Заказ остаётся в списке: неудачная попытка — не повод его потерять.
+        await status.edit_text(
+            f"❌ <b>Не вышло</b>\n\n{html.escape(str(msg)[:400])}",
+            reply_markup=_pending_kb(p))
+
+
+def _profit_text(p: dict) -> str:
+    """Сколько выдано и сколько на этом заработано — по журналу выдач."""
+    log = [e for e in (p.get("log") or []) if isinstance(e, dict)]
+    if not log:
+        return ("💎 <b>Прибыль</b>\n\n"
+                "Пока нечего считать — выдач не было.\n\n"
+                "<i>Здесь появится, сколько звёзд выдано, сколько получено с "
+                "заказов и сколько TON на это ушло. Считается по факту: "
+                "выручка — из заказа, расход — из суммы, которую подписал "
+                "кошелёк.</i>")
+    now = time.time()
+
+    def summarize(rows: list) -> tuple[int, int, float, float]:
+        stars = sum(int(e.get("qty") or 0) for e in rows)
+        ton = sum(float(e.get("ton") or 0) for e in rows)
+        rub = sum(float(e.get("revenue") or 0) for e in rows)
+        return len(rows), stars, ton, rub
+
+    day = [e for e in log if now - float(e.get("ts") or 0) < 86400]
+    month = [e for e in log if now - float(e.get("ts") or 0) < 30 * 86400]
+
+    lines = ["💎 <b>Прибыль AutoStars</b>", ""]
+    for title, rows in (("За сутки", day), ("За 30 дней", month),
+                        ("Всего", log)):
+        n, stars, ton, rub = summarize(rows)
+        if not n:
+            lines.append(f"<b>{title}</b>: выдач нет")
+            continue
+        lines.append(f"<b>{title}</b>: {n} выдач, {stars}⭐")
+        if rub:
+            lines.append(f"   получено <b>{rub:.0f} ₽</b>")
+        lines.append(f"   потрачено <b>{ton:.4f} TON</b>")
+    known = [e for e in log if e.get("revenue")]
+    if known:
+        rub = sum(float(e.get("revenue") or 0) for e in known)
+        stars = sum(int(e.get("qty") or 0) for e in known)
+        if stars:
+            lines += ["", f"<i>Средняя цена продажи: {rub / stars:.2f} ₽ за "
+                          f"звезду (по {len(known)} заказам с известной "
+                          f"суммой).</i>"]
+    lines += ["", "<i>Расход в рублях бот не считает: курс TON он не знает, а "
+                  "выдумывать его нельзя. Сравните TON с тем, во сколько "
+                  "обошлось пополнение кошелька.</i>"]
+    return "\n".join(lines)
 
 
 @router.callback_query(F.data == "plugins:stars:profit")
 async def stars_profit(callback: CallbackQuery) -> None:
-    await callback.answer("📊 Статистика прибыли появится в следующем обновлении", show_alert=True)
+    p = get_settings(callback.from_user.id)["plugins"]["auto_stars"]
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Обновить", callback_data="plugins:stars:profit")
+    b.button(text="⬅️ Назад", callback_data="plugins:auto_stars")
+    b.adjust(2)
+    await callback.message.edit_text(_profit_text(p), reply_markup=b.as_markup())
+    await callback.answer()
 
 
 @router.callback_query(F.data == "plugins:stars:balance")
@@ -801,14 +983,153 @@ async def stars_balance(callback: CallbackQuery) -> None:
     await callback.message.edit_text(text, reply_markup=b.as_markup())
 
 
+# Какие уведомления бот шлёт продавцу по звёздам. Провал молчать не должен
+# никогда, но удачная выдача в потоке из тридцати заказов — это шум.
+_STARS_NOTIFS = (
+    ("done", "✅ Об удачной выдаче"),
+    ("failed", "❌ О неудаче"),
+    ("low_balance", "⚠️ О нехватке TON"),
+)
+
+
+def _notifs_text(p: dict) -> str:
+    n = p.get("notify") or {}
+    lines = ["🔔 <b>Уведомления AutoStars</b>", ""]
+    for key, title in _STARS_NOTIFS:
+        lines.append(f"{'🟢' if n.get(key, True) else '🔴'} {title}")
+    lines += ["", "<i>Выдача и напоминания покупателю от этого не зависят — "
+                  "молчит только лента продавца.</i>"]
+    return "\n".join(lines)
+
+
+def _notifs_kb(p: dict) -> InlineKeyboardMarkup:
+    n = p.get("notify") or {}
+    b = InlineKeyboardBuilder()
+    for key, title in _STARS_NOTIFS:
+        mark = "🟢" if n.get(key, True) else "🔴"
+        b.button(text=f"{mark} {title}", callback_data=f"plugins:stars:ntog:{key}")
+    b.button(text="⬅️ Назад", callback_data="plugins:auto_stars")
+    b.adjust(1)
+    return b.as_markup()
+
+
 @router.callback_query(F.data == "plugins:stars:notifs")
 async def stars_notifs(callback: CallbackQuery) -> None:
-    await callback.answer("🔔 Настройки уведомлений появятся в следующем обновлении", show_alert=True)
+    p = get_settings(callback.from_user.id)["plugins"]["auto_stars"]
+    await callback.message.edit_text(_notifs_text(p), reply_markup=_notifs_kb(p))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("plugins:stars:ntog:"))
+async def stars_notif_toggle(callback: CallbackQuery) -> None:
+    key = callback.data.rsplit(":", 1)[1]
+    if key not in dict(_STARS_NOTIFS):
+        await callback.answer("Неизвестная настройка", show_alert=True)
+        return
+    uid = callback.from_user.id
+    s = get_settings(uid)
+    n = s["plugins"]["auto_stars"].setdefault("notify", {})
+    n[key] = not n.get(key, True)
+    save_settings(uid, s)
+    await callback.answer("Включено" if n[key] else "Выключено")
+    p = s["plugins"]["auto_stars"]
+    await callback.message.edit_text(_notifs_text(p), reply_markup=_notifs_kb(p))
+
+
+# Что бот пишет покупателю на каждом шаге. Подставляются только эти поля —
+# обещать в подсказке больше, чем подставляется, хуже, чем не обещать.
+_STARS_REPLIES = (
+    ("ask", "❓ Запрос ника", "—"),
+    ("remind", "🔔 Напоминание", "—"),
+    ("sending", "⏳ Отправляю", "{qty}, {username}"),
+    ("done", "✅ Готово", "{qty}, {username}"),
+    ("failed", "⚠️ Не вышло", "{qty}, {username}"),
+)
+
+
+def _replies_text(p: dict) -> str:
+    from tasks.manager import STARS_TEXTS
+    texts = p.get("texts") or {}
+    lines = ["💬 <b>Ответы покупателю</b>", ""]
+    for key, title, fields in _STARS_REPLIES:
+        own = str(texts.get(key) or "").strip()
+        body = own or STARS_TEXTS.get(key, "")
+        mark = "✏️" if own else "▫️"
+        lines.append(f"{mark} <b>{title}</b>"
+                     + ("" if own else " <i>(стандартный)</i>"))
+        lines.append(f"<i>{html.escape(body[:160])}</i>")
+        if fields != "—":
+            lines.append(f"<code>{html.escape(fields)}</code>")
+        lines.append("")
+    lines.append("<i>Нажмите, чтобы заменить. Пустое сообщение вернёт "
+                 "стандартный текст.</i>")
+    return "\n".join(lines)
+
+
+def _replies_kb(p: dict) -> InlineKeyboardMarkup:
+    texts = p.get("texts") or {}
+    b = InlineKeyboardBuilder()
+    for key, title, _f in _STARS_REPLIES:
+        mark = "✏️" if str(texts.get(key) or "").strip() else "▫️"
+        b.button(text=f"{mark} {title}", callback_data=f"plugins:stars:rep:{key}")
+    b.button(text="⬅️ Назад", callback_data="plugins:auto_stars")
+    b.adjust(2, 2, 1, 1)
+    return b.as_markup()
 
 
 @router.callback_query(F.data == "plugins:stars:replies")
-async def stars_replies(callback: CallbackQuery) -> None:
-    await callback.answer("💬 Авто-ответы появятся в следующем обновлении", show_alert=True)
+async def stars_replies(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    p = get_settings(callback.from_user.id)["plugins"]["auto_stars"]
+    await callback.message.edit_text(_replies_text(p), reply_markup=_replies_kb(p))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("plugins:stars:rep:"))
+async def stars_reply_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    from tasks.manager import STARS_TEXTS
+    key = callback.data.rsplit(":", 1)[1]
+    titles = {k: (title, fields) for k, title, fields in _STARS_REPLIES}
+    if key not in titles:
+        await callback.answer("Неизвестный текст", show_alert=True)
+        return
+    title, fields = titles[key]
+    p = get_settings(callback.from_user.id)["plugins"]["auto_stars"]
+    own = str((p.get("texts") or {}).get(key) or "").strip()
+    await state.set_state(PluginState.stars_set_reply)
+    await state.update_data(reply_key=key)
+    hint = ("" if fields == "—" else
+            f"\n\nМожно подставить: <code>{html.escape(fields)}</code>")
+    await callback.message.edit_text(
+        f"💬 <b>{title}</b>\n\n"
+        f"Сейчас{' (свой)' if own else ' (стандартный)'}:\n"
+        f"<i>{html.escape(own or STARS_TEXTS.get(key, ''))}</i>"
+        + hint
+        + "\n\nПришлите новый текст. Чтобы вернуть стандартный — "
+          "отправьте <code>-</code>.",
+        reply_markup=_cancel_kb("plugins:stars:replies"))
+    await callback.answer()
+
+
+@router.message(PluginState.stars_set_reply)
+async def stars_reply_save(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    key = str(data.get("reply_key") or "")
+    await state.clear()
+    uid = message.from_user.id
+    s = get_settings(uid)
+    texts = s["plugins"]["auto_stars"].setdefault("texts", {})
+    raw = (message.text or "").strip()
+    if raw in ("-", "—", ""):
+        texts[key] = ""
+        said = "Вернул стандартный текст."
+    else:
+        texts[key] = raw[:900]
+        said = "Сохранил."
+    save_settings(uid, s)
+    p = s["plugins"]["auto_stars"]
+    await message.answer(f"✅ {said}\n\n" + _replies_text(p),
+                         reply_markup=_replies_kb(p))
 
 
 # ---------------------------------------------------------------------------

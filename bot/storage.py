@@ -156,7 +156,6 @@ _DEFAULT_SETTINGS = {
     "notify_messages": {"enabled": True},
     "daily_report": {"enabled": False, "hour": 20, "last_report_day": ""},
     "quick_replies": ["Спасибо за заказ!", "Отправлю в течение часа.", "Уточните, пожалуйста."],
-    "buyer_notes": {},
     "bump_schedule": {
         "enabled": False, "times": [], "last_runs": {},
         "price_per_bump": 0,   # ₽ за одно поднятие (0 = бесплатно)
@@ -187,6 +186,13 @@ _DEFAULT_SETTINGS = {
             "low_balance_deliveries": 2,
             "balance_checked_at": 0,
             "balance_low": False,
+            "log": [],                 # журнал выдач: что, кому, почём
+            # Что сообщать продавцу. Раньше слалось всё и всегда: удачная
+            # выдача в потоке из тридцати заказов — это шум, а провал — нет.
+            "notify": {"done": True, "failed": True, "low_balance": True},
+            # Тексты покупателю. Пустая строка = взять стандартный.
+            "texts": {"ask": "", "remind": "", "sending": "", "done": "",
+                      "failed": ""},
         },
         "auto_roblox": {"enabled": False, "robux": 0, "note": ""},
         "auto_gifts": {"enabled": False, "gift_type": "", "note": ""},

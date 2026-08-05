@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import re
 import time
@@ -486,6 +487,71 @@ def _card(title: str, body: list[str], footer: str = "") -> str:
     if footer:
         parts += [_RULE, footer]
     return "\n".join(parts)
+
+
+# Сколько выдач помним. Журнал нужен для «Прибыли» и «Накопленных», но это
+# настройки, а не база данных: расти без предела им нельзя.
+_STARS_LOG_LIMIT = 300
+
+# Тексты покупателю. Продавец может заменить любой; пустая строка означает
+# «оставить как есть». Подстановки — только те, что здесь перечислены:
+# обещать в подсказке больше, чем подставляется, хуже, чем не обещать.
+STARS_TEXTS = {
+    "ask": ("⭐ Для выдачи звёзд отправьте, пожалуйста, ваш ник в Telegram — "
+            "одним сообщением, например: durov\nЗвёзды придут автоматически."),
+    "remind": ("⭐ Напоминаем: пришлите ваш ник в Telegram одним сообщением — "
+               "и звёзды придут автоматически. Если ника нет, его можно "
+               "задать в настройках Telegram."),
+    "sending": "⏳ Отправляю {qty}⭐ на @{username}…",
+    "done": "✅ Готово! {qty}⭐ отправлены на @{username}. Спасибо за заказ!",
+    "failed": ("⚠️ Не удалось отправить звёзды автоматически. "
+               "Продавец скоро выдаст их вручную."),
+}
+
+
+def stars_text(settings: dict, key: str, **fields) -> str:
+    """Текст покупателю: свой, если задан, иначе стандартный.
+
+    Подстановка защищена: продавец пишет текст руками, и {опечатка} в нём не
+    должна ронять выдачу — сообщение уйдёт как есть.
+    """
+    p = (settings.get("plugins") or {}).get("auto_stars") or {}
+    custom = str(((p.get("texts") or {}).get(key) or "")).strip()
+    template = custom or STARS_TEXTS.get(key, "")
+    try:
+        return template.format(**fields)
+    except (KeyError, IndexError, ValueError):
+        return template
+
+
+def stars_notify_on(settings: dict, key: str) -> bool:
+    """Слать ли продавцу уведомление этого рода."""
+    p = (settings.get("plugins") or {}).get("auto_stars") or {}
+    return bool((p.get("notify") or {}).get(key, True))
+
+
+def _log_delivery(settings: dict, order_id: str, qty: int, username: str,
+                  ton: float) -> None:
+    """Записать выдачу: что, кому, когда и во сколько обошлась.
+
+    Раньше оставался только список номеров заказов — по нему нельзя ответить
+    ни «сколько звёзд выдано», ни «сколько на этом заработано».
+    """
+    p = settings.setdefault("plugins", {}).setdefault("auto_stars", {})
+    entry = {"order_id": str(order_id), "qty": int(qty or 0),
+             "username": str(username or "").lstrip("@"),
+             "ts": time.time(), "ton": round(float(ton or 0.0), 6)}
+    # Выручку берём из заказа: цена уже прочитана при разборе, и это
+    # единственное честное «сколько получили» — курс тут ни при чём.
+    det = (settings.get("known_order_details") or {}).get(str(order_id)) or {}
+    from orderfields import order_price
+    revenue = order_price(det) if isinstance(det, dict) else None
+    if revenue is not None:
+        entry["revenue"] = float(revenue)
+    log = p.setdefault("log", [])
+    log.append(entry)
+    if len(log) > _STARS_LOG_LIMIT:
+        del log[:len(log) - _STARS_LOG_LIMIT]
 
 
 def _stars_failure_hint(result) -> str:
@@ -1467,12 +1533,8 @@ class TaskManager:
         pending[order_id] = {"quantity": qty, "asked_at": time.time(),
                              "title": title, "chat_id": chat_id,
                              "reminded": 0}
-        await self._send_chat(
-            api, chat_id,
-            "⭐ Для выдачи звёзд отправьте, пожалуйста, ваш ник в Telegram — "
-            "одним сообщением, например: durov\n"
-            "Звёзды придут автоматически.", settings,
-        )
+        await self._send_chat(api, chat_id,
+                              stars_text(settings, "ask", qty=qty), settings)
         logger.info("AutoStars: asked username for order %s (qty=%s)", order_id, qty)
 
     async def _maybe_deliver_stars_reply(
@@ -1573,17 +1635,24 @@ class TaskManager:
             return True
 
         await self._send_chat(
-            api, chat_id, f"⏳ Отправляю {qty}⭐ на @{username}…", settings)
+            api, chat_id,
+            stars_text(settings, "sending", qty=qty, username=username),
+            settings)
 
+        # Сколько TON реально ушло — считает сам кошелёк. Иначе «прибыль»
+        # пришлось бы прикидывать по курсу из головы.
+        spend: dict = {}
         try:
             ok, result = await asyncio.wait_for(
                 loop.run_in_executor(
-                    None, buy_stars_sync,
-                    creds["cookies"], creds["mnemonic"], username, qty,
-                    creds.get("wallet_version", "v4r2"),
-                    # Пусто — значит бот подберёт хеш сам. Прописывать сюда
-                    # чужой хеш нельзя: Fragment отвечает на него «Bad request».
-                    creds.get("api_hash", ""),
+                    None, functools.partial(
+                        buy_stars_sync,
+                        creds["cookies"], creds["mnemonic"], username, qty,
+                        creds.get("wallet_version", "v4r2"),
+                        # Пусто — значит бот подберёт хеш сам. Прописывать сюда
+                        # чужой хеш нельзя: Fragment отвечает «Bad request».
+                        creds.get("api_hash", ""),
+                        report=spend),
                 ),
                 timeout=180,
             )
@@ -1594,20 +1663,23 @@ class TaskManager:
         pending.pop(order_id, None)
         if ok:
             p.setdefault("delivered", []).append(order_id)
+            _log_delivery(settings, order_id, qty, username,
+                          float(spend.get("ton") or 0.0))
             await self._send_chat(
                 api, chat_id,
-                f"✅ Готово! {qty}⭐ отправлены на @{username}. Спасибо за заказ!", settings,
-            )
+                stars_text(settings, "done", qty=qty, username=username),
+                settings)
             # try to confirm the order automatically
             try:
                 await api.confirm_order(order_id)
             except Exception as e:
                 logger.warning("AutoStars confirm order %s: %s", order_id, e)
-            await self._notify(
-                user_id,
-                f"⭐ <b>AutoStars</b>: выдано {qty}⭐ на @{username} "
-                f"(заказ #{order_id})\n{result}",
-            )
+            if stars_notify_on(settings, "done"):
+                await self._notify(
+                    user_id,
+                    f"⭐ <b>AutoStars</b>: выдано {qty}⭐ на @{username} "
+                    f"(заказ #{order_id})\n{result}",
+                )
         else:
             # Три попытки — и хватит. Раньше заказ возвращался в ожидание без
             # счёта, и каждая новая попытка приносила продавцу ещё одно
@@ -1618,16 +1690,16 @@ class TaskManager:
                                      "asked_at": time.time(), "tries": tries}
                 await self._send_chat(
                     api, chat_id,
-                    "⚠️ Не удалось отправить звёзды автоматически. "
-                    "Продавец скоро выдаст их вручную.", settings,
-                )
+                    stars_text(settings, "failed", qty=qty, username=username),
+                    settings)
             else:
                 p.setdefault("stuck", {})[order_id] = {
                     "username": username, "quantity": qty,
                     "reason": str(result)[:200], "ts": time.time()}
             # Уведомление — только о первой неудаче и о том, что попытки
             # кончились. Промежуточные продавцу ничего не добавляют.
-            if tries == 1 or tries >= self._STARS_MAX_TRIES:
+            if (stars_notify_on(settings, "failed")
+                    and (tries == 1 or tries >= self._STARS_MAX_TRIES)):
                 tail = ("\n\n<b>Попытки исчерпаны</b> — заказ ждёт вас."
                         if tries >= self._STARS_MAX_TRIES else "")
                 await self._notify(
@@ -1672,11 +1744,7 @@ class TaskManager:
                 # чата, и раньше бот доставал из него «username» как ответ
                 # покупателя. Отпечаток теперь тоже ставится — вторая страховка.
                 await self._send_chat(
-                    api, chat_id,
-                    "⭐ Напоминаем: пришлите ваш ник в Telegram одним "
-                    "сообщением — и звёзды придут автоматически. "
-                    "Если ника нет, его можно задать в настройках Telegram.",
-                    settings)
+                    api, chat_id, stars_text(settings, "remind"), settings)
                 entry["reminded"] = 1
                 entry["reminded_at"] = now
             if waited >= self._STARS_ESCALATE_AFTER and reminded < 2:
@@ -1705,6 +1773,8 @@ class TaskManager:
 
         p = settings.get("plugins", {}).get("auto_stars", {})
         if not p.get("enabled") or not p.get("low_balance_warn", True):
+            return ""
+        if not stars_notify_on(settings, "low_balance"):
             return ""
         if (now - float(p.get("balance_checked_at") or 0)) < 6 * 3600:
             return ""
