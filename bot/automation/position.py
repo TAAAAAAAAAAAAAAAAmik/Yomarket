@@ -41,7 +41,11 @@ DEFAULT_INTERVAL_HOURS = 1.0
 # listing and an empty card: a cooldown, and a per-day count.
 DEFAULT_COOLDOWN_HOURS = 6.0
 DEFAULT_DAILY_LIMIT = 3
-MAX_WATCHES = 10
+# Предел был 10, когда интервал был один на всех: чаще проверять — значит
+# чаще обходить витрину за каждым наблюдением. Теперь интервал у товара свой,
+# и спокойные позиции можно проверять раз в несколько часов, поэтому список
+# может быть длиннее.
+MAX_WATCHES = 30
 # How many silent failures before the seller is told the watch stopped working.
 # One is noise (a page hiccups); three in a row is a broken watch.
 FAILS_BEFORE_ALARM = 3
@@ -50,7 +54,9 @@ FAILS_BEFORE_ALARM = 3
 def new_watch(url: str, *, title: str = "", item_id: str = "",
               market_id: str = "", category_id=None,
               max_position: int = DEFAULT_MAX_POSITION,
-              min_price: float = 0, undercut_guard: float = 0) -> dict:
+              min_price: float = 0, undercut_guard: float = 0,
+              interval_hours: float | None = None,
+              auto_promote: bool | None = None) -> dict:
     return {
         "url": str(url or "").strip(),
         "item_id": str(item_id or ""),          # panel record — what gets paid
@@ -65,6 +71,10 @@ def new_watch(url: str, *, title: str = "", item_id: str = "",
         "max_position": int(max_position),
         "min_price": float(min_price or 0),
         "undercut_guard": float(undercut_guard or 0),
+        # None/пусто = как у магазина. Не 0 и не False: «как у магазина» и
+        # «выключено этому товару» — разные вещи, и путать их нельзя.
+        "interval_hours": interval_hours,
+        "auto_promote": auto_promote,
         "last_pos": 0,
         "last_alert_pos": 0,
         "last_check": 0.0,
@@ -104,7 +114,8 @@ def watches(pp: dict) -> list[dict]:
 
 def interval_hours(pp: dict) -> float:
     try:
-        return max(0.25, float(pp.get("interval_hours") or DEFAULT_INTERVAL_HOURS))
+        return max(MIN_INTERVAL_HOURS,
+                   float(pp.get("interval_hours") or DEFAULT_INTERVAL_HOURS))
     except (TypeError, ValueError):
         return DEFAULT_INTERVAL_HOURS
 
@@ -123,10 +134,46 @@ def daily_limit(pp: dict) -> int:
         return DEFAULT_DAILY_LIMIT
 
 
+# Реже, чем крутится фоновый цикл, проверять нельзя: значение меньше этого
+# ничего не ускоряет — проверка всё равно случится на следующем тике, а
+# продавец видел бы «каждые 15 минут» и получал полчаса.
+MIN_INTERVAL_HOURS = 0.5
+
+
+def watch_interval_hours(watch: dict, pp: dict) -> float:
+    """Как часто проверять именно этот товар.
+
+    Один интервал на все наблюдения заставлял выбирать вслепую: 15 минут ради
+    одного горячего товара — это те же 15 минут для всех десяти и вчетверо
+    больше обходов витрины; три часа ради экономии — горячий товар висит внизу
+    до трёх часов. Пусто у наблюдения = как у магазина.
+    """
+    own = watch.get("interval_hours")
+    if own in (None, "", 0):
+        return interval_hours(pp)
+    try:
+        return max(MIN_INTERVAL_HOURS, float(own))
+    except (TypeError, ValueError):
+        return interval_hours(pp)
+
+
+def watch_auto_promote(watch: dict, pp: dict) -> bool:
+    """Платить ли за этот товар. None у наблюдения = как у магазина.
+
+    Один переключатель на магазин ставил перед выбором из крайностей: либо бот
+    платит за любой просевший товар, либо не платит никогда. А окупается
+    поднятие не у всех — у товара с тонкой маржой 19 ₽ съедают продажу.
+    """
+    own = watch.get("auto_promote")
+    if own is None:
+        return bool(pp.get("auto_promote"))
+    return bool(own)
+
+
 def is_due(watch: dict, pp: dict, now: float | None = None) -> bool:
     now = _time.time() if now is None else now
     last = float(watch.get("last_check") or 0)
-    return (now - last) / 3600.0 >= interval_hours(pp)
+    return (now - last) / 3600.0 >= watch_interval_hours(watch, pp)
 
 
 def _day(now: float) -> str:
@@ -173,6 +220,11 @@ def budget_left(pp: dict, now: float) -> float:
     return max(0.0, budget - spent_today(pp, now))
 
 
+# Сколько поднятий помним для отчёта. Это настройки, а не база данных: расти
+# без предела журналу нельзя.
+PROMO_LOG_LIMIT = 200
+
+
 def note_promotion(watch: dict, now: float, price: float = 0,
                    pp: dict | None = None) -> None:
     """Record a promotion that actually happened.
@@ -191,6 +243,37 @@ def note_promotion(watch: dict, now: float, price: float = 0,
             pp["spent_day"] = today
             pp["spent_today"] = 0
         pp["spent_today"] = float(pp.get("spent_today") or 0) + float(price)
+    if pp is not None:
+        # Позиция «до» — чтобы потом было видно, помогло ли поднятие. Без неё
+        # отчёт умеет сказать только «потрачено столько-то», а вопрос у
+        # продавца другой: не зря ли.
+        log = pp.setdefault("promo_log", [])
+        log.append({"ts": now, "title": str(watch.get("title") or "")[:60],
+                    "item_id": str(watch.get("item_id") or ""),
+                    "price": float(price or 0),
+                    "pos_before": int(watch.get("last_pos") or 0)})
+        if len(log) > PROMO_LOG_LIMIT:
+            del log[:len(log) - PROMO_LOG_LIMIT]
+
+
+def note_position_after(pp: dict, item_id: str, pos: int, now: float,
+                        within_hours: float = 6.0) -> None:
+    """Дописать в журнал, какой стала позиция после недавнего поднятия.
+
+    Записывается один раз и только по свежей записи: смысл в паре «было —
+    стало», а не в постоянном переписывании последнего значения.
+    """
+    if not pos:
+        return
+    for entry in reversed(pp.get("promo_log") or []):
+        if str(entry.get("item_id")) != str(item_id):
+            continue
+        if entry.get("pos_after") is not None:
+            return
+        if (now - float(entry.get("ts") or 0)) / 3600.0 > within_hours:
+            return
+        entry["pos_after"] = int(pos)
+        return
 
 
 class Verdict:
@@ -238,7 +321,7 @@ def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
     pp = pp if pp is not None else {}
     now = _time.time() if now is None else now
     if auto_promote is None:
-        auto_promote = bool(pp.get("auto_promote"))
+        auto_promote = watch_auto_promote(watch, pp)
 
     v = Verdict()
     watch["last_check"] = now

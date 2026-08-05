@@ -2116,7 +2116,8 @@ class TaskManager:
         """
         from automation.market import fetch_listing
         from automation.position import (budget_left, evaluate, is_due,
-                                         note_promotion, watches)
+                                         note_position_after, note_promotion,
+                                         watches)
         from storage import get_shop_name
 
         pp = settings.setdefault("promo_position", {})
@@ -2159,6 +2160,11 @@ class TaskManager:
 
             verdict = evaluate(w, res["offers"], shop=shop, pp=pp, now=now,
                                price=_promo_price(settings))
+            # Чем кончилось недавнее поднятие — видно только на следующей
+            # проверке. Иначе отчёт умеет сказать «потрачено», но не «помогло».
+            if verdict.found:
+                note_position_after(pp, str(w.get("item_id") or ""),
+                                    int(verdict.pos or 0), now)
             lines = list(verdict.lines)
             if verdict.promote:
                 ok_paid, msg = await self._promote_one(

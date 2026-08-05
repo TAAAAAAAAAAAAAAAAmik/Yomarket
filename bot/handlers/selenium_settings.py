@@ -26,6 +26,7 @@ class SeleniumState(StatesGroup):
     waiting_restore_interval = State()
     waiting_pos_url = State()
     waiting_pos_threshold = State()
+    waiting_watch_interval = State()
     waiting_pos_interval = State()
     waiting_pos_price = State()
     waiting_pos_guard = State()
@@ -502,6 +503,7 @@ def _pos_kb(s: dict) -> InlineKeyboardMarkup:
              callback_data="pos:budget")
     if ws:
         b.button(text="🔍 Проверить все", callback_data="pos:checkall")
+    b.button(text="🧾 Отчёт по тратам", callback_data="pos:report")
     b.button(text="⬅️ К продвижению", callback_data="selenium:bump:menu")
     # One watch per row so its name and place stay readable; the settings pair
     # up below them.
@@ -589,12 +591,86 @@ async def pos_undercut(callback: CallbackQuery) -> None:
 
 # --- adding a watch --------------------------------------------------------
 
+def _promo_report_text(s: dict) -> str:
+    """Куда ушли деньги и что из этого вышло.
+
+    Отдельные сообщения «⭐ Поднял · 19 ₽» не складываются в ответ на вопрос,
+    ради которого всё и включалось: окупается ли это. Здесь — суммы и пары
+    «было место — стало место».
+    """
+    import time as _t
+
+    pp = s.get("promo_position", {})
+    log = [e for e in (pp.get("promo_log") or []) if isinstance(e, dict)]
+    if not log:
+        return ("🧾 <b>Отчёт по поднятиям</b>\n\n"
+                "Пока пусто — платных поднятий по позиции ещё не было.\n\n"
+                "<i>Сюда попадут суммы и то, как менялось место: с какого "
+                "поднимали и на каком товар оказался при следующей "
+                "проверке.</i>")
+    now = _t.time()
+
+    def part(days: float) -> tuple[int, float]:
+        rows = [e for e in log if (now - float(e.get("ts") or 0)) < days * 86400]
+        return len(rows), sum(float(e.get("price") or 0) for e in rows)
+
+    lines = ["🧾 <b>Отчёт по поднятиям</b>", ""]
+    for title, days in (("Сегодня", 1), ("За 7 дней", 7), ("За 30 дней", 30)):
+        n, rub = part(days)
+        lines.append(f"<b>{title}</b>: {n} шт."
+                     + (f", <b>{rub:.0f} ₽</b>" if rub else ""))
+
+    # Помогло ли. Считаем только те, где известна позиция и до, и после.
+    measured = [e for e in log
+                if e.get("pos_before") and e.get("pos_after")]
+    lines.append("")
+    if measured:
+        better = [e for e in measured
+                  if int(e["pos_after"]) < int(e["pos_before"])]
+        gain = sum(int(e["pos_before"]) - int(e["pos_after"]) for e in measured)
+        lines.append(f"<b>Результат</b> (по {len(measured)} поднятиям, где "
+                     f"место известно до и после):")
+        lines.append(f"• помогло: <b>{len(better)}</b> из {len(measured)}")
+        lines.append(f"• в среднем вверх на <b>{gain / len(measured):.1f}</b> "
+                     f"мест")
+    else:
+        lines.append("<i>Результат появится после следующей проверки: место "
+                     "«после» видно только на ней.</i>")
+
+    lines.append("")
+    lines.append("<b>Последние:</b>")
+    for e in reversed(log[-6:]):
+        when = _fmt_ts(e.get("ts"))
+        move = ""
+        if e.get("pos_before") and e.get("pos_after"):
+            move = f" · {e['pos_before']}→{e['pos_after']} место"
+        elif e.get("pos_before"):
+            move = f" · с {e['pos_before']} места"
+        price = float(e.get("price") or 0)
+        lines.append(f"• {_esc(str(e.get('title') or '—')[:32])}"
+                     + (f" · {price:.0f} ₽" if price else "")
+                     + move + (f" · {when}" if when != "—" else ""))
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data == "pos:report")
+async def pos_report_screen(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Обновить", callback_data="pos:report")
+    b.button(text="⬅️ Назад", callback_data="pos:menu")
+    b.adjust(2)
+    await _pos_edit(callback.message, _promo_report_text(s), b.as_markup())
+    await callback.answer()
+
+
 @router.callback_query(F.data == "pos:add")
 async def pos_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     """Two ways in, and the one that needs no copying is offered first."""
     await state.clear()
     b = InlineKeyboardBuilder()
     b.button(text="📦 Выбрать из моих товаров", callback_data="pos:addlist")
+    b.button(text="⚡ Добавить все сразу", callback_data="pos:addall")
     b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
     b.button(text="⬅️ Назад", callback_data="pos:menu")
     b.adjust(1)
@@ -608,6 +684,77 @@ async def pos_add_start(callback: CallbackQuery, state: FSMContext) -> None:
         "надо за конкретной выдачей с фильтром.</i>",
         b.as_markup())
     await callback.answer()
+
+
+@router.callback_query(F.data == "pos:addall")
+async def pos_add_all(callback: CallbackQuery) -> None:
+    """Поставить под наблюдение все товары разом.
+
+    По одному — это по три-четыре нажатия на товар и минута ожидания; у
+    магазина на тридцать позиций так никто делать не станет, и функция
+    остаётся невключённой.
+    """
+    from automation.position import MAX_WATCHES, new_watch, watches
+
+    uid = callback.from_user.id
+    await callback.answer("⏳ Загружаю ваши товары…")
+    ads = await _my_ads(uid, reload=True)
+    if not ads:
+        await _pos_edit(callback.message,
+                        "❌ Не получил список ваших объявлений. Проверьте "
+                        "токен (/start).", _cancel_kb("pos:add"))
+        return
+
+    s = get_settings(uid)
+    pp = s.setdefault("promo_position", {})
+    ws = watches(pp)
+    known = {str(w.get("market_id") or "") for w in ws}
+    todo = [a for a in ads if a["id"] not in known][:MAX_WATCHES - len(ws)]
+    if not todo:
+        await _pos_edit(
+            callback.message,
+            f"📍 Добавлять нечего: все товары уже под наблюдением либо "
+            f"достигнут предел в {MAX_WATCHES}.", _cancel_kb("pos:menu"))
+        return
+
+    added, missed = [], []
+    for i, ad in enumerate(todo, 1):
+        await _pos_edit(
+            callback.message,
+            f"⏳ Ищу страницы витрины… <b>{i}</b> из {len(todo)}\n\n"
+            f"Сейчас: «{_esc(ad['title'][:40])}»\n"
+            f"✅ Добавлено: {len(added)}   ❔ Не нашёл: {len(missed)}\n\n"
+            f"<i>Каждый товар — отдельный обход витрины, это не быстро.</i>",
+            _cancel_kb("pos:menu"))
+        chosen, pos, _seen, _urls = await _find_listing_page(uid, ad)
+        if not chosen:
+            missed.append(ad["title"])
+            continue
+        s = get_settings(uid)
+        pp = s.setdefault("promo_position", {})
+        ws = watches(pp)
+        w = new_watch(chosen, title=ad["title"], market_id=ad["id"])
+        w["last_pos"] = pos
+        ws.append(w)
+        pp["watches"] = ws
+        save_settings(uid, s)
+        # Привязка к записи в панели — то, чем потом платят за поднятие.
+        await _bind_panel_item(uid, len(ws) - 1, ad["title"])
+        added.append(ad["title"])
+
+    s = get_settings(uid)
+    lines = [f"📍 <b>Готово</b>\n",
+             f"✅ Под наблюдением новых: <b>{len(added)}</b>"]
+    if missed:
+        lines.append(f"❔ Не нашёл на витрине: <b>{len(missed)}</b>")
+        for title in missed[:5]:
+            lines.append(f"• {_esc(title[:40])}")
+        if len(missed) > 5:
+            lines.append(f"…и ещё {len(missed) - 5}")
+        lines.append("")
+        lines.append("<i>Их можно добавить по одному — там бот покажет "
+                     "каталог и даст выбрать раздел руками.</i>")
+    await _pos_edit(callback.message, "\n".join(lines), _pos_kb(s))
 
 
 @router.callback_query(F.data == "pos:addurl")
@@ -688,6 +835,66 @@ async def pos_add_list(callback: CallbackQuery) -> None:
         b.as_markup())
 
 
+async def _find_listing_page(uid: int, ad: dict) -> tuple[str, int, int, list]:
+    """Найти страницу витрины, где стоит это объявление.
+
+    Возвращает (адрес, место, предложений на странице, кандидаты). Пустой
+    адрес — не нашли, и тогда важен последний элемент: «кандидатов не было
+    вовсе» и «кандидаты были, но нас там нет» — разные беды, и продавцу для
+    них нужно разное. Вынесено отдельно, потому что тем же путём идёт
+    добавление сразу всех товаров: по одному у магазина на тридцать позиций —
+    полчаса нажатий.
+    """
+    import asyncio
+
+    from automation.market import (category_meta, fetch_listing, find_position,
+                                   listing_path, listing_urls_for)
+    from storage import get_shop_name
+
+    loop = asyncio.get_event_loop()
+    shop = get_shop_name(uid) or ""
+    try:
+        urls = await asyncio.wait_for(
+            loop.run_in_executor(None, listing_urls_for, ad["id"], None,
+                                 ad["title"]),
+            timeout=90)
+    except Exception as e:
+        logger.warning("listing urls for %s: %s", ad["id"], e)
+        return "", 0, 0, []
+
+    # Какой из slug — игра, а какой — раздел, нигде не сказано, поэтому
+    # кандидаты сверяются с каталогом: адрес, чей последний slug маркетплейс
+    # знает как раздел, и есть настоящий. По одному лёгкому запросу на
+    # кандидата — вычитывать каждому весь список было бы до сорока пяти
+    # страниц на штуку.
+    chosen = ""
+    for url in urls[:4]:
+        slugs, _f = listing_path(url)
+        try:
+            meta = await asyncio.wait_for(
+                loop.run_in_executor(None, category_meta, slugs), timeout=30)
+        except Exception:
+            continue
+        if meta and str(meta.get("slug") or "") == (slugs[-1] if slugs else ""):
+            chosen = url
+            break
+    if not chosen:
+        return "", 0, 0, urls
+
+    # Раздел существует — ещё не доказательство, что мы в нём стоим.
+    try:
+        ok, res = await asyncio.wait_for(
+            loop.run_in_executor(None, fetch_listing, chosen, shop),
+            timeout=180)
+    except Exception:
+        return "", 0, 0, urls
+    mine = find_position(res["offers"], ad_id=ad["id"], title=ad["title"],
+                         seller=shop) if ok else None
+    if not mine:
+        return "", 0, 0, urls
+    return chosen, int(mine["pos"]), len(res["offers"]), urls
+
+
 @router.callback_query(F.data.startswith("pos:addpick:"))
 async def pos_add_pick(callback: CallbackQuery) -> None:
     """Set a watch up from one of our own listings, end to end.
@@ -726,56 +933,13 @@ async def pos_add_pick(callback: CallbackQuery) -> None:
                     f"⏳ Ищу, на какой странице витрины стоит "
                     f"«{_esc(ad['title'][:40])}»...", _cancel_kb("pos:menu"))
 
-    loop = asyncio.get_event_loop()
-    shop = get_shop_name(callback.from_user.id) or ""
-    try:
-        urls = await asyncio.wait_for(
-            loop.run_in_executor(None, listing_urls_for, ad["id"], None,
-                                 ad["title"]),
-            timeout=90)
-    except Exception as e:
-        urls = []
-        logger.warning("listing urls for %s: %s", ad["id"], e)
-
-    # Which slug is the game and which is the section is not stated anywhere,
-    # so the candidates are checked against the catalogue: an address whose
-    # deepest slug the marketplace knows as a section is the real one. One
-    # light request each — reading every candidate's whole listing instead
-    # would be up to forty-five pages apiece.
-    from automation.market import category_meta, listing_path
-    chosen = ""
-    for url in urls[:4]:
-        slugs, _f = listing_path(url)
-        try:
-            meta = await asyncio.wait_for(
-                loop.run_in_executor(None, category_meta, slugs), timeout=30)
-        except Exception:
-            continue
-        if meta and str(meta.get("slug") or "") == (slugs[-1] if slugs else ""):
-            chosen = url
-            break
-
-    # Then read it once, and only accept it if our listing is really in there:
-    # a section that exists is not yet proof that this is where we stand.
-    pos, seen = 0, 0
-    if chosen:
-        try:
-            ok, res = await asyncio.wait_for(
-                loop.run_in_executor(None, fetch_listing, chosen, shop),
-                timeout=180)
-        except Exception:
-            ok, res = False, ""
-        mine = find_position(res["offers"], ad_id=ad["id"],
-                             title=ad["title"], seller=shop) if ok else None
-        if mine:
-            pos, seen = int(mine["pos"]), len(res["offers"])
-        else:
-            chosen = ""
+    chosen, pos, seen, urls = await _find_listing_page(callback.from_user.id, ad)
 
     if not chosen:
         # Say which of the two steps failed. "Не смог" alone left nothing to
         # act on — and the two causes need different things from the seller.
         from automation.market import search_keys
+        # Две причины — два разных действия продавца, и путать их нельзя.
         if urls:
             why = (f"Нашёл товар на витрине, но ни одна из {len(urls)} "
                    f"страниц-кандидатов его не показала:\n"
@@ -1152,6 +1316,15 @@ def _watch_text(s: dict, idx: int, note: str = "") -> str:
     floor = float(w.get("min_price") or 0)
     lines.append("⚠️ Сигнал, если цена на витрине упала ниже: "
                  + (f"<b>{floor:.0f} ₽</b>" if floor else "не задан"))
+    from automation.position import watch_auto_promote, watch_interval_hours
+    own_mode = w.get("auto_promote")
+    mode = "⭐ поднимать" if watch_auto_promote(w, pp) else "🔔 только сигнал"
+    lines.append(f"Режим: <b>{mode}</b>"
+                 + ("" if own_mode is not None else " <i>(как у магазина)</i>"))
+    every = watch_interval_hours(w, pp)
+    lines.append(f"Проверка: каждые <b>{every:g} ч</b>"
+                 + ("" if w.get("interval_hours") else
+                    " <i>(как у магазина)</i>"))
     if w.get("item_id"):
         lines.append(f"Товар в панели: <code>{_esc(w['item_id'])}</code>")
     else:
@@ -1185,12 +1358,21 @@ def _watch_kb(s: dict, idx: int) -> InlineKeyboardMarkup:
     floor = float(w.get("min_price") or 0)
     b.button(text=f"⚠️ Сигнал цены: {f'{floor:.0f} ₽' if floor else 'нет'}",
              callback_data=f"pos:wp:{idx}")
+    from automation.position import watch_auto_promote, watch_interval_hours
+    pp = s.get("promo_position", {})
+    own = w.get("auto_promote")
+    mode = ("⭐ Поднимать" if watch_auto_promote(w, pp) else "🔔 Сигнал")
+    b.button(text=f"{mode}" + ("" if own is not None else " (общий)"),
+             callback_data=f"pos:wm:{idx}")
+    b.button(text=f"⏱ Проверка: {watch_interval_hours(w, pp):g} ч"
+                  + ("" if w.get("interval_hours") else " (общ.)"),
+             callback_data=f"pos:wh:{idx}")
     b.button(text=("🔗 Товар: привязан" if w.get("item_id") else "🔗 Привязать товар"),
              callback_data=f"pos:wi:{idx}")
     b.button(text="🔍 Проверить сейчас", callback_data=f"pos:wc:{idx}")
     b.button(text="🗑 Удалить", callback_data=f"pos:wd:{idx}")
     b.button(text="⬅️ К списку", callback_data="pos:menu")
-    b.adjust(2, 2, 1, 1, 1)
+    b.adjust(2, 2, 2, 1, 1, 1)
     return b.as_markup()
 
 
@@ -1444,6 +1626,89 @@ async def _ask_number(callback: CallbackQuery, state: FSMContext,
     await state.update_data(pos_idx=idx)
     await _pos_edit(callback.message, text, _cancel_kb(f"pos:w:{idx}"))
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pos:wm:"))
+async def pos_watch_mode(callback: CallbackQuery) -> None:
+    """Режим этого товара: как у магазина → поднимать → только сигнал.
+
+    Один переключатель на весь магазин ставил перед выбором из крайностей:
+    либо бот платит за любой просевший товар, либо не платит никогда. А
+    окупается поднятие не у всех — у товара с тонкой маржой 19 ₽ съедают
+    продажу.
+    """
+    got = _watch_at(callback.from_user.id, callback.data)
+    if not got:
+        await callback.answer("Наблюдение не найдено", show_alert=True)
+        return
+    s, _pp, ws, idx = got
+    w = ws[idx]
+    order = {None: True, True: False, False: None}
+    w["auto_promote"] = order[w.get("auto_promote")]
+    save_settings(callback.from_user.id, s)
+    said = {None: "Как у магазина", True: "Поднимать автоматически",
+            False: "Только сигнал"}[w["auto_promote"]]
+    if w["auto_promote"] and not promo_params(s):
+        said = "Поднимать — но сначала выберите тариф «Премиум»"
+    await callback.answer(said, show_alert=bool(w["auto_promote"]
+                                                and not promo_params(s)))
+    await _pos_edit(callback.message, _watch_text(s, idx), _watch_kb(s, idx))
+
+
+@router.callback_query(F.data.startswith("pos:wh:"))
+async def pos_watch_interval_start(callback: CallbackQuery,
+                                   state: FSMContext) -> None:
+    got = _watch_at(callback.from_user.id, callback.data)
+    if not got:
+        await callback.answer("Наблюдение не найдено", show_alert=True)
+        return
+    s, pp, ws, idx = got
+    from automation.position import (MIN_INTERVAL_HOURS, interval_hours,
+                                     watch_interval_hours)
+    await _ask_number(
+        callback, state, SeleniumState.waiting_watch_interval, idx,
+        f"⏱ <b>Как часто проверять этот товар</b>\n\n"
+        f"Сейчас: каждые <b>{watch_interval_hours(ws[idx], pp):g} ч</b>"
+        + ("" if ws[idx].get("interval_hours") else " (как у магазина)")
+        + f"\n\nПришлите число часов — от {MIN_INTERVAL_HOURS:g} до 168. "
+          f"Чтобы вернуться к общему значению ({interval_hours(pp):g} ч), "
+          f"отправьте <code>-</code>.\n\n"
+          f"<i>Чаще, чем раз в полчаса, проверять бессмысленно: фоновый цикл "
+          f"просыпается именно с такой частотой.</i>")
+
+
+@router.message(SeleniumState.waiting_watch_interval)
+async def pos_watch_interval_save(message: Message, state: FSMContext) -> None:
+    from automation.position import MIN_INTERVAL_HOURS, watches
+
+    data = await state.get_data()
+    raw = (message.text or "").strip().replace(",", ".")
+    own: float | None
+    if raw in ("-", "—"):
+        own = None
+    else:
+        try:
+            own = float(raw)
+            if not MIN_INTERVAL_HOURS <= own <= 168:
+                raise ValueError
+        except ValueError:
+            await message.answer(
+                f"❌ Нужно число от {MIN_INTERVAL_HOURS:g} до 168, "
+                f"либо <code>-</code> — вернуть общее значение.")
+            return
+    await state.clear()
+    idx = int(data.get("pos_idx") or 0)
+    uid = message.from_user.id
+    s = get_settings(uid)
+    ws = watches(s.setdefault("promo_position", {}))
+    if idx >= len(ws):
+        await message.answer("Наблюдение уже удалено.")
+        return
+    ws[idx]["interval_hours"] = own
+    save_settings(uid, s)
+    note = ("↩️ Проверка — как у магазина." if own is None
+            else f"✅ Проверяю этот товар каждые {own:g} ч.")
+    await message.answer(_watch_text(s, idx, note), reply_markup=_watch_kb(s, idx))
 
 
 @router.callback_query(F.data.startswith("pos:wt:"))
