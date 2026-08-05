@@ -375,7 +375,7 @@ async def edit_price_save(message: Message, state: FSMContext) -> None:
 
 
 @router.message(Command("item_debug"))
-async def item_debug(message: Message) -> None:
+async def item_debug(message: Message, api: YooMarketAPI = None) -> None:
     """/item_debug 223960 — что панель знает об этом товаре.
 
     Появилась потому, что «✅ Цена обновлена» и старая цена на сайте
@@ -392,9 +392,27 @@ async def item_debug(message: Message) -> None:
     status = await message.answer("⏳ Смотрю, что отдаёт панель…")
     lines, err = await _run(message.from_user.id, panel_item_fields_probe_sync,
                             item_id, message.from_user.id)
-    if not lines:
-        await status.edit_text(f"❌ {err or 'панель ничего не ответила'}")
-        return
+    lines = list(lines or [])
+    if err and not lines:
+        lines = [f"панель: {err}"]
+
+    # И вторая сторона. Цену можно менять двумя путями — через панель и через
+    # API маркетплейса, — а номера у них могут быть из разных пространств.
+    # Пока обе стороны не видно рядом, «цена не меняется» неразличимо с
+    # «правим не тот товар».
+    lines.append("")
+    if api is None:
+        lines.append("api: токен не подключён")
+    else:
+        try:
+            ad = await api.get_ad(item_id)
+            ad = ad.get("data") if isinstance(ad.get("data"), dict) else ad
+            lines.append(f"api /ads/{item_id}: цена «{ad.get('price')}», "
+                         f"статус «{ad.get('status')}», "
+                         f"«{str(ad.get('title') or '')[:40]}»")
+        except Exception as e:
+            lines.append(f"api /ads/{item_id}: {str(e)[:120]}")
+
     import html as _html
     body = "\n".join(_html.escape(str(x)) for x in lines)[:3500]
     await status.edit_text(f"🔍 <b>Товар #{item_id}</b>\n<code>{body}</code>")
