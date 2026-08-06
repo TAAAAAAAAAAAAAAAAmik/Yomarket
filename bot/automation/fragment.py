@@ -559,6 +559,66 @@ def _looks_logged_out(html: str) -> bool:
     return not signed_in
 
 
+# Чем бот может представиться. Сессию Fragment выдаёт браузеру, и она
+# бывает привязана не только к куке: куки, снятые с телефона, десктопному
+# User-Agent могут не подойти. Перебрать три строки дешевле, чем гадать.
+_USER_AGENTS = (
+    ("телефон Android", "Mozilla/5.0 (Linux; Android 13; SM-S911B) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Mobile Safari/537.36"),
+    ("iPhone", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
+               "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 "
+               "Mobile/15E148 Safari/604.1"),
+    ("компьютер", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0 Safari/537.36"),
+)
+
+
+def probe_session_sync(cookies: dict) -> list[str]:
+    """Почему Fragment не признаёт эту сессию — перебором, а не рассуждением.
+
+    Отвечает страница гостя: значит куки до Fragment либо не доходят, либо
+    им не подходят. Проверяем три вещи, которые можно проверить сами:
+    сколько кук задано и какой они длины, отвечает ли Fragment иначе на
+    другой User-Agent, и меняет ли что-то отсутствие XHR-заголовков.
+    """
+    out: list[str] = []
+    cookies = cookies or {}
+    out.append(f"Кук задано: {len(cookies)}")
+    for name in ("stel_token", "stel_ssid", "stel_ton_token"):
+        value = str(cookies.get(name) or "")
+        # Значения не печатаем — это доступ к аккаунту. Длина скажет
+        # достаточно: обрезанная при копировании кука видна сразу.
+        out.append(f"  · {name}: "
+                   + (f"{len(value)} символов" if value else "нет"))
+    extra = [k for k in cookies if k not in
+             ("stel_token", "stel_ssid", "stel_ton_token")]
+    if extra:
+        out.append(f"  · ещё кук: {', '.join(sorted(extra)[:6])}")
+
+    for label, ua in _USER_AGENTS:
+        session = requests.Session()
+        session.cookies.update(cookies)
+        session.headers.update({
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru,en;q=0.9",
+        })
+        try:
+            r = session.get("https://fragment.com/stars", timeout=20)
+        except Exception as e:
+            out.append(f"{label}: ошибка сети {str(e)[:50]}")
+            continue
+        body = r.text or ""
+        signed = not _looks_logged_out(body)
+        out.append(f"{label}: HTTP {r.status_code}, {len(body)} символов, "
+                   + ("✅ вошли" if signed else "гость"))
+        if signed:
+            out.append("  ↑ вот с этим User-Agent сессия признаётся")
+    return out
+
+
 def check_fragment_session_sync(cookies: dict,
                                 api_hash: str = "") -> tuple[bool, object]:
     """Light check that the Fragment session is alive.

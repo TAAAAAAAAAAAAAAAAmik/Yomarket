@@ -8,6 +8,7 @@ import re
 import time
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
@@ -564,6 +565,29 @@ async def stars_check_creds(callback: CallbackQuery) -> None:
         return
     await callback.message.answer(("✅ " if ok else "⚠️ ")
                                   + f"Fragment: {msg}" + wallets)
+
+
+@router.message(Command("fragment_debug"))
+async def fragment_debug(message: Message) -> None:
+    """/fragment_debug — почему Fragment не признаёт сессию. Только чтение."""
+    from automation.fragment import probe_session_sync
+
+    creds = get_fragment_creds(message.from_user.id) or {}
+    if not creds.get("cookies"):
+        await message.answer("⚠️ Куки Fragment не заданы: Плагины → AutoStars "
+                             "→ 🔑 Данные Fragment")
+        return
+    status = await message.answer("⏳ Пробую разные способы представиться…")
+    loop = asyncio.get_event_loop()
+    try:
+        lines = await asyncio.wait_for(
+            loop.run_in_executor(None, probe_session_sync, creds["cookies"]),
+            timeout=90)
+    except Exception as e:
+        await status.edit_text(f"❌ {html.escape(str(e)[:200])}")
+        return
+    body = "\n".join(html.escape(str(x)) for x in lines)[:3500]
+    await status.edit_text(f"🔍 <b>Сессия Fragment</b>\n<code>{body}</code>")
 
 
 @router.callback_query(F.data == "plugins:stars:set_hash")
