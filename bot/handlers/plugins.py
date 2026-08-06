@@ -558,7 +558,7 @@ async def stars_check_creds(callback: CallbackQuery) -> None:
         # непонятно, истекли куки или изменилась страница.
         report = [str(line) for line in (msg.get("report") or [])]
         if report:
-            body = "\n".join(html.escape(line) for line in report[:6])
+            body = "\n".join(html.escape(line) for line in report[:14])
             text += f"\n\n<b>Что увидел бот:</b>\n<code>{body}</code>"
         await callback.message.answer(text + wallets)
         return

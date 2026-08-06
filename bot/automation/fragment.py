@@ -414,13 +414,17 @@ _HASH_PAGES = ("https://fragment.com/stars",
                "https://fragment.com/premium")
 
 
-def collect_api_hashes_sync(cookies: dict,
-                            report: list | None = None) -> list[str]:
+def collect_api_hashes_sync(cookies: dict, report: list | None = None,
+                            facts: dict | None = None) -> list[str]:
     """Все хеши, какие видны на страницах Fragment, — в порядке доверия.
 
     Раньше брался первый совпавший, и этого не хватило: в разметке лежит не
     один «hash», и подойти к API может не тот, что нашёлся первым. Перебрать
     несколько дешевле, чем гадать.
+
+    `facts` — то, что вызывающему нужно решать, а не показывать: вошли ли мы.
+    Вычитывать это обратно из текста отчёта значило бы управлять логикой по
+    прозе, а она меняется от любой правки формулировки.
     """
     session = _page_session(cookies or {})
     found: list[str] = []
@@ -433,9 +437,11 @@ def collect_api_hashes_sync(cookies: dict,
             continue
         body = r.text or ""
         if report is not None:
-            signed = "не видно входа" if _looks_logged_out(body) else "вход есть"
-            report.append(f"{url}: HTTP {r.status_code}, "
-                          f"{len(body)} символов, {signed}")
+            report.append(f"{url}: HTTP {r.status_code}, {len(body)} символов")
+            for line in page_signals(body):
+                report.append(f"  · {line}")
+        if facts is not None and "signed_in" not in facts:
+            facts["signed_in"] = not _looks_logged_out(body)
         if r.status_code != 200:
             continue
         for pattern in _HASH_PATTERNS:
@@ -512,16 +518,45 @@ def _same_wallet(a: str, b: str) -> bool:
     return a[2:] == b[2:] if a[:1] in "EU" and b[:1] in "EU" else a == b
 
 
+def page_signals(html: str) -> list[str]:
+    """Что именно видно на странице — фактами, а не выводом.
+
+    Прежний детектор считал признаком входа строку «ton-auth», хотя это
+    кнопка «Connect TON», то есть признак ровно обратного: бот докладывал
+    «вход есть» на гостевой странице. Списку найденных маркеров соврать
+    труднее, чем одному слову.
+    """
+    text = html or ""
+    low = text.lower()
+    out: list[str] = []
+    # Заголовок — из оригинала: в нижнем регистре он читается как чужой.
+    m = re.search(r"<title[^>]*>(.{0,80}?)</title>", text, re.S | re.I)
+    if m:
+        out.append(f"заголовок: «{m.group(1).strip()}»")
+    checks = (
+        ("ссылка выхода", "/logout" in low),
+        ("кнопка «Log in»", "log in" in low or "sign in" in low),
+        ("кнопка «Connect TON»", "connect ton" in low or "ton-auth" in low),
+        ("раздел «My assets»", "my assets" in low),
+        ("форма покупки звёзд", "buystars" in low or "stars-form" in low),
+    )
+    for name, present in checks:
+        out.append(f"{name}: {'есть' if present else 'нет'}")
+    return out
+
+
 def _looks_logged_out(html: str) -> bool:
-    """Похоже ли, что страница отдана гостю. Куки живут недолго, и «хеш не
-    найден» чаще всего означает именно это."""
+    """Похоже ли, что страница отдана гостю.
+
+    Вход подтверждает только то, что бывает лишь у вошедшего: ссылка выхода
+    или личный раздел. Кнопка подключения кошелька входом не является — на
+    этом прежняя версия и ошибалась.
+    """
     low = (html or "").lower()
     if not low:
         return True
-    signed_in = ("logout" in low or "ton-auth" in low or "my assets" in low
-                 or "аккаунт" in low)
-    guest = "connect ton" in low or "log in" in low or "sign in" in low
-    return guest and not signed_in
+    signed_in = "/logout" in low or "my assets" in low
+    return not signed_in
 
 
 def check_fragment_session_sync(cookies: dict,
@@ -557,9 +592,10 @@ def check_fragment_session_sync(cookies: dict,
     # странице, и пробуем каждый: в разметке их несколько, и подойти может не
     # первый.
     report: list[str] = []
+    facts: dict = {}
     tried = {(api_hash or DEFAULT_HASH)}
     fresh = ""
-    for candidate in collect_api_hashes_sync(cookies, report):
+    for candidate in collect_api_hashes_sync(cookies, report, facts):
         if candidate in tried:
             continue
         tried.add(candidate)
@@ -575,8 +611,7 @@ def check_fragment_session_sync(cookies: dict,
         return False, err
     said = str((data or {}).get("error") or data)[:120]
     if "bad request" in said.lower():
-        guest = any("не видно входа" in line for line in report)
-        if guest:
+        if facts.get("signed_in") is False:
             why = "Куки Fragment больше не действуют — страница отдаётся как гостю."
         elif checked:
             # Хеши нашлись, но ни один не принят. Говорить «прочитать не

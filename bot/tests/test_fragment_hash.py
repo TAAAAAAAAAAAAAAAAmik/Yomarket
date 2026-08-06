@@ -19,7 +19,9 @@ logging.getLogger("automation.fragment").setLevel(logging.CRITICAL)
 
 COOKIES = {"stel_token": "a", "stel_ssid": "b", "stel_ton_token": "c"}
 REAL_HASH = "0123456789abcdef"
-PAGE = ('<html><script>var x = "/api?hash=' + REAL_HASH + '";</script></html>')
+SIGNED_IN = '<a href="/logout">Log out</a>'          # признак вошедшего
+PAGE = ('<html>' + SIGNED_IN + '<script>var x = "/api?hash=' + REAL_HASH
+        + '";</script></html>')
 
 
 class Reply:
@@ -100,13 +102,15 @@ class FindingIt(Case):
         self.assertEqual(F.fetch_api_hash_sync(COOKIES), REAL_HASH)
 
     def test_a_page_without_one_yields_nothing_rather_than_a_guess(self):
-        self.fake.page = "<html>ничего</html>"
+        self.fake.page = "<html>" + SIGNED_IN + "ничего</html>"
         self.assertEqual(F.fetch_api_hash_sync(COOKIES), "")
 
     def test_other_shapes_the_page_might_use(self):
         for page, expect in (
-                ('{"apiHash":"aabbccddeeff0011"}', "aabbccddeeff0011"),
-                ("hash: 'ffeeddccbbaa9988'", "ffeeddccbbaa9988")):
+                (SIGNED_IN + '{"apiHash":"aabbccddeeff0011"}',
+                 "aabbccddeeff0011"),
+                (SIGNED_IN + "hash: 'ffeeddccbbaa9988'",
+                 "ffeeddccbbaa9988")):
             self.fake.page = page
             self.assertEqual(F.fetch_api_hash_sync(COOKIES), expect)
 
@@ -127,7 +131,7 @@ class CheckingTheSession(Case):
 
     def test_dead_cookies_are_not_blamed_on_the_hash(self):
         self.fake.good_hash = "\\x00nothing-matches"
-        self.fake.page = "<html>no hash here</html>"
+        self.fake.page = "<html>" + SIGNED_IN + "no hash here</html>"
         ok, res = F.check_fragment_session_sync(COOKIES, "whatever")
         self.assertFalse(ok)
         self.assertIn("Bad request", str(res))
@@ -207,7 +211,8 @@ class AnAnswerOnTheMerits(Case):
 class WhenItCannotBeFound(Case):
     """The seller has a phone and no computer. F12 is not an instruction."""
 
-    def _fail(self, page="<html>no hash here</html>"):
+    def _fail(self, page=None):
+        page = page if page is not None else "<html>" + SIGNED_IN + "нет хеша</html>"
         self.fake.good_hash = "\\x00nothing-matches"
         self.fake.page = page
         ok, res = F.check_fragment_session_sync(COOKIES, "whatever")
@@ -359,7 +364,7 @@ class ComparingWallets(unittest.TestCase):
 class TryingEveryCandidate(Case):
     """В разметке лежит не один «hash», и подойти может не первый."""
 
-    TWO = ('<script>var a = {"hash":"aaaaaaaaaaaaaaaa"};'
+    TWO = (SIGNED_IN + '<script>var a = {"hash":"aaaaaaaaaaaaaaaa"};'
            ' var b = "/api?hash=bbbbbbbbbbbbbbbb";</script>')
 
     def test_the_second_candidate_is_tried_when_the_first_fails(self):
@@ -386,7 +391,7 @@ class TryingEveryCandidate(Case):
         self.assertIn("не принял ни один", res["message"])
 
     def test_with_no_candidates_at_all_it_still_says_so(self):
-        self.fake.page = "<html>пусто</html>"
+        self.fake.page = "<html>" + SIGNED_IN + "пусто</html>"
         self.fake.good_hash = "\x00nothing-matches"
         ok, res = F.check_fragment_session_sync(COOKIES, "stale")
         self.assertFalse(ok)
@@ -416,6 +421,30 @@ class ReadingTheWalletOffThePage(Case):
     def test_a_page_with_no_wallet_says_nothing_rather_than_guessing(self):
         self.fake.page = "<div>Connect TON</div>"
         self.assertEqual(F.wallet_on_page_sync(COOKIES), "")
+
+
+class WhatThePageActuallyShows(unittest.TestCase):
+    """Признаки страницы — фактами. Прежний детектор считал входом строку
+    «ton-auth», хотя это кнопка «Connect TON», то есть признак обратного:
+    бот докладывал «вход есть» на гостевой странице."""
+
+    def test_the_connect_button_is_not_mistaken_for_being_signed_in(self):
+        guest = '<a class="ton-auth-link">Connect TON</a>'
+        self.assertTrue(F._looks_logged_out(guest))
+
+    def test_a_logout_link_is_what_proves_it(self):
+        self.assertFalse(F._looks_logged_out('<a href="/logout">Log out</a>'))
+
+    def test_the_signals_are_listed_one_by_one(self):
+        got = F.page_signals('<title>Stars</title>'
+                             '<a class="ton-auth">Connect TON</a>')
+        joined = " | ".join(got)
+        self.assertIn("Stars", joined)
+        self.assertIn("кнопка «Connect TON»: есть", joined)
+        self.assertIn("ссылка выхода: нет", joined)
+
+    def test_an_empty_page_is_not_called_signed_in(self):
+        self.assertTrue(F._looks_logged_out(""))
 
 if __name__ == "__main__":
     unittest.main()
