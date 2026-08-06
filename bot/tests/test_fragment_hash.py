@@ -267,5 +267,93 @@ class BuyingWithAStaleHash(Case):
         self.assertEqual(self.fake.gets, [])
 
 
+class WhenTheSessionCannotBuy(Case):
+    """«Access denied» на покупке — не то же, что мёртвые куки.
+
+    Получателя Fragment нашёл, значит сессия жива. Покупку разрешает не вход
+    через Telegram, а привязанный TON-кошелёк, и голое «Access denied»
+    продавцу об этом не говорит ничего.
+    """
+
+    def test_it_is_explained_rather_than_repeated(self):
+        outer = self.fake
+
+        def post(url, params=None, data=None, **kw):
+            body = dict(data or {})
+            outer.bodies.append(body)
+            if body.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            return Reply({"ok": False, "error": "Access denied"})
+
+        sess = outer.session()
+        sess.post = post
+        F._make_session = lambda cookies: sess
+        ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
+                                   api_hash=REAL_HASH)
+        self.assertFalse(ok)
+        self.assertIn("кошел", msg.lower(), msg)
+        self.assertIn("Проверить вход", msg)
+
+    def test_other_failures_keep_their_own_wording(self):
+        outer = self.fake
+
+        def post(url, params=None, data=None, **kw):
+            body = dict(data or {})
+            if body.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            return Reply({"ok": False, "error": "Quantity too small"})
+
+        sess = outer.session()
+        sess.post = post
+        F._make_session = lambda cookies: sess
+        _ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
+                                    api_hash=REAL_HASH)
+        self.assertIn("Quantity too small", msg)
+        self.assertNotIn("кошел", msg.lower())
+
+
+class ComparingWallets(unittest.TestCase):
+    def test_the_two_ways_of_writing_one_address_match(self):
+        eq = "EQAbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIj"
+        uq = "UQAbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIj"
+        self.assertTrue(F._same_wallet(eq, uq))
+
+    def test_different_addresses_do_not(self):
+        self.assertFalse(F._same_wallet(
+            "EQAbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIj",
+            "EQZzZzZzGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIj"))
+
+    def test_a_missing_address_is_never_a_match(self):
+        self.assertFalse(F._same_wallet("", "EQAbCd"))
+        self.assertFalse(F._same_wallet("EQAbCd", ""))
+
+    def test_the_address_is_read_off_the_page(self):
+        addr = "EQAbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIj"
+
+        class Sess:
+            @staticmethod
+            def get(url, **kw):
+                return Reply(None, 200, f'<div data-address="{addr}"></div>')
+
+        old = F._page_session
+        F._page_session = lambda cookies: Sess()
+        try:
+            self.assertEqual(F.wallet_on_page_sync(COOKIES), addr)
+        finally:
+            F._page_session = old
+
+    def test_a_page_without_a_wallet_yields_nothing(self):
+        class Sess:
+            @staticmethod
+            def get(url, **kw):
+                return Reply(None, 200, "<div>Connect TON</div>")
+
+        old = F._page_session
+        F._page_session = lambda cookies: Sess()
+        try:
+            self.assertEqual(F.wallet_on_page_sync(COOKIES), "")
+        finally:
+            F._page_session = old
+
 if __name__ == "__main__":
     unittest.main()

@@ -497,7 +497,8 @@ async def stars_check_creds(callback: CallbackQuery) -> None:
     belonged to somebody else's session, which is answered with «Bad request»;
     discovering the right one is most of what this check is for.
     """
-    from automation.fragment import check_fragment_session_sync
+    from automation.fragment import (check_fragment_session_sync, _same_wallet,
+                                     wallet_address_sync, wallet_on_page_sync)
     uid = callback.from_user.id
     creds = get_fragment_creds(uid) or {}
     await callback.answer("⏳ Проверяю…")
@@ -510,6 +511,41 @@ async def stars_check_creds(callback: CallbackQuery) -> None:
         )
     except Exception as e:
         ok, msg = False, str(e)[:80]
+
+    # Сверка кошельков. Покупку разрешает не вход через Telegram, а
+    # привязанный TON-кошелёк: сессия может быть живой, а покупка — отвечать
+    # «Access denied», и без двух адресов рядом это неразличимо.
+    wallets = ""
+    if creds.get("cookies"):
+        try:
+            on_page, mine = await asyncio.wait_for(asyncio.gather(
+                loop.run_in_executor(None, wallet_on_page_sync,
+                                     creds["cookies"]),
+                loop.run_in_executor(None, wallet_address_sync,
+                                     creds.get("mnemonic", ""),
+                                     creds.get("wallet_version", "v4r2"))),
+                timeout=40)
+        except Exception:
+            on_page, mine = "", ""
+        if mine or on_page:
+            lines = ["", "<b>Кошельки</b>"]
+            lines.append(f"На Fragment: <code>{html.escape(on_page)}</code>"
+                         if on_page else
+                         "На Fragment: <b>не вижу подключённого</b>")
+            lines.append(f"У бота: <code>{html.escape(mine)}</code>" if mine
+                         else "У бота: <b>seed-фраза не задана</b>")
+            if on_page and mine:
+                lines.append("✅ Это один кошелёк — покупать можно."
+                             if _same_wallet(on_page, mine) else
+                             "❌ <b>Это разные кошельки.</b> Fragment примет "
+                             "оплату только с того, который к нему подключён — "
+                             "отсюда «Access denied» при покупке.")
+            elif not on_page:
+                lines.append("⚠️ Подключите TON-кошелёк на fragment.com и "
+                             "заново скопируйте куку "
+                             "<code>stel_ton_token</code> — без неё покупка "
+                             "запрещена, даже когда вход через Telegram есть.")
+            wallets = "\n".join(lines)
     if isinstance(msg, dict):
         if msg.get("api_hash"):
             save_fragment_creds(uid, {"api_hash": msg["api_hash"]})
@@ -524,9 +560,10 @@ async def stars_check_creds(callback: CallbackQuery) -> None:
         if report:
             body = "\n".join(html.escape(line) for line in report[:6])
             text += f"\n\n<b>Что увидел бот:</b>\n<code>{body}</code>"
-        await callback.message.answer(text)
+        await callback.message.answer(text + wallets)
         return
-    await callback.message.answer(("✅ " if ok else "⚠️ ") + f"Fragment: {msg}")
+    await callback.message.answer(("✅ " if ok else "⚠️ ")
+                                  + f"Fragment: {msg}" + wallets)
 
 
 @router.callback_query(F.data == "plugins:stars:set_hash")

@@ -249,10 +249,22 @@ def buy_stars_sync(
         return False, f"@{username}: {err}. Проверьте username и cookies."
 
     # 2. init request
-    init = _post("initBuyStarsRequest", {"recipient": recipient, "quantity": quantity})
+    init = _post("initBuyStarsRequest", {"recipient": recipient,
+                                         "quantity": quantity})
     req_id = init.get("req_id") or init.get("id")
     if not req_id:
-        err = init.get("error") or init.get("error_message") or str(init)[:120]
+        err = str(init.get("error") or init.get("error_message")
+                  or str(init)[:120])
+        if "access denied" in err.lower():
+            # Получателя Fragment нашёл — значит сессия жива. Отказ именно на
+            # покупке: её разрешает не вход через Telegram, а привязанный
+            # TON-кошелёк. Голое «Access denied» продавцу ничего не говорит.
+            return False, ("Fragment: «Access denied» — сессии не разрешена "
+                           "покупка. Обычно это значит, что к аккаунту "
+                           "Fragment не подключён TON-кошелёк, либо подключён "
+                           "не тот, чья seed-фраза задана боту. Проверьте "
+                           "сверку кошельков: AutoStars → 🔑 Данные Fragment "
+                           "→ 🧪 Проверить вход.")
         return False, f"initBuyStarsRequest не дал req_id: {err}"
 
     # 3. wallet
@@ -436,6 +448,51 @@ def fetch_api_hash_sync(cookies: dict, report: list | None = None) -> str:
                     report.append(f"хеш найден на {url}")
                 return m.group(1)
     return ""
+
+
+# Адрес TON-кошелька на странице Fragment. Покупку разрешает не вход через
+# Telegram, а привязанный кошелёк, и его адрес виден в разметке.
+_ADDR_RE = re.compile(r"\b([EU]Q[A-Za-z0-9_-]{46})\b")
+
+
+def wallet_on_page_sync(cookies: dict) -> str:
+    """Какой TON-кошелёк Fragment считает привязанным к этой сессии.
+
+    «Access denied» на покупке означает не «куки протухли», а «этой сессии
+    покупать нельзя» — чаще всего потому, что кошелёк не подключён или
+    подключён другой. Пока оба адреса не видно рядом, различить нечем.
+    """
+    session = _page_session(cookies or {})
+    for url in ("https://fragment.com/stars/buy", "https://fragment.com/stars",
+                "https://fragment.com/"):
+        try:
+            r = session.get(url, timeout=20)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+        found = _ADDR_RE.findall(r.text or "")
+        if found:
+            # Первый попавшийся адрес — свой: чужие в разметке страницы
+            # покупки не встречаются, а если встретятся, увидим это в сверке.
+            return found[0]
+    return ""
+
+
+def wallet_address_sync(mnemonic: str, wallet_version: str = "v4r2") -> str:
+    """Адрес кошелька бота — того, с которого он собирается платить."""
+    try:
+        wallet = _wallet_from_mnemonic(mnemonic, wallet_version)
+        return wallet.address.to_string(True, True, True)
+    except Exception:
+        return ""
+
+
+def _same_wallet(a: str, b: str) -> bool:
+    """Один ли это кошелёк. EQ… и UQ… — две записи одного адреса."""
+    if not a or not b:
+        return False
+    return a[2:] == b[2:] if a[:1] in "EU" and b[:1] in "EU" else a == b
 
 
 def _looks_logged_out(html: str) -> bool:
