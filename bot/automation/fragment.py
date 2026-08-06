@@ -264,7 +264,7 @@ def buy_stars_sync(
                            "Проверьте сверку кошельков: AutoStars → "
                            "🔑 Данные Fragment → 🧪 Проверить вход. Если там "
                            "«это один кошелёк», причина в другом — покажет "
-                           "команда /stars_probe <ник>.")
+                           "команда /stars_probe с ником покупателя.")
         return False, f"initBuyStarsRequest не дал req_id: {err}"
 
     # 3. wallet
@@ -787,47 +787,57 @@ def probe_page_api_sync(cookies: dict) -> list[str]:
     """Что страница покупки говорит о своих же запросах.
 
     Пять вариантов формы запроса получили один и тот же «Access denied», а
-    поиск получателя прошёл в каждом — значит дело не в том, как мы шлём, а
-    в том, что шлём или кем. Образец, по которому написан код, мог устареть:
-    Fragment мог переименовать метод или начать требовать поле, которого мы
-    не шлём. Всё это лежит в скриптах его собственной страницы.
+    поиск получателя прошёл в каждом — значит дело не в том, как мы шлём.
+    Образец, по которому написан код, мог устареть: Fragment мог
+    переименовать метод или начать требовать поле, которого мы не шлём.
+
+    Имена методов лежат не в разметке, а в подключаемых скриптах, поэтому
+    смотреть надо и в них: в самой странице их может не быть вовсе.
     """
     out: list[str] = []
     session = _page_session(cookies or {})
-    for url in ("https://fragment.com/stars/buy", "https://fragment.com/stars"):
+    try:
+        r = session.get("https://fragment.com/stars/buy", timeout=20)
+    except Exception as e:
+        return [f"страница покупки: {str(e)[:60]}"]
+    if r.status_code != 200:
+        return [f"страница покупки: HTTP {r.status_code}"]
+    body = r.text or ""
+    out.append(f"страница: {len(body)} символов")
+
+    sources = [("страница", body)]
+    # Скрипты страницы — там и живут вызовы API.
+    for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', body)[:6]:
+        url = src if src.startswith("http") else (
+            "https://fragment.com" + (src if src.startswith("/") else "/" + src))
         try:
-            r = session.get(url, timeout=20)
-        except Exception as e:
-            out.append(f"{url}: {str(e)[:50]}")
+            js = session.get(url, timeout=20)
+        except Exception:
             continue
-        if r.status_code != 200:
-            out.append(f"{url}: HTTP {r.status_code}")
-            continue
-        body = r.text or ""
-        out.append(f"{url}: {len(body)} символов")
+        if js.status_code == 200 and js.text:
+            sources.append((url.rsplit("/", 1)[-1][:32], js.text))
+    out.append(f"скриптов прочитано: {len(sources) - 1}")
 
-        # Имена методов, которые страница вызывает у /api
-        methods = sorted(set(re.findall(
+    seen_methods: set[str] = set()
+    for name, text in sources:
+        methods = set(re.findall(
             r"""method['"]?\s*[:=]\s*['"]([A-Za-z][A-Za-z0-9_]{3,40})['"]""",
-            body)))
-        if methods:
-            out.append("  методы: " + ", ".join(methods[:12]))
-        stars = [m for m in methods if "star" in m.lower()]
-        if stars:
-            out.append("  из них про звёзды: " + ", ".join(stars))
+            text))
+        # Fragment зовёт методы и короче — просто по имени в кавычках рядом
+        # с ajax-вызовом; отбираем то, что похоже на его словарь.
+        methods |= set(re.findall(r"['\"]((?:get|init|search|confirm|update)"
+                                  r"[A-Z][A-Za-z0-9]{3,40})['\"]", text))
+        fresh = sorted(m for m in methods if m not in seen_methods)
+        seen_methods |= methods
+        if fresh:
+            out.append(f"{name}: " + ", ".join(fresh[:14]))
 
-        # Поля, которые уходят вместе с покупкой — рядом с её вызовом
-        for name in ("initBuyStarsRequest", "getBuyStarsLink"):
-            at = body.find(name)
-            if at < 0:
-                out.append(f"  {name}: на странице не упоминается")
-                continue
-            around = body[max(0, at - 200):at + 400]
-            fields = sorted(set(re.findall(r"['\"]?([a-z_]{3,20})['\"]?\s*:",
-                                           around)))
-            out.append(f"  {name}: рядом поля — "
-                       + ", ".join(fields[:12]))
-        break
+    stars = sorted(m for m in seen_methods if "star" in m.lower())
+    out.append("методы про звёзды: " + (", ".join(stars) if stars
+                                        else "не нашёл ни одного"))
+    for name in ("initBuyStarsRequest", "getBuyStarsLink"):
+        out.append(f"{name}: " + ("есть" if name in seen_methods
+                                  else "НЕ упоминается нигде"))
     return out
 
 

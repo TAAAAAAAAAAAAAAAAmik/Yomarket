@@ -523,5 +523,63 @@ class TheSessionProbe(Case):
         for label, _ua in F._USER_AGENTS:
             self.assertIn(label, got)
 
+
+class TextThatTelegramMustAccept(unittest.TestCase):
+    """«Unsupported start tag "ник"» — Telegram отклонил сообщение целиком,
+    приняв <ник> из подсказки заHTML-тег. Сообщение о неудаче не дошло
+    вообще, а неудача осталась."""
+
+    def test_no_message_carries_a_bare_angle_bracket(self):
+        import ast
+        import pathlib as _p
+        import re as _re
+
+        root = _p.Path(__file__).resolve().parent.parent
+        placeholder = _re.compile(r"<(?:ник|номер|url|id|имя|username)[>»]")
+        bad = []
+        for path in (list((root / "handlers").glob("*.py"))
+                     + list((root / "automation").glob("*.py"))
+                     + [root / "tasks/manager.py"]):
+            tree = ast.parse(path.read_text())
+            # Докстроки и комментарии в чат не уходят — их пропускаем, иначе
+            # проверка ловит объяснения вместо сообщений.
+            docs = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Module, ast.FunctionDef,
+                                     ast.AsyncFunctionDef, ast.ClassDef)):
+                    first = (node.body or [None])[0]
+                    if (isinstance(first, ast.Expr)
+                            and isinstance(first.value, ast.Constant)
+                            and isinstance(first.value.value, str)):
+                        docs.add(id(first.value))
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Constant)
+                        and isinstance(node.value, str)
+                        and id(node) not in docs
+                        and placeholder.search(node.value)):
+                    bad.append(f"{path.name}:{node.lineno}")
+        self.assertFalse(bad, "угловые скобки в тексте для чата: "
+                              + ", ".join(bad))
+
+    def test_the_access_denied_hint_is_safe(self):
+        outer = FakeFragment()
+
+        def post(url, params=None, data=None, **kw):
+            body = dict(data or {})
+            if body.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            return Reply({"ok": False, "error": "Access denied"})
+
+        sess = outer.session()
+        sess.post = post
+        old = F._make_session
+        F._make_session = lambda cookies: sess
+        try:
+            _ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
+                                        100, api_hash=REAL_HASH)
+        finally:
+            F._make_session = old
+        self.assertNotIn("<", msg, msg)
+
 if __name__ == "__main__":
     unittest.main()
