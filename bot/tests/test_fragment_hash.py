@@ -446,5 +446,64 @@ class WhatThePageActuallyShows(unittest.TestCase):
     def test_an_empty_page_is_not_called_signed_in(self):
         self.assertTrue(F._looks_logged_out(""))
 
+
+class TheSessionProbe(Case):
+    """Куки не приняты — а причин три, и две проверяются сами."""
+
+    def _probe(self, cookies):
+        import automation.fragment as FR
+
+        class Sess:
+            headers: dict = {}
+            cookies = type("C", (), {"update": staticmethod(lambda *a: None),
+                                     "__iter__": lambda self: iter(())})()
+
+            @staticmethod
+            def get(url, **kw):
+                return Reply(None, 200, "<html>Connect TON</html>")
+
+        old = FR.requests.Session
+        FR.requests.Session = lambda: Sess()
+        try:
+            return FR.probe_session_sync(cookies)
+        finally:
+            FR.requests.Session = old
+
+    def test_swapped_values_are_caught_by_their_length(self):
+        """stel_ssid длиннее stel_token — почти всегда перепутанные поля."""
+        got = "\n".join(self._probe({"stel_token": "x" * 39,
+                                     "stel_ssid": "y" * 69,
+                                     "stel_ton_token": "z" * 200}))
+        self.assertIn("перепутаны местами", got)
+
+    def test_a_normal_set_raises_no_alarm(self):
+        got = "\n".join(self._probe({"stel_token": "x" * 120,
+                                     "stel_ssid": "y" * 20,
+                                     "stel_ton_token": "z" * 400}))
+        self.assertNotIn("перепутаны местами", got)
+        self.assertNotIn("необычная длина", got)
+
+    def test_an_odd_length_is_flagged_on_its_own(self):
+        got = "\n".join(self._probe({"stel_token": "x" * 5,
+                                     "stel_ssid": "y" * 20,
+                                     "stel_ton_token": "z" * 400}))
+        self.assertIn("необычная длина", got)
+
+    def test_a_missing_cookie_is_named(self):
+        got = "\n".join(self._probe({"stel_token": "x" * 120}))
+        self.assertIn("stel_ssid: нет", got)
+
+    def test_no_secret_ever_reaches_the_report(self):
+        secret = "SUPERSECRETVALUE"
+        got = "\n".join(self._probe({"stel_token": secret * 8,
+                                     "stel_ssid": "y" * 20,
+                                     "stel_ton_token": "z" * 400}))
+        self.assertNotIn(secret, got)
+
+    def test_every_user_agent_is_tried(self):
+        got = "\n".join(self._probe({"stel_token": "x" * 120}))
+        for label, _ua in F._USER_AGENTS:
+            self.assertIn(label, got)
+
 if __name__ == "__main__":
     unittest.main()

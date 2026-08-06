@@ -586,12 +586,27 @@ def probe_session_sync(cookies: dict) -> list[str]:
     out: list[str] = []
     cookies = cookies or {}
     out.append(f"Кук задано: {len(cookies)}")
+    # Типичные длины. Не проверка подлинности, а проверка правдоподобия:
+    # stel_token длиннее stel_ssid в разы, и обратное соотношение почти
+    # всегда значит, что значения попали не в свои поля.
+    typical = {"stel_token": (60, 400), "stel_ssid": (10, 40),
+               "stel_ton_token": (100, 2000)}
     for name in ("stel_token", "stel_ssid", "stel_ton_token"):
         value = str(cookies.get(name) or "")
         # Значения не печатаем — это доступ к аккаунту. Длина скажет
         # достаточно: обрезанная при копировании кука видна сразу.
-        out.append(f"  · {name}: "
-                   + (f"{len(value)} символов" if value else "нет"))
+        if not value:
+            out.append(f"  · {name}: нет")
+            continue
+        low, high = typical[name]
+        mark = "" if low <= len(value) <= high else "  ⚠️ необычная длина"
+        out.append(f"  · {name}: {len(value)} символов "
+                   f"(обычно {low}–{high}){mark}")
+    token, ssid = (str(cookies.get("stel_token") or ""),
+                   str(cookies.get("stel_ssid") or ""))
+    if token and ssid and len(ssid) > len(token):
+        out.append("⚠️ stel_ssid длиннее stel_token — обычно наоборот. "
+                   "Похоже, значения перепутаны местами.")
     extra = [k for k in cookies if k not in
              ("stel_token", "stel_ssid", "stel_ton_token")]
     if extra:
@@ -616,6 +631,15 @@ def probe_session_sync(cookies: dict) -> list[str]:
                    + ("✅ вошли" if signed else "гость"))
         if signed:
             out.append("  ↑ вот с этим User-Agent сессия признаётся")
+        # Что Fragment ставит сам: имена кук, которые он на самом деле
+        # использует. Если среди них есть та, которой у нас нет, гадать о
+        # «неполном наборе» больше не придётся.
+        try:
+            names = sorted({c.name for c in session.cookies})
+        except Exception:
+            names = []
+        if names:
+            out.append(f"  куки после ответа: {', '.join(names[:8])}")
     return out
 
 
