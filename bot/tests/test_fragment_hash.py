@@ -318,15 +318,33 @@ class WhenTheSessionCannotBuy(Case):
 
 
 class ComparingWallets(unittest.TestCase):
-    def test_the_two_ways_of_writing_one_address_match(self):
-        eq = "EQAbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIj"
-        uq = "UQAbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIj"
-        self.assertTrue(F._same_wallet(eq, uq))
+    """У одного адреса три записи: EQ…, UQ… и сырая 0:hex. Сравнение строк
+    объявляло их разными кошельками — и бот уверенно сообщал «Fragment
+    примет оплату только со своего», глядя на два написания одного и того
+    же адреса."""
+
+    EQ = "EQA24k42CMkz2G0SzJoSVjxkneLkcqY4V-4NvhXEtB_aX13S"
+    RAW = "0:36e24e3608c933d86d12cc9a12563c649de2e472a63857ee0dbe15c4b41fda5f"
+
+    def test_the_raw_form_is_the_same_wallet(self):
+        self.assertTrue(F._same_wallet(self.EQ, self.RAW))
+        self.assertTrue(F._same_wallet(self.RAW, self.EQ))
+
+    def test_bounceable_and_not_are_the_same_wallet(self):
+        """EQ… и UQ… различаются одним флагом, кошелёк за ними один."""
+        import base64 as _b64
+        raw = _b64.urlsafe_b64decode(self.EQ + "=" * (-len(self.EQ) % 4))
+        uq = _b64.urlsafe_b64encode(bytes([0x51]) + raw[1:]).decode().rstrip("=")
+        self.assertEqual(F.wallet_hash(uq), F.wallet_hash(self.EQ))
 
     def test_different_addresses_do_not(self):
-        self.assertFalse(F._same_wallet(
-            "EQAbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIj",
-            "EQZzZzZzGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIj"))
+        other = ("0:0000003608c933d86d12cc9a12563c649de2e472a63857ee0dbe15c4"
+                 "b41fda5f")
+        self.assertFalse(F._same_wallet(self.EQ, other))
+
+    def test_rubbish_is_not_matched_to_anything(self):
+        self.assertEqual(F.wallet_hash("не адрес"), "")
+        self.assertFalse(F._same_wallet("не адрес", self.EQ))
 
     def test_a_missing_address_is_never_a_match(self):
         self.assertFalse(F._same_wallet("", "EQAbCd"))

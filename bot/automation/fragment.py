@@ -511,11 +511,34 @@ def wallet_address_sync(mnemonic: str, wallet_version: str = "v4r2") -> str:
         return ""
 
 
+def wallet_hash(addr: str) -> str:
+    """Внутренний хеш адреса — то, чем один кошелёк отличается от другого.
+
+    У одного адреса три записи: EQ… и UQ… (base64url, различаются только
+    флагом bounceable) и сырая 0:hex. Сравнение строк объявляло их разными
+    кошельками — и бот уверенно сообщал «Fragment примет оплату только со
+    своего», глядя на два написания одного и того же.
+    """
+    v = str(addr or "").strip()
+    if not v:
+        return ""
+    if ":" in v:                                  # сырая форма 0:hex
+        tail = v.split(":", 1)[1].lower()
+        return tail if re.fullmatch(r"[0-9a-f]{64}", tail) else ""
+    try:
+        raw = base64.urlsafe_b64decode(v + "=" * (-len(v) % 4))
+    except Exception:
+        return ""
+    # tag(1) + workchain(1) + hash(32) + crc(2)
+    return raw[2:34].hex() if len(raw) == 36 else ""
+
+
 def _same_wallet(a: str, b: str) -> bool:
-    """Один ли это кошелёк. EQ… и UQ… — две записи одного адреса."""
-    if not a or not b:
-        return False
-    return a[2:] == b[2:] if a[:1] in "EU" and b[:1] in "EU" else a == b
+    """Один ли это кошелёк — по хешу, а не по написанию."""
+    ha, hb = wallet_hash(a), wallet_hash(b)
+    if ha and hb:
+        return ha == hb
+    return bool(a) and bool(b) and str(a).strip() == str(b).strip()
 
 
 def page_signals(html: str) -> list[str]:
