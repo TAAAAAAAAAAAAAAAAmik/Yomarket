@@ -259,12 +259,12 @@ def buy_stars_sync(
             # Получателя Fragment нашёл — значит сессия жива. Отказ именно на
             # покупке: её разрешает не вход через Telegram, а привязанный
             # TON-кошелёк. Голое «Access denied» продавцу ничего не говорит.
-            return False, ("Fragment: «Access denied» — сессии не разрешена "
-                           "покупка. Обычно это значит, что к аккаунту "
-                           "Fragment не подключён TON-кошелёк, либо подключён "
-                           "не тот, чья seed-фраза задана боту. Проверьте "
-                           "сверку кошельков: AutoStars → 🔑 Данные Fragment "
-                           "→ 🧪 Проверить вход.")
+            return False, ("Fragment: «Access denied» — сессию он признаёт "
+                           "(получателя нашёл), но покупку ей не разрешает. "
+                           "Проверьте сверку кошельков: AutoStars → "
+                           "🔑 Данные Fragment → 🧪 Проверить вход. Если там "
+                           "«это один кошелёк», причина в другом — покажет "
+                           "команда /stars_probe <ник>.")
         return False, f"initBuyStarsRequest не дал req_id: {err}"
 
     # 3. wallet
@@ -697,6 +697,83 @@ def probe_session_sync(cookies: dict) -> list[str]:
             names = []
         if names:
             out.append(f"  куки после ответа: {', '.join(names[:8])}")
+    return out
+
+
+def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
+                   api_hash: str = "") -> list[str]:
+    """Где именно ломается покупка — по шагам и в нескольких вариантах.
+
+    Поиск получателя проходит, а заявка отвечает «Access denied»: значит
+    сессию Fragment признаёт, но покупку ей не разрешает. Причин может быть
+    несколько — заголовки запроса, хеш не с той страницы, — и перебрать их
+    дешевле, чем рассуждать. Ничего не оплачивается: заявка (initBuyStars-
+    Request) денег не двигает, списание происходит только при отправке
+    подписанной транзакции.
+    """
+    username = (username or "").strip().lstrip("@")
+    out: list[str] = []
+    if not cookies or not username:
+        return ["нужны куки и ник"]
+
+    hashes = collect_api_hashes_sync(cookies) or []
+    stored = (api_hash or "").strip()
+    if stored and stored not in hashes:
+        hashes.insert(0, stored)
+    if not hashes:
+        return ["не нашёл ни одного api-hash на страницах Fragment"]
+    out.append(f"Хешей найдено: {len(hashes)}")
+
+    variants = (
+        ("как сейчас", {"X-Requested-With": "XMLHttpRequest",
+                        "Origin": "https://fragment.com",
+                        "Referer": "https://fragment.com/stars"}),
+        ("referer /stars/buy", {"X-Requested-With": "XMLHttpRequest",
+                                "Origin": "https://fragment.com",
+                                "Referer": "https://fragment.com/stars/buy"}),
+        ("без XHR-заголовка", {"Origin": "https://fragment.com",
+                               "Referer": "https://fragment.com/stars"}),
+    )
+
+    for label, extra in variants:
+        session = requests.Session()
+        session.cookies.update(cookies)
+        session.headers.update({
+            "User-Agent": _USER_AGENTS[0][1],
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            **extra,
+        })
+        for h in hashes[:2]:
+            tag = f"{label} · хеш …{h[-6:]}"
+            try:
+                r = session.post(FRAGMENT_API_URL, params={"hash": h},
+                                 data={"method": "searchStarsRecipient",
+                                       "query": username,
+                                       "quantity": quantity}, timeout=20)
+                search = r.json()
+            except Exception as e:
+                out.append(f"{tag}: поиск — ошибка {str(e)[:40]}")
+                continue
+            recipient = _extract_recipient(search)
+            if not recipient:
+                out.append(f"{tag}: поиск — "
+                           f"{str(search.get('error') or search)[:60]}")
+                continue
+            try:
+                r2 = session.post(FRAGMENT_API_URL, params={"hash": h},
+                                  data={"method": "initBuyStarsRequest",
+                                        "recipient": recipient,
+                                        "quantity": quantity}, timeout=20)
+                init = r2.json()
+            except Exception as e:
+                out.append(f"{tag}: заявка — ошибка {str(e)[:40]}")
+                continue
+            req_id = init.get("req_id") or init.get("id")
+            if req_id:
+                out.append(f"✅ {tag}: заявка принята — вот рабочий вариант")
+                return out
+            out.append(f"{tag}: заявка — "
+                       f"{str(init.get('error') or init)[:80]}")
     return out
 
 

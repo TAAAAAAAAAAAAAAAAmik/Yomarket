@@ -604,6 +604,44 @@ async def fragment_debug(message: Message) -> None:
     await status.edit_text(f"🔍 <b>Сессия Fragment</b>\n<code>{body}</code>")
 
 
+@router.message(Command("stars_probe"))
+async def stars_probe(message: Message) -> None:
+    """/stars_probe <ник> [кол-во] — на каком шаге ломается покупка.
+
+    Ничего не оплачивает: доходит до заявки, а деньги двигает только
+    подписанная транзакция после неё.
+    """
+    from automation.fragment import probe_buy_sync
+
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Укажите ник: <code>/stars_probe NO0RD</code>")
+        return
+    username = parts[1].lstrip("@")
+    try:
+        qty = int(parts[2]) if len(parts) > 2 else 50
+    except ValueError:
+        qty = 50
+    creds = get_fragment_creds(message.from_user.id) or {}
+    if not creds.get("cookies"):
+        await message.answer("⚠️ Куки Fragment не заданы")
+        return
+    status = await message.answer("⏳ Пробую варианты запроса…")
+    loop = asyncio.get_event_loop()
+    try:
+        lines = await asyncio.wait_for(
+            loop.run_in_executor(None, functools.partial(
+                probe_buy_sync, creds["cookies"], username, qty,
+                creds.get("api_hash", ""))),
+            timeout=120)
+    except Exception as e:
+        await status.edit_text(f"❌ {html.escape(str(e)[:200])}")
+        return
+    body = "\n".join(html.escape(str(x)) for x in lines)[:3500]
+    await status.edit_text(f"🔍 <b>Покупка {qty}⭐ для @{html.escape(username)}"
+                           f"</b>\n<code>{body}</code>")
+
+
 @router.callback_query(F.data == "plugins:stars:set_hash")
 async def stars_set_hash_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     creds = get_fragment_creds(callback.from_user.id) or {}
