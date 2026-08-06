@@ -163,5 +163,66 @@ class TheChecklist(CredsCase):
                             for l in labels), labels)
 
 
+
+class RecognisingWhichCookieIsWhich(unittest.TestCase):
+    """Значения вводятся по одной куке, и перепутать поля легко: выглядят
+    они одинаково «технически». Fragment на такой набор отвечает как гостю,
+    и дальше причину ищут в хеше, кошельке и куках по очереди — полдня."""
+
+    def setUp(self):
+        from automation.fragment import guess_cookie_name
+        self.guess = guess_cookie_name
+
+    SSID = "03227614fa4151fc3e_13062736091860598753"
+    TOKEN = ("8a61aff62666763ee015ca472626f0968a61afec8a61ada31cfa"
+             "7d1fb33da463cfafe")
+    TON = "N" + "sUG_9x1GB5bVh7xxY9pfq2gR215uABZ" * 6
+
+    def test_the_session_id_is_known_by_its_underscore(self):
+        self.assertEqual(self.guess(self.SSID), "stel_ssid")
+
+    def test_the_token_is_plain_hex(self):
+        self.assertEqual(self.guess(self.TOKEN), "stel_token")
+
+    def test_the_wallet_token_is_long_and_base64(self):
+        self.assertEqual(self.guess(self.TON), "stel_ton_token")
+
+    def test_nothing_is_guessed_from_nonsense(self):
+        self.assertEqual(self.guess("просто текст"), "")
+        self.assertEqual(self.guess(""), "")
+
+    def test_a_short_hex_is_not_taken_for_a_token(self):
+        """Иначе обрезанное при копировании значение прошло бы за целое."""
+        self.assertEqual(self.guess("8a61aff626"), "")
+
+
+class TheProbeNamesTheMixUp(unittest.TestCase):
+    def test_swapped_fields_are_reported(self):
+        import automation.fragment as FR
+
+        class Sess:
+            headers: dict = {}
+            cookies = type("C", (), {"update": staticmethod(lambda *a: None),
+                                     "__iter__": lambda self: iter(())})()
+
+            @staticmethod
+            def get(url, **kw):
+                class R:
+                    status_code = 200
+                    text = "<html>Connect TON</html>"
+                return R()
+
+        old = FR.requests.Session
+        FR.requests.Session = lambda: Sess()
+        try:
+            out = "\n".join(FR.probe_session_sync({
+                "stel_token": RecognisingWhichCookieIsWhich.SSID,
+                "stel_ssid": RecognisingWhichCookieIsWhich.TOKEN,
+            }))
+        finally:
+            FR.requests.Session = old
+        self.assertIn("не в свои поля", out)
+        self.assertIn("в stel_token лежит значение от stel_ssid", out)
+
 if __name__ == "__main__":
     unittest.main()

@@ -375,6 +375,20 @@ async def stars_set_one_cookie_input(message: Message,
         await message.answer("❌ Пустое значение — ничего не сохранил.",
                              reply_markup=_creds_kb(False, cookies))
         return
+
+    # Куки вводятся по одной, и перепутать поля легко — у значений
+    # одинаково «технический» вид. Но отличаются они надёжно, так что
+    # значение кладётся туда, откуда оно на самом деле: молча сохранить его
+    # не в своё поле значит отдать Fragment набор, на который он ответит как
+    # гостю, и дальше искать причину в куках, хеше и кошельке по очереди.
+    from automation.fragment import guess_cookie_name
+    looks = guess_cookie_name(raw)
+    moved = ""
+    if looks and looks != name:
+        moved = (f"\n\n↪️ Это значение похоже на <b>{looks}</b>, а не на "
+                 f"<b>{name}</b> — сохранил его как {looks}. "
+                 f"Проверьте, что в остальные поля попало своё.")
+        name = looks
     cookies[name] = raw
     save_fragment_creds(message.from_user.id, {"cookies": cookies})
     creds = get_fragment_creds(message.from_user.id) or {}
@@ -382,7 +396,7 @@ async def stars_set_one_cookie_input(message: Message,
     if not creds.get("mnemonic"):
         left.append("🔐 Seed-фраза TON")
     await message.answer(
-        f"✅ Сохранено: <b>{name}</b>"
+        f"✅ Сохранено: <b>{name}</b>" + moved
         + (f"\n\nОсталось заполнить: {', '.join(left)}" if left
            else "\n\nВсё готово — проверьте вход кнопкой «🧪 Проверить вход»."),
         reply_markup=_creds_kb(not left and bool(creds.get("mnemonic")), cookies),

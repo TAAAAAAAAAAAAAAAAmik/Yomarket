@@ -575,6 +575,26 @@ _USER_AGENTS = (
 )
 
 
+def guess_cookie_name(value: str) -> str:
+    """На какую куку Fragment похоже это значение. Пусто — не похоже ни на что.
+
+    Куки вводятся по одной, и перепутать поля легко: у stel_ssid и
+    stel_token значения выглядят одинаково «технически». Отличаются они
+    надёжно — у ssid есть подчёркивание и он короткий, token — сплошной
+    hex, ton_token заметно длиннее и в base64url.
+    """
+    v = str(value or "").strip()
+    if not v:
+        return ""
+    if re.fullmatch(r"[0-9a-f]{8,32}_\d{6,30}", v):
+        return "stel_ssid"
+    if re.fullmatch(r"[0-9a-f]{40,400}", v):
+        return "stel_token"
+    if len(v) > 100 and re.fullmatch(r"[A-Za-z0-9_\-=]+", v):
+        return "stel_ton_token"
+    return ""
+
+
 def probe_session_sync(cookies: dict) -> list[str]:
     """Почему Fragment не признаёт эту сессию — перебором, а не рассуждением.
 
@@ -602,11 +622,25 @@ def probe_session_sync(cookies: dict) -> list[str]:
         mark = "" if low <= len(value) <= high else "  ⚠️ необычная длина"
         out.append(f"  · {name}: {len(value)} символов "
                    f"(обычно {low}–{high}){mark}")
-    token, ssid = (str(cookies.get("stel_token") or ""),
-                   str(cookies.get("stel_ssid") or ""))
-    if token and ssid and len(ssid) > len(token):
-        out.append("⚠️ stel_ssid длиннее stel_token — обычно наоборот. "
-                   "Похоже, значения перепутаны местами.")
+    # Не только по длине: у значений есть узнаваемый вид, и перепутанные
+    # поля видно наверняка, а не по подозрению.
+    wrong = []
+    for name in ("stel_token", "stel_ssid", "stel_ton_token"):
+        value = str(cookies.get(name) or "")
+        looks = guess_cookie_name(value)
+        if value and looks and looks != name:
+            wrong.append(f"в {name} лежит значение от {looks}")
+    if wrong:
+        out.append("⚠️ Значения попали не в свои поля: " + "; ".join(wrong)
+                   + ". Введите их заново по одному.")
+    else:
+        # Формат опознаётся не всегда — например, у значения непривычного
+        # вида. Соотношение длин остаётся вторым, более грубым признаком.
+        token, ssid = (str(cookies.get("stel_token") or ""),
+                       str(cookies.get("stel_ssid") or ""))
+        if token and ssid and len(ssid) > len(token):
+            out.append("⚠️ stel_ssid длиннее stel_token — обычно наоборот. "
+                       "Похоже, значения перепутаны местами.")
     extra = [k for k in cookies if k not in
              ("stel_token", "stel_ssid", "stel_ton_token")]
     if extra:
