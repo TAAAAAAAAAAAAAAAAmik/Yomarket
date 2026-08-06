@@ -637,7 +637,19 @@ async def stars_probe(message: Message) -> None:
     except Exception as e:
         await status.edit_text(f"❌ {html.escape(str(e)[:200])}")
         return
-    body = "\n".join(html.escape(str(x)) for x in lines)[:3500]
+    # Форма запроса перебрана — если ни одна не прошла, полезнее посмотреть,
+    # что о своих же запросах говорит страница Fragment.
+    if not any(str(x).startswith("✅") for x in lines):
+        from automation.fragment import probe_page_api_sync
+        try:
+            lines = list(lines) + ["", "— что говорит страница —"] + list(
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, probe_page_api_sync,
+                                         creds["cookies"]),
+                    timeout=60))
+        except Exception as e:
+            lines = list(lines) + [f"страница: {str(e)[:60]}"]
+    body = "\n".join(html.escape(str(x)) for x in lines)[:3800]
     await status.edit_text(f"🔍 <b>Покупка {qty}⭐ для @{html.escape(username)}"
                            f"</b>\n<code>{body}</code>")
 

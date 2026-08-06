@@ -783,6 +783,54 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
     return out
 
 
+def probe_page_api_sync(cookies: dict) -> list[str]:
+    """Что страница покупки говорит о своих же запросах.
+
+    Пять вариантов формы запроса получили один и тот же «Access denied», а
+    поиск получателя прошёл в каждом — значит дело не в том, как мы шлём, а
+    в том, что шлём или кем. Образец, по которому написан код, мог устареть:
+    Fragment мог переименовать метод или начать требовать поле, которого мы
+    не шлём. Всё это лежит в скриптах его собственной страницы.
+    """
+    out: list[str] = []
+    session = _page_session(cookies or {})
+    for url in ("https://fragment.com/stars/buy", "https://fragment.com/stars"):
+        try:
+            r = session.get(url, timeout=20)
+        except Exception as e:
+            out.append(f"{url}: {str(e)[:50]}")
+            continue
+        if r.status_code != 200:
+            out.append(f"{url}: HTTP {r.status_code}")
+            continue
+        body = r.text or ""
+        out.append(f"{url}: {len(body)} символов")
+
+        # Имена методов, которые страница вызывает у /api
+        methods = sorted(set(re.findall(
+            r"""method['"]?\s*[:=]\s*['"]([A-Za-z][A-Za-z0-9_]{3,40})['"]""",
+            body)))
+        if methods:
+            out.append("  методы: " + ", ".join(methods[:12]))
+        stars = [m for m in methods if "star" in m.lower()]
+        if stars:
+            out.append("  из них про звёзды: " + ", ".join(stars))
+
+        # Поля, которые уходят вместе с покупкой — рядом с её вызовом
+        for name in ("initBuyStarsRequest", "getBuyStarsLink"):
+            at = body.find(name)
+            if at < 0:
+                out.append(f"  {name}: на странице не упоминается")
+                continue
+            around = body[max(0, at - 200):at + 400]
+            fields = sorted(set(re.findall(r"['\"]?([a-z_]{3,20})['\"]?\s*:",
+                                           around)))
+            out.append(f"  {name}: рядом поля — "
+                       + ", ".join(fields[:12]))
+        break
+    return out
+
+
 def check_fragment_session_sync(cookies: dict,
                                 api_hash: str = "") -> tuple[bool, object]:
     """Light check that the Fragment session is alive.
