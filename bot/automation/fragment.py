@@ -702,20 +702,21 @@ def probe_session_sync(cookies: dict) -> list[str]:
 
 def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
                    api_hash: str = "") -> list[str]:
-    """Где именно ломается покупка — по шагам и в нескольких вариантах.
+    """Где именно ломается покупка — перебором того, чем запросы отличаются.
 
-    Поиск получателя проходит, а заявка отвечает «Access denied»: значит
-    сессию Fragment признаёт, но покупку ей не разрешает. Причин может быть
-    несколько — заголовки запроса, хеш не с той страницы, — и перебрать их
-    дешевле, чем рассуждать. Ничего не оплачивается: заявка (initBuyStars-
-    Request) денег не двигает, списание происходит только при отправке
-    подписанной транзакции.
+    Рабочий образец шлёт всё в строке запроса и ставит только User-Agent;
+    здесь параметры уехали в тело, а к ним добавились Origin и
+    X-Requested-With. Что из этого мешает — вопрос эксперимента, а не
+    рассуждения, тем более что поиск получателя проходит в обоих случаях.
+
+    Ничего не оплачивается: заявка денег не двигает, списание происходит
+    только при отправке подписанной транзакции после неё.
     """
     username = (username or "").strip().lstrip("@")
-    out: list[str] = []
     if not cookies or not username:
         return ["нужны куки и ник"]
 
+    out: list[str] = []
     hashes = collect_api_hashes_sync(cookies) or []
     stored = (api_hash or "").strip()
     if stored and stored not in hashes:
@@ -724,33 +725,41 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
         return ["не нашёл ни одного api-hash на страницах Fragment"]
     out.append(f"Хешей найдено: {len(hashes)}")
 
+    plain = {"User-Agent": "Mozilla/5.0"}
+    rich = {"User-Agent": _USER_AGENTS[0][1],
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://fragment.com",
+            "Referer": "https://fragment.com/stars"}
+
+    # (название, всё-в-строке-запроса, заголовки, слать ли quantity в поиске)
     variants = (
-        ("как сейчас", {"X-Requested-With": "XMLHttpRequest",
-                        "Origin": "https://fragment.com",
-                        "Referer": "https://fragment.com/stars"}),
-        ("referer /stars/buy", {"X-Requested-With": "XMLHttpRequest",
-                                "Origin": "https://fragment.com",
-                                "Referer": "https://fragment.com/stars/buy"}),
-        ("без XHR-заголовка", {"Origin": "https://fragment.com",
-                               "Referer": "https://fragment.com/stars"}),
+        ("как в образце", True, plain, False),
+        ("строка запроса + наши заголовки", True, rich, False),
+        ("тело запроса, без quantity", False, rich, False),
+        ("тело запроса, с quantity", False, rich, True),
+        ("тело запроса, простые заголовки", False, plain, True),
     )
 
-    for label, extra in variants:
-        session = requests.Session()
-        session.cookies.update(cookies)
-        session.headers.update({
-            "User-Agent": _USER_AGENTS[0][1],
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            **extra,
-        })
+    def call(session, in_query, h, method, args):
+        if in_query:
+            return session.post(FRAGMENT_API_URL,
+                                params={"method": method, "hash": h, **args},
+                                timeout=20)
+        return session.post(FRAGMENT_API_URL, params={"hash": h},
+                            data={"method": method, **args}, timeout=20)
+
+    for label, in_query, headers, with_qty in variants:
         for h in hashes[:2]:
             tag = f"{label} · хеш …{h[-6:]}"
+            session = requests.Session()
+            session.cookies.update(cookies)
+            session.headers.update(headers)
+            args = {"query": username}
+            if with_qty:
+                args["quantity"] = quantity
             try:
-                r = session.post(FRAGMENT_API_URL, params={"hash": h},
-                                 data={"method": "searchStarsRecipient",
-                                       "query": username,
-                                       "quantity": quantity}, timeout=20)
-                search = r.json()
+                search = call(session, in_query, h,
+                              "searchStarsRecipient", args).json()
             except Exception as e:
                 out.append(f"{tag}: поиск — ошибка {str(e)[:40]}")
                 continue
@@ -760,20 +769,17 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
                            f"{str(search.get('error') or search)[:60]}")
                 continue
             try:
-                r2 = session.post(FRAGMENT_API_URL, params={"hash": h},
-                                  data={"method": "initBuyStarsRequest",
-                                        "recipient": recipient,
-                                        "quantity": quantity}, timeout=20)
-                init = r2.json()
+                init = call(session, in_query, h, "initBuyStarsRequest",
+                            {"recipient": recipient,
+                             "quantity": quantity}).json()
             except Exception as e:
                 out.append(f"{tag}: заявка — ошибка {str(e)[:40]}")
                 continue
-            req_id = init.get("req_id") or init.get("id")
-            if req_id:
-                out.append(f"✅ {tag}: заявка принята — вот рабочий вариант")
+            if init.get("req_id") or init.get("id"):
+                out.append(f"✅ {tag}: ЗАЯВКА ПРИНЯТА — вот рабочий вариант")
                 return out
             out.append(f"{tag}: заявка — "
-                       f"{str(init.get('error') or init)[:80]}")
+                       f"{str(init.get('error') or init)[:70]}")
     return out
 
 
