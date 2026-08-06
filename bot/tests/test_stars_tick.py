@@ -250,5 +250,86 @@ class WatchingTheWallet(unittest.TestCase):
             self.assertEqual(h.balance_watch(), "")
 
 
+
+class RetryingAfterAFailure(unittest.TestCase):
+    """Покупатель присылает ник один раз. Если покупка сорвалась, ждать от
+    него второго сообщения бессмысленно — а именно это и происходило:
+    заказ возвращался в ожидание пустым и стоял до эскалации."""
+
+    def _settings(self, **over):
+        p = {"enabled": True, "ask_username": True, "amount": 50,
+             "pending": {}, "delivered": [], "stuck": {}}
+        p.update(over)
+        return {"plugins": {"auto_stars": p},
+                "known_orders": {"77": "paid"},
+                "known_order_details": {"77": {"chat_id": "99"}}}
+
+    def _manager(self):
+        from tasks.manager import TaskManager
+        tm = TaskManager.__new__(TaskManager)
+        tm.notes = []
+        tm.delivered = []
+
+        async def _notify(uid, text, **kw):
+            tm.notes.append(text)
+
+        async def _deliver(user_id, api, settings, order_id, text, chat_id):
+            tm.delivered.append((order_id, text))
+            return True
+
+        tm._notify = _notify
+        tm._maybe_deliver_stars_reply = _deliver
+        return tm
+
+    def test_the_username_survives_a_failed_purchase(self):
+        """Иначе повторять будет нечем."""
+        import inspect
+        from tasks import manager as M
+        src = inspect.getsource(M.TaskManager._maybe_deliver_stars_reply)
+        self.assertIn('"username": username', src,
+                      "ник должен сохраняться в pending при неудаче")
+
+    def test_a_known_username_is_retried_without_the_buyer(self):
+        import asyncio
+        tm = self._manager()
+        now = time.time()
+        s = self._settings(pending={"77": {"quantity": 50, "username": "NO0RD",
+                                           "chat_id": "99", "tries": 1,
+                                           "asked_at": now - 60,
+                                           "retry_at": now - 1}})
+        asyncio.run(tm._stars_pending_sweep(1, None, s, now))
+        self.assertEqual(tm.delivered, [("77", "@NO0RD")], tm.delivered)
+
+    def test_it_waits_out_the_pause_between_attempts(self):
+        """Повтор через секунду упрётся в ту же причину."""
+        import asyncio
+        tm = self._manager()
+        now = time.time()
+        s = self._settings(pending={"77": {"quantity": 50, "username": "NO0RD",
+                                           "chat_id": "99", "tries": 1,
+                                           "asked_at": now - 60,
+                                           "retry_at": now + 600}})
+        asyncio.run(tm._stars_pending_sweep(1, None, s, now))
+        self.assertEqual(tm.delivered, [])
+
+    def test_an_order_still_waiting_for_a_username_is_not_retried(self):
+        import asyncio
+        tm = self._manager()
+        now = time.time()
+        s = self._settings(pending={"77": {"quantity": 50, "chat_id": "99",
+                                           "asked_at": now - 60}})
+        asyncio.run(tm._stars_pending_sweep(1, None, s, now))
+        self.assertEqual(tm.delivered, [])
+
+    def test_the_next_attempt_is_scheduled_after_this_one(self):
+        import asyncio
+        tm = self._manager()
+        now = time.time()
+        entry = {"quantity": 50, "username": "NO0RD", "chat_id": "99",
+                 "tries": 1, "asked_at": now - 60, "retry_at": now - 1}
+        s = self._settings(pending={"77": entry})
+        asyncio.run(tm._stars_pending_sweep(1, None, s, now))
+        self.assertGreater(float(entry["retry_at"]), now)
+
 if __name__ == "__main__":
     unittest.main()

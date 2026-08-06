@@ -1686,8 +1686,14 @@ class TaskManager:
             # одинаковое «не удалось»: в ленте их было с десяток подряд.
             tries = int(entry.get("tries", 0) or 0) + 1
             if tries < self._STARS_MAX_TRIES:
+                # Ник сохраняем: покупатель прислал его один раз и второй раз
+                # не пришлёт. Без этого заказ возвращался в ожидание пустым и
+                # ждал сообщения, которого не будет, — автовыдача после первой
+                # же неудачи молча умирала.
                 pending[order_id] = {**entry, "quantity": qty,
-                                     "asked_at": time.time(), "tries": tries}
+                                     "username": username,
+                                     "asked_at": time.time(), "tries": tries,
+                                     "retry_at": time.time() + self._STARS_RETRY_AFTER}
                 await self._send_chat(
                     api, chat_id,
                     stars_text(settings, "failed", qty=qty, username=username),
@@ -1710,6 +1716,10 @@ class TaskManager:
                     + "Выдайте вручную: Плагины → AutoStars → 🚀 Ручная выдача",
                 )
         return True
+
+    # Через сколько повторить покупку, которая не удалась. Не сразу: отказ
+    # чаще всего временный, но повтор через секунду упрётся в ту же причину.
+    _STARS_RETRY_AFTER = 20 * 60
 
     # Сколько раз пытаться выдать звёзды по одному заказу, прежде чем оставить
     # его продавцу. Без счёта каждая неудача возвращала заказ в очередь, и
@@ -1736,6 +1746,19 @@ class TaskManager:
         for order_id, entry in list(pending.items()):
             if not isinstance(entry, dict):
                 continue
+
+            # Ник известен — ждать нечего, надо повторять покупку. Раньше
+            # заказ с уже полученным ником стоял в очереди «ждут username»
+            # до эскалации: повтор случался только если покупатель напишет
+            # ещё раз, а зачем бы ему.
+            known = str(entry.get("username") or "").lstrip("@")
+            if known and now >= float(entry.get("retry_at") or 0):
+                entry["retry_at"] = now + self._STARS_RETRY_AFTER
+                await self._maybe_deliver_stars_reply(
+                    user_id, api, settings, order_id, f"@{known}",
+                    str(entry.get("chat_id") or ""))
+                continue
+
             waited = now - float(entry.get("asked_at") or 0)
             chat_id = entry.get("chat_id")
             reminded = int(entry.get("reminded") or 0)
