@@ -414,19 +414,16 @@ _HASH_PAGES = ("https://fragment.com/stars",
                "https://fragment.com/premium")
 
 
-def fetch_api_hash_sync(cookies: dict, report: list | None = None) -> str:
-    """The api hash Fragment issued to this session, read off its own page.
+def collect_api_hashes_sync(cookies: dict,
+                            report: list | None = None) -> list[str]:
+    """Все хеши, какие видны на страницах Fragment, — в порядке доверия.
 
-    Fragment stamps every request with a per-session hash, and a hash from
-    somebody else's session is answered with «Bad request» — which is what a
-    hardcoded one produced. It sits in the page's own JavaScript, so there is
-    no reason to make a seller find it by hand, let alone open developer tools
-    on a phone.
-
-    `report` собирает, что ответила каждая страница: без этого «не нашёл» —
-    это тупик, а с ним видно, истекли ли куки или изменилась разметка.
+    Раньше брался первый совпавший, и этого не хватило: в разметке лежит не
+    один «hash», и подойти к API может не тот, что нашёлся первым. Перебрать
+    несколько дешевле, чем гадать.
     """
     session = _page_session(cookies or {})
+    found: list[str] = []
     for url in _HASH_PAGES:
         try:
             r = session.get(url, timeout=20)
@@ -442,20 +439,39 @@ def fetch_api_hash_sync(cookies: dict, report: list | None = None) -> str:
         if r.status_code != 200:
             continue
         for pattern in _HASH_PATTERNS:
-            m = re.search(pattern, body)
-            if m:
-                if report is not None:
-                    report.append(f"хеш найден на {url}")
-                return m.group(1)
-    return ""
+            for m in re.finditer(pattern, body):
+                h = m.group(1)
+                if h and h not in found:
+                    found.append(h)
+        if found and report is not None:
+            report.append(f"кандидатов в хеш на этой странице: {len(found)}")
+        if found:
+            break
+    return found
+
+
+def fetch_api_hash_sync(cookies: dict, report: list | None = None) -> str:
+    """The api hash Fragment issued to this session, read off its own page.
+
+    Fragment stamps every request with a per-session hash, and a hash from
+    somebody else's session is answered with «Bad request» — which is what a
+    hardcoded one produced. It sits in the page's own JavaScript, so there is
+    no reason to make a seller find it by hand, let alone open developer tools
+    on a phone.
+    """
+    got = collect_api_hashes_sync(cookies, report)
+    return got[0] if got else ""
 
 
 # Адрес TON-кошелька на странице Fragment. Покупку разрешает не вход через
-# Telegram, а привязанный кошелёк, и его адрес виден в разметке.
-_ADDR_RE = re.compile(r"\b([EU]Q[A-Za-z0-9_-]{46})\b")
+# Telegram, а привязанный кошелёк, и его адрес виден в разметке. Границу
+# слова в конце не ставим: адрес может заканчиваться на «-» или «_», и \b
+# после них не срабатывает.
+_ADDR_RE = re.compile(r"(?<![A-Za-z0-9_-])([EU]Q[A-Za-z0-9_-]{46})")
+_RAW_ADDR_RE = re.compile(r"(?<![0-9a-fA-F:])(0:[0-9a-fA-F]{64})")
 
 
-def wallet_on_page_sync(cookies: dict) -> str:
+def wallet_on_page_sync(cookies: dict, report: list | None = None) -> str:
     """Какой TON-кошелёк Fragment считает привязанным к этой сессии.
 
     «Access denied» на покупке означает не «куки протухли», а «этой сессии
@@ -471,10 +487,11 @@ def wallet_on_page_sync(cookies: dict) -> str:
             continue
         if r.status_code != 200:
             continue
-        found = _ADDR_RE.findall(r.text or "")
+        body = r.text or ""
+        found = _ADDR_RE.findall(body) or _RAW_ADDR_RE.findall(body)
+        if report is not None:
+            report.append(f"{url}: адресов в разметке {len(found)}")
         if found:
-            # Первый попавшийся адрес — свой: чужие в разметке страницы
-            # покупки не встречаются, а если встретятся, увидим это в сверке.
             return found[0]
     return ""
 
@@ -536,27 +553,40 @@ def check_fragment_session_sync(cookies: dict,
     if data is not None and (data.get("ok") or data.get("found")):
         return True, "сессия работает"
 
-    # «Bad request» is what a hash from another session earns. Fetch this
-    # session's own and try once more before blaming the cookies.
+    # «Bad request» — это ответ на чужой хеш. Собираем все, какие видны на
+    # странице, и пробуем каждый: в разметке их несколько, и подойти может не
+    # первый.
     report: list[str] = []
-    fresh = fetch_api_hash_sync(cookies, report)
-    if fresh and fresh != (api_hash or DEFAULT_HASH):
-        data2, err2 = _try(fresh)
+    tried = {(api_hash or DEFAULT_HASH)}
+    fresh = ""
+    for candidate in collect_api_hashes_sync(cookies, report):
+        if candidate in tried:
+            continue
+        tried.add(candidate)
+        data2, err2 = _try(candidate)
         if data2 is not None and (data2.get("ok") or data2.get("found")):
             return True, {"message": "сессия работает (обновил api-hash)",
-                          "api_hash": fresh}
+                          "api_hash": candidate}
         data, err = data2, err2
+        fresh = candidate
+    checked = len(tried) - 1
 
     if err:
         return False, err
     said = str((data or {}).get("error") or data)[:120]
     if "bad request" in said.lower():
-        # Отправлять человека в F12 — плохой ответ: с телефона это невозможно,
-        # а причина почти всегда одна и та же. Говорим, что увидели сами.
         guest = any("не видно входа" in line for line in report)
-        why = ("Куки Fragment больше не действуют — страница отдаётся как "
-               "гостю." if guest else
-               "Хеш сессии со страницы Fragment прочитать не удалось.")
+        if guest:
+            why = "Куки Fragment больше не действуют — страница отдаётся как гостю."
+        elif checked:
+            # Хеши нашлись, но ни один не принят. Говорить «прочитать не
+            # удалось» здесь — прямая ложь, и она уводит от настоящей причины.
+            why = (f"Со страницы прочитано хешей: {checked}, и Fragment не "
+                   f"принял ни один. Обычно так отвечает сессия, которую "
+                   f"Fragment считает чужой: куки скопированы из другого "
+                   f"браузера или устарели.")
+        else:
+            why = "Хеш сессии со страницы Fragment прочитать не удалось."
         return False, {
             "message": f"Fragment: «Bad request». {why}",
             "how": ("Хеш вводить руками не нужно — бот читает его сам. "

@@ -519,8 +519,8 @@ async def stars_check_creds(callback: CallbackQuery) -> None:
     if creds.get("cookies"):
         try:
             on_page, mine = await asyncio.wait_for(asyncio.gather(
-                loop.run_in_executor(None, wallet_on_page_sync,
-                                     creds["cookies"]),
+                loop.run_in_executor(None, functools.partial(
+                    wallet_on_page_sync, creds["cookies"])),
                 loop.run_in_executor(None, wallet_address_sync,
                                      creds.get("mnemonic", ""),
                                      creds.get("wallet_version", "v4r2"))),

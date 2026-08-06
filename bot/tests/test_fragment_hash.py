@@ -355,5 +355,67 @@ class ComparingWallets(unittest.TestCase):
         finally:
             F._page_session = old
 
+
+class TryingEveryCandidate(Case):
+    """В разметке лежит не один «hash», и подойти может не первый."""
+
+    TWO = ('<script>var a = {"hash":"aaaaaaaaaaaaaaaa"};'
+           ' var b = "/api?hash=bbbbbbbbbbbbbbbb";</script>')
+
+    def test_the_second_candidate_is_tried_when_the_first_fails(self):
+        self.fake.page = self.TWO
+        self.fake.good_hash = "bbbbbbbbbbbbbbbb"
+        ok, res = F.check_fragment_session_sync(COOKIES, "stale")
+        self.assertTrue(ok, res)
+        self.assertEqual(res["api_hash"], "bbbbbbbbbbbbbbbb")
+
+    def test_all_candidates_are_collected(self):
+        self.fake.page = self.TWO
+        got = F.collect_api_hashes_sync(COOKIES)
+        self.assertIn("aaaaaaaaaaaaaaaa", got)
+        self.assertIn("bbbbbbbbbbbbbbbb", got)
+
+    def test_a_hash_that_was_read_but_refused_is_not_called_unreadable(self):
+        """Прежний текст говорил «прочитать не удалось», хотя отчёт рядом
+        сообщал «хеш найден» — и уводил от настоящей причины."""
+        self.fake.page = self.TWO
+        self.fake.good_hash = "\x00nothing-matches"
+        ok, res = F.check_fragment_session_sync(COOKIES, "stale")
+        self.assertFalse(ok)
+        self.assertNotIn("прочитать не удалось", res["message"])
+        self.assertIn("не принял ни один", res["message"])
+
+    def test_with_no_candidates_at_all_it_still_says_so(self):
+        self.fake.page = "<html>пусто</html>"
+        self.fake.good_hash = "\x00nothing-matches"
+        ok, res = F.check_fragment_session_sync(COOKIES, "stale")
+        self.assertFalse(ok)
+        self.assertIn("прочитать не удалось", res["message"])
+
+    def test_the_stored_hash_is_not_retried_as_a_candidate(self):
+        self.fake.page = self.TWO
+        self.fake.good_hash = "\x00nothing-matches"
+        F.check_fragment_session_sync(COOKIES, "aaaaaaaaaaaaaaaa")
+        used = [p.get("hash") for p in self.fake.posts]
+        self.assertEqual(used.count("aaaaaaaaaaaaaaaa"), 1, used)
+
+
+class ReadingTheWalletOffThePage(Case):
+    ADDR = "EQA24k42CMkz2G0SzJoSVjxkneLkcqY4V-4NvhXEtB_aX13S"
+
+    def test_an_address_ending_in_a_dash_is_still_found(self):
+        """У адреса на конце бывает «-» или «_», и \\b там не срабатывает."""
+        self.fake.page = f'<div data-address="{self.ADDR}"></div>'
+        self.assertEqual(F.wallet_on_page_sync(COOKIES), self.ADDR)
+
+    def test_the_raw_form_is_understood_too(self):
+        raw = "0:" + "ab" * 32
+        self.fake.page = f'<span>{raw}</span>'
+        self.assertEqual(F.wallet_on_page_sync(COOKIES), raw)
+
+    def test_a_page_with_no_wallet_says_nothing_rather_than_guessing(self):
+        self.fake.page = "<div>Connect TON</div>"
+        self.assertEqual(F.wallet_on_page_sync(COOKIES), "")
+
 if __name__ == "__main__":
     unittest.main()
