@@ -1343,6 +1343,18 @@ class TaskManager:
                     stale = age > _MSG_FRESH
                     if stale:
                         missed.append((order_id, chat_id, raw_text))
+                        # Записываем и это: пропуск по давности — тоже причина
+                        # молчания, а без записи экран «Почему молчит» уверенно
+                        # отвечает «не молчал», хотя покупателю не ответили.
+                        import autoreply as _ar
+                        conf = _ar.cfg(settings)
+                        if conf.get("enabled"):
+                            conf["last_skip"] = {
+                                "ts": time.time(), "chat": str(chat_id),
+                                "text": (raw_text or "")[:80],
+                                "why": (f"сообщению {age / 3600:.0f} ч — "
+                                        f"отвечать поздно, чат помечен "
+                                        f"ждущим")}
                         continue
 
                     time_str = _fmt_time(msg.get("created_at") or msg.get("date"))

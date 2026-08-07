@@ -1126,8 +1126,14 @@ async def ar_why(callback: CallbackQuery) -> None:
         ago = int((datetime.now().timestamp() - ts) / 60)
         lines.append(f"{_sw(ago < 5)} Чаты читались "
                      + ("только что" if ago < 1 else f"{ago} мин назад"))
-        lines.append(f"   под наблюдением: <b>{poll.get('chats', 0)}</b> "
-                     f"из {poll.get('orders', 0)} заказов")
+        watched = int(poll.get("chats", 0) or 0)
+        total = int(poll.get("orders", 0) or 0)
+        lines.append(f"   под наблюдением: <b>{watched}</b> из {total} заказов")
+        if total > watched:
+            # Опрашиваются самые свежие заказы. Сообщение в старом чате бот
+            # не увидит вовсе — и это не «не сработало правило», а другое.
+            lines.append(f"   <i>Старые {total - watched} заказов не "
+                         f"опрашиваются — в них бот сообщений не увидит.</i>")
         if poll.get("new_msgs"):
             lines.append(f"   новых сообщений в прошлый заход: "
                          f"<b>{poll['new_msgs']}</b>")
