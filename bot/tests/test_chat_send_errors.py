@@ -323,7 +323,9 @@ class AWatermarkFromAnotherChatDeafensThisOne(unittest.TestCase):
 
     def test_the_watermark_is_repaired_to_this_chat_s_own_newest(self):
         s, _api = self._run("15488419", self.FRESH)
-        self.assertEqual(s["known_messages"]["77"], "5")
+        # Отметка живёт на чате, а не на заказе: у постоянного покупателя
+        # заказов несколько, а переписка одна.
+        self.assertEqual(s["known_messages"]["c99"], "5")
 
     def test_the_repair_happens_once_not_every_pass(self):
         """Второй проход не должен отвечать на то же самое снова."""
@@ -347,7 +349,7 @@ class AWatermarkFromAnotherChatDeafensThisOne(unittest.TestCase):
                  "created_at": stamp(600)}]
         s, api = self._run("9", rows)
         self.assertEqual(api.sent, [])
-        self.assertEqual(s["known_messages"]["77"], "9")
+        self.assertEqual(s["known_messages"]["c99"], "9")
 
 
 if __name__ == "__main__":

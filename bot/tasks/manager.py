@@ -1386,22 +1386,35 @@ class TaskManager:
         order_details: dict = settings.get("known_order_details", {})
 
         active = _chats_to_poll(known_orders, order_details)
+        # Постоянный покупатель ведёт ВСЕ свои заказы в одном чате: у второго
+        # и третьего заказа тот же chat_id. Опрос шёл по заказам, поэтому один
+        # и тот же чат читался столько раз, сколько у покупателя заказов, — и
+        # каждое его письмо приходило продавцу столько же раз. У случайного
+        # покупателя заказ один, и там всё выглядело исправно.
+        by_chat: dict[str, list[str]] = {}
+        for oid in active:
+            cid = str((order_details.get(oid) or {}).get("chat_id") or oid)
+            by_chat.setdefault(cid, []).append(oid)
+
         # Пульс опроса: по нему видно, читает ли бот чаты вообще. Без этого
         # «автоответы не работают» невозможно отличить от «до чатов не дошло».
-        poll = {"ts": 0.0, "chats": len(active), "orders": len(known_orders),
+        poll = {"ts": 0.0, "chats": len(by_chat), "orders": len(known_orders),
                 "new_msgs": 0, "error": ""}
         # Сообщения, которые бот увидел с опозданием (чат раньше не читался).
         # Они собираются здесь и уходят одной сводкой, а не пачкой уведомлений.
         missed: list[tuple[str, str, str]] = []
 
-        for order_id in active:
+        for chat_id, chat_orders in by_chat.items():
+            # `active` отсортирован от свежих к старым, значит первый — самый
+            # свежий заказ этого покупателя. Письмо почти наверняка про него:
+            # к нему и привязываем товар, ник и очередь выдачи звёзд.
+            order_id = chat_orders[0]
             try:
                 # Messages live under the ORDER'S CHAT, not the order:
                 # GET /chats/{chat_id}/messages. Querying by order id returned
                 # nothing whenever the two differ, so buyer messages never
                 # arrived. The id was already stored when the order was seen.
                 details = order_details.get(order_id, {})
-                chat_id = str(details.get("chat_id") or order_id)
 
                 data = await api.get_messages(chat_id)
                 # Чат прочитался — прошлые сбои больше не в счёт. Отметку
@@ -1414,7 +1427,24 @@ class TaskManager:
                     continue
 
                 newest_id = _newest_id(messages)
-                last_known_id = known_messages.get(order_id)
+                # Отметка «дочитано» теперь на ЧАТ, а не на заказ: у одного
+                # чата их может быть несколько, и каждая отмечала прочитанное
+                # отдельно. Старые отметки по заказам сворачиваем в одну и
+                # берём самую дальнюю — так ничего не объявится по второму
+                # разу при переходе на новый ключ.
+                mark_key = f"c{chat_id}"
+                last_known_id = known_messages.get(mark_key)
+                for oid in chat_orders:
+                    old = known_messages.pop(oid, None)
+                    if old is None:
+                        continue
+                    if last_known_id is None or _is_newer(old, last_known_id):
+                        last_known_id = old
+                if last_known_id is not None:
+                    # Записываем сразу: ниже несколько законных `continue`, а
+                    # старые ключи уже сняты — иначе свёртка потерялась бы, и
+                    # чат на следующем проходе выглядел бы непрочитанным.
+                    known_messages[mark_key] = last_known_id
 
                 # Кто написал последним — этим и подсвечивается чат в списке.
                 # Считается на каждом проходе, даже когда новых сообщений нет:
@@ -1438,7 +1468,7 @@ class TaskManager:
                             det["waiting"] = (_ts_of(newest) or time.time())
 
                 if last_known_id is None:
-                    known_messages[order_id] = newest_id
+                    known_messages[mark_key] = newest_id
                     continue
 
                 # Отметка «дочитано до» выше всего, что есть в чате, — значит
@@ -1593,7 +1623,7 @@ class TaskManager:
                         order_id=order_id, text=raw_text, details=details,
                         is_complaint=is_complaint, batch=answerable)
 
-                known_messages[order_id] = newest_id
+                known_messages[mark_key] = newest_id
 
             except Exception as e:
                 logger.warning("Message check for order %s: %s", order_id, e)
