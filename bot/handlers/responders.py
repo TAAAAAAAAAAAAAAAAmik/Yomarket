@@ -9,6 +9,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from storage import get_settings, save_settings
 
 import autoreply as ar
+import localtime as _lt
 from datetime import datetime
 
 router = Router()
@@ -487,7 +488,7 @@ def _sw(on: bool) -> str:
     return "🟢" if on else "🔴"
 
 
-def _ar_text(conf: dict) -> str:
+def _ar_text(conf: dict, s: dict | None = None) -> str:
     rules = conf.get("rules") or []
     live = [r for r in rules if r.get("on", True) and (r.get("text") or "").strip()]
     fb = conf.get("fallback") or {}
@@ -515,7 +516,7 @@ def _ar_text(conf: dict) -> str:
     if sent:
         failed = sum(1 for e in sent if not e.get("ok"))
         last = sent[0]
-        when_s = datetime.fromtimestamp(float(last.get("ts", 0) or 0)).strftime("%d.%m %H:%M")
+        when_s = _lt.fmt(float(last.get("ts", 0) or 0), s)
         lines += ["", f"📜 Последний: {'✅' if last.get('ok') else '❌'} {when_s}"]
         if failed:
             lines.append(f"   ❌ не доставлено за последнее время: <b>{failed}</b>")
@@ -543,8 +544,8 @@ def _ar_kb(conf: dict) -> InlineKeyboardMarkup:
 @router.callback_query(F.data == "ar:menu")
 async def ar_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    _, conf = _conf(callback.from_user.id)
-    await callback.message.edit_text(_ar_text(conf), reply_markup=_ar_kb(conf))
+    s, conf = _conf(callback.from_user.id)
+    await callback.message.edit_text(_ar_text(conf, s), reply_markup=_ar_kb(conf))
     await callback.answer()
 
 
@@ -561,7 +562,7 @@ async def ar_toggle(callback: CallbackQuery) -> None:
                               show_alert=True)
         return await ar_templates(callback)
     await callback.answer("🟢 Включено" if conf["enabled"] else "🔴 Выключено")
-    await callback.message.edit_text(_ar_text(conf), reply_markup=_ar_kb(conf))
+    await callback.message.edit_text(_ar_text(conf, s), reply_markup=_ar_kb(conf))
 
 
 # ─────────────────────────────── правила ───────────────────────────────
@@ -748,7 +749,7 @@ async def ar_add_text(message: Message, state: FSMContext) -> None:
         f"✅ Правило добавлено и автоответы включены.\n\n"
         f"🔑 <b>{_esc(', '.join(words))}</b>\n"
         f"<blockquote>{_esc(body)}</blockquote>")
-    await message.answer(_ar_text(conf), reply_markup=_ar_kb(conf))
+    await message.answer(_ar_text(conf, s), reply_markup=_ar_kb(conf))
 
 
 @router.callback_query(F.data.startswith("ar:rkw:"))
@@ -886,7 +887,7 @@ async def ar_template_apply(callback: CallbackQuery, state: FSMContext) -> None:
     _save(callback.from_user.id, s)
     await callback.answer(f"✅ {what}", show_alert=True)
     await state.clear()
-    await callback.message.edit_text(_ar_text(conf), reply_markup=_ar_kb(conf))
+    await callback.message.edit_text(_ar_text(conf, s), reply_markup=_ar_kb(conf))
 
 
 # ─────────────────────────── когда отвечать ───────────────────────────
@@ -1077,14 +1078,14 @@ async def ar_test_run(message: Message, state: FSMContext) -> None:
                 known.items(), key=lambda kv: float(kv[1].get("seen_at", 0) or 0),
                 reverse=True)[0]
         body = ar.render(rule.get("text", ""),
-                         ar.context(details, oid, s.get("shop_name", "")))
+                         ar.context(details, oid, s.get("shop_name", ""), s))
         where = (f"правило «{_esc(matched)}»" if matched else "запасной ответ")
         lines.append(f"\n✅ Сработает: <b>{where}</b>")
         lines.append(f"\n💬 Уйдёт в чат:\n<blockquote>{_esc(body)}</blockquote>")
         if details:
             lines.append(f"<i>Подставлены данные заказа #{_esc(oid)}.</i>")
 
-        allowed, why = ar.gate(conf, "тест-чат")
+        allowed, why = ar.gate(conf, "тест-чат", settings=s)
         lines.append(f"\n{'🟢' if allowed else '🔴'} Отправка: {_esc(why)}")
 
     b = InlineKeyboardBuilder()
@@ -1135,6 +1136,8 @@ async def ar_why(callback: CallbackQuery) -> None:
 
     ts = float(poll.get("ts") or 0)
     if ts:
+        # Разность моментов эпохи от часового пояса не зависит:
+        # это «сколько минут назад», а не время на часах.
         ago = int((datetime.now().timestamp() - ts) / 60)
         lines.append(f"{_sw(ago < 5)} Чаты читались "
                      + ("только что" if ago < 1 else f"{ago} мин назад"))
@@ -1158,7 +1161,7 @@ async def ar_why(callback: CallbackQuery) -> None:
 
     skip = conf.get("last_skip") or {}
     if skip:
-        when = datetime.fromtimestamp(float(skip.get("ts", 0) or 0)).strftime("%d.%m %H:%M")
+        when = _lt.fmt(float(skip.get("ts", 0) or 0), s)
         lines += ["", f"🔇 <b>Последний раз промолчал</b> ({when})",
                   f"   На сообщение: <i>{_esc(str(skip.get('text', ''))[:70])}</i>",
                   f"   Причина: <b>{_esc(skip.get('why', ''))}</b>"]
@@ -1166,7 +1169,7 @@ async def ar_why(callback: CallbackQuery) -> None:
     sent = conf.get("log") or []
     if sent:
         last = sent[0]
-        when = datetime.fromtimestamp(float(last.get("ts", 0) or 0)).strftime("%d.%m %H:%M")
+        when = _lt.fmt(float(last.get("ts", 0) or 0), s)
         lines += ["", f"📜 Последняя отправка: {'✅' if last.get('ok') else '❌'} {when}"]
         if not last.get("ok"):
             why, fixable = ar.explain_error(str(last.get("err", "")))
@@ -1205,13 +1208,13 @@ async def ar_why_quiet_off(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "ar:log")
 async def ar_log(callback: CallbackQuery) -> None:
-    _, conf = _conf(callback.from_user.id)
+    s, conf = _conf(callback.from_user.id)
     entries = conf.get("log") or []
     lines = ["📜 <b>Журнал автоответов</b>", ""]
     if not entries:
         lines.append("Пока пусто — бот ещё ничего не отправлял.")
     for e in entries[:15]:
-        when = datetime.fromtimestamp(float(e.get("ts", 0) or 0)).strftime("%d.%m %H:%M")
+        when = _lt.fmt(float(e.get("ts", 0) or 0), s)
         mark = "✅" if e.get("ok") else "❌"
         tag = f" · {_esc(e.get('rule'))}" if e.get("rule") else ""
         lines.append(f"{mark} <code>{when}</code>{tag}")

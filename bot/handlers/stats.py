@@ -13,6 +13,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
+import localtime as _lt
 from storage import get_settings
 from handlers.balance import _parse_check, _bump_spent, _RUB
 from stats_source import (LOCAL, PANEL, day_start, events_for, invalidate,
@@ -85,7 +86,7 @@ async def show_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
     events, source, panel_err = await _events(uid)
 
     now = time.time()
-    d0 = day_start(now)
+    d0 = day_start(now, settings)
     today = summarize(events, d0)
     week = summarize(events, now - 7 * 86400)
     month = summarize(events, now - 30 * 86400)
@@ -168,6 +169,7 @@ async def show_operations(callback: CallbackQuery) -> None:
 
     icons = {"sale": "🛒", "payout": "💸", "bump": "⬆️", "refund": "↩️",
              "in": "➕", "out": "➖", "other": "•", "order": "🧾"}
+    s = get_settings(callback.from_user.id)
     rows = sorted(events, key=lambda e: float(e.get("ts") or 0), reverse=True)[:20]
 
     lines = ["💳 <b>Последние операции</b>", ""]
@@ -175,7 +177,7 @@ async def show_operations(callback: CallbackQuery) -> None:
         lines.append("Операций нет." if source == PANEL
                      else "Панель не отдала операции, а локальная история пуста.")
     for e in rows:
-        when = datetime.fromtimestamp(float(e["ts"])).strftime("%d.%m %H:%M") \
+        when = _lt.fmt(float(e["ts"]), s) \
             if e.get("ts") else "—"
         kind = str(e.get("kind") or "other")
         sign = "−" if kind in ("payout", "bump", "out") else ""
@@ -208,7 +210,7 @@ async def show_revenue(callback: CallbackQuery) -> None:
     now = time.time()
     # «Сегодня» means since midnight, not «за последние 24 часа» — a seller
     # comparing the figure against the panel counts the calendar day.
-    since = day_start(now) if days == 1 else (now - days * 86400 if days else 0.0)
+    since = day_start(now, settings) if days == 1 else (now - days * 86400 if days else 0.0)
     agg = summarize(events, since)
     count, revenue = agg["sales"], agg["revenue"]
 
@@ -225,7 +227,7 @@ async def show_revenue(callback: CallbackQuery) -> None:
     spent_exact = True
     if not spent and source == LOCAL:
         bs = settings.get("bump_schedule", {})
-        if days == 1 and bs.get("spent_day") == datetime.now().strftime("%Y-%m-%d"):
+        if days == 1 and bs.get("spent_day") == _lt.today_str(settings):
             spent = float(bs.get("spent_today", 0) or 0)
         else:
             spent = float(bs.get("spent_total", 0) or 0)
@@ -295,13 +297,14 @@ async def show_chart(callback: CallbackQuery) -> None:
     await callback.answer()
 
     events, source, err = await _events(callback.from_user.id)
+    s = get_settings(callback.from_user.id)
 
-    today = datetime.now().date()
+    today = _lt.now(s).date()
     days_counts: dict[int, int] = defaultdict(int)
     days_revenue: dict[int, float] = defaultdict(float)
 
-    for e in _sales(events, day_start() - 6 * 86400):
-        sold = datetime.fromtimestamp(float(e["ts"])).date()
+    for e in _sales(events, day_start(None, s) - 6 * 86400):
+        sold = _lt.to_local(float(e["ts"]), s).date()
         delta = (today - sold).days
         if 0 <= delta < 7:
             idx = 6 - delta
@@ -390,7 +393,7 @@ async def export_orders(callback: CallbackQuery, api: YooMarketAPI) -> None:
 
     lines = [
         "YooMarket — Экспорт заказов",
-        f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        f"Дата: {_lt.now(s).strftime('%d.%m.%Y %H:%M')}",
         f"Всего заказов: {len(known_orders)}",
         "=" * 40,
         "",
@@ -503,11 +506,12 @@ async def show_hours_chart(callback: CallbackQuery) -> None:
 
     events, source, err = await _events(callback.from_user.id)
 
+    s = get_settings(callback.from_user.id)
     hour_counts: dict[int, int] = defaultdict(int)
     # Local time, not UTC: a «пиковый час» three hours off tells the seller to
     # promote at the wrong time of day.
     for e in _sales(events):
-        hour_counts[datetime.fromtimestamp(float(e["ts"])).hour] += 1
+        hour_counts[_lt.to_local(float(e["ts"]), s).hour] += 1
 
     total_count = sum(hour_counts.values())
 
@@ -611,6 +615,7 @@ async def export_orders_csv(callback: CallbackQuery) -> None:
     await callback.answer("⏳ Генерирую CSV...", show_alert=False)
 
     events, source, _err = await _events(callback.from_user.id)
+    s = get_settings(callback.from_user.id)
     rows = sorted(events, key=lambda e: float(e.get("ts") or 0), reverse=True)
 
     output = io.StringIO()
@@ -620,7 +625,7 @@ async def export_orders_csv(callback: CallbackQuery) -> None:
 
     for e in rows:
         ts = float(e.get("ts") or 0)
-        date_str = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M") if ts else "—"
+        date_str = _lt.fmt(ts, s, "%d.%m.%Y %H:%M") or "—"
         kind = str(e.get("kind") or "other")
         amount = e.get("amount")
         signed = -amount if (amount is not None and kind in
@@ -676,7 +681,7 @@ async def stats_debug(message: Message) -> None:
     invalidate(message.from_user.id)
     events, source, err = await _events(message.from_user.id, force=True)
     now = time.time()
-    today = summarize(events, day_start(now))
+    today = summarize(events, day_start(now, s))
     week = summarize(events, now - 7 * 86400)
     tail = (f"\n\nсобытий: {len(events)} (источник {source}{', ' + err if err else ''})"
             f"\nсегодня: {today['sales']} продаж / {today['revenue']:.0f} ₽"

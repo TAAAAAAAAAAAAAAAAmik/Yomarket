@@ -176,8 +176,17 @@ def is_due(watch: dict, pp: dict, now: float | None = None) -> bool:
     return (now - last) / 3600.0 >= watch_interval_hours(watch, pp)
 
 
-def _day(now: float) -> str:
-    return _time.strftime("%Y-%m-%d", _time.localtime(now))
+def _day(now: float, pp: dict | None = None) -> str:
+    """Какие это сутки — по часам продавца, а не сервера.
+
+    Дневной бюджет на продвижение обнулялся в полночь по UTC, то есть
+    посреди дня продавца. Смещение кладёт сюда `_check_position` на каждом
+    проходе: настройки целиком в эти функции не доходят, а сутки считать
+    надо здесь.
+    """
+    import localtime as _lt
+    return _lt.to_local(now, {"tz_offset_min": (pp or {}).get(
+        "_tz_min", _lt.DEFAULT_OFFSET_MIN)}).strftime("%Y-%m-%d")
 
 
 def daily_budget(pp: dict) -> float:
@@ -195,7 +204,7 @@ def daily_budget(pp: dict) -> float:
 
 def spent_today(pp: dict, now: float) -> float:
     """What this trigger has already spent today, in roubles."""
-    if pp.get("spent_day") != _day(now):
+    if pp.get("spent_day") != _day(now, pp):
         return 0.0
     try:
         return float(pp.get("spent_today") or 0)
@@ -208,7 +217,7 @@ def promos_left(watch: dict, pp: dict, now: float) -> int:
     limit = daily_limit(pp)
     if not limit:
         return -1
-    used = int(watch.get("promos_today") or 0) if watch.get("promo_day") == _day(now) else 0
+    used = int(watch.get("promos_today") or 0) if watch.get("promo_day") == _day(now, pp) else 0
     return max(0, limit - used)
 
 
@@ -232,7 +241,7 @@ def note_promotion(watch: dict, now: float, price: float = 0,
     Only what really went through is recorded: a refused action is not a
     promotion, and counting it would spend the day's budget on nothing.
     """
-    today = _day(now)
+    today = _day(now, pp)
     if watch.get("promo_day") != today:
         watch["promo_day"] = today
         watch["promos_today"] = 0

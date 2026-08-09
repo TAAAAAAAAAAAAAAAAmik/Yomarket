@@ -98,8 +98,12 @@ def render(text: str, ctx: dict | None = None) -> str:
 
 
 def context(details: dict | None = None, order_id: str = "",
-            shop: str = "") -> dict:
-    """Контекст подстановки из того, что бот уже знает о заказе."""
+            shop: str = "", settings: dict | None = None) -> dict:
+    """Контекст подстановки из того, что бот уже знает о заказе.
+
+    {время} — часы продавца: покупателю уходило время сервера, то есть
+    чужое."""
+    import localtime as _lt
     d = details or {}
     return {
         "title": d.get("title") or "",
@@ -108,7 +112,7 @@ def context(details: dict | None = None, order_id: str = "",
         "quantity": d.get("quantity") or "",
         "order_id": str(order_id or ""),
         "shop": shop or "",
-        "time": time.strftime("%H:%M"),
+        "time": _lt.now(settings).strftime("%H:%M"),
     }
 
 
@@ -171,9 +175,19 @@ def pick(conf: dict, text: str) -> tuple[dict | None, str]:
 
 # ─────────────────────────── когда можно отвечать ───────────────────────────
 
-def in_quiet_window(conf: dict, now: float | None = None) -> bool:
-    """Сейчас «нерабочее» время (окно может переходить через полночь)."""
-    hour = time.localtime(now if now is not None else time.time()).tm_hour
+def in_quiet_window(conf: dict, now: float | None = None,
+                    settings: dict | None = None) -> bool:
+    """Сейчас «нерабочее» время (окно может переходить через полночь).
+
+    Часы — продавца, а не сервера. Контейнер живёт по UTC, и окно
+    «22:00—09:00» у продавца из UTC+5 работало с 03:00 до 14:00: бот молчал
+    весь его вечер и отвечал среди рабочего дня.
+    """
+    import localtime as _lt
+    if now is not None:
+        hour = _lt.to_local(now, settings).hour
+    else:
+        hour = _lt.hour(settings)
     start = int(conf.get("from_hour", 22) or 0)
     end = int(conf.get("to_hour", 9) or 0)
     if start == end:
@@ -183,8 +197,8 @@ def in_quiet_window(conf: dict, now: float | None = None) -> bool:
     return hour >= start or hour < end   # 22:00 → 09:00
 
 
-def gate(conf: dict, chat_id: str, now: float | None = None
-         ) -> tuple[bool, str]:
+def gate(conf: dict, chat_id: str, now: float | None = None,
+         settings: dict | None = None) -> tuple[bool, str]:
     """Можно ли сейчас отправить автоответ в этот чат → (можно, причина).
 
     Причина возвращается всегда, даже когда «можно»: её показывает экран
@@ -193,7 +207,7 @@ def gate(conf: dict, chat_id: str, now: float | None = None
     now = now if now is not None else time.time()
     if not conf.get("enabled"):
         return False, "автоответы выключены"
-    if conf.get("quiet_only") and not in_quiet_window(conf, now):
+    if conf.get("quiet_only") and not in_quiet_window(conf, now, settings):
         return False, (f"сейчас рабочее время — отвечаю только "
                        f"с {int(conf.get('from_hour', 22)):02d}:00 "
                        f"до {int(conf.get('to_hour', 9)):02d}:00")

@@ -4363,8 +4363,8 @@ def panel_stats_probe_sync(cookie_string: str) -> str:
         out.append(f"{res}: {str(e)[:80]}")
 
     for op in ops[:5]:
-        when = (datetime.fromtimestamp(op["ts"], tz=timezone.utc)
-                .strftime("%d.%m %H:%M") if op.get("ts") else "без даты")
+        import localtime as _lt
+        when = _lt.fmt(op.get("ts"), None) or "без даты"
         out.append(f"  · {when} | {op.get('kind')} / {op.get('direction')} | "
                    f"{op.get('amount')} ₽ | {str(op.get('type') or '')[:24]} | "
                    f"{str(op.get('title') or '')[:24]}")

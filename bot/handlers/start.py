@@ -12,7 +12,7 @@ from storage import delete_token, get_token, save_token, get_settings, save_sett
 router = Router()
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-08-09-own-reply-and-publish"
+BOT_VERSION = "2026-08-09-seller-timezone"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -148,7 +148,9 @@ async def cmd_sent(message: Message) -> None:
     import storage
     from tasks.manager import _SENT_LOG, _SENDER_LEASE_TTL
 
-    lease = (storage.get_settings(message.from_user.id).get("_sender") or {})
+    import localtime as _lt
+    _settings = storage.get_settings(message.from_user.id)
+    lease = (_settings.get("_sender") or {})
     owner = str(lease.get("inst") or "—")
     age = _time.time() - float(lease.get("ts") or 0)
     mine = owner == INSTANCE_ID
@@ -166,7 +168,7 @@ async def cmd_sent(message: Message) -> None:
         seen[head] = seen.get(head, 0) + 1
     import html as _h
     for ts, head in _SENT_LOG[-15:]:
-        when = _time.strftime("%H:%M:%S", _time.localtime(ts))
+        when = _lt.fmt(ts, _settings, "%H:%M:%S")
         mark = "‼️" if seen.get(head, 0) > 1 else "•"
         lines.append(f"{mark} <code>{when}</code> {_h.escape(head)}")
     lines += ["", "<i>‼️ — этот процесс отправил одно и то же дважды. "

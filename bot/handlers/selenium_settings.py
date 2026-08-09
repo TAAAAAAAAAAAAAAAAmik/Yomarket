@@ -46,12 +46,16 @@ def _st(on: bool) -> str:
     return "🟢 ВКЛ" if on else "🔴 ВЫКЛ"
 
 
-def _fmt_ts(ts) -> str:
+def _fmt_ts(ts, s: dict | None = None) -> str:
+    """Отметка времени глазами продавца."""
     if not ts:
         return "—"
     try:
-        dt = datetime.fromtimestamp(float(ts)) if isinstance(ts, (int, float)) else datetime.strptime(str(ts)[:19], "%Y-%m-%dT%H:%M:%S")
-        return dt.strftime("%d.%m %H:%M")
+        import localtime as _lt
+        from tasks.manager import _ts_of
+        epoch = float(ts) if isinstance(ts, (int, float)) \
+            else _ts_of({"created_at": ts})
+        return _lt.fmt(epoch, s) or str(ts)[:16]
     except Exception:
         return str(ts)[:16]
 
@@ -199,8 +203,10 @@ def _sched_text(s: dict) -> str:
     times = bs.get("times") or []
     price = promo_price(s) or float(bs.get("price_per_bump", 0) or 0)
     ceiling = float(bs.get("daily_ceiling", 0) or 0)
+    import localtime as _lt
+    # Ключ суток пишется по часам продавца — сравнивать надо тем же.
     spent = float(bs.get("spent_today", 0) or 0) if (
-        bs.get("spent_day") == datetime.now().strftime("%Y-%m-%d")) else 0.0
+        bs.get("spent_day") == _lt.today_str(s)) else 0.0
     lines = [
         "🕐 <b>Авто-продвижение по времени</b>\n",
         f"Статус: {_st(bs.get('enabled', False))}",

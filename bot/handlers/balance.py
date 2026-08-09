@@ -11,6 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
 from keyboards.main import back_keyboard
+import localtime as _lt
 from storage import get_settings, save_settings
 
 router = Router()
@@ -210,7 +211,7 @@ def _bump_spent(s: dict, since: float) -> float:
     """Promotion spend to subtract from revenue. Only today's is tracked
     precisely; for the week it is the best figure available."""
     bs = s.get("bump_schedule", {})
-    if bs.get("spent_day") == datetime.now().strftime("%Y-%m-%d"):
+    if bs.get("spent_day") == _lt.today_str(s):
         return float(bs.get("spent_today", 0) or 0)
     return 0.0
 
@@ -220,7 +221,8 @@ def _activity_block(uid: int) -> str:
     details = s.get("known_order_details", {})
     known = s.get("known_orders", {})
     now = time.time()
-    day_start = now - (now % 86400)
+    from stats_source import day_start as _day_start
+    day_start = _day_start(now, s)
     week_start = now - 7 * 86400
 
     d_sales, d_rev = _earned(details, known, day_start)
@@ -1071,13 +1073,14 @@ async def withdrawal_history(callback: CallbackQuery, api: YooMarketAPI) -> None
         else:
             lines = [f"📜 <b>История выводов</b> ({len(hist)})\n"
                      "<i>(локальный журнал бота)</i>\n"]
+            s = get_settings(callback.from_user.id)
             for w in hist[:25]:
                 amt = w.get("amount", 0)
                 amt_str = f"{amt:.0f} ₽" if amt else "всё"
                 wtype = "🤖" if w.get("type") == "auto" else "✋"
                 st = "✅" if w.get("status") == "requested" else "❌"
                 try:
-                    date = datetime.fromtimestamp(w.get("ts", 0)).strftime("%d.%m %H:%M")
+                    date = _lt.fmt(w.get("ts", 0), s)
                 except Exception:
                     date = ""
                 lines.append(f"{st} {wtype} <b>{amt_str}</b>  {date}")

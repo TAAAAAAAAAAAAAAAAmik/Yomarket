@@ -898,18 +898,25 @@ async def wchat_history(callback: CallbackQuery, api: YooMarketAPI) -> None:
         mine = bool(msg.get("is_mine") or msg.get("is_own")) or str(sender).lower() in (
             "me", "self", "own", "shop", "seller")
         who = "🟢 Вы" if mine else f"🛟 {label}"
-        when = _fmt_msg_time(msg.get("created_at") or msg.get("date"))
+        when = _fmt_msg_time(msg.get("created_at") or msg.get("date"),
+                             get_settings(callback.from_user.id))
         await callback.message.answer(
             f"{who}{('  •  🕐 ' + when) if when else ''}\n"
             f"<blockquote>{_esc(text[:900])}</blockquote>")
 
 
-def _fmt_msg_time(raw) -> str:
+def _fmt_msg_time(raw, settings: dict | None = None) -> str:
+    """Время письма глазами продавца.
+
+    Строка приходит со смещением («…+00:00»), а разбиралась как местная —
+    продавец видел время сервера.
+    """
     if not raw:
         return ""
     try:
-        from datetime import datetime
-        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).strftime("%d.%m %H:%M")
+        import localtime as _lt
+        from tasks.manager import _ts_of
+        return _lt.fmt(_ts_of({"created_at": raw}), settings) or str(raw)[:16]
     except Exception:
         return str(raw)[:16]
 
@@ -1036,6 +1043,7 @@ async def _chain_report(uid: int, api: YooMarketAPI, order_id: str,
     """
     import time
     import autoreply as ar
+    import localtime as _lt
     import orderfields as of
     from tasks.manager import _chats_to_poll, _msg_rows, _msg_text, _ts_of, \
         _is_own_message, _is_our_text, _is_service_message, _is_newer, \
@@ -1077,8 +1085,7 @@ async def _chain_report(uid: int, api: YooMarketAPI, order_id: str,
     for m in ordered[-3:]:
         who = ("🏪" if _is_own_message(m) or _is_our_text(s, chat_id, _msg_text(m))
                else "⚙️" if _is_service_message(m) else "👤")
-        when = time.strftime("%d.%m %H:%M", time.localtime(_ts_of(m))) \
-            if _ts_of(m) else "—"
+        when = _lt.fmt(_ts_of(m), s) or "—"
         out.append(f"   {who} <code>{when}</code> "
                    f"<i>{_esc(_msg_text(m)[:55]) or '(пусто)'}</i>")
 
@@ -1120,7 +1127,7 @@ async def _chain_report(uid: int, api: YooMarketAPI, order_id: str,
     else:
         where = f"правило «{_esc(matched)}»" if matched else "запасной ответ"
         out.append(f"   🟢 Сработает: {where}")
-        allowed, why = ar.gate(conf, chat_id)
+        allowed, why = ar.gate(conf, chat_id, settings=s)
         out.append(f"   {'🟢' if allowed else '🔴'} Отправка: {_esc(why)}")
 
     # 5. Примет ли маркетплейс ответ в этот чат.
@@ -1132,8 +1139,7 @@ async def _chain_report(uid: int, api: YooMarketAPI, order_id: str,
                     and "no_active_orders" in str(e.get("err", "")).lower()),
                    None)
     if refusal:
-        when = time.strftime("%d.%m %H:%M",
-                             time.localtime(float(refusal.get("ts", 0) or 0)))
+        when = _lt.fmt(float(refusal.get("ts", 0) or 0), s)
         out.append(f"5️⃣ 🔴 Маркетплейс уже отказал в этот чат ({when}): "
                    f"по заказу нет активных сделок. Ни бот, ни вы вручную "
                    f"туда не напишете")

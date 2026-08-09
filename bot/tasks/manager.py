@@ -81,25 +81,22 @@ def _barred_map(ar: dict) -> dict:
     return {str(st).lower(): time.time() + _RESTORE_BARRED_TTL for st in legacy}
 
 
-def _fmt_time(raw) -> str:
+def _fmt_time(raw, settings: dict | None = None) -> str:
+    """Время маркетплейса → время продавца.
+
+    Раньше строка вида «2026-08-09T06:50:00+00:00» обрезалась до девятнадцати
+    символов и разбиралась как местная: часовой пояс из ответа выбрасывался, и
+    продавец видел время сервера. Разбор теперь общий с `_ts_of`, который
+    смещение учитывает.
+    """
     if not raw:
         return ""
-    try:
-        if isinstance(raw, (int, float)):
-            dt = datetime.fromtimestamp(raw)
-        else:
-            s = str(raw)[:19]
-            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-                try:
-                    dt = datetime.strptime(s, fmt)
-                    break
-                except ValueError:
-                    continue
-            else:
-                return str(raw)[:16]
-        return dt.strftime("%d.%m %H:%M")
-    except Exception:
-        return str(raw)[:16]
+    import localtime as _lt
+    ts = _ts_of({"created_at": raw}) if not isinstance(raw, (int, float)) \
+        else float(raw)
+    if ts:
+        return _lt.fmt(ts, settings)
+    return str(raw)[:16]
 
 
 def _is_newer(msg_id: str, last_id: str) -> bool:
@@ -530,7 +527,7 @@ def _chats_to_poll(known_orders: dict, order_details: dict) -> list[str]:
 def _ar_context(details: dict | None, order_id: str, settings: dict) -> dict:
     """Данные заказа для подстановок вида {товар} в автоответе."""
     from autoreply import context
-    return context(details, order_id, settings.get("shop_name", ""))
+    return context(details, order_id, settings.get("shop_name", ""), settings)
 
 
 def _ar_log(settings: dict, chat_id: str, text: str, ok: bool, err: str,
@@ -545,14 +542,16 @@ def _ar_log(settings: dict, chat_id: str, text: str, ok: bool, err: str,
     log(cfg(settings), chat_id=chat_id, text=text, ok=ok, err=err, rule=rule)
 
 
-def _today_stats(order_details: dict, known_orders: dict) -> tuple[int, int]:
+def _today_stats(order_details: dict, known_orders: dict,
+                 settings: dict | None = None) -> tuple[int, int]:
     """(orders today, revenue today ₽) from locally tracked order details.
 
     Kept for the new-purchase notification's running tally, which counts every
     order taken today, not only completed ones.
     """
     now = time.time()
-    day_start = now - (now % 86400)
+    from stats_source import day_start as _day_start
+    day_start = _day_start(now, settings)
     cnt = 0
     rev = 0
     for oid, det in order_details.items():
@@ -959,7 +958,10 @@ class TaskManager:
         if not (bs.get("enabled") and bs.get("times")):
             return
 
-        now_dt = datetime.now()
+        # Сутки и часы — продавца: слот «10:00» должен срабатывать в его
+        # десять утра, а дневной лимит трат — обнуляться в его полночь.
+        import localtime as _lt
+        now_dt = _lt.now(settings)
         today_str = now_dt.strftime("%Y-%m-%d")
         last_runs: dict = bs.setdefault("last_runs", {})
         dirty = False
@@ -1213,8 +1215,8 @@ class TaskManager:
                             logger.warning("Auto-accept order %s: %s", oid, e)
                     if not is_blacklisted and settings.get(
                             "notify_orders", {}).get("enabled", True):
-                        time_str = _fmt_time(time_raw)
-                        cnt_today, rev_today = _today_stats(order_details, known)
+                        time_str = _fmt_time(time_raw, settings)
+                        cnt_today, rev_today = _today_stats(order_details, known, settings)
                         qty_part = f"  ×{quantity}" if quantity else ""
                         who_line = f"👤 <b>{_esc(buyer)}</b>" + (
                             f"  {_esc(username)}" if username else "")
@@ -1265,7 +1267,7 @@ class TaskManager:
                             _ar_context(order_details.get(oid), oid, settings))
                         ok, err = await self._send_chat(api, chat_id, msg, settings)
                         _ar_log(settings, chat_id, msg, ok, err, "заказ выполнен")
-                    cnt_today, rev_today = _today_stats(order_details, known)
+                    cnt_today, rev_today = _today_stats(order_details, known, settings)
                     buyer_line = _esc(f"👤 {buyer}" + (f" ({username})" if username else ""))
                     await self._notify(
                         user_id,
@@ -1392,7 +1394,8 @@ class TaskManager:
                     if not announce:
                         continue
                     text = (msg.get("text") or msg.get("message") or "")[:400]
-                    time_str = _fmt_time(msg.get("created_at") or msg.get("date"))
+                    time_str = _fmt_time(msg.get("created_at")
+                                         or msg.get("date"), settings)
                     await self._notify(
                         user_id,
                         _card(f"🛟 <b>{_esc(label).upper()}</b>",
@@ -1601,7 +1604,8 @@ class TaskManager:
                                         f"ждущим")}
                         continue
 
-                    time_str = _fmt_time(msg.get("created_at") or msg.get("date"))
+                    time_str = _fmt_time(msg.get("created_at")
+                                         or msg.get("date"), settings)
                     time_part = f"  •  🕐 {time_str}" if time_str else ""
                     # raw_text stays intact for the rules below; only the copy
                     # that goes into an HTML message is escaped
@@ -2305,7 +2309,7 @@ class TaskManager:
         rule, matched = ar.pick(conf, text)
         if not rule:
             return skip("ни одно правило не совпало, запасной ответ выключен")
-        allowed, why = ar.gate(conf, chat_id)
+        allowed, why = ar.gate(conf, chat_id, settings=settings)
         if not allowed:
             return skip(why)
 
@@ -2321,7 +2325,7 @@ class TaskManager:
 
         body = ar.render(rule.get("text", ""),
                          ar.context(details, order_id,
-                                    settings.get("shop_name", "")))
+                                    settings.get("shop_name", ""), settings))
         ok, err = await self._send_chat(api, chat_id, body, settings)
         ar.log(conf, chat_id=chat_id, text=body, ok=ok, err=err,
                rule=matched or ("запасной" if rule.get("id") == "fallback" else ""))
@@ -2514,6 +2518,10 @@ class TaskManager:
         from storage import get_shop_name
 
         pp = settings.setdefault("promo_position", {})
+        # Часовой пояс продавца — в pp: функции лимитов настройки целиком не
+        # получают, а сутки им считать надо по его часам.
+        import localtime as _lt
+        pp["_tz_min"] = _lt.offset_minutes(settings)
         ws = watches(pp)
         if not ws:
             return ""
@@ -2619,13 +2627,14 @@ class TaskManager:
         from stats_source import LOCAL, day_start, events_for, summarize
 
         events, source, panel_err = await events_for(user_id, settings, force=True)
-        d0 = day_start()
+        d0 = day_start(None, settings)
         st = summarize(events, d0)
 
         spent_today = st["spend"]
         if not spent_today and source == LOCAL:
             bs = settings.get("bump_schedule", {})
-            if bs.get("spent_day") == datetime.now().strftime("%Y-%m-%d"):
+            import localtime as _lt
+            if bs.get("spent_day") == _lt.today_str(settings):
                 spent_today = float(bs.get("spent_today", 0) or 0)
 
         try:
@@ -2658,7 +2667,7 @@ class TaskManager:
                         + (f" ({_esc(panel_err)})" if panel_err else "") + ".</i>")
 
         return _card("📊 <b>ИТОГИ ДНЯ</b>", body,
-                     f"🗓 {datetime.now().strftime('%d.%m.%Y')}")
+                     f"🗓 {__import__('localtime').now(settings).strftime('%d.%m.%Y')}")
 
     async def _panel_republish(self, user_id: int, rows: list[dict]
                                ) -> tuple[list[dict], list[dict]]:
@@ -3116,9 +3125,10 @@ class TaskManager:
             dr = settings.get("daily_report", {})
             if dr.get("enabled"):
                 report_hour = dr.get("hour", 20)
-                today_str = datetime.now().strftime("%Y-%m-%d")
+                import localtime as _lt
+                today_str = _lt.today_str(settings)
                 last_day = dr.get("last_report_day", "")
-                if last_day != today_str and datetime.now().hour >= report_hour:
+                if last_day != today_str and _lt.hour(settings) >= report_hour:
                     try:
                         await self._notify(
                             user_id,

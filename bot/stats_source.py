@@ -156,17 +156,23 @@ def summarize(events: list[dict], since: float = 0.0,
     return res
 
 
-def day_start(now: float | None = None) -> float:
+def day_start(now: float | None = None,
+              settings: dict | None = None) -> float:
     """Midnight local time, as epoch seconds.
 
     `now - now % 86400` is midnight UTC, which for a Moscow seller cuts the day
     three hours late — sales made between 00:00 and 03:00 were counted into the
     previous day's report.
     """
-    from datetime import datetime
+    from datetime import timedelta, timezone
+    import localtime as _lt
     ts = now if now is not None else time.time()
-    d = datetime.fromtimestamp(ts)
-    return d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    # Полночь продавца, а не сервера: у продавца из UTC+5 «сегодня» начиналось
+    # в пять утра, и утренние продажи попадали во вчерашний отчёт.
+    off = timedelta(minutes=_lt.offset_minutes(settings))
+    local = _lt.to_local(ts, settings).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return (local - off).replace(tzinfo=timezone.utc).timestamp()
 
 
 def source_note(source: str, err: str = "") -> str:

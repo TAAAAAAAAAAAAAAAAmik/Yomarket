@@ -20,6 +20,7 @@ from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import localtime as _lt
 from storage import get_settings, save_settings
 
 router = Router()
@@ -301,7 +302,7 @@ def is_on(s: dict, auto: dict) -> bool:
     return bool(_get_path(s, auto["path"]))
 
 
-def _baseline_past_slots(bs: dict) -> None:
+def _baseline_past_slots(bs: dict, s: dict | None = None) -> None:
     """Mark today's already-past promotion slots as done.
 
     The scheduler catches up on slots missed while the bot was down. Without a
@@ -309,7 +310,7 @@ def _baseline_past_slots(bs: dict) -> None:
     immediately — surprising, and «Премиум» costs money. Only slots that come
     due after the change should fire.
     """
-    now = datetime.now()
+    now = _lt.now(s)
     today = now.strftime("%Y-%m-%d")
     last_runs = bs.setdefault("last_runs", {})
     for slot in bs.get("times", []):
@@ -331,7 +332,7 @@ def _apply_defaults(s: dict, auto: dict) -> None:
         if _get_path(s, path) in (None, "", [], {}, 0):
             _set_path(s, path, value)
     if auto["key"] == "promo_sched":
-        _baseline_past_slots(s.setdefault("bump_schedule", {}))
+        _baseline_past_slots(s.setdefault("bump_schedule", {}), s)
 
 
 def set_automation(s: dict, auto: dict, on: bool) -> None:

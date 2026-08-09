@@ -101,6 +101,18 @@ def settings_for(**pp) -> dict:
             "auto_bump": {"promo": {"values": {"up_id": "1"}, "price": 49}}}
 
 
+# Полдень по времени продавца. Тесты дневных лимитов гоняют шесть часовых
+# проходов подряд: от `time.time()` они то и дело переваливали за полночь, и
+# счётчик суток честно обнулялся — тест падал в зависимости от часа запуска.
+# С полудня шесть часов внутри одних суток при любом часовом поясе.
+def midday() -> float:
+    import localtime as _lt
+    from datetime import datetime, timedelta, timezone
+    local = _lt.now(None).replace(hour=12, minute=0, second=0, microsecond=0)
+    return (local - timedelta(minutes=_lt.offset_minutes(None))).replace(
+        tzinfo=timezone.utc).timestamp()
+
+
 class PaidPromotion(unittest.TestCase):
     def test_slipping_charges_exactly_the_watched_listing(self):
         s = settings_for()
@@ -138,7 +150,7 @@ class PaidPromotion(unittest.TestCase):
 
     def test_daily_cap_holds_across_a_long_slip(self):
         s = settings_for(cooldown_hours=0, daily_limit=2)
-        now = time.time()
+        now = midday()
         with Harness(self, settings=s) as h:
             for i in range(6):
                 h.run(now + i * 3600)
@@ -198,7 +210,7 @@ class PaidPromotion(unittest.TestCase):
         several watches; this is the number the seller actually cares about.
         """
         s = settings_for(cooldown_hours=0, daily_limit=0, daily_budget=100)
-        now = time.time()
+        now = midday()
         with Harness(self, settings=s) as h:
             for i in range(6):
                 h.run(now + i * 3600)
