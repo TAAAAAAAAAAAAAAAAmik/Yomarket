@@ -234,6 +234,20 @@ async def _load_messages(uid: int, order_key: str, api
     return _rows(await api.get_messages(found)), found, det
 
 
+def _remember_own(uid: int, chat_id: str, text: str) -> None:
+    """Запомнить письмо, отправленное продавцом вручную.
+
+    Маркетплейс возвращает его следующим проходом и ничем не помечает, а
+    фоновый цикл узнаёт своё только по отпечатку. Отпечатки ставил лишь
+    `_send_chat` — то есть автоответы. Написанное руками из бота приходило
+    продавцу обратно как «СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ» с его же текстом.
+    """
+    from tasks.manager import _note_sent_by_hand
+    s = get_settings(uid)
+    _note_sent_by_hand(s, str(chat_id), text)
+    save_settings(uid, s)
+
+
 def _resolve_chat(uid: int, key: str) -> tuple[str, dict]:
     """(номер чата для API, что бот знает о заказе).
 
@@ -570,6 +584,7 @@ async def send_reply(message: Message, state: FSMContext, api: YooMarketAPI) -> 
     real_id, det = _resolve_chat(message.from_user.id, chat_id)
     try:
         await api.send_message(real_id, text_to_send)
+        _remember_own(message.from_user.id, real_id, text_to_send)
         who = str((det or {}).get("buyer") or "").strip()
         text = "✅ Отправлено" + (f" покупателю {_esc(who)}" if who and who != "—"
                                  else f" в чат #{_esc(chat_id)}")
@@ -605,6 +620,7 @@ async def send_quick_reply(callback: CallbackQuery, api: YooMarketAPI) -> None:
     real_id, _det = _resolve_chat(callback.from_user.id, chat_id)
     try:
         await api.send_message(real_id, text)
+        _remember_own(callback.from_user.id, real_id, text)
         _mark_answered(callback.from_user.id, chat_id)
         await callback.answer("✅ Отправлено!", show_alert=True)
     except Exception as e:

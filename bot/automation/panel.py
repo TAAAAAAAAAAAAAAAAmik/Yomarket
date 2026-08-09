@@ -1220,6 +1220,46 @@ def panel_find_listing_sync(
     return found, "; ".join(trace)[:400]
 
 
+# Поля, по которым видно, опубликован товар или нет.
+_STATUS_ATTRS = ("status", "state", "public", "is_public", "visible",
+                 "is_active", "active", "published", "moderation")
+
+
+def _publish_state(fields: list[dict]) -> str:
+    """Состояние публикации одной строкой, или «» — если поля нет.
+
+    Сравнивать «до и после» надо по чему-то устойчивому: имена полей у панели
+    свои, поэтому берём все похожие на статус сразу.
+    """
+    if not fields:
+        return ""
+    parts: list[str] = []
+    for f in fields:
+        attr = str(f.get("attribute") or "").lower()
+        if attr in _STATUS_ATTRS:
+            parts.append(f"{attr}={_field_text(f)[:24]}")
+    return ", ".join(parts)
+
+
+def _nova_refusal(resp) -> str:
+    """Отказ, спрятанный в теле успешного ответа Nova.
+
+    Действие может вернуть 200 и при этом ничего не сделать: причина лежит в
+    поле `danger`. По коду ответа это неотличимо от успеха.
+    """
+    try:
+        body = resp.json()
+    except Exception:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    for key in ("danger", "error"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def panel_publish_item_sync(
     cookie_string: str, item_id: str, uid: int | None = None,
     public: bool = True, resource: str = "items",
@@ -1254,6 +1294,12 @@ def panel_publish_item_sync(
     except Exception as e:
         trace.append(f"actions: {str(e)[:40]}")
 
+    # Снимок состояния до действия. Nova отвечает 200 и на отказ — сообщение
+    # об отказе лежит в теле, а бот рапортовал «Отправлен на модерацию» по
+    # одному коду ответа. Сравнение «до и после» — единственное доказательство.
+    _code_before, _fields_before = _probe_one(session, hdrs, resource, item_id)
+    before = _publish_state(_fields_before)
+
     action_names = [(a.get("name") or a.get("uriKey") or "?") for a in actions]
     for a in actions:
         name = str(a.get("name") or "").lower()
@@ -1272,8 +1318,23 @@ def panel_publish_item_sync(
                 )
                 trace.append(f"action {key}: {resp.status_code}")
                 if resp.status_code in (200, 201, 204):
+                    refused = _nova_refusal(resp)
+                    if refused:
+                        trace.append(f"отказ: {refused[:60]}")
+                        continue
                     _save_refreshed_cookies(uid, cookie_string, session)
-                    return True, f"через действие «{a.get('name') or key}»"
+                    _code, fields_after = _probe_one(session, hdrs, resource,
+                                                     item_id)
+                    after = _publish_state(fields_after)
+                    if after and before and after == before:
+                        # Панель приняла запрос и ничего не изменила. Самый
+                        # частый случай — у нового товара нет остатков, и
+                        # публиковать нечего.
+                        return False, (
+                            f"панель приняла «{a.get('name') or key}», но "
+                            f"статус не изменился ({after})")
+                    what = f" — статус: {after}" if after else ""
+                    return True, f"через действие «{a.get('name') or key}»{what}"
             except Exception as e:
                 trace.append(f"action {key}: {str(e)[:40]}")
 

@@ -294,6 +294,34 @@ _SENT_PER_CHAT = 20
 _SENT_CHATS = 100
 
 
+def _note_sent_by_hand(settings: dict, chat_id: str, text: str) -> None:
+    """Это написал продавец сам, из бота, а не автоответ.
+
+    Маркетплейс возвращает такое письмо следующим проходом и ничем не
+    помечает — бот присылал его продавцу как «СООБЩЕНИЕ ОТ ПОКУПАТЕЛЯ» с его
+    же текстом. Отпечаток кладётся в общую книгу (чтобы своё узнавалось) и
+    отдельно сюда — чтобы подпись была «вы ответили», а не тишина: автоответ
+    продавец не писал, а это писал.
+    """
+    _note_sent_text(settings, chat_id, text)
+    if not text:
+        return
+    book: dict = settings.setdefault("_hand_fp", {})
+    row: list = book.setdefault(str(chat_id), [])
+    row.insert(0, _fingerprint(text))
+    del row[_SENT_PER_CHAT:]
+    if len(book) > _SENT_CHATS:
+        for key in list(book)[_SENT_CHATS:]:
+            book.pop(key, None)
+
+
+def _is_hand_text(settings: dict, chat_id: str, text: str) -> bool:
+    if not text:
+        return False
+    row = (settings.get("_hand_fp") or {}).get(str(chat_id)) or []
+    return _fingerprint(text) in row
+
+
 def _note_sent_text(settings: dict, chat_id: str, text: str) -> None:
     """Запомнить, что это писали мы.
 
@@ -1522,6 +1550,23 @@ class TaskManager:
                         # Наше же сообщение, вернувшееся из чата. Бот отвечал
                         # сам себе и доставал «@username» из собственного
                         # вопроса — с этого начинался круг покупок в пустоту.
+                        # Написанное продавцом вручную всё же показываем: он
+                        # ждёт подтверждения, что ответ дошёл. Но подписью
+                        # «вы ответили», а не «сообщение от покупателя» — с
+                        # его же текстом внутри. Автоответы остаются немыми:
+                        # их продавец не писал, и эхо ему ни к чему.
+                        if (_is_hand_text(settings, chat_id, raw_text)
+                                and settings.get("notify_messages", {})
+                                        .get("enabled", True)):
+                            await self._notify(
+                                user_id,
+                                _card("✍️ <b>ВЫ ОТВЕТИЛИ</b>",
+                                      [f"<blockquote>{_esc(raw_text[:200])}"
+                                       f"</blockquote>",
+                                       "",
+                                       "<i>Доставлено покупателю.</i>"],
+                                      f"{order_line}\n🧾 <code>#{order_id}</code>"),
+                                reply_markup=_message_notify_kb(chat_id, order_id))
                         continue
                     sender = msg.get("sender_type") or msg.get("sender")
                     if isinstance(sender, str) and sender.lower() not in (

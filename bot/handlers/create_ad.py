@@ -724,9 +724,17 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
                 # A fresh listing usually has nothing to sell yet, and the
                 # marketplace refuses to publish an empty one — say what to do
                 # instead of just reporting a failure.
+                #
+                # Раньше «отправлен на модерацию» писалось по одному коду
+                # ответа панели, без проверки. Панель отвечает 200 и на отказ,
+                # так что продавец считал товар отправленным, а он лежал
+                # черновиком. Теперь публикация подтверждается перечитыванием,
+                # и здесь остаются два честных шага по порядку.
                 pub_note = (
-                    f"\n📦 Не опубликован — сначала добавьте остатки."
-                    f"\n<i>{pub_msg[:150]}</i>"
+                    "\n\n📦 <b>На модерацию пока не отправлен.</b>"
+                    "\n1. Добавьте остатки — без них публиковать нечего."
+                    "\n2. Нажмите «🚀 На модерацию»."
+                    f"\n\n<i>Панель ответила: {pub_msg[:150]}</i>"
                 )
 
         b = InlineKeyboardBuilder()
@@ -800,13 +808,19 @@ async def publish_item(callback: CallbackQuery) -> None:
 
     b = InlineKeyboardBuilder()
     if not ok:
-        b.button(text="🚀 Отправить на модерацию", callback_data=f"cadpub:{item_id}")
+        # Публиковать пустой товар маркетплейс отказывается, так что первая
+        # кнопка — остатки, а не повтор того же самого.
+        b.button(text="📦 Добавить остатки", callback_data=f"pitem_stock:{item_id}")
+        b.button(text="🚀 Попробовать снова", callback_data=f"cadpub:{item_id}")
     b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
     b.button(text="📦 Мои товары", callback_data="menu:ads")
     b.adjust(1)
     result = (f"🕓 <b>Товар {item_id} отправлен на модерацию</b> ({msg_text})"
               f"\nПоявится в маркете после проверки." if ok
-              else f"⚠️ <b>Не удалось опубликовать товар {item_id}</b>\n\n{msg_text}")
+              else (f"⚠️ <b>Товар {item_id} на модерацию не отправлен</b>\n\n"
+                    f"Чаще всего причина одна: у товара нет остатков, а пустой "
+                    f"маркетплейс не публикует.\n\n"
+                    f"<i>Панель ответила: {msg_text}</i>"))
     try:
         await callback.message.edit_text(result, reply_markup=b.as_markup())
     except Exception:
