@@ -109,22 +109,46 @@ def _is_newer(msg_id: str, last_id: str) -> bool:
         return msg_id > last_id
 
 
+def _msg_sort_key(msg: dict) -> tuple:
+    """Ключ хронологического порядка: сначала номер, время — на ничью.
+
+    Номер и есть определение «новее» во всём остальном коде (`_is_newer`,
+    `_newest_id`), и порядок обязан считаться так же — иначе у бота два
+    расходящихся представления о том, какое письмо позже.
+    """
+    mid = str(msg.get("id", ""))
+    try:
+        return (0, int(mid), _ts_of(msg))
+    except (ValueError, TypeError):
+        # Нечисловой номер — сравниваем строкой, но отдельной группой:
+        # смешивать int и str в одном ключе нельзя.
+        return (1, mid, _ts_of(msg))
+
+
 def _msg_rows(data) -> list[dict]:
-    """The messages out of whatever envelope the API used.
+    """The messages out of whatever envelope the API used, oldest first.
 
     A chat outside an order does not have to answer in the same shape as one
     attached to an order, and a nested list arriving where a list was assumed
     raised inside the poll loop, where the error was only logged — so nothing
     ever arrived and nothing ever complained.
+
+    Порядок задаётся здесь, потому что это единственное место, через которое
+    проходят все читатели переписки. Юмаркет отдаёт письма ОТ НОВЫХ К СТАРЫМ;
+    те, кто по списку ходил и показывал, получали разговор задом наперёд:
+    уведомления в обратном порядке, а экран чата — начало переписки вместо
+    свежих сообщений. Срезы `[-10:]` и `[-15:]` теперь значат то, что и
+    читается — «самые свежие».
     """
     if isinstance(data, list):
-        return [m for m in data if isinstance(m, dict)]
+        return sorted((m for m in data if isinstance(m, dict)), key=_msg_sort_key)
     if not isinstance(data, dict):
         return []
     for key in ("data", "items", "messages", "results"):
         v = data.get(key)
         if isinstance(v, list):
-            return [m for m in v if isinstance(m, dict)]
+            return sorted((m for m in v if isinstance(m, dict)),
+                          key=_msg_sort_key)
         if isinstance(v, dict):
             inner = _msg_rows(v)
             if inner:
@@ -385,6 +409,14 @@ def _stars_drop_if_closed(settings: dict, order_id: str) -> str:
         return ""
     pending.pop(str(order_id), None)
     return of.status_ru(status)
+
+
+def _stars_awaiting_delivery(settings: dict, order_id: str) -> bool:
+    """Заказ стоит в очереди AutoStars — товар ещё не отправлен."""
+    p = (settings.get("plugins") or {}).get("auto_stars") or {}
+    if not p.get("enabled"):
+        return False
+    return str(order_id) in (p.get("pending") or {})
 
 
 def _chats_to_poll(known_orders: dict, order_details: dict) -> list[str]:
@@ -1340,6 +1372,13 @@ class TaskManager:
                 who = _esc(f"{buyer_name}" + (f" ({d_username})" if d_username else ""))
                 order_line = _esc(f"📦 {title}" + (f"  •  💰 {d_price} ₽" if d_price and d_price != "—" else ""))
 
+                # Пачка писем за один проход отвечается один раз, и последним
+                # письмом: «привет» и следом «где ключ» — вопрос во втором.
+                # Раньше отвечало то, которое API вернул первым, а он отдаёт
+                # от новых к старым — то есть выбор был случайностью формата.
+                answer_to: tuple[str, bool] | None = None
+                answerable = 0
+
                 for msg in messages:
                     msg_id = str(msg.get("id", ""))
                     if not _is_newer(msg_id, last_known_id):
@@ -1448,13 +1487,21 @@ class TaskManager:
                             reply_markup=_message_notify_kb(chat_id, order_id),
                         )
 
-                    # Уведомить продавца — половина дела; покупателю нужен
-                    # ответ. Отправляется после уведомления, чтобы продавец
-                    # видел и вопрос, и то, что бот на него ответил.
+                    # Уведомление ушло по каждому письму — их продавцу нужны
+                    # все. Ответ покупателю один, и на последнее письмо:
+                    # список идёт по возрастанию, так что побеждает свежее.
+                    answerable += 1
+                    answer_to = (raw_text, is_complaint)
+
+                # Уведомить продавца — половина дела; покупателю нужен ответ.
+                # Отправляется после уведомлений, чтобы продавец видел и
+                # вопрос, и то, что бот на него ответил.
+                if answer_to:
+                    raw_text, is_complaint = answer_to
                     await self._auto_answer(
                         user_id, api, settings, chat_id=chat_id,
                         order_id=order_id, text=raw_text, details=details,
-                        is_complaint=is_complaint)
+                        is_complaint=is_complaint, batch=answerable)
 
                 known_messages[order_id] = newest_id
 
@@ -1552,6 +1599,13 @@ class TaskManager:
         now = time.time()
         known_orders: dict = settings.get("known_orders", {})
         order_details: dict = settings.get("known_order_details", {})
+        # Отметки «предупредил, что товар не выдан» живут ровно столько,
+        # сколько заказ стоит в очереди. Возвращённый заказ подтверждения так
+        # и не дождётся, и без уборки его отметка осталась бы в настройках
+        # навсегда.
+        for oid in list(ac.get("held") or {}):
+            if not _stars_awaiting_delivery(settings, oid):
+                ac["held"].pop(oid, None)
         for oid, status in list(known_orders.items()):
             if status not in ("work", "working", "processing"):
                 continue
@@ -1559,11 +1613,37 @@ class TaskManager:
             work_at = det.get("work_at")
             if not work_at or (now - work_at) < threshold_secs:
                 continue
+            # «Выполнил заказ» — это заявление перед покупателем и площадкой.
+            # Заказ, который ещё стоит в очереди на выдачу звёзд, товара не
+            # получил, и подтверждать его — рапортовать о невыданном: выдача
+            # падает, деньги уходят продавцу, покупатель идёт в арбитраж.
+            if _stars_awaiting_delivery(settings, oid):
+                held = ac.setdefault("held", {})
+                if str(oid) not in held:
+                    held[str(oid)] = now
+                    await self._notify(
+                        user_id,
+                        _card("⏸ <b>НЕ ПОДТВЕРЖДАЮ — ТОВАР НЕ ВЫДАН</b>",
+                              [f"📦 {_esc(det.get('title', f'Заказ #{oid}'))} "
+                               f"<code>#{_esc(str(oid))}</code>",
+                               "",
+                               "Заказ ждёт выдачи звёзд. Подтвержу, когда "
+                               "товар уйдёт покупателю, — или выдайте "
+                               "вручную: Плагины → AutoStars."]))
+                continue
+            ac.get("held", {}).pop(str(oid), None)
             try:
                 await api.confirm_order(oid)
                 known_orders[oid] = "confirmed"
                 title = det.get("title", f"Заказ #{oid}")
-                await self._notify(user_id, f"✅ <b>Авто-подтверждение</b>\n\n📦 {title} #{oid}")
+                # Раньше здесь было просто «Авто-подтверждение», и отличить
+                # его от подтверждения из AutoStars или от ручного нажатия
+                # было нельзя — источник записи в чате оставался загадкой.
+                hours = int(ac.get("hours", 24) or 24)
+                await self._notify(
+                    user_id,
+                    f"✅ <b>Авто-подтверждение</b>\n\n📦 {title} #{oid}\n"
+                    f"<i>Причина: заказ в работе больше {hours} ч.</i>")
             except Exception as e:
                 logger.warning("Auto-confirm order %s: %s", oid, e)
         settings["known_orders"] = known_orders
@@ -2032,7 +2112,8 @@ class TaskManager:
 
     async def _auto_answer(self, user_id: int, api: YooMarketAPI, settings: dict,
                            *, chat_id: str, order_id: str, text: str,
-                           details: dict, is_complaint: bool) -> None:
+                           details: dict, is_complaint: bool,
+                           batch: int = 1) -> None:
         """Ответить покупателю на его сообщение, если есть чем и можно.
 
         Бот присылал продавцу уведомление и молчал в чате — ночью покупатель
@@ -2062,6 +2143,16 @@ class TaskManager:
         allowed, why = ar.gate(conf, chat_id)
         if not allowed:
             return skip(why)
+
+        if batch > 1:
+            # Остальные письма пачки остались без ответа — намеренно, но
+            # молчать об этом нельзя: экран «Почему молчит» иначе покажет
+            # только последнее и создаст впечатление, что их и не было.
+            conf["last_skip"] = {
+                "ts": time.time(), "chat": str(chat_id),
+                "text": (text or "")[:80],
+                "why": (f"писем за один проход: {batch} — ответил на "
+                        f"последнее, оно и несёт вопрос")}
 
         body = ar.render(rule.get("text", ""),
                          ar.context(details, order_id,

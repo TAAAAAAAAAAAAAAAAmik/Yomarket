@@ -962,7 +962,9 @@ async def chats_debug(message: Message, api: YooMarketAPI) -> None:
         except Exception as e:
             out.append(f"  чат не читается: {str(e)[:90]}")
             continue
-        rows = data.get("data") or data.get("items") or []
+        # Через общий разбор, а не .get("data") напрямую: там же задан
+        # хронологический порядок, и в обход него список приходил перевёрнутым.
+        rows = _rows(data)
         out.append(f"  сообщений сейчас: {len(rows)}")
         out.append(f"  самое новое: {_newest_id(rows) or '—'}")
         for m in rows[-3:]:
@@ -1051,10 +1053,8 @@ async def _chain_report(uid: int, api: YooMarketAPI, order_id: str,
         out.append(f"2️⃣ ❌ Чат не читается: <code>{_esc(str(e)[:150])}</code>")
         return out
     out.append(f"\n2️⃣ В чате сообщений: <b>{len(rows)}</b>")
-    # Порядок в ответе API не гарантирован, и брать rows[-1] за «последнее»
-    # нельзя: при обратной сортировке это самое старое письмо. Фоновый цикл
-    # это уже учитывал (_newest_id берёт максимум) — экран не учитывал.
-    ordered = sorted(rows, key=lambda m: (_ts_of(m), str(m.get("id", ""))))
+    # Порядок задан в _msg_rows — здесь он уже хронологический.
+    ordered = rows
     buyer = [m for m in ordered if not _is_own_message(m)
              and not _is_service_message(m) and _msg_text(m)
              and not _is_our_text(s, chat_id, _msg_text(m))]

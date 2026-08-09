@@ -162,5 +162,90 @@ class AFailedRequestForTheUsernameIsNotSwallowed(unittest.TestCase):
         self.assertNotIn("no_active_orders", note)
 
 
+class AutoConfirmDoesNotReportWhatWasNotDelivered(unittest.TestCase):
+    """«Участник магазина сообщил, что выполнил заказ ✅» — это заявление
+    перед покупателем и площадкой. Заказ, стоящий в очереди на выдачу
+    звёзд, товара не получил: выдача падает, деньги уходят продавцу,
+    покупатель идёт в арбитраж."""
+
+    class ConfirmAPI:
+        def __init__(self):
+            self.confirmed: list[str] = []
+
+        async def confirm_order(self, oid):
+            self.confirmed.append(str(oid))
+            return {"ok": True}
+
+    def _run(self, *, pending: bool, times: int = 1):
+        s = settings("paid")
+        s["known_orders"]["77"] = "work"
+        s["known_order_details"]["77"]["work_at"] = time.time() - 48 * 3600
+        s["auto_confirm"] = {"enabled": True, "hours": 24}
+        if not pending:
+            s["plugins"]["auto_stars"]["pending"] = {}
+        api = self.ConfirmAPI()
+        tm = manager()
+        for _ in range(times):
+            asyncio.run(tm._auto_confirm(1, api, s))
+        return s, api, tm.notes
+
+    def test_an_order_awaiting_stars_is_not_confirmed(self):
+        _s, api, _notes = self._run(pending=True)
+        self.assertEqual(api.confirmed, [])
+
+    def test_the_seller_is_told_why(self):
+        _s, _api, notes = self._run(pending=True)
+        self.assertTrue(any("ТОВАР НЕ ВЫДАН" in n for n in notes), notes)
+
+    def test_the_warning_is_not_repeated_every_pass(self):
+        _s, _api, notes = self._run(pending=True, times=4)
+        held = [n for n in notes if "ТОВАР НЕ ВЫДАН" in n]
+        self.assertEqual(len(held), 1, held)
+
+    def test_an_order_with_nothing_pending_is_confirmed(self):
+        _s, api, _notes = self._run(pending=False)
+        self.assertEqual(api.confirmed, ["77"])
+
+    def test_the_confirmation_says_what_triggered_it(self):
+        """Отличить его от подтверждения из AutoStars и от ручного нажатия
+        было нельзя — источник записи в чате оставался загадкой."""
+        _s, _api, notes = self._run(pending=False)
+        note = next(n for n in notes if "Авто-подтверждение" in n)
+        self.assertIn("больше 24 ч", note)
+
+
+    def test_the_held_mark_is_cleared_once_the_queue_lets_go(self):
+        """Возвращённый заказ подтверждения не дождётся — без уборки его
+        отметка осталась бы в настройках навсегда."""
+        s, _api, _notes = self._run(pending=True)
+        self.assertIn("77", s["auto_confirm"]["held"])
+        s["plugins"]["auto_stars"]["pending"] = {}
+        asyncio.run(manager()._auto_confirm(1, self.ConfirmAPI(), s))
+        self.assertEqual(s["auto_confirm"]["held"], {})
+
+    def test_a_second_hold_warns_again_after_that(self):
+        """Уборка не должна превращаться в повторное молчание: если заказ
+        снова попал в очередь, продавцу об этом говорят."""
+        s, _api, _notes = self._run(pending=True)
+        s["plugins"]["auto_stars"]["pending"] = {}
+        asyncio.run(manager()._auto_confirm(1, self.ConfirmAPI(), s))
+        s["known_orders"]["77"] = "work"
+        s["plugins"]["auto_stars"]["pending"] = {"77": {"quantity": 50}}
+        tm = manager()
+        asyncio.run(tm._auto_confirm(1, self.ConfirmAPI(), s))
+        self.assertTrue(any("ТОВАР НЕ ВЫДАН" in n for n in tm.notes), tm.notes)
+
+    def test_a_disabled_plugin_holds_nothing_back(self):
+        """Выключённая автовыдача ничего не ждёт — заказ подтверждается."""
+        s = settings("paid")
+        s["known_orders"]["77"] = "work"
+        s["known_order_details"]["77"]["work_at"] = time.time() - 48 * 3600
+        s["auto_confirm"] = {"enabled": True, "hours": 24}
+        s["plugins"]["auto_stars"]["enabled"] = False
+        api = self.ConfirmAPI()
+        asyncio.run(manager()._auto_confirm(1, api, s))
+        self.assertEqual(api.confirmed, ["77"])
+
+
 if __name__ == "__main__":
     unittest.main()
