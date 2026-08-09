@@ -1187,37 +1187,12 @@ class TaskManager:
                     if sold_ad:
                         sold_ads.add(str(sold_ad))
 
-                    # Auto-accept: press "начать заказ" immediately so orders
-                    # don't sit unaccepted (buyer can't force a refund).
-                    accepted = False
-                    if settings.get("auto_accept", {}).get("enabled") and status in (
-                            "new", "pending", "created", "paid", "active"):
-                        try:
-                            await api.work_order(oid)
-                            # Статус не назначаем от себя, а перечитываем.
-                            # Раньше здесь стояло `status = "work"` — догадка о
-                            # том, что делает /orders/{id}/work. Проверить её
-                            # было нечем, а на витрине покупатель в ту же
-                            # минуту видел «магазин сообщил, что выполнил
-                            # заказ». Теперь видно, что получилось на самом
-                            # деле, и это попадает в уведомление.
-                            real = ""
-                            try:
-                                fresh = await api.get_order(oid)
-                                node = (fresh.get("data")
-                                        if isinstance(fresh, dict)
-                                        and isinstance(fresh.get("data"), dict)
-                                        else fresh)
-                                real = _describe(node if isinstance(node, dict)
-                                                 else {})["status"]
-                            except Exception as e:
-                                logger.warning("Auto-accept re-read %s: %s", oid, e)
-                            known[oid] = status = real or "work"
-                            order_details[oid]["work_at"] = time.time()
-                            order_details[oid]["work_result"] = real
-                            accepted = True
-                        except Exception as e:
-                            logger.warning("Auto-accept order %s: %s", oid, e)
+                    # Auto-accept: press "начать заказ" so the order does not
+                    # sit unaccepted (an unaccepted order the buyer can cancel).
+                    accepted, real = await self._maybe_accept_order(
+                        user_id, api, settings, oid, status, order_details)
+                    if accepted:
+                        known[oid] = status = real or "work"
                     if not is_blacklisted and settings.get(
                             "notify_orders", {}).get("enabled", True):
                         time_str = _fmt_time(time_raw, settings)
@@ -1313,6 +1288,16 @@ class TaskManager:
                 if prev_status is not None and prev_status != status:
                     from orderfields import is_paid as _is_paid
                     if _is_paid(status) and not _is_paid(prev_status):
+                        # Взять в работу — тоже здесь. Автопринятие жило в
+                        # ветке «заказ увиден впервые», а увиден он бывает
+                        # неоплаченным: деньги приходили следующим проходом, и
+                        # второго шанса у автопринятия не было. Для магазина,
+                        # где оплата догоняет заказ, функция просто не
+                        # срабатывала — при включённом тумблере.
+                        got, real = await self._maybe_accept_order(
+                            user_id, api, settings, oid, status, order_details)
+                        if got:
+                            status = real or "work"
                         await self._maybe_ask_stars_username(
                             api, settings, oid, title, chat_id, status)
 
@@ -1764,6 +1749,66 @@ class TaskManager:
             settings["reminded_orders"] = list(reminded_set)
             from storage import save_settings
             save_settings(user_id, settings)
+
+    async def _maybe_accept_order(self, user_id: int, api: YooMarketAPI,
+                                  settings: dict, oid: str, status: str,
+                                  order_details: dict) -> tuple[bool, str]:
+        """Взять заказ в работу → (взяли, настоящий статус после действия).
+
+        Три вещи, без которых это не работало или работало во вред.
+
+        Только оплаченный. В списке разрешённых статусов стояли «new»,
+        «created», «pending» — то есть неоплаченные. Панель на такой заказ
+        прямо предупреждает «не выдавайте товар», а бот брал его в работу.
+
+        Статус не назначается от себя, а перечитывается: что делает
+        `POST /orders/{id}/work` на этом маркетплейсе, из кода не видно.
+
+        И если перечитанный статус оказался «выполнен» — значит «взять в
+        работу» здесь означает «отчитаться о выдаче». Это не догадка, а
+        наблюдение, поэтому оно записывается, продавцу говорят один раз, и
+        дальше заказы, ждущие выдачи, автопринятие не трогает.
+        """
+        from orderfields import describe as _describe, is_paid as _is_paid
+        aa = settings.get("auto_accept", {})
+        if not aa.get("enabled") or not _is_paid(status):
+            return False, ""
+        if aa.get("means_fulfilled") and _stars_awaiting_delivery(settings, oid):
+            logger.info("auto-accept skipped for %s: awaiting delivery", oid)
+            return False, ""
+        try:
+            await api.work_order(oid)
+        except Exception as e:
+            logger.warning("Auto-accept order %s: %s", oid, e)
+            return False, ""
+
+        real = ""
+        try:
+            fresh = await api.get_order(oid)
+            node = (fresh.get("data") if isinstance(fresh, dict)
+                    and isinstance(fresh.get("data"), dict) else fresh)
+            real = _describe(node if isinstance(node, dict) else {})["status"]
+        except Exception as e:
+            logger.warning("Auto-accept re-read %s: %s", oid, e)
+
+        det = order_details.setdefault(str(oid), {})
+        det["work_at"] = time.time()
+        det["work_result"] = real
+        if real and real in _DONE_STATUSES and not aa.get("means_fulfilled"):
+            aa["means_fulfilled"] = True
+            settings["auto_accept"] = aa
+            await self._notify(
+                user_id,
+                _card("⚠️ <b>«В РАБОТУ» = ОТЧЁТ О ВЫДАЧЕ</b>",
+                      [f"Заказ <code>#{_esc(str(oid))}</code> после «взять в "
+                       f"работу» сразу стал <b>{_status_ru(real)}</b>.",
+                       "",
+                       "Значит на этом маркетплейсе это не «начал заниматься», "
+                       "а заявление покупателю, что товар выдан.",
+                       "",
+                       "Заказы, ждущие выдачи звёзд, автопринятие больше не "
+                       "трогает. Остальные берёт как раньше."]))
+        return True, real
 
     async def _auto_confirm(self, user_id: int, api: YooMarketAPI, settings: dict) -> None:
         ac = settings.get("auto_confirm", {})
