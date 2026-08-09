@@ -109,6 +109,44 @@ def _is_newer(msg_id: str, last_id: str) -> bool:
         return msg_id > last_id
 
 
+# Один отправитель на магазин. Фоновый цикл шлёт уведомления сам, никого не
+# спрашивая: сколько процессов запущено, столько копий и приходит продавцу.
+# Команды при этом отвечают как обычно — апдейт Telegram достаётся только
+# одному, — так что изнутри бота два процесса неотличимы от ошибки в коде.
+# Аренда пишется в общее хранилище: владелец продлевает её на каждом проходе,
+# остальные молчат. Чужая аренда старше этого срока считается брошенной —
+# иначе упавший контейнер заткнул бы бота навсегда.
+_SENDER_LEASE_TTL = 180.0
+
+
+def _claim_sender(settings: dict, now: float | None = None,
+                  instance: str = "") -> bool:
+    """Взять право рассылки на этот проход → можно ли работать."""
+    from handlers.start import INSTANCE_ID
+    me = instance or INSTANCE_ID
+    now = now if now is not None else time.time()
+    lease = settings.get("_sender") or {}
+    owner = str(lease.get("inst") or "")
+    fresh = now - float(lease.get("ts") or 0) < _SENDER_LEASE_TTL
+    if owner and owner != me and fresh:
+        logger.info("sender lease held by %s — skipping tick", owner)
+        return False
+    settings["_sender"] = {"inst": me, "ts": now}
+    return True
+
+
+# Что этот процесс уже отправил — для /sent. Живёт в памяти и только своего
+# процесса: если продавец видит дубль, а здесь одна запись, вторую копию
+# прислал кто-то другой. Это и отличает две беды друг от друга.
+_SENT_LOG: list[tuple[float, str]] = []
+_SENT_LOG_MAX = 40
+
+
+def _note_sent_notification(text: str) -> None:
+    _SENT_LOG.append((time.time(), " ".join(str(text or "").split())[:70]))
+    del _SENT_LOG[:-_SENT_LOG_MAX]
+
+
 def _is_formatting_error(exc: Exception) -> bool:
     """Telegram отказался разбирать HTML — единственный случай, когда то же
     сообщение можно послать заново.
@@ -873,6 +911,8 @@ class TaskManager:
             return
         async with self._lock(user_id):
             settings = get_settings(user_id)
+            if not _claim_sender(settings):
+                return
             await self._process_orders(user_id, token, settings)
             await self._check_reminders(user_id, settings)
             await self._maybe_bump_schedule(user_id, settings)
@@ -2867,6 +2907,7 @@ class TaskManager:
     async def _notify(self, user_id: int, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
         try:
             await self.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=reply_markup)
+            _note_sent_notification(text)
             return
         except Exception as e:
             logger.warning("Notify failed (user %s): %s", user_id, e)
@@ -2912,6 +2953,9 @@ class TaskManager:
     async def _tick_auto_locked(self, user_id: int, token: str) -> None:
         settings = get_settings(user_id)
         now = time.time()
+        # Второй цикл тоже рассылает — и тоже только у владельца аренды.
+        if not _claim_sender(settings, now):
+            return
         messages = []
 
         api = YooMarketAPI(token)

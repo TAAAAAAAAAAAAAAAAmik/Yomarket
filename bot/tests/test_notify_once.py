@@ -204,5 +204,63 @@ class WhatWasAnnouncedIsRemembered(unittest.TestCase):
         self.assertIn("1200750", saved[-1])
 
 
+class OnlyOneProcessSendsPerShop(unittest.TestCase):
+    """Сколько процессов запущено, столько копий уведомления и приходит.
+    Команды при этом отвечают как обычно — апдейт Telegram достаётся
+    только одному, — поэтому изнутри бота это неотличимо от ошибки."""
+
+    def test_the_first_process_takes_the_lease(self):
+        from tasks.manager import _claim_sender
+        s = {}
+        self.assertTrue(_claim_sender(s, now=1000.0, instance="aaa"))
+        self.assertEqual(s["_sender"]["inst"], "aaa")
+
+    def test_a_second_process_stays_quiet(self):
+        from tasks.manager import _claim_sender
+        s = {}
+        _claim_sender(s, now=1000.0, instance="aaa")
+        self.assertFalse(_claim_sender(s, now=1010.0, instance="bbb"))
+
+    def test_the_owner_keeps_renewing(self):
+        from tasks.manager import _claim_sender
+        s = {}
+        _claim_sender(s, now=1000.0, instance="aaa")
+        self.assertTrue(_claim_sender(s, now=1120.0, instance="aaa"))
+        self.assertEqual(s["_sender"]["ts"], 1120.0)
+
+    def test_an_abandoned_lease_is_taken_over(self):
+        """Упавший контейнер не должен заткнуть бота навсегда."""
+        from tasks.manager import _claim_sender, _SENDER_LEASE_TTL
+        s = {}
+        _claim_sender(s, now=1000.0, instance="aaa")
+        later = 1000.0 + _SENDER_LEASE_TTL + 1
+        self.assertTrue(_claim_sender(s, now=later, instance="bbb"))
+        self.assertEqual(s["_sender"]["inst"], "bbb")
+
+    def test_a_silenced_tick_does_no_work_at_all(self):
+        """Молчать — значит и не опрашивать: иначе второй процесс тратит
+        лимиты маркетплейса и переписывает чужие отметки."""
+        import tasks.manager as MM
+        tm = MM.TaskManager.__new__(MM.TaskManager)
+        tm._locks = {}
+        touched: list[str] = []
+
+        async def boom(*a, **kw):
+            touched.append("polled")
+
+        tm._process_orders = boom
+        tm._check_reminders = boom
+        tm._maybe_bump_schedule = boom
+        real_token, real_get = MM.get_token, MM.get_settings
+        MM.get_token = lambda uid: "tok"
+        MM.get_settings = lambda uid: {
+            "_sender": {"inst": "someone-else", "ts": __import__("time").time()}}
+        try:
+            asyncio.run(tm._tick(1))
+        finally:
+            MM.get_token, MM.get_settings = real_token, real_get
+        self.assertEqual(touched, [])
+
+
 if __name__ == "__main__":
     unittest.main()

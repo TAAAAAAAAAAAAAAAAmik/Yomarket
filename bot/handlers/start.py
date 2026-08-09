@@ -12,7 +12,7 @@ from storage import delete_token, get_token, save_token, get_settings, save_sett
 router = Router()
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-08-09-remember-what-was-sent"
+BOT_VERSION = "2026-08-09-single-sender"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -135,6 +135,44 @@ async def cmd_version(message: Message) -> None:
         + f"\n{redis_line}\n\n"
         + f"{token_line}\n{panel_line}"
     )
+
+
+@router.message(Command("sent"))
+async def cmd_sent(message: Message) -> None:
+    """Что ЭТОТ процесс отправил за последнее время.
+
+    Продавец видит дубль — а здесь одна запись: значит вторую копию прислал
+    другой процесс. Две записи подряд — беда внутри одного. Различить это
+    иначе нельзя: в Telegram обе копии выглядят одинаково.
+    """
+    import storage
+    from tasks.manager import _SENT_LOG, _SENDER_LEASE_TTL
+
+    lease = (storage.get_settings(message.from_user.id).get("_sender") or {})
+    owner = str(lease.get("inst") or "—")
+    age = _time.time() - float(lease.get("ts") or 0)
+    mine = owner == INSTANCE_ID
+
+    lines = [f"📤 <b>Отправлено этим процессом</b>  <code>{INSTANCE_ID}</code>",
+             "",
+             f"{'🟢' if mine else '🟡'} Рассылку ведёт: <code>{owner}</code>"
+             + (" — это я" if mine else " — другой процесс"),
+             f"   продлена {int(age)} с назад "
+             f"(аренда {int(_SENDER_LEASE_TTL)} с)", ""]
+    if not _SENT_LOG:
+        lines.append("<i>этот процесс ещё ничего не отправлял</i>")
+    seen: dict[str, int] = {}
+    for ts, head in _SENT_LOG[-15:]:
+        seen[head] = seen.get(head, 0) + 1
+    import html as _h
+    for ts, head in _SENT_LOG[-15:]:
+        when = _time.strftime("%H:%M:%S", _time.localtime(ts))
+        mark = "‼️" if seen.get(head, 0) > 1 else "•"
+        lines.append(f"{mark} <code>{when}</code> {_h.escape(head)}")
+    lines += ["", "<i>‼️ — этот процесс отправил одно и то же дважды. "
+              "Если дубль в чате есть, а здесь запись одна — вторую копию "
+              "прислал другой процесс.</i>"]
+    await message.answer("\n".join(lines)[:3900])
 
 
 @router.message(AuthState.waiting_for_token)
