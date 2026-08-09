@@ -119,5 +119,90 @@ class TheProcessIsIdentifiable(unittest.TestCase):
         self.assertIn("несколько ботов", src)
 
 
+class WhatWasAnnouncedIsRemembered(unittest.TestCase):
+    """save_settings стоял последней строкой try. Стоило упасть чему-нибудь
+    после рассылки — и всё уже разосланное не записывалось: следующий проход
+    считал заказы и письма новыми и уведомлял по второму разу."""
+
+    class API:
+        def __init__(self):
+            self.calls = 0
+
+        async def start(self):
+            pass
+
+        async def close(self):
+            pass
+
+        async def get_orders(self, cursor=None):
+            return {"data": [{"id": "1200750", "status": "paid",
+                              "title": "50 звёзд", "price": 60,
+                              "chat_id": "1139042"}]}
+
+        async def get_order(self, oid):
+            return {"data": {"id": str(oid), "status": "paid",
+                             "title": "50 звёзд", "price": 60,
+                             "chat_id": "1139042"}}
+
+        async def get_messages(self, cid):
+            return {"data": []}
+
+        async def send_message(self, cid, text):
+            return {"ok": True}
+
+    def _run(self, *, blow_up: bool):
+        import tasks.manager as MM
+        saved: list = []
+        real_api, real_save = MM.YooMarketAPI, MM.save_settings
+        api = self.API()
+        MM.YooMarketAPI = lambda token=None: api
+
+        def save(uid, s):
+            saved.append(dict(s.get("known_orders") or {}))
+
+        MM.save_settings = save
+        tm = MM.TaskManager.__new__(MM.TaskManager)
+        tm.notes = []
+
+        async def notify(uid, text, **kw):
+            tm.notes.append(text)
+
+        tm._notify = notify
+
+        async def boom(*a, **kw):
+            raise RuntimeError("панель не ответила")
+
+        async def quiet(*a, **kw):
+            return None
+
+        tm._check_messages = boom if blow_up else quiet
+        tm._check_watched_chats = quiet
+        tm._auto_confirm = quiet
+        tm._restore_after_sale = quiet
+        s = {"known_orders": {"999": "paid"}, "known_order_details": {},
+             "orders_initialized": True, "notify_orders": {"enabled": True},
+             "auto_reply": {"enabled": False},
+             "plugins": {"auto_stars": {"enabled": False}}}
+        try:
+            asyncio.run(tm._process_orders(1, "tok", s))
+        except Exception:
+            pass
+        finally:
+            MM.YooMarketAPI, MM.save_settings = real_api, real_save
+        return saved, tm.notes
+
+    def test_a_quiet_pass_records_the_order(self):
+        saved, notes = self._run(blow_up=False)
+        self.assertTrue(any("НОВАЯ ПОКУПКА" in n for n in notes))
+        self.assertIn("1200750", saved[-1])
+
+    def test_a_failure_afterwards_still_records_it(self):
+        """Иначе покупка объявляется заново на каждом проходе."""
+        saved, notes = self._run(blow_up=True)
+        self.assertTrue(any("НОВАЯ ПОКУПКА" in n for n in notes))
+        self.assertTrue(saved, "настройки не сохранились вовсе")
+        self.assertIn("1200750", saved[-1])
+
+
 if __name__ == "__main__":
     unittest.main()

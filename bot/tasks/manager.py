@@ -1257,8 +1257,16 @@ class TaskManager:
                 await self._restore_after_sale(user_id, api, settings,
                                                sold_ads, sold_now)
 
-            save_settings(user_id, settings)
         finally:
+            # Сохраняем при любом исходе. Раньше save_settings стоял последней
+            # строкой try: стоило упасть чему-нибудь после рассылки — проверке
+            # чатов, автоподтверждению, возврату товара в продажу, — и всё уже
+            # разосланное не записывалось. Следующий проход считал заказы и
+            # письма новыми и уведомлял по второму разу.
+            try:
+                save_settings(user_id, settings)
+            except Exception as e:
+                logger.error("Save settings failed (user %s): %s", user_id, e)
             await api.close()
 
     async def _check_watched_chats(self, user_id: int, api: YooMarketAPI,
