@@ -1300,6 +1300,17 @@ class TaskManager:
                     known_messages[order_id] = newest_id
                     continue
 
+                # Отметка «дочитано до» выше всего, что есть в чате, — значит
+                # она не отсюда: номера сообщений на маркетплейсе сквозные, и
+                # проход по чужому чату (когда номер чата ещё не был известен
+                # и подставлялся номер заказа) записывал сюда чужой номер.
+                # Дальше «есть ли что новее» отвечает «нет» — навсегда, и чат
+                # глохнет молча. Сбрасываем и читаем заново от свежих.
+                if newest_id and _is_newer(last_known_id, newest_id):
+                    logger.info("chat %s: watermark %s above chat max %s — reset",
+                                chat_id, last_known_id, newest_id)
+                    last_known_id = ""
+
                 if not _is_newer(newest_id, last_known_id):
                     continue
 

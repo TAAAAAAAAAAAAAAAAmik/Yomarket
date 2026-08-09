@@ -300,5 +300,55 @@ class TheScreenShowsRussianForTheLastSend(unittest.TestCase):
         self.assertNotIn("не поломка бота", text)
 
 
+class AWatermarkFromAnotherChatDeafensThisOne(unittest.TestCase):
+    """Номера сообщений на маркетплейсе сквозные. Проход по чужому чату —
+    когда номер чата ещё не был известен и подставлялся номер заказа —
+    записывал сюда чужой номер. Он выше всего, что есть в этой переписке,
+    и «есть ли что новее» отвечает «нет». Навсегда, и молча.
+    """
+
+    def _run(self, watermark: str, rows):
+        s = settings()
+        s["known_messages"]["77"] = watermark
+        api = FakeAPI(rows)
+        asyncio.run(manager()._check_messages(1, api, s))
+        return s, api
+
+    FRESH = [{"id": "5", "sender_type": "buyer", "text": "где ключ",
+              "created_at": stamp(60)}]
+
+    def test_a_poisoned_watermark_no_longer_swallows_the_message(self):
+        _s, api = self._run("15488419", self.FRESH)
+        self.assertEqual(api.sent, ["Ключ придёт в течение часа."], api.sent)
+
+    def test_the_watermark_is_repaired_to_this_chat_s_own_newest(self):
+        s, _api = self._run("15488419", self.FRESH)
+        self.assertEqual(s["known_messages"]["77"], "5")
+
+    def test_the_repair_happens_once_not_every_pass(self):
+        """Второй проход не должен отвечать на то же самое снова."""
+        s = settings()
+        s["known_messages"]["77"] = "15488419"
+        api = FakeAPI(self.FRESH)
+        tm = manager()
+        asyncio.run(tm._check_messages(1, api, s))
+        asyncio.run(tm._check_messages(1, api, s))
+        self.assertEqual(len(api.sent), 1, api.sent)
+
+    def test_an_ordinary_watermark_is_left_alone(self):
+        _s, api = self._run("5", self.FRESH)
+        self.assertEqual(api.sent, [], "уже зачтённое отвечать заново нельзя")
+
+    def test_a_reversed_api_order_does_not_look_poisoned(self):
+        """Ответ от нового к старому — не повод считать отметку чужой."""
+        rows = [{"id": "9", "sender_type": "buyer", "text": "где ключ",
+                 "created_at": stamp(60)},
+                {"id": "3", "sender_type": "buyer", "text": "привет",
+                 "created_at": stamp(600)}]
+        s, api = self._run("9", rows)
+        self.assertEqual(api.sent, [])
+        self.assertEqual(s["known_messages"]["77"], "9")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1020,7 +1020,8 @@ async def _chain_report(uid: int, api: YooMarketAPI, order_id: str,
     import autoreply as ar
     import orderfields as of
     from tasks.manager import _chats_to_poll, _msg_rows, _msg_text, _ts_of, \
-        _is_own_message, _is_service_message, _CHAT_POLL_LIMIT, _MSG_FRESH
+        _is_own_message, _is_our_text, _is_service_message, _is_newer, \
+        _newest_id, _CHAT_POLL_LIMIT, _MSG_FRESH
 
     s = get_settings(uid)
     out: list[str] = [""]
@@ -1031,8 +1032,7 @@ async def _chain_report(uid: int, api: YooMarketAPI, order_id: str,
     queue = _chats_to_poll(known, details)
     status = str(known.get(order_id, "—"))
     closed = status in of.BACK or status in of.DONE
-    out.append(f"1️⃣ Статус заказа: {of.status_icon(status)} "
-               f"<b>{_esc(of.status_ru(status))}</b>")
+    out.append(f"1️⃣ Статус заказа: <b>{_esc(of.status_ru(status))}</b>")
     if order_id in queue:
         out.append(f"   🟢 В очереди опроса — {queue.index(order_id) + 1}-й "
                    f"из {len(queue)} (предел {_CHAT_POLL_LIMIT})")
@@ -1051,23 +1051,39 @@ async def _chain_report(uid: int, api: YooMarketAPI, order_id: str,
         out.append(f"2️⃣ ❌ Чат не читается: <code>{_esc(str(e)[:150])}</code>")
         return out
     out.append(f"\n2️⃣ В чате сообщений: <b>{len(rows)}</b>")
-    buyer = [m for m in rows if not _is_own_message(m)
-             and not _is_service_message(m) and _msg_text(m)]
-    for m in rows[-3:]:
-        who = "🏪" if _is_own_message(m) else (
-            "⚙️" if _is_service_message(m) else "👤")
-        out.append(f"   {who} <i>{_esc(_msg_text(m)[:60]) or '(пусто)'}</i>")
+    # Порядок в ответе API не гарантирован, и брать rows[-1] за «последнее»
+    # нельзя: при обратной сортировке это самое старое письмо. Фоновый цикл
+    # это уже учитывал (_newest_id берёт максимум) — экран не учитывал.
+    ordered = sorted(rows, key=lambda m: (_ts_of(m), str(m.get("id", ""))))
+    buyer = [m for m in ordered if not _is_own_message(m)
+             and not _is_service_message(m) and _msg_text(m)
+             and not _is_our_text(s, chat_id, _msg_text(m))]
+    for m in ordered[-3:]:
+        who = ("🏪" if _is_own_message(m) or _is_our_text(s, chat_id, _msg_text(m))
+               else "⚙️" if _is_service_message(m) else "👤")
+        when = time.strftime("%d.%m %H:%M", time.localtime(_ts_of(m))) \
+            if _ts_of(m) else "—"
+        out.append(f"   {who} <code>{when}</code> "
+                   f"<i>{_esc(_msg_text(m)[:55]) or '(пусто)'}</i>")
 
     # 3. Считается ли последнее письмо новым
     seen = str((s.get("known_messages") or {}).get(order_id, ""))
-    newest = str(rows[-1].get("id", "")) if rows else ""
+    newest = _newest_id(rows)
     out.append(f"\n3️⃣ Бот дочитал до <code>{_esc(seen or 'ничего')}</code>, "
-               f"в чате последнее <code>{_esc(newest or '—')}</code>")
-    if seen and newest and seen == newest:
-        out.append("   ⚪ Новых сообщений нет — всё уже зачтено")
-    elif not seen:
+               f"в чате самое новое <code>{_esc(newest or '—')}</code>")
+    if not seen:
         out.append("   ⚠️ Чат ещё ни разу не читался: первый проход только "
                    "запомнит текущее место, не отвечая на старое")
+    elif seen == newest:
+        out.append("   ⚪ Новых сообщений нет — всё уже зачтено")
+    elif newest and _is_newer(seen, newest):
+        # Отметка выше всего, что есть в чате: она пришла не отсюда. Пока
+        # она стоит, «есть ли что новее» отвечает «нет» — навсегда.
+        out.append("   🔴 <b>Отметка выше всего, что есть в чате</b> — она "
+                   "не из этой переписки. Пока так, бот не увидит здесь "
+                   "ни одного нового сообщения")
+    else:
+        out.append(f"   🟢 Есть непрочитанное — бот к нему ещё не дошёл")
 
     # 4. Что бот сделал бы с последним письмом покупателя
     if not buyer:

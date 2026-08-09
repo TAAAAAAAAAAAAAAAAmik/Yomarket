@@ -171,6 +171,67 @@ class AClosedOrderIsTheEndOfTheLine(unittest.TestCase):
         self.assertNotIn("refunded", text)
 
 
+class TheOrderOfMessagesIsNotAssumed(unittest.TestCase):
+    """API может отдать переписку от новой к старой. Тогда rows[-1] — самое
+    СТАРОЕ письмо, и экран уверенно докладывал про трёхдневную давность,
+    пока сегодняшнее сообщение висело непрочитанным."""
+
+    REVERSED = [
+        {"id": "15488500", "sender_type": "buyer", "text": "долго",
+         "created_at": stamp(120)},
+        {"id": "15360529", "sender_type": "buyer", "text": "спасибо",
+         "created_at": stamp(69 * 3600)},
+    ]
+
+    def test_the_newest_letter_wins_even_when_the_api_sorts_backwards(self):
+        text = report(settings(seen="1"), FakeAPI(self.REVERSED))
+        self.assertIn("долго", text)
+        self.assertIn("0.0 ч назад", text)
+
+    def test_the_newest_id_is_the_largest_not_the_last(self):
+        text = report(settings(seen="1"), FakeAPI(self.REVERSED))
+        self.assertIn("15488500", text)
+
+    def test_an_unread_letter_is_announced(self):
+        text = report(settings(seen="15360529"), FakeAPI(self.REVERSED))
+        self.assertIn("Есть непрочитанное", text)
+
+
+class AWatermarkFromElsewhereIsCalledOut(unittest.TestCase):
+    """Отметка выше всего, что есть в чате, глушит переписку навсегда —
+    и снаружи это выглядит просто как «бот молчит»."""
+
+    def test_it_is_named_as_the_broken_link(self):
+        text = report(settings(seen="15488419"), FakeAPI(MSG))
+        self.assertIn("Отметка выше всего", text)
+        self.assertIn("не из этой переписки", text)
+
+    def test_an_equal_watermark_is_just_nothing_new(self):
+        text = report(settings(seen="5"), FakeAPI(MSG))
+        self.assertIn("всё уже зачтено", text)
+        self.assertNotIn("Отметка выше", text)
+
+
+class OurOwnAnswerComingBackIsNotABuyerLetter(unittest.TestCase):
+    """Бот отвечал сам себе и доставал «@ник» из собственного вопроса —
+    с этого начинался круг покупок в пустоту. Экран обязан показывать
+    авторство так же, как его считает фоновый цикл."""
+
+    def _with_fingerprint(self):
+        from tasks.manager import _note_sent_text
+        s = settings(seen="1")
+        _note_sent_text(s, "99", "Спасибо за заказ! Скоро свяжемся с вами.")
+        rows = [{"id": "7", "sender_type": "buyer", "created_at": stamp(300),
+                 "text": "Спасибо за заказ! Скоро свяжемся с вами."}]
+        return report(s, FakeAPI(rows))
+
+    def test_it_is_marked_as_ours(self):
+        self.assertIn("🏪", self._with_fingerprint())
+
+    def test_and_is_not_counted_as_a_letter_to_answer(self):
+        self.assertIn("Писем покупателя в чате нет", self._with_fingerprint())
+
+
 class EveryCommandNameIsUnique(unittest.TestCase):
     """/chat_debug был объявлен дважды. Побеждал тот роутер, что подключён
     раньше, и вторая команда молча не работала — без единой ошибки."""
