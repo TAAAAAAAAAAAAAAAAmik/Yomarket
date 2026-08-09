@@ -2861,9 +2861,14 @@ async def _panel_actions_for(uid: int, item_id) -> str:
         return f"ошибка: {str(e)[:90]}"
 
 
-@router.message(Command("withdraw_debug"))
-async def withdraw_debug(message: Message) -> None:
-    """Where the payout action lives — read-only, runs nothing."""
+@router.message(Command("withdraw_form"))
+async def withdraw_form(message: Message) -> None:
+    """Where the payout action lives — read-only, runs nothing.
+
+    Раньше называлась /withdraw_debug и была тенью: то же имя занято в
+    panel_items, а его роутер подключается раньше — эта команда не
+    срабатывала ни разу. Пробы разные, поэтому имена теперь тоже.
+    """
     import asyncio as _a
     import html as _html
     from storage import get_panel_creds

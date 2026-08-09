@@ -1003,15 +1003,112 @@ async def chat_debug(message: Message, api: YooMarketAPI) -> None:
         lines.append("❌ Нет токена — отправьте /start")
         await message.answer("\n".join(lines))
         return
+    lines += await _chain_report(message.from_user.id, api, str(arg),
+                                 real_id, det)
+    await message.answer("\n".join(lines)[:3900])
+
+
+async def _chain_report(uid: int, api: YooMarketAPI, order_id: str,
+                        chat_id: str, det: dict) -> list[str]:
+    """Вся цепочка «увидел → узнал → ответил» по одному заказу.
+
+    Каждое звено рвётся по-своему, а снаружи всё выглядит одинаково: бот
+    промолчал. Заказ вне очереди опроса, сообщение уже зачтённое, закрытый
+    заказ, не совпавшее правило, пауза — здесь видно, какое именно звено.
+    """
+    import time
+    import autoreply as ar
+    import orderfields as of
+    from tasks.manager import _chats_to_poll, _msg_rows, _msg_text, _ts_of, \
+        _is_own_message, _is_service_message, _CHAT_POLL_LIMIT, _MSG_FRESH
+
+    s = get_settings(uid)
+    out: list[str] = [""]
+
+    # 1. Попадает ли заказ в очередь опроса
+    known = s.get("known_orders") or {}
+    details = s.get("known_order_details") or {}
+    queue = _chats_to_poll(known, details)
+    status = str(known.get(order_id, "—"))
+    closed = status in of.BACK or status in of.DONE
+    out.append(f"1️⃣ Статус заказа: {of.status_icon(status)} "
+               f"<b>{_esc(of.status_ru(status))}</b>")
+    if order_id in queue:
+        out.append(f"   🟢 В очереди опроса — {queue.index(order_id) + 1}-й "
+                   f"из {len(queue)} (предел {_CHAT_POLL_LIMIT})")
+    else:
+        why = ("чат помечен несуществующим" if det.get("chat_gone")
+               else "заказ закрыт больше недели назад" if closed
+               else f"не входит в {_CHAT_POLL_LIMIT} самых свежих "
+                    f"из {len(known)} заказов")
+        out.append(f"   🔴 <b>Не опрашивается</b> — {why}")
+        out.append("   <i>Сообщений в этом чате бот не увидит вовсе.</i>")
+
+    # 2. Что в чате на самом деле
     try:
-        data = await api.get_messages(real_id)
-        rows = _rows(data)
-        lines.append(f"Ответ API: <b>{len(rows)}</b> сообщений")
-        for m in rows[-3:]:
-            who = "🏪" if (m.get("sender_type") in ("shop", "seller")
-                           or m.get("is_mine")) else "👤"
-            body = str(m.get("text") or m.get("message") or "").strip()
-            lines.append(f"{who} <i>{_esc(body[:60]) or '(пусто)'}</i>")
+        rows = _msg_rows(await api.get_messages(chat_id))
     except Exception as e:
-        lines.append(f"❌ API: <code>{_esc(str(e)[:200])}</code>")
-    await message.answer("\n".join(lines))
+        out.append(f"2️⃣ ❌ Чат не читается: <code>{_esc(str(e)[:150])}</code>")
+        return out
+    out.append(f"\n2️⃣ В чате сообщений: <b>{len(rows)}</b>")
+    buyer = [m for m in rows if not _is_own_message(m)
+             and not _is_service_message(m) and _msg_text(m)]
+    for m in rows[-3:]:
+        who = "🏪" if _is_own_message(m) else (
+            "⚙️" if _is_service_message(m) else "👤")
+        out.append(f"   {who} <i>{_esc(_msg_text(m)[:60]) or '(пусто)'}</i>")
+
+    # 3. Считается ли последнее письмо новым
+    seen = str((s.get("known_messages") or {}).get(order_id, ""))
+    newest = str(rows[-1].get("id", "")) if rows else ""
+    out.append(f"\n3️⃣ Бот дочитал до <code>{_esc(seen or 'ничего')}</code>, "
+               f"в чате последнее <code>{_esc(newest or '—')}</code>")
+    if seen and newest and seen == newest:
+        out.append("   ⚪ Новых сообщений нет — всё уже зачтено")
+    elif not seen:
+        out.append("   ⚠️ Чат ещё ни разу не читался: первый проход только "
+                   "запомнит текущее место, не отвечая на старое")
+
+    # 4. Что бот сделал бы с последним письмом покупателя
+    if not buyer:
+        out.append("\n4️⃣ Писем покупателя в чате нет")
+        return out
+    last = buyer[-1]
+    text = _msg_text(last)
+    age = time.time() - (_ts_of(last) or time.time())
+    out.append(f"\n4️⃣ Последнее письмо покупателя ({age / 3600:.1f} ч назад):"
+               f"\n   <blockquote>{_esc(text[:120])}</blockquote>")
+    if age > _MSG_FRESH:
+        out.append(f"   🔴 Старше {_MSG_FRESH // 3600} ч — бот на такое не "
+                   f"отвечает, только пометит чат ждущим")
+    conf = ar.cfg(s)
+    rule, matched = ar.pick(conf, text)
+    if not rule:
+        out.append("   🔴 Ни одно правило не совпало, запасной ответ выключен")
+    else:
+        where = f"правило «{_esc(matched)}»" if matched else "запасной ответ"
+        out.append(f"   🟢 Сработает: {where}")
+        allowed, why = ar.gate(conf, chat_id)
+        out.append(f"   {'🟢' if allowed else '🔴'} Отправка: {_esc(why)}")
+
+    # 5. Примет ли маркетплейс ответ в этот чат.
+    # Отказ утверждаем только там, где он уже случился: догадка, поданная
+    # как факт, — ровно та болезнь, от которой этот экран и заводился.
+    out.append("")
+    refusal = next((e for e in (conf.get("log") or [])
+                    if str(e.get("chat")) == str(chat_id) and not e.get("ok")
+                    and "no_active_orders" in str(e.get("err", "")).lower()),
+                   None)
+    if refusal:
+        when = time.strftime("%d.%m %H:%M",
+                             time.localtime(float(refusal.get("ts", 0) or 0)))
+        out.append(f"5️⃣ 🔴 Маркетплейс уже отказал в этот чат ({when}): "
+                   f"по заказу нет активных сделок. Ни бот, ни вы вручную "
+                   f"туда не напишете")
+    elif closed:
+        out.append("5️⃣ 🟡 Заказ закрыт. По закрытым сделкам маркетплейс "
+                   "отвечает <code>no_active_orders_in_chat</code> — ответ "
+                   "скорее всего не пройдёт, но здесь это ещё не проверялось")
+    else:
+        out.append("5️⃣ 🟢 Заказ активен — чат должен принимать сообщения")
+    return out

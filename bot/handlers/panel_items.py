@@ -1647,16 +1647,20 @@ async def pos_debug(message: Message) -> None:
     await status.delete()
 
 
-@router.message(Command("chat_debug"))
-async def chat_debug(message: Message) -> None:
-    """/chat_debug 1076867 — find how the panel sends a support message.
+@router.message(Command("chat_send_probe"))
+async def chat_send_probe(message: Message) -> None:
+    """/chat_send_probe 1076867 — find how the panel sends a support message.
+
+    Раньше называлась /chat_debug и перехватывала это имя у диагностики в
+    handlers/chats.py: panel_items подключается раньше, так что нужная
+    команда просто не срабатывала. Имена команд обязаны быть уникальными.
 
     Read-only: sends nothing. Reveals the token, the reachable endpoints and
     the send route, so replying to support can be wired to the real request.
     """
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Укажите номер чата: <code>/chat_debug 1076867</code>")
+        await message.answer("Укажите номер чата: <code>/chat_send_probe 1076867</code>")
         return
     chat_id = parts[1].strip().rstrip("/").split("/")[-1]
     creds = get_panel_creds(message.from_user.id)
