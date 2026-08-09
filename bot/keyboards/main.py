@@ -92,12 +92,15 @@ def ads_list_keyboard(
 
 def order_actions_keyboard(order_id: str, chat_id: str = "") -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="▶️ В работу", callback_data=OrderCallback(order_id=order_id, action="work").pack())
+    # «В работу» убрана: что POST /orders/{id}/work делает на этом
+    # маркетплейсе, не подтверждено — на тестовом заказе покупатель сразу
+    # увидел «магазин сообщил, что выполнил заказ». Автопринятие в Автопилоте
+    # остаётся, там это осознанный выбор с показом настоящего статуса.
     builder.button(text="✅ Подтвердить", callback_data=OrderCallback(order_id=order_id, action="confirm").pack())
     builder.button(text="↩️ Возврат", callback_data=OrderCallback(order_id=order_id, action="refund").pack())
     builder.button(text="💬 Чат по заказу", callback_data=ChatCallback(chat_id=chat_id or order_id).pack())
     builder.button(text="⬅️ Назад", callback_data="menu:orders")
-    builder.adjust(3, 1, 1)
+    builder.adjust(2, 1, 1)
     return builder.as_markup()
 
 

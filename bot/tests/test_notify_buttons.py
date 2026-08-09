@@ -123,15 +123,31 @@ class EveryButtonOnANotificationLeadsSomewhere(unittest.TestCase):
 
 
 class TheNewOrderCardOffersTheThreeActionsItPromises(unittest.TestCase):
-    """Пункт A3 приёмки: карточка с «В работу», «Подтвердить» и «Чат»,
-    и кнопки срабатывают."""
+    """Пункт A3 приёмки: карточка с действиями по заказу, и кнопки
+    срабатывают."""
 
     def setUp(self):
         self.kb = M._order_notify_kb("1200750", "1139042")
         self.labels = [b.text for row in self.kb.inline_keyboard for b in row]
 
-    def test_take_into_work_is_there_and_wired(self):
-        self.assertIn("▶️ В работу", self.labels)
+    def test_taking_into_work_is_not_offered_in_one_tap(self):
+        """Что делает POST /orders/{id}/work на этом маркетплейсе, не
+        подтверждено: на тестовом заказе покупатель в ту же минуту увидел
+        «магазин сообщил, что выполнил заказ». Такое не вешают на кнопку в
+        уведомлении — это заявление перед покупателем и площадкой."""
+        self.assertNotIn("▶️ В работу", self.labels)
+        self.assertNotIn("order:1200750:work", presses(self.kb))
+
+    def test_and_it_is_gone_from_the_other_screens_too(self):
+        """Убирать надо везде, иначе половинчато и непонятно."""
+        from keyboards.main import order_actions_keyboard
+        for kb in (order_actions_keyboard("1200750", "1139042"),
+                   M._message_notify_kb("1139042", "1200750")):
+            self.assertFalse(
+                [d for d in presses(kb) if d.endswith(":work")], presses(kb))
+
+    def test_the_handler_stays_for_auto_accept(self):
+        """Автопринятие ходит тем же путём — обработчик убирать нельзя."""
         self.assertEqual(handler_of("order:1200750:work"),
                          ("orders", "handle_order_action"))
 

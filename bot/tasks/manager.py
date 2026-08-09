@@ -712,13 +712,19 @@ def _stars_failure_hint(result) -> str:
 
 def _order_notify_kb(order_id: str, chat_id: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    # Quick actions straight from the notification (no need to open the order)
-    builder.button(text="▶️ В работу", callback_data=f"order:{order_id}:work")
+    # Quick actions straight from the notification (no need to open the order).
+    #
+    # Кнопки «В работу» здесь нет намеренно. Что делает POST /orders/{id}/work
+    # на этом маркетплейсе, до конца не выяснено: на тестовом заказе покупатель
+    # в ту же минуту увидел «магазин сообщил, что выполнил заказ». Пока это не
+    # подтверждено, нажимать такое одним тапом из уведомления нельзя — это
+    # заявление перед покупателем и площадкой. Автопринятие остаётся: оно
+    # включается осознанно и показывает настоящий статус после действия.
     builder.button(text="✅ Подтвердить", callback_data=f"order:{order_id}:confirm")
     builder.button(text="↩️ Возврат", callback_data=f"order:{order_id}:refundask")
     builder.button(text="💬 Чат", callback_data=f"chat:{chat_id}:")
     builder.button(text="🔍 Детали", callback_data=f"order:{order_id}:view")
-    builder.adjust(3, 2)
+    builder.adjust(2, 2)
     return builder.as_markup()
 
 
@@ -758,10 +764,9 @@ def _message_notify_kb(chat_id: str, order_id: str = "") -> InlineKeyboardMarkup
     builder.button(text="💬 Открыть чат", callback_data=f"chat:{chat_id}:")
     if order_id:
         # Most replies are followed by acting on the order, so keep those here
-        builder.button(text="▶️ В работу", callback_data=f"order:{order_id}:work")
         builder.button(text="✅ Подтвердить",
                        callback_data=f"order:{order_id}:confirm")
-        builder.adjust(2, 2)
+        builder.adjust(2, 1)
     else:
         builder.adjust(2)
     return builder.as_markup()
