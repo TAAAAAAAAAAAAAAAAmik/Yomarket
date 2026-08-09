@@ -368,6 +368,25 @@ _CHAT_POLL_LIMIT = 25
 _CLOSED_QUIET_AFTER = 7 * 86400
 
 
+def _stars_drop_if_closed(settings: dict, order_id: str) -> str:
+    """Снять закрытый заказ с очереди «ждём @ник» → статус по-русски или «».
+
+    Очередь AutoStars перехватывает каждое письмо покупателя в чате заказа,
+    считая его ответом с ником. Для возвращённого заказа ждать нечего, а
+    перехват остаётся: письма не доходят ни до уведомлений, ни до правил.
+    """
+    import orderfields as of
+    status = str((settings.get("known_orders") or {}).get(str(order_id), ""))
+    if not status or (status not in of.BACK and status not in of.DONE):
+        return ""
+    pending = ((settings.get("plugins") or {}).get("auto_stars") or {}
+               ).get("pending") or {}
+    if str(order_id) not in pending:
+        return ""
+    pending.pop(str(order_id), None)
+    return of.status_ru(status)
+
+
 def _chats_to_poll(known_orders: dict, order_details: dict) -> list[str]:
     """Чаты каких заказов читать — самые свежие, а не первые попавшиеся.
 
@@ -1598,13 +1617,39 @@ class TaskManager:
         if not entry:
             return False
 
+        # Возвращённый заказ из очереди не выходил сам. А пока он в ней стоит,
+        # ЛЮБОЕ письмо покупателя в этом чате считается ответом с ником: оно
+        # не доходит ни до уведомления, ни до правил автоответа. Продавец
+        # видит только тишину — ни ошибки, ни записи в журнале.
+        closed = _stars_drop_if_closed(settings, order_id)
+        if closed:
+            await self._notify(
+                user_id,
+                _card("⭐ <b>ЗАКАЗ ЗАКРЫТ — СНЯТ С ОЧЕРЕДИ</b>",
+                      [f"Заказ #{_esc(order_id)}: <b>{_esc(closed)}</b>.",
+                       "Звёзд он больше не ждёт, и письма покупателя в этом "
+                       "чате снова идут обычным путём."]))
+            return False
+
         username = _extract_username(buyer_text)
         if not username:
-            await self._send_chat(
+            ok, err = await self._send_chat(
                 api, chat_id,
                 "Не разобрал ник. Пришлите его одним сообщением: латиница, "
                 "минимум 5 символов, например durov", settings,
             )
+            if not ok:
+                # Раньше исход этой отправки не смотрели вовсе: покупатель не
+                # получал ни звёзд, ни просьбы прислать ник, а продавец —
+                # ни строчки. Сообщение при этом считалось разобранным.
+                import autoreply as _ar
+                why, _fixable = _ar.explain_error(err)
+                await self._notify(
+                    user_id,
+                    _card("⭐ <b>НЕ СПРОСИЛ НИК</b>",
+                          [f"Заказ #{_esc(order_id)}: покупатель написал, но "
+                           f"переспросить не вышло.",
+                           f"❌ {_esc(why)}"]))
             return True
 
         qty = int(entry.get("quantity", p.get("amount", 50)))
@@ -1790,8 +1835,16 @@ class TaskManager:
         if not pending:
             return ""
         stuck = []
+        dropped: list[str] = []
         for order_id, entry in list(pending.items()):
             if not isinstance(entry, dict):
+                continue
+
+            # Закрытый заказ снимается сам, не дожидаясь письма покупателя:
+            # иначе очередь копит возвраты, и каждый из них глушит свой чат.
+            was = _stars_drop_if_closed(settings, order_id)
+            if was:
+                dropped.append(f"• #{_esc(str(order_id))} — {_esc(was)}")
                 continue
 
             # Ник известен — ждать нечего, надо повторять покупку. Раньше
@@ -1820,6 +1873,10 @@ class TaskManager:
             if waited >= self._STARS_ESCALATE_AFTER and reminded < 2:
                 entry["reminded"] = 2
                 stuck.append((order_id, entry, waited))
+        if dropped and not stuck:
+            return _card("⭐ <b>СНЯТЫ С ОЧЕРЕДИ</b>", dropped[:8],
+                         "Заказы закрыты — звёзд они больше не ждут, и чаты "
+                         "снова читаются обычным путём.")
         if not stuck:
             return ""
         lines = []
