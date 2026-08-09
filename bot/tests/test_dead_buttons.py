@@ -66,6 +66,31 @@ def callbacks(kb) -> list[str]:
                                   for b in row]
 
 
+class Patched(unittest.TestCase):
+    """Подмена, которая сама за собой убирает.
+
+    Здесь подменяются функции в общих модулях — `promo_params`, чтение
+    настроек, вызов панели. Без отката они остаются подменёнными до конца
+    процесса: «тарифа нет» из одного теста уезжало в чужой набор, и
+    тринадцать тестов автоподнятия падали, хотя код был исправен.
+    """
+
+    def setUp(self) -> None:
+        self._undo: list[tuple[object, str, object, bool]] = []
+
+    def patch(self, module, name: str, value) -> None:
+        had = hasattr(module, name)
+        self._undo.append((module, name, getattr(module, name, None), had))
+        setattr(module, name, value)
+
+    def tearDown(self) -> None:
+        for module, name, old, had in reversed(self._undo):
+            if had:
+                setattr(module, name, old)
+            else:
+                delattr(module, name)
+
+
 class NothingUsesTheApiThatHasNoSuchMethod(unittest.TestCase):
     """У Юмаркета нет ни поднятия, ни вывода, ни отзывов через API."""
 
@@ -89,16 +114,17 @@ class NothingUsesTheApiThatHasNoSuchMethod(unittest.TestCase):
             self.assertNotIn("get_reviews", text, path.name)
 
 
-class BumpingAPack(unittest.TestCase):
+class BumpingAPack(Patched):
     def setUp(self):
+        super().setUp()
         self.settings = {"ad_packs": {"Мой пак": ["1", "2", "3"]}}
-        PK.get_settings = lambda uid: self.settings
-        PK.get_panel_creds = None          # ставится через модуль storage
         import storage
-        storage.get_panel_creds = lambda uid: {"cookies": {"a": "b"}}
         import handlers.selenium_settings as SS
-        SS.promo_params = lambda s: {"up_id": "1"}
-        SS.promo_price = lambda s: 19
+        self.patch(PK, "get_settings", lambda uid: self.settings)
+        self.patch(PK, "get_panel_creds", None)   # ставится через модуль storage
+        self.patch(storage, "get_panel_creds", lambda uid: {"cookies": {"a": "b"}})
+        self.patch(SS, "promo_params", lambda s: {"up_id": "1"})
+        self.patch(SS, "promo_price", lambda s: 19)
         self.ss = SS
 
     def test_it_asks_before_spending(self):
@@ -114,7 +140,7 @@ class BumpingAPack(unittest.TestCase):
         self.assertIn("57 ₽", cb.message.last, cb.message.last)   # 19 × 3
 
     def test_without_a_tariff_it_sends_you_to_pick_one(self):
-        self.ss.promo_params = lambda s: {}
+        self.patch(self.ss, "promo_params", lambda s: {})
         cb = CB("pack:bump:0")
         asyncio.run(PK.pack_bump_ask(cb))
         self.assertIn("promo:setup", callbacks(cb.message.kbs[-1]))
@@ -126,7 +152,7 @@ class BumpingAPack(unittest.TestCase):
         def fake(cookies, item_id, uid=None, confirm=False, params=None):
             return seq.pop(0)
 
-        PP.panel_bump_item_sync = fake
+        self.patch(PP, "panel_bump_item_sync", fake)
         cb = CB("pack:bumpok:0")
         asyncio.run(PK.pack_bump(cb))
         return cb
@@ -153,11 +179,12 @@ class BumpingAPack(unittest.TestCase):
         self.assertEqual(cb.message.last.count("нет прав"), 1, cb.message.last)
 
 
-class WithdrawingMoney(unittest.TestCase):
+class WithdrawingMoney(Patched):
     def setUp(self):
+        super().setUp()
         self.settings = {"auto_withdraw": {}}
-        BL.get_settings = lambda uid: self.settings
-        BL.save_settings = lambda uid, s: None
+        self.patch(BL, "get_settings", lambda uid: self.settings)
+        self.patch(BL, "save_settings", lambda uid, s: None)
 
     def _ready(self):
         self.settings["auto_withdraw"] = {
@@ -173,7 +200,7 @@ class WithdrawingMoney(unittest.TestCase):
     def test_with_details_it_asks_for_an_amount(self):
         self._ready()
         import tasks.manager as M
-        M.shop_balance = _fake_balance(1500.0, "1 500")
+        self.patch(M, "shop_balance", _fake_balance(1500.0, "1 500"))
         cb = CB("balance:withdraw")
         asyncio.run(BL.withdraw_start(cb, FSM(), None))
         self.assertIn("1 500", cb.message.last)
@@ -182,7 +209,7 @@ class WithdrawingMoney(unittest.TestCase):
     def test_withdraw_all_confirms_before_moving_money(self):
         self._ready()
         import tasks.manager as M
-        M.shop_balance = _fake_balance(1500.0, "1 500")
+        self.patch(M, "shop_balance", _fake_balance(1500.0, "1 500"))
         cb = CB("balance:withdraw_all")
         asyncio.run(BL.withdraw_all(cb, FSM(), None))
         self.assertIn("Подтвердите", cb.message.last)
@@ -191,7 +218,7 @@ class WithdrawingMoney(unittest.TestCase):
     def test_an_empty_balance_is_not_offered_for_withdrawal(self):
         self._ready()
         import tasks.manager as M
-        M.shop_balance = _fake_balance(0.0, "0")
+        self.patch(M, "shop_balance", _fake_balance(0.0, "0"))
         cb = CB("balance:withdraw_all")
         asyncio.run(BL.withdraw_all(cb, FSM(), None))
         self.assertIn("выводить нечего", cb.message.last)
@@ -222,7 +249,7 @@ def _fake_balance(amount, text):
     return shop_balance
 
 
-class ReadingReviews(unittest.TestCase):
+class ReadingReviews(Patched):
     """Отзывы теперь читаются из панели — в API их нет вовсе."""
 
     def test_the_parser_understands_a_nova_row(self):
@@ -261,8 +288,8 @@ class ReadingReviews(unittest.TestCase):
                             {"attribute": "name", "value": "категория"}]}]}
                 return R()
 
-        P._make_panel_requests_session = lambda ck: Sess()
-        P._panel_xsrf_headers = lambda s, ck: {}
+        self.patch(P, "_make_panel_requests_session", lambda ck: Sess())
+        self.patch(P, "_panel_xsrf_headers", lambda s, ck: {})
         ok, got = P.panel_reviews_sync("cookie")
         self.assertFalse(ok)
         self.assertIn("похожих на отзыв 0", str(got))

@@ -211,6 +211,39 @@ def gate(conf: dict, chat_id: str, now: float | None = None
     return True, "можно отвечать"
 
 
+# Что маркетплейс отвечает на попытку написать в чат — и что это значит
+# продавцу. Голый английский код в интерфейсе означает «разбирайся сам», а
+# половина этих ошибок вообще не про бота: чат закрыт, и вручную туда тоже
+# не написать. Третий элемент — можно ли ответить руками.
+_SEND_ERRORS: tuple[tuple[str, str, bool], ...] = (
+    ("no_active_orders_in_chat",
+     "маркетплейс закрыл чат — по заказу нет активных сделок. "
+     "Написать туда нельзя ни боту, ни вручную", False),
+    ("resource_not_found",
+     "чата больше нет — заказ удалён или скрыт маркетплейсом", False),
+    ("chat_is_closed", "чат заказа закрыт маркетплейсом", False),
+    ("unauthenticated",
+     "токен интеграции больше не действует — обновите его в «Настройках»", True),
+    ("unauthorized",
+     "токен интеграции больше не действует — обновите его в «Настройках»", True),
+    ("too_many_requests",
+     "маркетплейс попросил сбавить темп — попробую позже", True),
+)
+
+
+def explain_error(err: str) -> tuple[str, bool]:
+    """Ошибка отправки по-русски → (объяснение, можно ли исправить вручную).
+
+    Второе значение важнее первого: советовать «ответьте вручную» там, где
+    маркетплейс закрыл чат, — это отправить продавца биться в стену.
+    """
+    low = (err or "").lower()
+    for needle, text, actionable in _SEND_ERRORS:
+        if needle in low:
+            return text, actionable
+    return ((err or "неизвестная ошибка")[:120], True)
+
+
 def note_sent(conf: dict, chat_id: str, now: float | None = None) -> None:
     now = now if now is not None else time.time()
     state = conf.setdefault("state", {})

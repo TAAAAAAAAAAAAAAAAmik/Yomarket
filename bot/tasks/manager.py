@@ -386,6 +386,11 @@ def _chats_to_poll(known_orders: dict, order_details: dict) -> list[str]:
         # Возврат недельной давности писем уже не приносит.
         if closed and seen and now - seen > _CLOSED_QUIET_AFTER:
             continue
+        # Чат, которого нет: маркетплейс отвечает 404 на каждом проходе. Он
+        # занимал место в очереди из 25 чатов и висел предупреждением на
+        # экране, притом что читать там нечего.
+        if det.get("chat_gone"):
+            continue
         rows.append((seen, str(oid)))
     rows.sort(key=lambda r: r[0], reverse=True)
     return [oid for _, oid in rows[:_CHAT_POLL_LIMIT]]
@@ -1258,6 +1263,11 @@ class TaskManager:
                 chat_id = str(details.get("chat_id") or order_id)
 
                 data = await api.get_messages(chat_id)
+                # Чат прочитался — прошлые сбои больше не в счёт. Отметку
+                # снимаем здесь, а не в конце разбора: ниже несколько
+                # законных `continue`, и до конца доходит не каждый проход.
+                if order_id in order_details:
+                    order_details[order_id].pop("chat_misses", None)
                 messages = _msg_rows(data)
                 if not messages:
                     continue
@@ -1420,7 +1430,21 @@ class TaskManager:
 
             except Exception as e:
                 logger.warning("Message check for order %s: %s", order_id, e)
-                poll["error"] = f"#{order_id}: {str(e)[:80]}"
+                import autoreply as _ar
+                why, _fixable = _ar.explain_error(str(e))
+                poll["error"] = f"#{order_id}: {why[:80]}"
+                # Чат, которого нет, не появится сам. Три промаха подряд — и
+                # заказ выпадает из опроса: иначе он вечно занимает одно из
+                # 25 мест и держит на экране предупреждение, по которому
+                # нечего делать.
+                if "resource_not_found" in str(e).lower() and order_id in order_details:
+                    det = order_details[order_id]
+                    misses = int(det.get("chat_misses", 0) or 0) + 1
+                    det["chat_misses"] = misses
+                    if misses >= 3:
+                        det["chat_gone"] = time.time()
+                        poll["error"] = (f"#{order_id}: чата нет — "
+                                         f"больше не опрашиваю")
 
         settings["known_messages"] = known_messages
         poll["ts"] = time.time()
@@ -1985,17 +2009,27 @@ class TaskManager:
             # Молчаливый провал — худший исход: продавец считает, что покупателю
             # ответили. Сообщаем, но не чаще раза в час, чтобы упавшее API не
             # превратилось в поток уведомлений.
+            why, fixable = ar.explain_error(err)
+            skip(f"отправка не прошла: {why}")
             now = time.time()
             if now - float(conf.get("last_fail_notice", 0) or 0) > 3600:
                 conf["last_fail_notice"] = now
+                # «Ответьте вручную» уместно, только когда вручную и правда
+                # можно. На закрытом чате этот совет отправлял продавца
+                # биться в стену — маркетплейс не примет и его сообщение.
+                tail = ("Покупателю ничего не отправлено — ответьте вручную."
+                        if fixable else
+                        "Покупателю ничего не отправлено, и написать туда "
+                        "уже нельзя — чат закрыт на стороне маркетплейса.")
                 await self._notify(
                     user_id,
                     _card("⚠️ <b>АВТООТВЕТ НЕ ДОШЁЛ</b>",
                           [f"💬 Чат <code>{_esc(chat_id)}</code>",
-                           f"❌ {_esc(err)}",
+                           f"❌ {_esc(why)}",
                            "",
-                           "Покупателю ничего не отправлено — ответьте вручную."]),
-                    reply_markup=_message_notify_kb(chat_id, order_id))
+                           tail]),
+                    reply_markup=_message_notify_kb(chat_id, order_id)
+                    if fixable else None)
 
     async def _panel_bump(self, user_id: int, api: YooMarketAPI | None = None,
                           ) -> tuple[int, str]:

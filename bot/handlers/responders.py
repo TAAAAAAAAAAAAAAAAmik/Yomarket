@@ -1121,6 +1121,18 @@ async def ar_why(callback: CallbackQuery) -> None:
     lines.append(f"{_sw(bool(live) or fb_on)} Правил: <b>{len(live)}</b>"
                  + (", есть запасной ответ" if fb_on else ""))
 
+    # Ночной режим показываем здесь, а не только в «промолчал». Иначе он
+    # виден лишь постфактум: включён набором «🌙 Ночной ответ», молчит весь
+    # день, и понять это можно только поймав пропущенное сообщение.
+    if conf.get("quiet_only"):
+        window = (f"{int(conf.get('from_hour', 22)):02d}:00—"
+                  f"{int(conf.get('to_hour', 9)):02d}:00")
+        if ar.in_quiet_window(conf):
+            lines.append(f"🟢 Режим: только {window} — сейчас это время")
+        else:
+            lines.append(f"🟡 Режим: только {window} — <b>сейчас бот молчит "
+                         f"по расписанию</b>")
+
     ts = float(poll.get("ts") or 0)
     if ts:
         ago = int((datetime.now().timestamp() - ts) / 60)
@@ -1157,17 +1169,38 @@ async def ar_why(callback: CallbackQuery) -> None:
         when = datetime.fromtimestamp(float(last.get("ts", 0) or 0)).strftime("%d.%m %H:%M")
         lines += ["", f"📜 Последняя отправка: {'✅' if last.get('ok') else '❌'} {when}"]
         if not last.get("ok"):
-            lines.append(f"   {_esc(last.get('err', ''))}")
+            why, fixable = ar.explain_error(str(last.get("err", "")))
+            lines.append(f"   {_esc(why)}")
+            if not fixable:
+                lines.append("   <i>Это не поломка бота — писать в такой чат "
+                             "маркетплейс не даёт никому.</i>")
     else:
         lines += ["", "📜 Бот пока ничего не отправлял."]
 
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить", callback_data="ar:why")
     b.button(text="🧪 Проверить правило", callback_data="ar:test")
+    night = bool(conf.get("quiet_only"))
+    if night:
+        b.button(text="🕐 Отвечать круглосуточно", callback_data="ar:why:quiet")
     b.button(text="📜 Журнал", callback_data="ar:log")
     b.button(text="⬅️ Автоответы", callback_data="ar:menu")
-    b.adjust(2, 2)
+    b.adjust(*((2, 1, 2) if night else (2, 2)))
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "ar:why:quiet")
+async def ar_why_quiet_off(callback: CallbackQuery) -> None:
+    """Снять ночной режим прямо здесь.
+
+    Причина молчания названа на этом экране — значит и выключаться должна
+    отсюда, а не через «Автоответы → Когда отвечать → режим». Ответ на
+    нажатие даёт сам `ar_why`; второй `answer()` Telegram уже не примет.
+    """
+    s, conf = _conf(callback.from_user.id)
+    conf["quiet_only"] = False
+    _save(callback.from_user.id, s)
+    await ar_why(callback)
 
 
 @router.callback_query(F.data == "ar:log")
@@ -1184,7 +1217,7 @@ async def ar_log(callback: CallbackQuery) -> None:
         lines.append(f"{mark} <code>{when}</code>{tag}")
         lines.append(f"   <i>{_esc(str(e.get('text', ''))[:90])}</i>")
         if not e.get("ok") and e.get("err"):
-            lines.append(f"   ❌ {_esc(e.get('err'))}")
+            lines.append(f"   ❌ {_esc(ar.explain_error(str(e.get('err')))[0])}")
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить", callback_data="ar:log")
     b.button(text="🧹 Очистить", callback_data="ar:logclr")
