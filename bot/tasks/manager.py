@@ -109,6 +109,20 @@ def _is_newer(msg_id: str, last_id: str) -> bool:
         return msg_id > last_id
 
 
+def _is_formatting_error(exc: Exception) -> bool:
+    """Telegram отказался разбирать HTML — единственный случай, когда то же
+    сообщение можно послать заново.
+
+    Разрыв связи и таймаут сюда не входят: сообщение при этом обычно уже
+    доставлено, и повтор превращается в дубль. Отличить их по факту
+    доставки нельзя, поэтому повторяем только явный отказ разбора.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(mark in text for mark in (
+        "can't parse entities", "cant parse entities", "unsupported start tag",
+        "unclosed start tag", "can't find end tag", "entity", "bad request"))
+
+
 def _msg_sort_key(msg: dict) -> tuple:
     """Ключ хронологического порядка: сначала номер, время — на ничью.
 
@@ -2848,6 +2862,12 @@ class TaskManager:
             return
         except Exception as e:
             logger.warning("Notify failed (user %s): %s", user_id, e)
+            # Повторять можно только то, что Telegram ТОЧНО не принял.
+            # Раньше повтор шёл на любую ошибку, включая таймаут: сообщение
+            # при этом уже доставлено, и продавец получал его дважды — второй
+            # раз без разметки. Разрыв связи не значит «не дошло».
+            if not _is_formatting_error(e):
+                return
         # A notification is worth more unformatted than not at all: if the HTML
         # was rejected, strip the tags and send it as plain text.
         try:

@@ -12,7 +12,18 @@ from storage import delete_token, get_token, save_token, get_settings, save_sett
 router = Router()
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-08-09-work-readback"
+BOT_VERSION = "2026-08-09-notify-once"
+
+# Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
+# ведут каждый свой фоновый цикл, и продавец получает все уведомления
+# дважды — при этом команды отвечают как обычно, потому что апдейт Telegram
+# отдаёт только одному из них. Отличить это от ошибки в коде можно единственным
+# способом: вызвать /version несколько раз и посмотреть, меняется ли метка.
+import time as _time
+import uuid as _uuid
+
+INSTANCE_ID = _uuid.uuid4().hex[:6]
+STARTED_AT = _time.time()
 
 
 class AuthState(StatesGroup):
@@ -112,8 +123,14 @@ async def cmd_version(message: Message) -> None:
     panel = storage.get_panel_creds(uid)
     panel_line = f"🌐 Куки панели: {'✅ есть' if panel and panel.get('cookies') else '❌ нет'}"
 
+    uptime = int((_time.time() - STARTED_AT) / 60)
     await message.answer(
-        f"🤖 <b>Версия:</b> <code>{BOT_VERSION}</code>\n\n"
+        f"🤖 <b>Версия:</b> <code>{BOT_VERSION}</code>\n"
+        f"🆔 Процесс: <code>{INSTANCE_ID}</code> · PID {os.getpid()} · "
+        f"работает {uptime} мин\n"
+        f"<i>Вызовите /version 4–5 раз. Если метка процесса меняется — "
+        f"запущено несколько ботов на одном токене, и все уведомления "
+        f"приходят по столько же раз.</i>\n\n"
         + "\n".join(storage_lines)
         + f"\n{redis_line}\n\n"
         + f"{token_line}\n{panel_line}"
