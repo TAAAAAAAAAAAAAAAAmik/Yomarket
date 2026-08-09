@@ -171,5 +171,69 @@ class TheFallbackIsLastSoItCatchesOnlyLeftovers(unittest.TestCase):
         self.assertIsNone(handler_of("совершенно:неизвестное:нажатие"))
 
 
+class PressingAnActionSurvivesAFailure(unittest.TestCase):
+    """Кнопки карточки ходят в API, а он отвечает и отказами. Текст отказа
+    уходит в HTML-сообщение: одиночный «<» роняет всю отправку, и продавец
+    видит вечно крутящуюся кнопку вместо причины."""
+
+    class Screen:
+        def __init__(self):
+            self.texts: list[str] = []
+
+        async def edit_text(self, text, reply_markup=None, **kw):
+            self.texts.append(text)
+            return self
+
+    class Press:
+        def __init__(self):
+            self.message = PressingAnActionSurvivesAFailure.Screen()
+            self.from_user = type("U", (), {"id": 1})()
+            self.data = "order:1200750:work"
+
+        async def answer(self, text="", **kw):
+            pass
+
+    class API:
+        def __init__(self, error=None):
+            self.error = error
+            self.called: list[str] = []
+
+        async def work_order(self, oid):
+            self.called.append(str(oid))
+            if self.error:
+                raise RuntimeError(self.error)
+            return {"ok": True}
+
+    def _press(self, error=None):
+        from keyboards.main import OrderCallback
+        import handlers.orders as O
+        cb = self.Press()
+        api = self.API(error)
+        asyncio.run(O.handle_order_action(
+            cb, OrderCallback(order_id="1200750", action="work"), api))
+        return cb.message.texts[-1], api
+
+    def test_a_successful_press_says_so(self):
+        text, api = self._press()
+        self.assertIn("взят в работу", text)
+        self.assertEqual(api.called, ["1200750"])
+
+    def test_an_angle_bracket_in_the_error_cannot_break_the_message(self):
+        """Ровно так однажды упало сообщение с «<ник>» внутри."""
+        text, _api = self._press("unexpected <tag> in response")
+        self.assertNotIn("<tag>", text)
+        self.assertIn("&lt;tag&gt;", text)
+
+    def test_a_known_refusal_is_explained_in_russian(self):
+        text, _api = self._press("no_active_orders_in_chat")
+        self.assertIn("закрыл чат", text)
+        self.assertNotIn("no_active_orders", text)
+
+    def test_the_failure_does_not_pretend_to_have_worked(self):
+        text, _api = self._press("boom")
+        self.assertNotIn("взят в работу", text)
+        self.assertIn("Не получилось", text)
+
+
 if __name__ == "__main__":
     unittest.main()

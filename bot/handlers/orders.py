@@ -256,7 +256,14 @@ async def handle_order_action(
             await api.refund_order(callback_data.order_id)
         text = f"{labels[callback_data.action]} — заказ #{callback_data.order_id}"
     except Exception as e:
-        text = f"❌ Ошибка: {e}"
+        # Текст ошибки идёт в HTML-сообщение, а приходит он с маркетплейса:
+        # одиночный «<» роняет всю отправку, и продавец видит вечно
+        # крутящуюся кнопку вместо причины. Плюс английский код ошибки на
+        # этом экране — отписка, разбирать её продавцу не по чему.
+        import html as _html
+        from autoreply import explain_error
+        why, _fixable = explain_error(str(e))
+        text = f"❌ Не получилось: {_html.escape(why)}"
 
     builder = InlineKeyboardBuilder()
     builder.button(text="🔍 Детали заказа", callback_data=OrderCallback(order_id=callback_data.order_id, action="view").pack())
