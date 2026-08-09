@@ -1105,8 +1105,27 @@ class TaskManager:
                             "new", "pending", "created", "paid", "active"):
                         try:
                             await api.work_order(oid)
-                            known[oid] = status = "work"
+                            # Статус не назначаем от себя, а перечитываем.
+                            # Раньше здесь стояло `status = "work"` — догадка о
+                            # том, что делает /orders/{id}/work. Проверить её
+                            # было нечем, а на витрине покупатель в ту же
+                            # минуту видел «магазин сообщил, что выполнил
+                            # заказ». Теперь видно, что получилось на самом
+                            # деле, и это попадает в уведомление.
+                            real = ""
+                            try:
+                                fresh = await api.get_order(oid)
+                                node = (fresh.get("data")
+                                        if isinstance(fresh, dict)
+                                        and isinstance(fresh.get("data"), dict)
+                                        else fresh)
+                                real = _describe(node if isinstance(node, dict)
+                                                 else {})["status"]
+                            except Exception as e:
+                                logger.warning("Auto-accept re-read %s: %s", oid, e)
+                            known[oid] = status = real or "work"
                             order_details[oid]["work_at"] = time.time()
+                            order_details[oid]["work_result"] = real
                             accepted = True
                         except Exception as e:
                             logger.warning("Auto-accept order %s: %s", oid, e)
@@ -1127,7 +1146,16 @@ class TaskManager:
                             if time_str else f"🧾 <code>#{oid}</code>",
                         ]
                         if accepted:
-                            body.append("▶️ <i>взят в работу автоматически</i>")
+                            # Что маркетплейс сделал с заказом на самом деле,
+                            # а не как называется кнопка. Если «Брать в
+                            # работу» переводит заказ сразу в «выполнен» —
+                            # продавец обязан это увидеть в ту же минуту, а не
+                            # узнать от покупателя.
+                            got = order_details[oid].get("work_result") or ""
+                            body.append(
+                                f"▶️ <i>взят в работу автоматически</i> → "
+                                f"{_status_ru(got)}" if got else
+                                "▶️ <i>взят в работу автоматически</i>")
                         await self._notify(
                             user_id,
                             _card("🛒 <b>НОВАЯ ПОКУПКА</b>", body,

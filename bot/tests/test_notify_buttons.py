@@ -235,5 +235,92 @@ class PressingAnActionSurvivesAFailure(unittest.TestCase):
         self.assertIn("Не получилось", text)
 
 
+class TakingIntoWorkReportsWhatActuallyHappened(unittest.TestCase):
+    """«Брать заказы в работу» — так называется кнопка. Что при этом делает
+    маркетплейс, из кода не видно, и бот раньше просто назначал статус
+    «work» сам. Если на деле заказ уходит в «выполнен», продавец обязан
+    увидеть это в ту же минуту, а не узнать от покупателя."""
+
+    class API:
+        """Подменяет YooMarketAPI целиком: _process_orders создаёт его сам."""
+
+        after = "work"
+        worked: list = []
+
+        def __init__(self, token=None):
+            pass
+
+        async def start(self):
+            pass
+
+        async def close(self):
+            pass
+
+        async def get_orders(self, cursor=None):
+            return {"data": [{"id": "1200750", "status": "paid",
+                              "title": "50 звёзд", "price": 60,
+                              "chat_id": "1139042"}]}
+
+        async def get_order(self, oid):
+            return {"data": {"id": str(oid), "status": type(self).after,
+                             "title": "50 звёзд", "price": 60,
+                             "chat_id": "1139042"}}
+
+        async def work_order(self, oid):
+            type(self).worked.append(str(oid))
+            return {"ok": True}
+
+        async def send_message(self, cid, text):
+            return {"ok": True}
+
+        async def get_messages(self, cid):
+            return {"data": []}
+
+    def _run(self, after):
+        import tasks.manager as MM
+        self.API.after = after
+        self.API.worked = []
+        real_api = MM.YooMarketAPI
+        MM.YooMarketAPI = self.API
+        try:
+            tm = MM.TaskManager.__new__(MM.TaskManager)
+            tm.notes = []
+
+            async def notify(uid, text, **kw):
+                tm.notes.append(text)
+
+            tm._notify = notify
+            s = {"known_orders": {"999": "paid"},   # не первый проход
+                 "known_order_details": {}, "orders_initialized": True,
+                 "auto_accept": {"enabled": True},
+                 "notify_orders": {"enabled": True},
+                 "auto_reply": {"enabled": False},
+                 "plugins": {"auto_stars": {"enabled": False}}}
+            asyncio.run(tm._process_orders(1, "tok", s))
+            return s, self.API.worked, tm.notes
+        finally:
+            MM.YooMarketAPI = real_api
+
+    def test_the_order_is_taken_into_work(self):
+        _s, worked, _notes = self._run("work")
+        self.assertEqual(worked, ["1200750"])
+
+    def test_the_status_is_read_back_not_assumed(self):
+        """Раньше здесь стояло `status = "work"` — догадка без проверки."""
+        s, _w, _notes = self._run("success")
+        self.assertEqual(s["known_orders"]["1200750"], "success")
+
+    def test_a_surprising_outcome_reaches_the_card(self):
+        _s, _w, notes = self._run("success")
+        card = next(n for n in notes if "НОВАЯ ПОКУПКА" in n)
+        self.assertIn("взят в работу автоматически", card)
+        self.assertIn("Выполнен", card)
+
+    def test_the_ordinary_outcome_is_reported_too(self):
+        _s, _w, notes = self._run("work")
+        card = next(n for n in notes if "НОВАЯ ПОКУПКА" in n)
+        self.assertIn("взят в работу автоматически", card)
+
+
 if __name__ == "__main__":
     unittest.main()
