@@ -862,8 +862,11 @@ class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
                "stel_ton_token": "n" * 400}
 
     def _probe(self, page=None, deny=True, myself=False,
-               deny_others=True, control="stranger"):
-        """deny — отказ на основном нике, deny_others — на контрольном."""
+               deny_others=True, control="stranger", only_at=False):
+        """deny — отказ на основном нике, deny_others — на контрольном.
+
+        only_at — Fragment отвечает лишь на написание с «собакой».
+        """
         import automation.fragment as FR
 
         outer = self.fake
@@ -887,7 +890,12 @@ class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
                 q.update(data or {})
                 outer.queries.append(q)
                 if q.get("method") == "searchStarsRecipient":
-                    self.who = q.get("query", "")
+                    asked = q.get("query", "")
+                    if only_at and not asked.startswith("@"):
+                        return Reply({"ok": False, "error":
+                                      "Please enter a username assigned "
+                                      "to a user."})
+                    self.who = asked.lstrip("@")
                     found = {"recipient": "R" + self.who}
                     if myself and self.who == "durov":
                         found["myself"] = True
@@ -977,7 +985,7 @@ class TheControlRequestTellsTheTwoRefusalsApart(Case):
         lines, _gets = self._probe()
         self.assertTrue(any("@stranger" in x for x in lines), lines)
         asked = [q.get("query") for q in self.fake.queries if q.get("query")]
-        self.assertIn("stranger", asked)
+        self.assertIn("@stranger", asked)
 
     def test_a_control_that_goes_through_clears_the_delivery(self):
         got = "\n".join(self._probe(deny_others=False)[0])
@@ -996,6 +1004,87 @@ class TheControlRequestTellsTheTwoRefusalsApart(Case):
     def test_the_same_nick_is_not_used_as_its_own_control(self):
         lines, _gets = self._probe(control="durov")
         self.assertFalse(any("Контрольная заявка" in x for x in lines), lines)
+
+    def test_the_control_nick_is_tried_in_every_writing(self):
+        """Перебор написаний был вписан в покупку, а в пробу — нет, и
+        контрольная заявка упёрлась в «Please enter a username assigned to a
+        user» на живом нике."""
+        lines, _gets = self._probe(only_at=True)
+        self.assertTrue(any("покупать нельзя вообще" in x for x in lines),
+                        lines)
+
+    def test_a_nick_nobody_can_find_is_not_left_without_advice(self):
+        got = "\n".join(self._probe(control="ghost", only_at=True,
+                                    deny_others=True)[0])
+        self.assertIn("покупать нельзя вообще", got)
+
+
+class WhichCookieActuallyDoesAnything(Case):
+    """«Connect TON» на странице ничего не доказывает.
+
+    Это либо «кошелёк не подключён», либо «разметка окна лежит там всегда» —
+    по HTML не различить, а на похожем признаке (`ton-auth`) мы уже один раз
+    ошиблись и объявили гостя вошедшим. Зато различить можно опытом: убрать
+    куку и посмотреть, изменилось ли хоть что-нибудь.
+    """
+
+    COOKIES = {"stel_token": "t" * 120, "stel_ssid": "s" * 20,
+               "stel_ton_token": "n" * 400}
+
+    def _roles(self, *, ton_token_matters):
+        import automation.fragment as FR
+
+        outer = self.fake
+        seen: list[dict] = []
+
+        def page_session(cookies):
+            sess = outer.session()
+            has_ton = "stel_ton_token" in (cookies or {})
+            body = PAGE + ("<div>My assets</div>" if has_ton
+                           or not ton_token_matters else "")
+            sess.get = lambda url, **kw: Reply(None, 200, body)
+            return sess
+
+        class Sess:
+            def __init__(self):
+                self.headers: dict = {}
+                self.cookies = type("C", (), {
+                    "update": staticmethod(lambda *a: seen.append(dict(a[0])))
+                })()
+
+            def post(self, url, params=None, data=None, **kw):
+                q = dict(params or {})
+                if q.get("method") == "searchStarsRecipient":
+                    return Reply({"ok": True, "found": {"recipient": "R1"}})
+                return Reply({"ok": False, "error": "Access denied"})
+
+        old_page, old_sess = FR._page_session, FR.requests.Session
+        FR._page_session = page_session
+        FR.requests.Session = Sess
+        try:
+            return FR._probe_cookie_roles(self.COOKIES, "durov", 50), seen
+        finally:
+            FR._page_session, FR.requests.Session = old_page, old_sess
+
+    def test_every_cookie_is_left_out_in_turn(self):
+        lines, _seen = self._roles(ton_token_matters=True)
+        text = "\n".join(lines)
+        for name in self.COOKIES:
+            self.assertIn(f"без {name}", text)
+        self.assertIn("без кук вовсе", text)
+
+    def test_a_cookie_that_changes_nothing_is_named(self):
+        lines, _seen = self._roles(ton_token_matters=False)
+        self.assertTrue(any("не работает" in x for x in lines), lines)
+
+    def test_a_cookie_that_does_change_things_is_not_accused(self):
+        lines, _seen = self._roles(ton_token_matters=True)
+        self.assertFalse([x for x in lines if "не работает" in x], lines)
+
+    def test_the_request_really_goes_without_that_cookie(self):
+        """Иначе опыт ничего не проверяет: убрали из подписи, а шлём то же."""
+        _lines, seen = self._roles(ton_token_matters=True)
+        self.assertTrue(any("stel_ton_token" not in s for s in seen), seen)
 
     def test_no_cookie_value_ever_reaches_the_report(self):
         """Это доступ к чужому аккаунту и кошельку — в отчёт уходит длина."""

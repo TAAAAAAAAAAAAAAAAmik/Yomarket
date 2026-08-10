@@ -902,16 +902,24 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
                 except Exception as e:
                     out.append(f"{tag}: страница — ошибка {str(e)[:40]}")
                     continue
-            args = {"query": username}
-            if with_qty:
-                args["quantity"] = quantity
-            try:
-                search = call(session, in_query, h,
-                              "searchStarsRecipient", args).json()
-            except Exception as e:
-                out.append(f"{tag}: поиск — ошибка {str(e)[:40]}")
-                continue
-            recipient = _extract_recipient(search)
+            # Написания перебираются и здесь. Перебор был вписан в покупку,
+            # а в пробу — нет, и контрольная заявка упёрлась в «Please enter
+            # a username assigned to a user» на живом нике.
+            search, recipient = {}, ""
+            for form in _query_forms(username):
+                args = {"query": form}
+                if with_qty:
+                    args["quantity"] = quantity
+                try:
+                    search = call(session, in_query, h,
+                                  "searchStarsRecipient", args).json()
+                except Exception as e:
+                    out.append(f"{tag}: поиск — ошибка {str(e)[:40]}")
+                    search = {}
+                    break
+                recipient = _extract_recipient(search)
+                if recipient:
+                    break
             if not recipient:
                 out.append(f"{tag}: поиск — "
                            f"{str(search.get('error') or search)[:60]}")
@@ -961,7 +969,99 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
         out.append("")
         out.append(f"Контрольная заявка на чужой ник @{live}:")
         out += _probe_control(cookies, live, quantity, hashes[0])
+
+    out.append("")
+    out.append("Что меняет каждая кука:")
+    out += _probe_cookie_roles(cookies, username, quantity)
     return out
+
+
+def _probe_cookie_roles(cookies: dict, username: str,
+                        quantity: int) -> list[str]:
+    """Какая кука на что влияет — вычитанием, а не рассуждением.
+
+    «Connect TON» на странице значит либо «кошелёк не подключён», либо
+    «разметка окна лежит там всегда» — по HTML не различить, и на похожем
+    признаке (`ton-auth`) мы уже один раз ошиблись. Зато различить можно
+    опытом: убрать куку и посмотреть, изменилось ли хоть что-нибудь. Если
+    без `stel_ton_token` страница и ответы те же — значит она не работает,
+    и покупку запрещает именно это.
+    """
+    cookies = dict(cookies or {})
+    subsets = [("все куки", cookies)]
+    for name in ("stel_ton_token", "stel_token", "stel_ssid"):
+        if name in cookies:
+            subsets.append((f"без {name}",
+                            {k: v for k, v in cookies.items() if k != name}))
+    subsets.append(("без кук вовсе", {}))
+
+    out: list[str] = []
+    marks: list[str] = []
+    for label, sub in subsets:
+        try:
+            r = _page_session(sub).get("https://fragment.com/stars/buy",
+                                       timeout=20)
+            body = r.text or ""
+        except Exception as e:
+            out.append(f"  {label}: страница — {str(e)[:40]}")
+            continue
+        low = body.lower()
+        assets = "my assets" in low
+        h = ""
+        for pattern in _HASH_PATTERNS:
+            m = re.search(pattern, body)
+            if m:
+                h = m.group(1)
+                break
+        step = "хеша нет"
+        if h:
+            session = requests.Session()
+            session.cookies.update(sub)
+            session.headers.update({"User-Agent": "Mozilla/5.0"})
+            step = _probe_two_calls(session, h, username, quantity)
+        state = (f"{len(body)} симв., «My assets» "
+                 f"{'есть' if assets else 'нет'}, {step}")
+        marks.append(state)
+        out.append(f"  {label}: {state}")
+
+    # Вывод — только тот, который следует из сравнения, и только когда есть
+    # что сравнивать. Догадка сюда не пишется.
+    if len(marks) > 1 and marks[1] == marks[0] and "stel_ton_token" in cookies:
+        out.append("  ↑ без stel_ton_token не изменилось ничего — эта кука "
+                   "сейчас не работает. Подключите TON-кошелёк на "
+                   "fragment.com заново и снимите её ещё раз.")
+    return out
+
+
+def _probe_two_calls(session, api_hash: str, username: str,
+                     quantity: int) -> str:
+    """Поиск и заявка одной строкой — «нашёл, заявка: …»."""
+    recipient = ""
+    search: dict = {}
+    for form in _query_forms(username):
+        try:
+            search = session.post(
+                FRAGMENT_API_URL,
+                params={"method": "searchStarsRecipient", "hash": api_hash,
+                        "query": form}, timeout=20).json()
+        except Exception as e:
+            return f"поиск — ошибка {str(e)[:30]}"
+        recipient = _extract_recipient(search)
+        if recipient:
+            break
+    if not recipient:
+        return f"поиск — {str(search.get('error') or search)[:40]}"
+    try:
+        init = session.post(
+            FRAGMENT_API_URL,
+            params={"method": "initBuyStarsRequest", "hash": api_hash,
+                    "recipient": recipient, "quantity": quantity},
+            timeout=20).json()
+    except Exception as e:
+        return f"нашёл, заявка — ошибка {str(e)[:30]}"
+    if init.get("req_id") or init.get("id"):
+        return "нашёл, ЗАЯВКА ПРИНЯТА"
+    return f"нашёл, заявка — {str(init.get('error') or init)[:40]}"
 
 
 def _probe_control(cookies: dict, username: str, quantity: int,
@@ -980,13 +1080,20 @@ def _probe_control(cookies: dict, username: str, quantity: int,
                             params={"method": method, "hash": api_hash,
                                     **extra}, timeout=20)
 
-    try:
-        search = post("searchStarsRecipient", {"query": username}).json()
-    except Exception as e:
-        return [f"  поиск — ошибка {str(e)[:40]}"]
-    recipient = _extract_recipient(search)
+    search: dict = {}
+    recipient = ""
+    for form in _query_forms(username):
+        try:
+            search = post("searchStarsRecipient", {"query": form}).json()
+        except Exception as e:
+            return [f"  поиск — ошибка {str(e)[:40]}"]
+        recipient = _extract_recipient(search)
+        if recipient:
+            break
     if not recipient:
-        return [f"  поиск — {str(search.get('error') or search)[:60]}"]
+        return [f"  поиск — {str(search.get('error') or search)[:60]}",
+                "  Ник не нашёлся — заявку проверить не на ком. Задайте "
+                "другой третьим словом: /stars_probe NO0RD 50 иванов"]
     found = search.get("found")
     mine = bool(isinstance(found, dict) and found.get("myself"))
     out = [f"  найден, myself: {'да' if mine else 'нет'}"]

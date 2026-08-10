@@ -584,7 +584,7 @@ async def stars_check_creds(callback: CallbackQuery) -> None:
 @router.message(Command("fragment_debug"))
 async def fragment_debug(message: Message) -> None:
     """/fragment_debug — почему Fragment не признаёт сессию. Только чтение."""
-    from automation.fragment import probe_session_sync
+    from automation.fragment import probe_session_sync, probe_page_api_sync
 
     creds = get_fragment_creds(message.from_user.id) or {}
     if not creds.get("cookies"):
@@ -597,6 +597,13 @@ async def fragment_debug(message: Message) -> None:
         lines = await asyncio.wait_for(
             loop.run_in_executor(None, probe_session_sync, creds["cookies"]),
             timeout=90)
+        # Разбор страницы переехал сюда из /stars_probe: там он занимал
+        # место в отчёте, ничего не решая, а здесь речь как раз о сессии.
+        lines = list(lines) + ["", "— что говорит страница —"] + list(
+            await asyncio.wait_for(
+                loop.run_in_executor(None, probe_page_api_sync,
+                                     creds["cookies"]),
+                timeout=60))
     except Exception as e:
         await status.edit_text(f"❌ {html.escape(str(e)[:200])}")
         return
@@ -644,18 +651,10 @@ async def stars_probe(message: Message) -> None:
     except Exception as e:
         await status.edit_text(f"❌ {html.escape(str(e)[:200])}")
         return
-    # Форма запроса перебрана — если ни одна не прошла, полезнее посмотреть,
-    # что о своих же запросах говорит страница Fragment.
-    if not any(str(x).startswith("✅") for x in lines):
-        from automation.fragment import probe_page_api_sync
-        try:
-            lines = list(lines) + ["", "— что говорит страница —"] + list(
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, probe_page_api_sync,
-                                         creds["cookies"]),
-                    timeout=60))
-        except Exception as e:
-            lines = list(lines) + [f"страница: {str(e)[:60]}"]
+    # Раздел «что говорит страница» переехал в /fragment_debug: он два
+    # прогона подряд сообщал, что имён методов в разметке не видно, — а их
+    # там нет вовсе, включая работающий searchStarsRecipient. Вывода из него
+    # не следует никакого, зато он занимал место в отчёте.
     body = "\n".join(html.escape(str(x)) for x in lines)[:3800]
     await status.edit_text(f"🔍 <b>Покупка {qty}⭐ для @{html.escape(username)}"
                            f"</b>\n<code>{body}</code>")
