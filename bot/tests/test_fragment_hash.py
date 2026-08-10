@@ -487,11 +487,13 @@ class BuyingWithAStaleHash(Case):
 
 
 class WhenTheSessionCannotBuy(Case):
-    """«Access denied» на покупке — не то же, что мёртвые куки.
+    """Голое «Access denied» продавцу не говорит ничего.
 
-    Получателя Fragment нашёл, значит сессия жива. Покупку разрешает не вход
-    через Telegram, а привязанный TON-кошелёк, и голое «Access denied»
-    продавцу об этом не говорит ничего.
+    И «получателя нашли — значит сессия жива» тоже неправда: вычитанием
+    кук проверено, что поиск проходит и вовсе без stel_token. Совет должен
+    вести к тому единственному, что в опыте не работало, — к неподключённому
+    кошельку, — и при этом не выдавать это за установленный факт: заявка не
+    проходила ещё ни разу, сравнить «до и после» не с чем.
     """
 
     def test_it_is_explained_rather_than_repeated(self):
@@ -511,7 +513,44 @@ class WhenTheSessionCannotBuy(Case):
                                    api_hash=REAL_HASH)
         self.assertFalse(ok)
         self.assertIn("кошел", msg.lower(), msg)
-        self.assertIn("Проверить вход", msg)
+        # Что делать руками — иначе совет не совет.
+        self.assertIn("куки заново", msg)
+
+    def test_finding_the_recipient_is_not_passed_off_as_proof_of_access(self):
+        """Поиск проходит и без stel_token — проверено вычитанием."""
+        outer = self.fake
+
+        def post(url, params=None, data=None, **kw):
+            query = dict(params or {})
+            if query.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            return Reply({"ok": False, "error": "Access denied"})
+
+        sess = outer.session()
+        sess.post = post
+        F._make_session = lambda cookies: sess
+        _ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
+                                    100, api_hash=REAL_HASH)
+        self.assertNotIn("сессию он признаёт", msg)
+        self.assertNotIn("сессия жива", msg)
+
+    def test_a_guess_is_not_dressed_up_as_a_finding(self):
+        """Заявка не проходила ещё ни разу — сказать «причина в кошельке»
+        как о факте нельзя."""
+        outer = self.fake
+
+        def post(url, params=None, data=None, **kw):
+            query = dict(params or {})
+            if query.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            return Reply({"ok": False, "error": "Access denied"})
+
+        sess = outer.session()
+        sess.post = post
+        F._make_session = lambda cookies: sess
+        _ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
+                                    100, api_hash=REAL_HASH)
+        self.assertIn("Скорее всего", msg)
 
     def test_other_failures_keep_their_own_wording(self):
         outer = self.fake
@@ -923,6 +962,19 @@ class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
                 + '";</script></html>')
         got = "\n".join(self._probe(page=page)[0])
         self.assertIn("отдана как гостю", got)
+
+    def test_expired_cookies_come_with_what_to_do_about_them(self):
+        """Куки Fragment живут недолго: за полчаса личный раздел сменился
+        гостевой страницей с теми же куками. Пока это не сказано вслух,
+        причину ищут в боте."""
+        page = ('<html>Connect TON<script>var x = "/api?hash=' + REAL_HASH
+                + '";</script></html>')
+        got = "\n".join(self._probe(page=page)[0])
+        self.assertIn("Снимите их заново", got)
+
+    def test_a_live_session_is_not_told_to_re_take_the_cookies(self):
+        got = "\n".join(self._probe()[0])
+        self.assertNotIn("Снимите их заново", got)
 
     def test_it_says_whether_a_wallet_is_linked(self):
         got = "\n".join(self._probe(page=PAGE + self.ADDR)[0])
