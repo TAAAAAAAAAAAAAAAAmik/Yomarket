@@ -633,7 +633,10 @@ async def stars_probe(message: Message) -> None:
             loop.run_in_executor(None, functools.partial(
                 probe_buy_sync, creds["cookies"], username, qty,
                 creds.get("api_hash", ""))),
-            timeout=120)
+            # Вариантов шесть, на каждый по два хеша и по два запроса, плюс
+            # чтение страниц. Прежних 120 с на это уже не хватает, а обрыв по
+            # таймауту выглядит как отказ Fragment и путает следствие.
+            timeout=300)
     except Exception as e:
         await status.edit_text(f"❌ {html.escape(str(e)[:200])}")
         return

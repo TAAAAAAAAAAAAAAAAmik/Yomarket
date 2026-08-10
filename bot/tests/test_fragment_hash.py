@@ -633,5 +633,138 @@ class TheDocumentIsTheSourceOfTruth(unittest.TestCase):
         self.assertIn("0123456789abcdef0123", hits)
 
 
+class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
+    """Проба перебирала форму запроса — и молчала о главном.
+
+    Поиск получателя Fragment отдаёт и гостю, покупку — нет. Пока в отчёте
+    не написано, признан ли вход и виден ли привязанный кошелёк, «Access
+    denied» одинаково объясняется и транспортом, и тем, что этой сессии
+    покупать нельзя. Перебирать транспорт при этом можно бесконечно — что
+    мы и делали.
+    """
+
+    ADDR = "EQA24k42CMkz2G0SzJoSVjxkneLkcqY4V-4NvhXEtB_aX13S"
+    COOKIES = {"stel_token": "t" * 120, "stel_ssid": "s" * 20,
+               "stel_ton_token": "n" * 400}
+
+    def _probe(self, page=None, deny=True):
+        import automation.fragment as FR
+
+        outer = self.fake
+        outer.page = page if page is not None else PAGE
+        gets: list[str] = []
+
+        class Sess:
+            def __init__(self):
+                self.headers: dict = {}
+                self.cookies = type(
+                    "C", (), {"update": staticmethod(lambda *a: None),
+                              "__iter__": lambda self: iter(())})()
+
+            def get(self, url, **kw):
+                gets.append(url)
+                return Reply(None, 200, outer.page)
+
+            def post(self, url, params=None, data=None, **kw):
+                q = dict(params or {})
+                q.update(data or {})
+                outer.queries.append(q)
+                if q.get("method") == "searchStarsRecipient":
+                    return Reply({"ok": True, "found": {"recipient": "R1"}})
+                if deny:
+                    return Reply({"ok": False, "error": "Access denied"})
+                return Reply({"ok": True, "req_id": "REQ-1"})
+
+        old = FR.requests.Session
+        FR.requests.Session = Sess
+        try:
+            return FR.probe_buy_sync(self.COOKIES, "durov", 50), gets
+        finally:
+            FR.requests.Session = old
+
+    def test_it_says_whether_the_session_is_signed_in(self):
+        got = "\n".join(self._probe()[0])
+        self.assertIn("Вход:", got)
+        self.assertIn("признан", got)
+
+    def test_a_guest_page_is_not_reported_as_signed_in(self):
+        page = ('<html>Connect TON<script>var x = "/api?hash=' + REAL_HASH
+                + '";</script></html>')
+        got = "\n".join(self._probe(page=page)[0])
+        self.assertIn("отдана как гостю", got)
+
+    def test_it_says_whether_a_wallet_is_linked(self):
+        got = "\n".join(self._probe(page=PAGE + self.ADDR)[0])
+        self.assertIn("Кошелёк на странице Fragment: …", got)
+
+    def test_a_missing_wallet_is_said_plainly(self):
+        got = "\n".join(self._probe()[0])
+        self.assertIn("Кошелёк на странице Fragment: не видно", got)
+
+    def test_the_answer_to_the_request_is_printed_in_full(self):
+        """«Access denied» бывает не единственным полем ответа, и соседние
+        объясняют, чего не хватает."""
+        got = "\n".join(self._probe()[0])
+        self.assertIn("ответ заявки: HTTP 200", got)
+        self.assertIn("Access denied", got)
+
+    def test_the_recipient_we_actually_send_is_shown(self):
+        got = "\n".join(self._probe()[0])
+        self.assertIn("recipient для заявки: «R1»", got)
+
+    def test_the_details_are_printed_once_not_per_variant(self):
+        got = "\n".join(self._probe()[0])
+        self.assertEqual(got.count("ответ заявки: HTTP"), 1, got)
+
+    def test_a_variant_opens_the_buy_page_with_the_same_session(self):
+        """Рабочий клиент берёт хеш той же сессией, которой покупает; у нас
+        это были разные сессии, и куки, обновлённые страницей, терялись."""
+        lines, gets = self._probe()
+        self.assertTrue(any("сначала открыть" in x for x in lines), lines)
+        self.assertIn("https://fragment.com/stars/buy", gets)
+
+    def test_a_working_variant_stops_the_search(self):
+        lines, _gets = self._probe(deny=False)
+        self.assertTrue(any(x.startswith("✅") for x in lines), lines)
+
+    def test_cookie_names_and_lengths_are_shown(self):
+        got = "\n".join(self._probe()[0])
+        self.assertIn("stel_token (120)", got)
+
+    def test_no_cookie_value_ever_reaches_the_report(self):
+        """Это доступ к чужому аккаунту и кошельку — в отчёт уходит длина."""
+        secret = "SUPERSECRETVALUE"
+        import automation.fragment as FR
+
+        outer = self.fake
+        outer.page = PAGE
+
+        class Sess:
+            def __init__(self):
+                self.headers: dict = {}
+                self.cookies = type(
+                    "C", (), {"update": staticmethod(lambda *a: None),
+                              "__iter__": lambda self: iter(())})()
+
+            def get(self, url, **kw):
+                return Reply(None, 200, outer.page)
+
+            def post(self, url, params=None, data=None, **kw):
+                q = dict(params or {})
+                if q.get("method") == "searchStarsRecipient":
+                    return Reply({"ok": True, "found": {"recipient": "R1"}})
+                return Reply({"ok": False, "error": "Access denied"})
+
+        old = FR.requests.Session
+        FR.requests.Session = Sess
+        try:
+            got = "\n".join(FR.probe_buy_sync(
+                {"stel_token": secret * 8, "stel_ssid": "s" * 20,
+                 "stel_ton_token": "n" * 400}, "durov", 50))
+        finally:
+            FR.requests.Session = old
+        self.assertNotIn(secret, got)
+
+
 if __name__ == "__main__":
     unittest.main()

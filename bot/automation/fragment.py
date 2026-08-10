@@ -767,7 +767,28 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
         return ["нужны куки и ник"]
 
     out: list[str] = []
-    hashes = collect_api_hashes_sync(cookies) or []
+    # Какие куки вообще ушли — только имена и длины. Значения не печатаем
+    # никогда: это доступ к чужому аккаунту и кошельку.
+    names = ", ".join(f"{k} ({len(str(v))})"
+                      for k, v in sorted((cookies or {}).items()))
+    out.append("Куки: " + (names or "нет"))
+
+    # Признан ли вход — то единственное, чего проба до сих пор не показывала.
+    # Поиск получателя Fragment отдаёт и гостю, покупку — нет. Пока эта
+    # строка не напечатана, «Access denied» одинаково объясняется и
+    # транспортом, и тем, что сессии просто нельзя покупать.
+    facts: dict = {}
+    pages: list[str] = []
+    hashes = collect_api_hashes_sync(cookies, pages, facts) or []
+    if "signed_in" in facts:
+        out.append("Вход: " + ("✅ признан (есть выход/личный раздел)"
+                               if facts["signed_in"]
+                               else "❌ страница отдана как гостю"))
+    wallet = wallet_on_page_sync(cookies)
+    out.append("Кошелёк на странице Fragment: "
+               + (f"…{wallet[-6:]}" if wallet else "не видно"))
+    out += [f"  · {line}" for line in pages[:6]]
+
     stored = (api_hash or "").strip()
     if stored and stored not in hashes:
         hashes.insert(0, stored)
@@ -781,13 +802,18 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
             "Origin": "https://fragment.com",
             "Referer": "https://fragment.com/stars"}
 
-    # (название, всё-в-строке-запроса, заголовки, слать ли quantity в поиске)
+    # (название, всё-в-строке-запроса, заголовки, слать ли quantity в поиске,
+    #  открывать ли сначала страницу покупки той же сессией)
     variants = (
-        ("как в образце", True, plain, False),
-        ("строка запроса + наши заголовки", True, rich, False),
-        ("тело запроса, без quantity", False, rich, False),
-        ("тело запроса, с quantity", False, rich, True),
-        ("тело запроса, простые заголовки", False, plain, True),
+        ("как в образце", True, plain, False, False),
+        # Рабочий клиент берёт хеш той же сессией, которой потом покупает, —
+        # у нас хеш читает одна сессия, а запрос шлёт другая, и куки,
+        # обновлённые страницей, теряются. Отличие настоящее и непроверенное.
+        ("как в образце, сначала открыть /stars/buy", True, plain, False, True),
+        ("строка запроса + наши заголовки", True, rich, False, False),
+        ("тело запроса, без quantity", False, rich, False, False),
+        ("тело запроса, с quantity", False, rich, True, False),
+        ("тело запроса, простые заголовки", False, plain, True, False),
     )
 
     def call(session, in_query, h, method, args):
@@ -798,12 +824,22 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
         return session.post(FRAGMENT_API_URL, params={"hash": h},
                             data={"method": method, **args}, timeout=20)
 
-    for label, in_query, headers, with_qty in variants:
+    # Подробности печатаются один раз, а не по разу на каждый из десяти
+    # прогонов: иначе отчёт не влезет в сообщение.
+    shown = {"search": False, "init": False}
+
+    for label, in_query, headers, with_qty, warm in variants:
         for h in hashes[:2]:
             tag = f"{label} · хеш …{h[-6:]}"
             session = requests.Session()
             session.cookies.update(cookies)
             session.headers.update(headers)
+            if warm:
+                try:
+                    session.get("https://fragment.com/stars/buy", timeout=20)
+                except Exception as e:
+                    out.append(f"{tag}: страница — ошибка {str(e)[:40]}")
+                    continue
             args = {"query": username}
             if with_qty:
                 args["quantity"] = quantity
@@ -818,10 +854,20 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
                 out.append(f"{tag}: поиск — "
                            f"{str(search.get('error') or search)[:60]}")
                 continue
+            # Что именно нашлось — важнее, чем «нашлось». Если сюда попал не
+            # тот идентификатор (например, флаг `myself` вместо recipient),
+            # заявка обязана отвечать отказом, и искать причину в транспорте
+            # можно бесконечно.
+            if not shown["search"]:
+                shown["search"] = True
+                out.append(f"  поиск вернул поля: "
+                           f"{', '.join(sorted(search)) or '—'}")
+                out.append(f"  found: {str(search.get('found'))[:120]}")
+                out.append(f"  recipient для заявки: «{recipient[:60]}»")
             try:
-                init = call(session, in_query, h, "initBuyStarsRequest",
-                            {"recipient": recipient,
-                             "quantity": quantity}).json()
+                resp = call(session, in_query, h, "initBuyStarsRequest",
+                            {"recipient": recipient, "quantity": quantity})
+                init = resp.json()
             except Exception as e:
                 out.append(f"{tag}: заявка — ошибка {str(e)[:40]}")
                 continue
@@ -830,6 +876,13 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
                 return out
             out.append(f"{tag}: заявка — "
                        f"{str(init.get('error') or init)[:70]}")
+            # Ответ целиком, один раз: «Access denied» бывает не единственным
+            # полем, и соседние объясняют, чего не хватает.
+            if not shown["init"]:
+                shown["init"] = True
+                out.append(f"  ответ заявки: HTTP {resp.status_code}, "
+                           f"поля: {', '.join(sorted(init)) or '—'}")
+                out.append(f"  целиком: {str(init)[:200]}")
     return out
 
 
