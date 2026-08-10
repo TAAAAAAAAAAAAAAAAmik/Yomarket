@@ -27,7 +27,10 @@ FRAGMENT_API_URL = "https://fragment.com/api"
 TONCENTER_SEND = "https://toncenter.com/api/v2/sendBoc"
 TONCENTER_RUN = "https://toncenter.com/api/v2/runGetMethod"
 MAINNET_CHAIN = "-239"
-DEFAULT_HASH = "af142ec36cafbbfa89"
+# Зашитого хеша больше нет. Он был чужой, из образца, и это первая из пяти
+# причин, по которым выдача не работала: Fragment отвечал «Bad request», а
+# продавцу предлагалось лезть в F12. Хеш всегда читается со страницы покупки.
+DEFAULT_HASH = ""
 SEQNO_POLL_SECS = 3
 SEQNO_MAX_WAIT_SECS = 120
 
@@ -40,41 +43,25 @@ def _fix_base64(s: str) -> str:
 def _make_session(cookies: dict) -> requests.Session:
     s = requests.Session()
     s.cookies.update(cookies or {})
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0 Safari/537.36",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": "https://fragment.com",
-        "Referer": "https://fragment.com/stars",
-    })
+    # Заголовки — как в документации рабочего клиента: только User-Agent.
+    # Свои X-Requested-With / Origin / Referer убраны: они добавлялись по
+    # догадке, а сверять поведение надо с тем, что заведомо работает.
+    s.headers.update({"User-Agent": "Mozilla/5.0"})
     return s
 
 
 def _api_call(session: requests.Session, api_hash: str, method: str,
-              extra: dict, in_query: bool = False):
-    """Один запрос к Fragment API.
+              extra: dict):
+    """Один запрос к Fragment API — ровно как в документации рабочего клиента.
 
-    По умолчанию хеш — в строке запроса (`/api?hash=…`), метод и аргументы —
-    в теле, form-urlencoded. Fragment читает их именно оттуда, и это не
-    мелочь: пока всё уходило в строку запроса, хеш он видел, а `query` — нет,
-    и на живой ник отвечал «Please enter a username assigned to a user».
-    Поиск получателя — первый шаг покупки, так что дальше него дело не
-    доходило никогда.
-
-    `in_query=True` — вариант из документации стороннего рабочего клиента:
-    там ВСЁ уходит в строку запроса. Наш вариант доказан на поиске
-    получателя, тот — на покупке целиком, и какой правильный для каждого
-    метода, выяснится только на живом запросе. Поэтому оба остаются.
+    Всё уходит в строку запроса: и `method`, и `hash`, и аргументы. У нас
+    было по-своему — метод и аргументы в теле, — и на этом стояла выдача:
+    поиск получателя проходил, а покупка отвечала «Access denied». Своих
+    вариантов здесь больше нет: документация описывает клиента, который
+    доводит покупку до конца, и расхождения с ней мы не сочиняем.
     """
-    if in_query:
-        return session.post(FRAGMENT_API_URL,
-                            params={"method": method, "hash": api_hash,
-                                    **extra},
-                            timeout=20)
     return session.post(FRAGMENT_API_URL,
-                        params={"hash": api_hash},
-                        data={"method": method, **extra},
+                        params={"method": method, "hash": api_hash, **extra},
                         timeout=20)
 
 
@@ -191,7 +178,7 @@ def buy_stars_sync(
     username: str,
     quantity: int,
     wallet_version: str = "v4r2",
-    api_hash: str = DEFAULT_HASH,
+    api_hash: str = "",
     wait_confirm: bool = True,
     report: dict | None = None,
 ) -> tuple[bool, str]:
@@ -218,12 +205,19 @@ def buy_stars_sync(
         return False, "Fragment принимает заказы от 50 звёзд"
 
     session = _make_session(cookies)
-    state = {"hash": api_hash or DEFAULT_HASH, "refreshed": False,
-             "in_query": False, "swapped": False}
+    state = {"hash": api_hash or "", "refreshed": False}
+    if not state["hash"]:
+        # Хеш всегда берётся со страницы покупки, как в документации.
+        # Зашитого значения здесь больше нет: чужой хеш — первая из пяти
+        # причин, по которым выдача не работала.
+        state["hash"] = fetch_api_hash_sync(cookies)
+        if not state["hash"]:
+            return False, ("Не удалось прочитать hash со страницы "
+                           "fragment.com/stars/buy — проверьте куки Fragment")
 
-    def _raw(method: str, extra: dict, in_query: bool = False) -> dict:
+    def _raw(method: str, extra: dict) -> dict:
         try:
-            r = _api_call(session, state["hash"], method, extra, in_query)
+            r = _api_call(session, state["hash"], method, extra)
             r.raise_for_status()
             return r.json()
         except requests.exceptions.RequestException as e:
@@ -239,7 +233,7 @@ def buy_stars_sync(
         seller could do nothing about — the hash is not something they were
         ever asked for.
         """
-        out = _raw(method, extra, state["in_query"])
+        out = _raw(method, extra)
         said = str(out.get("error") or "").lower()
         if "bad request" in said and not state["refreshed"]:
             state["refreshed"] = True
@@ -247,31 +241,13 @@ def buy_stars_sync(
             if fresh and fresh != state["hash"]:
                 state["hash"] = fresh
                 logger.info("Fragment: refreshed api hash mid-flight")
-                out = _raw(method, extra, state["in_query"])
-                said = str(out.get("error") or "").lower()
-        # «Access denied» на покупке при живой сессии — то, на чём выдача
-        # стояла. Документация рабочего клиента складывает всё в строку
-        # запроса; наш способ доказан на поиске получателя, тот — на покупке.
-        # Пробуем второй способ и запоминаем, какой сработал, чтобы остаток
-        # цепочки шёл им же.
-        if "access denied" in said and not state["swapped"]:
-            state["swapped"] = True
-            other = _raw(method, extra, not state["in_query"])
-            if not str(other.get("error") or "").lower().startswith("access"):
-                state["in_query"] = not state["in_query"]
-                logger.info("Fragment: switched transport to %s",
-                            "query" if state["in_query"] else "body")
-                if report is not None:
-                    report["transport"] = ("всё в строке запроса"
-                                           if state["in_query"] else "в теле")
-                return other
+                return _raw(method, extra)
         return out
 
     # 1. find recipient
-    # quantity здесь не лишний: форма поиска на Fragment отправляет его вместе
-    # с ником, и без него ответ приходит не тот.
-    search = _post("searchStarsRecipient", {"query": username,
-                                            "quantity": quantity})
+    # Только `query` — так в документации. У нас сюда добавлялся ещё
+    # `quantity` по наблюдению за формой на сайте; документ его не шлёт.
+    search = _post("searchStarsRecipient", {"query": username})
     recipient = _extract_recipient(search)
     if not recipient:
         err = search.get("error") or search.get("error_message") or "получатель не найден"
@@ -435,6 +411,9 @@ _HASH_PATTERNS = (
     r'"apiHash"\s*:\s*"([0-9a-zA-Z]{8,64})"',
     r'"hash"\s*:\s*"([0-9a-zA-Z]{8,64})"',
     r"hash['\"]?\s*[:=]\s*['\"]([0-9a-f]{12,64})['\"]",
+    # Документация рабочего клиента ищет не только «hash»: у Fragment тот же
+    # ключ встречается под другими именами.
+    r"['\"](?:csrf|token|nonce|signature|sig)['\"]\s*:\s*['\"]([0-9a-f]{12,64})['\"]",
 )
 
 # Первой — страница покупки: именно её называет документация рабочего
@@ -445,6 +424,22 @@ _HASH_PAGES = ("https://fragment.com/stars/buy",
                "https://fragment.com/stars",
                "https://fragment.com/",
                "https://fragment.com/premium")
+
+
+def _script_urls(html: str) -> list[str]:
+    """Адреса подключённых скриптов, абсолютные."""
+    urls: list[str] = []
+    for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', html or ""):
+        src = m.group(1)
+        if src.startswith("//"):
+            src = "https:" + src
+        elif src.startswith("/"):
+            src = "https://fragment.com" + src
+        elif not src.startswith("http"):
+            continue
+        if src not in urls:
+            urls.append(src)
+    return urls
 
 
 def collect_api_hashes_sync(cookies: dict, report: list | None = None,
@@ -482,6 +477,24 @@ def collect_api_hashes_sync(cookies: dict, report: list | None = None,
                 h = m.group(1)
                 if h and h not in found:
                     found.append(h)
+        if not found:
+            # Документация ищет хеш и в подключённых JS-файлах: в разметке его
+            # может не быть вовсе. Только когда в самой странице пусто —
+            # лишние загрузки на каждый заказ ни к чему.
+            for src in _script_urls(body)[:6]:
+                try:
+                    js = session.get(src, timeout=15).text or ""
+                except Exception:
+                    continue
+                for pattern in _HASH_PATTERNS:
+                    for m in re.finditer(pattern, js):
+                        h = m.group(1)
+                        if h and h not in found:
+                            found.append(h)
+                if found:
+                    if report is not None:
+                        report.append(f"  · хеш найден в {src[:60]}")
+                    break
         if found and report is not None:
             report.append(f"кандидатов в хеш на этой странице: {len(found)}")
         if found:
@@ -518,7 +531,11 @@ def wallet_on_page_sync(cookies: dict, report: list | None = None) -> str:
     подключён другой. Пока оба адреса не видно рядом, различить нечем.
     """
     session = _page_session(cookies or {})
-    for url in ("https://fragment.com/stars/buy", "https://fragment.com/stars",
+    # Первой — страница профиля: документация рабочего клиента проверяет
+    # аккаунт и привязанный кошелёк именно на ней. Витрина показывает адрес
+    # не всегда, и «кошелёк не вижу» получалось на живой привязке.
+    for url in ("https://fragment.com/my/profile",
+                "https://fragment.com/stars/buy", "https://fragment.com/stars",
                 "https://fragment.com/"):
         try:
             r = session.get(url, timeout=20)

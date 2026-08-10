@@ -49,6 +49,7 @@ class FakeFragment:
         self.good_hash = good_hash
         self.posts: list = []
         self.bodies: list = []
+        self.queries: list = []
         self.gets: list = []
 
     def session(self):
@@ -63,16 +64,19 @@ class FakeFragment:
                 return Reply(None, outer.page_code, outer.page)
 
             def post(self, url, params=None, data=None, **kw):
-                # Как настоящий Fragment: хеш он берёт из строки запроса, а
-                # метод и аргументы — только из тела. Аргумент, уехавший в
-                # строку запроса, для него не существует.
+                # Как в документации: Fragment читает всё из строки запроса.
+                # Тело здесь остаётся пустым, и если что-то уехало туда —
+                # для него этого аргумента не существует.
+                query = dict(params or {})
                 body = dict(data or {})
-                outer.posts.append({**dict(params or {}), **body})
-                outer.bodies.append(body)
-                if (params or {}).get("hash") != outer.good_hash:
+                outer.posts.append({**query, **body})
+                outer.queries.append(query)
+                if body:
+                    outer.bodies.append(body)
+                if query.get("hash") != outer.good_hash:
                     return Reply({"ok": False, "error": "Bad request"})
-                if body.get("method") == "searchStarsRecipient":
-                    if not body.get("query"):
+                if query.get("method") == "searchStarsRecipient":
+                    if not query.get("query"):
                         return Reply({"ok": False, "error":
                                       "Please enter a username assigned "
                                       "to a user."})
@@ -139,36 +143,32 @@ class CheckingTheSession(Case):
 
 
 class HowTheRequestIsSent(Case):
-    """Хеш — в строке запроса, аргументы — в теле.
+    """Всё уходит в строку запроса — метод, хеш и аргументы.
 
-    Пока всё уходило в строку запроса, Fragment видел хеш и не видел `query`:
-    на живой ник он отвечал «Please enter a username assigned to a user», и
-    покупка умирала на первом же шаге — поиске получателя.
+    Так в документации клиента, который доводит покупку до конца. У нас было
+    по-своему: метод и аргументы в теле. Поиск получателя при этом проходил,
+    а покупка отвечала «Access denied» — и выдача стояла на этом днями.
     """
 
-    def test_arguments_go_into_the_body(self):
+    def test_everything_goes_into_the_query_string(self):
         F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
                          api_hash=REAL_HASH)
-        first = self.fake.bodies[0]
-        self.assertEqual(first.get("query"), "durov", first)
+        first = self.fake.queries[0]
         self.assertEqual(first.get("method"), "searchStarsRecipient", first)
+        self.assertEqual(first.get("query"), "durov", first)
+        self.assertEqual(first.get("hash"), REAL_HASH, first)
 
-    def test_the_hash_stays_in_the_query_string(self):
+    def test_nothing_is_sent_in_the_body(self):
         F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
                          api_hash=REAL_HASH)
-        self.assertNotIn("hash", self.fake.bodies[0], self.fake.bodies[0])
+        self.assertEqual(self.fake.bodies, [], self.fake.bodies)
 
-    def test_the_recipient_search_carries_the_quantity(self):
-        """Форма Fragment шлёт его вместе с ником."""
+    def test_the_search_carries_only_the_username(self):
+        """Документ шлёт один `query`. Наш `quantity` был домыслом по форме
+        на сайте."""
         F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
                          api_hash=REAL_HASH)
-        self.assertEqual(str(self.fake.bodies[0].get("quantity")), "100")
-
-    def test_the_check_reaches_fragment_the_same_way(self):
-        ok, res = F.check_fragment_session_sync(COOKIES, REAL_HASH)
-        self.assertTrue(ok, res)
-        self.assertEqual(self.fake.bodies[0].get("query"), "durov",
-                         self.fake.bodies[0])
+        self.assertNotIn("quantity", self.fake.queries[0], self.fake.queries[0])
 
 
 class AnAnswerOnTheMerits(Case):
@@ -284,9 +284,9 @@ class WhenTheSessionCannotBuy(Case):
         outer = self.fake
 
         def post(url, params=None, data=None, **kw):
-            body = dict(data or {})
-            outer.bodies.append(body)
-            if body.get("method") == "searchStarsRecipient":
+            query = dict(params or {})
+            outer.queries.append(query)
+            if query.get("method") == "searchStarsRecipient":
                 return Reply({"ok": True, "found": {"recipient": "R1"}})
             return Reply({"ok": False, "error": "Access denied"})
 
@@ -581,96 +581,6 @@ class TextThatTelegramMustAccept(unittest.TestCase):
             F._make_session = old
         self.assertNotIn("<", msg, msg)
 
-class TheTransportSwitchesWhenPurchaseIsDenied(unittest.TestCase):
-    """Наш способ (метод и аргументы в теле) доказан на поиске получателя:
-    пока всё уходило в строку запроса, Fragment не видел `query`. Документация
-    стороннего рабочего клиента складывает в строку ВСЁ и доводит покупку до
-    конца. Какой способ правильный для какого метода — выяснится только на
-    живом запросе, поэтому при «Access denied» пробуется второй.
-    """
-
-    def _session(self, *, deny_body: bool):
-        calls: list[dict] = []
-
-        class Resp:
-            def __init__(self, body):
-                self._body = body
-
-            def raise_for_status(self):
-                pass
-
-            def json(self):
-                return self._body
-
-        class Sess:
-            headers: dict = {}
-            cookies: dict = {}
-
-            def post(self, url, params=None, data=None, timeout=None):
-                where = "query" if data is None else "body"
-                method = ((params or {}).get("method")
-                          or (data or {}).get("method"))
-                calls.append({"where": where, "method": method})
-                if deny_body and where == "body":
-                    return Resp({"error": "Access denied"})
-                if method == "searchStarsRecipient":
-                    return Resp({"ok": True, "found": {"recipient": "R"}})
-                if method == "initBuyStarsRequest":
-                    return Resp({"ok": True, "req_id": "R1"})
-                # Дальше нужен кошелёк и сеть — до туда тест не идёт.
-                return Resp({"ok": True})
-
-        return Sess(), calls
-
-    def _buy(self, sess):
-        import automation.fragment as F
-        real = F._make_session
-        F._make_session = lambda cookies: sess
-        try:
-            return F.buy_stars_sync(
-                {"stel_token": "x"}, " ".join(["word"] * 24), "durov", 50)
-        finally:
-            F._make_session = real
-
-    def test_body_first_because_that_is_what_search_needs(self):
-        sess, calls = self._session(deny_body=False)
-        self._buy(sess)
-        self.assertEqual(calls[0]["where"], "body", calls[:2])
-        self.assertEqual(calls[0]["method"], "searchStarsRecipient")
-
-    def test_a_denial_makes_it_try_the_query_form(self):
-        sess, calls = self._session(deny_body=True)
-        self._buy(sess)
-        self.assertIn("query", [c["where"] for c in calls], calls)
-
-    def test_and_the_rest_of_the_chain_keeps_the_working_form(self):
-        """Иначе каждый следующий шаг заново упирался бы в отказ."""
-        sess, calls = self._session(deny_body=True)
-        self._buy(sess)
-        after = [c["where"] for c in calls[2:]]
-        self.assertTrue(after, calls)
-        self.assertNotIn("body", after, calls)
-
-    def test_the_swap_is_tried_once_not_on_every_call(self):
-        sess, calls = self._session(deny_body=True)
-        self._buy(sess)
-        bodies = [c for c in calls if c["where"] == "body"]
-        self.assertLessEqual(len(bodies), 2, calls)
-
-    def test_the_report_names_the_form_that_worked(self):
-        import automation.fragment as F
-        sess, _calls = self._session(deny_body=True)
-        real = F._make_session
-        F._make_session = lambda cookies: sess
-        report: dict = {}
-        try:
-            F.buy_stars_sync({"stel_token": "x"}, " ".join(["w"] * 24),
-                             "durov", 50, report=report)
-        finally:
-            F._make_session = real
-        self.assertIn("строке запроса", report.get("transport", ""))
-
-
 class TheHashComesFromTheBuyPageFirst(unittest.TestCase):
     """Хеш со страницы витрины годился для поиска получателя, а на покупке
     шёл «Access denied». Документация рабочего клиента берёт его со страницы
@@ -683,6 +593,44 @@ class TheHashComesFromTheBuyPageFirst(unittest.TestCase):
     def test_the_showcase_is_still_a_fallback(self):
         from automation.fragment import _HASH_PAGES
         self.assertIn("https://fragment.com/stars", _HASH_PAGES)
+
+
+class TheDocumentIsTheSourceOfTruth(unittest.TestCase):
+    """Документация клиента, который доводит покупку до конца. Где наша
+    реализация расходилась с ней, расхождение убрано — своих вариантов мы
+    здесь не сочиняем."""
+
+    def test_the_hash_page_is_the_buy_page(self):
+        self.assertEqual(F._HASH_PAGES[0], "https://fragment.com/stars/buy")
+
+    def test_no_hash_is_hardcoded_any_more(self):
+        """Зашитый чужой хеш — первая из пяти причин, по которым выдача
+        не работала."""
+        self.assertEqual(F.DEFAULT_HASH, "")
+
+    def test_the_session_carries_only_a_user_agent(self):
+        sess = F._make_session({"stel_token": "x"})
+        self.assertEqual(set(sess.headers) & {"X-Requested-With", "Origin",
+                                              "Referer"}, set())
+        self.assertIn("User-Agent", sess.headers)
+
+    def test_the_profile_page_is_checked_for_the_wallet(self):
+        import inspect
+        src = inspect.getsource(F.wallet_on_page_sync)
+        self.assertIn("fragment.com/my/profile", src)
+
+    def test_linked_scripts_are_searched_for_the_hash(self):
+        """Документация ищет хеш в HTML и в подключённых JS."""
+        self.assertEqual(
+            F._script_urls('<script src="/js/a.js"></script>'),
+            ["https://fragment.com/js/a.js"])
+
+    def test_the_other_parameter_names_are_recognised(self):
+        import re
+        blob = '"csrf": "0123456789abcdef0123"'
+        hits = [m.group(1) for p in F._HASH_PATTERNS
+                for m in re.finditer(p, blob)]
+        self.assertIn("0123456789abcdef0123", hits)
 
 
 if __name__ == "__main__":
