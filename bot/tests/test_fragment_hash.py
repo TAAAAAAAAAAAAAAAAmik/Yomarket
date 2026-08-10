@@ -581,5 +581,109 @@ class TextThatTelegramMustAccept(unittest.TestCase):
             F._make_session = old
         self.assertNotIn("<", msg, msg)
 
+class TheTransportSwitchesWhenPurchaseIsDenied(unittest.TestCase):
+    """Наш способ (метод и аргументы в теле) доказан на поиске получателя:
+    пока всё уходило в строку запроса, Fragment не видел `query`. Документация
+    стороннего рабочего клиента складывает в строку ВСЁ и доводит покупку до
+    конца. Какой способ правильный для какого метода — выяснится только на
+    живом запросе, поэтому при «Access denied» пробуется второй.
+    """
+
+    def _session(self, *, deny_body: bool):
+        calls: list[dict] = []
+
+        class Resp:
+            def __init__(self, body):
+                self._body = body
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self._body
+
+        class Sess:
+            headers: dict = {}
+            cookies: dict = {}
+
+            def post(self, url, params=None, data=None, timeout=None):
+                where = "query" if data is None else "body"
+                method = ((params or {}).get("method")
+                          or (data or {}).get("method"))
+                calls.append({"where": where, "method": method})
+                if deny_body and where == "body":
+                    return Resp({"error": "Access denied"})
+                if method == "searchStarsRecipient":
+                    return Resp({"ok": True, "found": {"recipient": "R"}})
+                if method == "initBuyStarsRequest":
+                    return Resp({"ok": True, "req_id": "R1"})
+                # Дальше нужен кошелёк и сеть — до туда тест не идёт.
+                return Resp({"ok": True})
+
+        return Sess(), calls
+
+    def _buy(self, sess):
+        import automation.fragment as F
+        real = F._make_session
+        F._make_session = lambda cookies: sess
+        try:
+            return F.buy_stars_sync(
+                {"stel_token": "x"}, " ".join(["word"] * 24), "durov", 50)
+        finally:
+            F._make_session = real
+
+    def test_body_first_because_that_is_what_search_needs(self):
+        sess, calls = self._session(deny_body=False)
+        self._buy(sess)
+        self.assertEqual(calls[0]["where"], "body", calls[:2])
+        self.assertEqual(calls[0]["method"], "searchStarsRecipient")
+
+    def test_a_denial_makes_it_try_the_query_form(self):
+        sess, calls = self._session(deny_body=True)
+        self._buy(sess)
+        self.assertIn("query", [c["where"] for c in calls], calls)
+
+    def test_and_the_rest_of_the_chain_keeps_the_working_form(self):
+        """Иначе каждый следующий шаг заново упирался бы в отказ."""
+        sess, calls = self._session(deny_body=True)
+        self._buy(sess)
+        after = [c["where"] for c in calls[2:]]
+        self.assertTrue(after, calls)
+        self.assertNotIn("body", after, calls)
+
+    def test_the_swap_is_tried_once_not_on_every_call(self):
+        sess, calls = self._session(deny_body=True)
+        self._buy(sess)
+        bodies = [c for c in calls if c["where"] == "body"]
+        self.assertLessEqual(len(bodies), 2, calls)
+
+    def test_the_report_names_the_form_that_worked(self):
+        import automation.fragment as F
+        sess, _calls = self._session(deny_body=True)
+        real = F._make_session
+        F._make_session = lambda cookies: sess
+        report: dict = {}
+        try:
+            F.buy_stars_sync({"stel_token": "x"}, " ".join(["w"] * 24),
+                             "durov", 50, report=report)
+        finally:
+            F._make_session = real
+        self.assertIn("строке запроса", report.get("transport", ""))
+
+
+class TheHashComesFromTheBuyPageFirst(unittest.TestCase):
+    """Хеш со страницы витрины годился для поиска получателя, а на покупке
+    шёл «Access denied». Документация рабочего клиента берёт его со страницы
+    покупки — с неё и начинаем."""
+
+    def test_the_buy_page_is_tried_before_the_showcase(self):
+        from automation.fragment import _HASH_PAGES
+        self.assertEqual(_HASH_PAGES[0], "https://fragment.com/stars/buy")
+
+    def test_the_showcase_is_still_a_fallback(self):
+        from automation.fragment import _HASH_PAGES
+        self.assertIn("https://fragment.com/stars", _HASH_PAGES)
+
+
 if __name__ == "__main__":
     unittest.main()

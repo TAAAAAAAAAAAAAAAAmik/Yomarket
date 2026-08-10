@@ -52,15 +52,26 @@ def _make_session(cookies: dict) -> requests.Session:
 
 
 def _api_call(session: requests.Session, api_hash: str, method: str,
-              extra: dict):
+              extra: dict, in_query: bool = False):
     """Один запрос к Fragment API.
 
-    Хеш — в строке запроса (`/api?hash=…`), метод и аргументы — в теле,
-    form-urlencoded. Fragment читает их именно оттуда, и это не мелочь: пока
-    всё уходило в строку запроса, хеш он видел, а `query` — нет, и на живой
-    ник отвечал «Please enter a username assigned to a user». Поиск получателя
-    — первый шаг покупки, так что дальше него дело не доходило никогда.
+    По умолчанию хеш — в строке запроса (`/api?hash=…`), метод и аргументы —
+    в теле, form-urlencoded. Fragment читает их именно оттуда, и это не
+    мелочь: пока всё уходило в строку запроса, хеш он видел, а `query` — нет,
+    и на живой ник отвечал «Please enter a username assigned to a user».
+    Поиск получателя — первый шаг покупки, так что дальше него дело не
+    доходило никогда.
+
+    `in_query=True` — вариант из документации стороннего рабочего клиента:
+    там ВСЁ уходит в строку запроса. Наш вариант доказан на поиске
+    получателя, тот — на покупке целиком, и какой правильный для каждого
+    метода, выяснится только на живом запросе. Поэтому оба остаются.
     """
+    if in_query:
+        return session.post(FRAGMENT_API_URL,
+                            params={"method": method, "hash": api_hash,
+                                    **extra},
+                            timeout=20)
     return session.post(FRAGMENT_API_URL,
                         params={"hash": api_hash},
                         data={"method": method, **extra},
@@ -207,11 +218,12 @@ def buy_stars_sync(
         return False, "Fragment принимает заказы от 50 звёзд"
 
     session = _make_session(cookies)
-    state = {"hash": api_hash or DEFAULT_HASH, "refreshed": False}
+    state = {"hash": api_hash or DEFAULT_HASH, "refreshed": False,
+             "in_query": False, "swapped": False}
 
-    def _raw(method: str, extra: dict) -> dict:
+    def _raw(method: str, extra: dict, in_query: bool = False) -> dict:
         try:
-            r = _api_call(session, state["hash"], method, extra)
+            r = _api_call(session, state["hash"], method, extra, in_query)
             r.raise_for_status()
             return r.json()
         except requests.exceptions.RequestException as e:
@@ -227,7 +239,7 @@ def buy_stars_sync(
         seller could do nothing about — the hash is not something they were
         ever asked for.
         """
-        out = _raw(method, extra)
+        out = _raw(method, extra, state["in_query"])
         said = str(out.get("error") or "").lower()
         if "bad request" in said and not state["refreshed"]:
             state["refreshed"] = True
@@ -235,7 +247,24 @@ def buy_stars_sync(
             if fresh and fresh != state["hash"]:
                 state["hash"] = fresh
                 logger.info("Fragment: refreshed api hash mid-flight")
-                return _raw(method, extra)
+                out = _raw(method, extra, state["in_query"])
+                said = str(out.get("error") or "").lower()
+        # «Access denied» на покупке при живой сессии — то, на чём выдача
+        # стояла. Документация рабочего клиента складывает всё в строку
+        # запроса; наш способ доказан на поиске получателя, тот — на покупке.
+        # Пробуем второй способ и запоминаем, какой сработал, чтобы остаток
+        # цепочки шёл им же.
+        if "access denied" in said and not state["swapped"]:
+            state["swapped"] = True
+            other = _raw(method, extra, not state["in_query"])
+            if not str(other.get("error") or "").lower().startswith("access"):
+                state["in_query"] = not state["in_query"]
+                logger.info("Fragment: switched transport to %s",
+                            "query" if state["in_query"] else "body")
+                if report is not None:
+                    report["transport"] = ("всё в строке запроса"
+                                           if state["in_query"] else "в теле")
+                return other
         return out
 
     # 1. find recipient
@@ -408,8 +437,12 @@ _HASH_PATTERNS = (
     r"hash['\"]?\s*[:=]\s*['\"]([0-9a-f]{12,64})['\"]",
 )
 
-_HASH_PAGES = ("https://fragment.com/stars",
-               "https://fragment.com/stars/buy",
+# Первой — страница покупки: именно её называет документация рабочего
+# клиента, и хеш, выданный на ней, точно годится для покупки. Хеш со
+# страницы витрины годился для поиска получателя, а дальше шёл «Access
+# denied» — возможно, ровно поэтому.
+_HASH_PAGES = ("https://fragment.com/stars/buy",
+               "https://fragment.com/stars",
                "https://fragment.com/",
                "https://fragment.com/premium")
 
