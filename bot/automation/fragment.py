@@ -995,6 +995,14 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
     out.append("Хешей найдено: " + ", ".join(
         f"…{h[-6:]} ({len(h)} знаков)" for h in hashes))
 
+    # Что отвечает Fragment на другие методы. Проверка, которой не хватало
+    # с самого начала: если «Access denied» приходит и на выдуманное имя
+    # метода, то это не «вам нельзя покупать», а «такого метода тут нет» —
+    # и вся линия рассуждений про права держалась на пустом месте.
+    out.append("")
+    out.append("Что отвечают другие методы:")
+    out += _probe_methods(cookies, hashes[0], username, quantity)
+
     plain = {"User-Agent": "Mozilla/5.0"}
     rich = {"User-Agent": _USER_AGENTS[0][1],
             "X-Requested-With": "XMLHttpRequest",
@@ -1119,6 +1127,67 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
     out.append("")
     out.append("Что меняет каждая кука:")
     out += _probe_cookie_roles(cookies, username, quantity)
+    return out
+
+
+def _probe_methods(cookies: dict, api_hash: str, username: str,
+                   quantity: int) -> list[str]:
+    """Чем отличаются ответы Fragment на разные методы.
+
+    «Access denied» мы полторы недели читали как «этой сессии покупать
+    нельзя» — и ни разу не спросили, что Fragment отвечает на имя метода,
+    которого не существует вовсе. Если то же самое, значит это его общее
+    «нет», и никаких выводов о правах из него не следует: скорее всего мы
+    зовём метод, которого на этом хеше нет.
+
+    Все вызовы безобидны: заявка денег не двигает, у `getBuyStarsLink` и
+    `confirmReq` заведомо несуществующий `id`.
+    """
+    session = _make_session(cookies)
+
+    def ask(method: str, args: dict) -> str:
+        try:
+            r = session.post(FRAGMENT_API_URL,
+                             params={"method": method, "hash": api_hash,
+                                     **args}, timeout=20)
+        except Exception as e:
+            return f"ошибка сети {str(e)[:30]}"
+        try:
+            data = r.json()
+        except ValueError:
+            return f"HTTP {r.status_code}, не JSON ({len(r.text or '')} симв.)"
+        if not isinstance(data, dict):
+            return f"HTTP {r.status_code}, {str(data)[:40]}"
+        if data.get("error") or data.get("error_message"):
+            return str(data.get("error") or data.get("error_message"))[:50]
+        return "принято: " + ", ".join(sorted(data))[:50]
+
+    recipient = ""
+    first = _query_forms(username)[:1]
+    if first:
+        try:
+            got = session.post(
+                FRAGMENT_API_URL,
+                params={"method": "searchStarsRecipient", "hash": api_hash,
+                        "query": first[0]}, timeout=20).json()
+            recipient = _extract_recipient(got)
+        except Exception:
+            recipient = ""
+
+    checks = [
+        ("searchStarsRecipient", {"query": first[0] if first else "x"}),
+        ("initBuyStarsRequest", {"recipient": recipient or "x",
+                                 "quantity": quantity}),
+        ("getBuyStarsLink", {"id": "0", "transaction": 1}),
+        ("confirmReq", {"id": "0", "boc": "x"}),
+        # Двух выдуманных имён достаточно, чтобы увидеть, отличает ли
+        # Fragment «нельзя» от «нет такого».
+        ("thisMethodDoesNotExist", {}),
+        ("searchStarsRecipientX", {"query": first[0] if first else "x"}),
+    ]
+    out = []
+    for method, args in checks:
+        out.append(f"  {method}: {ask(method, args)}")
     return out
 
 

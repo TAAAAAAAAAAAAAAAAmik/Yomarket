@@ -1094,6 +1094,73 @@ class TheControlRequestTellsTheTwoRefusalsApart(Case):
         self.assertIn("покупать нельзя вообще", got)
 
 
+class AskingWhatOtherMethodsAnswer(Case):
+    """Проверка, которой не хватало с самого начала.
+
+    «Access denied» полторы недели читался как «этой сессии покупать
+    нельзя» — и ни разу не был задан вопрос, что Fragment отвечает на имя
+    метода, которого не существует. Если то же самое, вывод о правах не
+    следует из ответа вообще, и вся линия рассуждений держалась на пустом.
+    """
+
+    def _ask(self, answers):
+        """answers — что отвечать на каждый метод; ключ «*» на остальные."""
+        outer = self.fake
+        sess = outer.session()
+        seen: list[str] = []
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            method = q.get("method", "")
+            seen.append(method)
+            if method == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R"}})
+            return Reply(answers.get(method, answers.get("*", {"ok": True})))
+
+        sess.post = post
+        F._make_session = lambda cookies: sess
+        return F._probe_methods(COOKIES, REAL_HASH, "durov", 50), seen
+
+    def test_a_made_up_method_is_asked_about_too(self):
+        _lines, seen = self._ask({})
+        self.assertIn("thisMethodDoesNotExist", seen)
+
+    def test_every_answer_is_shown_as_it_came(self):
+        lines, _seen = self._ask({"initBuyStarsRequest":
+                                  {"error": "Access denied"},
+                                  "thisMethodDoesNotExist":
+                                  {"error": "Unknown method"}})
+        text = "\n".join(lines)
+        self.assertIn("initBuyStarsRequest: Access denied", text)
+        self.assertIn("thisMethodDoesNotExist: Unknown method", text)
+
+    def test_an_accepted_answer_lists_its_fields(self):
+        lines, _seen = self._ask({"getBuyStarsLink": {"ok": True,
+                                                      "transaction": {}}})
+        self.assertTrue(any("принято: ok, transaction" in x for x in lines),
+                        lines)
+
+    def test_the_dead_ids_are_never_real_ones(self):
+        """Иначе проба подтвердила бы чужую оплату вместо диагностики."""
+        import inspect
+        src = inspect.getsource(F._probe_methods)
+        self.assertIn('"id": "0"', src)
+
+    def test_a_method_that_answers_no_json_is_still_reported(self):
+        outer = self.fake
+        sess = outer.session()
+
+        def post(url, params=None, data=None, **kw):
+            if (params or {}).get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R"}})
+            return Reply(None, 403, "<html>nope</html>")
+
+        sess.post = post
+        F._make_session = lambda cookies: sess
+        lines = F._probe_methods(COOKIES, REAL_HASH, "durov", 50)
+        self.assertTrue(any("не JSON" in x for x in lines), lines)
+
+
 class CheckingOneNickOnDemand(Case):
     """«Ник не находится» и «покупка запрещена» — разные беды.
 
