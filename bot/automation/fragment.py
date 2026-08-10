@@ -751,7 +751,7 @@ def probe_session_sync(cookies: dict) -> list[str]:
 
 
 def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
-                   api_hash: str = "") -> list[str]:
+                   api_hash: str = "", control: str = "durov") -> list[str]:
     """Где именно ломается покупка — перебором того, чем запросы отличаются.
 
     Рабочий образец шлёт всё в строке запроса и ставит только User-Agent;
@@ -860,10 +860,14 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
             # можно бесконечно.
             if not shown["search"]:
                 shown["search"] = True
+                found = search.get("found")
                 out.append(f"  поиск вернул поля: "
                            f"{', '.join(sorted(search)) or '—'}")
-                out.append(f"  found: {str(search.get('found'))[:120]}")
-                out.append(f"  recipient для заявки: «{recipient[:60]}»")
+                out.append(f"  found: {str(found)[:120]}")
+                out.append(f"  recipient длиной {len(recipient)}: "
+                           f"«{recipient[:24]}…»")
+                if isinstance(found, dict) and found.get("myself"):
+                    out.append("  ⚠️ myself: это ваш собственный аккаунт")
             try:
                 resp = call(session, in_query, h, "initBuyStarsRequest",
                             {"recipient": recipient, "quantity": quantity})
@@ -883,6 +887,61 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
                 out.append(f"  ответ заявки: HTTP {resp.status_code}, "
                            f"поля: {', '.join(sorted(init)) or '—'}")
                 out.append(f"  целиком: {str(init)[:200]}")
+
+    # Ни один вариант не прошёл. Осталось различить две причины, которые до
+    # сих пор объясняли отказ одинаково: сессии вообще нельзя покупать —
+    # или нельзя покупать себе. Проверяется одной заявкой на чужой ник.
+    # В работе получатель всегда покупатель, а не продавец, так что второй
+    # случай означал бы, что выдача исправна, а сломан только наш способ
+    # её проверять.
+    live = (control or "").strip().lstrip("@")
+    if live and live.lower() != username.lower():
+        out.append("")
+        out.append(f"Контрольная заявка на чужой ник @{live}:")
+        out += _probe_control(cookies, live, quantity, hashes[0])
+    return out
+
+
+def _probe_control(cookies: dict, username: str, quantity: int,
+                   api_hash: str) -> list[str]:
+    """Заявка на чужой ник — тем же способом, что и основная.
+
+    Денег не двигает: списание происходит только при отправке подписанной
+    транзакции, а до неё дело здесь не доходит.
+    """
+    session = requests.Session()
+    session.cookies.update(cookies or {})
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    def post(method: str, extra: dict):
+        return session.post(FRAGMENT_API_URL,
+                            params={"method": method, "hash": api_hash,
+                                    **extra}, timeout=20)
+
+    try:
+        search = post("searchStarsRecipient", {"query": username}).json()
+    except Exception as e:
+        return [f"  поиск — ошибка {str(e)[:40]}"]
+    recipient = _extract_recipient(search)
+    if not recipient:
+        return [f"  поиск — {str(search.get('error') or search)[:60]}"]
+    found = search.get("found")
+    mine = bool(isinstance(found, dict) and found.get("myself"))
+    out = [f"  найден, myself: {'да' if mine else 'нет'}"]
+    try:
+        resp = post("initBuyStarsRequest",
+                    {"recipient": recipient, "quantity": quantity})
+        init = resp.json()
+    except Exception as e:
+        return out + [f"  заявка — ошибка {str(e)[:40]}"]
+    if init.get("req_id") or init.get("id"):
+        out.append("  ✅ ЗАЯВКА ПРИНЯТА — Fragment не даёт покупать только "
+                   "себе. В работе получатель всегда покупатель, так что "
+                   "выдаче это не мешает.")
+    else:
+        out.append(f"  ❌ {str(init.get('error') or init)[:70]}")
+        out.append("  Отказ и на чужом нике — дело не в «себе»: этой сессии "
+                   "покупать нельзя вообще.")
     return out
 
 
@@ -938,9 +997,18 @@ def probe_page_api_sync(cookies: dict) -> list[str]:
     stars = sorted(m for m in seen_methods if "star" in m.lower())
     out.append("методы про звёзды: " + (", ".join(stars) if stars
                                         else "не нашёл ни одного"))
-    for name in ("initBuyStarsRequest", "getBuyStarsLink"):
+    for name in ("searchStarsRecipient", "initBuyStarsRequest",
+                 "getBuyStarsLink"):
         out.append(f"{name}: " + ("есть" if name in seen_methods
-                                  else "НЕ упоминается нигде"))
+                                  else "не видно в разметке"))
+    if "searchStarsRecipient" not in seen_methods:
+        # Иначе этот раздел врёт: «initBuyStarsRequest нигде не упоминается»
+        # читается как «метода больше нет», хотя рядом не упоминается и
+        # searchStarsRecipient — который работает. Значит имён здесь просто
+        # не видно, и вывода из их отсутствия сделать нельзя никакого.
+        out.append("↑ здесь не видно и searchStarsRecipient, который "
+                   "работает. Значит имён методов на этих страницах нет "
+                   "вовсе, и об их существовании отсюда судить нельзя.")
     return out
 
 

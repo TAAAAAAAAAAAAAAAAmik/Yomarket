@@ -647,7 +647,9 @@ class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
     COOKIES = {"stel_token": "t" * 120, "stel_ssid": "s" * 20,
                "stel_ton_token": "n" * 400}
 
-    def _probe(self, page=None, deny=True):
+    def _probe(self, page=None, deny=True, myself=False,
+               deny_others=True, control="stranger"):
+        """deny — отказ на основном нике, deny_others — на контрольном."""
         import automation.fragment as FR
 
         outer = self.fake
@@ -660,6 +662,7 @@ class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
                 self.cookies = type(
                     "C", (), {"update": staticmethod(lambda *a: None),
                               "__iter__": lambda self: iter(())})()
+                self.who = ""
 
             def get(self, url, **kw):
                 gets.append(url)
@@ -670,15 +673,21 @@ class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
                 q.update(data or {})
                 outer.queries.append(q)
                 if q.get("method") == "searchStarsRecipient":
-                    return Reply({"ok": True, "found": {"recipient": "R1"}})
-                if deny:
+                    self.who = q.get("query", "")
+                    found = {"recipient": "R" + self.who}
+                    if myself and self.who == "durov":
+                        found["myself"] = True
+                    return Reply({"ok": True, "found": found})
+                refuse = deny_others if self.who == control else deny
+                if refuse:
                     return Reply({"ok": False, "error": "Access denied"})
                 return Reply({"ok": True, "req_id": "REQ-1"})
 
         old = FR.requests.Session
         FR.requests.Session = Sess
         try:
-            return FR.probe_buy_sync(self.COOKIES, "durov", 50), gets
+            return FR.probe_buy_sync(self.COOKIES, "durov", 50,
+                                     control=control), gets
         finally:
             FR.requests.Session = old
 
@@ -710,7 +719,7 @@ class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
 
     def test_the_recipient_we_actually_send_is_shown(self):
         got = "\n".join(self._probe()[0])
-        self.assertIn("recipient для заявки: «R1»", got)
+        self.assertIn("recipient длиной 6: «Rdurov…»", got)
 
     def test_the_details_are_printed_once_not_per_variant(self):
         got = "\n".join(self._probe()[0])
@@ -730,6 +739,49 @@ class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
     def test_cookie_names_and_lengths_are_shown(self):
         got = "\n".join(self._probe()[0])
         self.assertIn("stel_token (120)", got)
+
+    def test_a_self_purchase_is_named_as_such(self):
+        """`myself: True` в ответе поиска — это не деталь: покупка себе и
+        покупка чужому могут разрешаться по-разному."""
+        got = "\n".join(self._probe(myself=True)[0])
+        self.assertIn("myself: это ваш собственный аккаунт", got)
+
+
+class TheControlRequestTellsTheTwoRefusalsApart(Case):
+    """«Access denied» объясняли одинаково две разные причины.
+
+    Сессии вообще нельзя покупать — или нельзя покупать себе. Отличить их
+    рассуждением нельзя, а одной заявкой на чужой ник можно. Разница не
+    отвлечённая: в работе получатель всегда покупатель, а не продавец, и во
+    втором случае выдача исправна, а сломана только проверка.
+    """
+
+    _probe = TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy._probe
+    COOKIES = TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy.COOKIES
+
+    def test_the_control_nick_is_actually_asked_about(self):
+        lines, _gets = self._probe()
+        self.assertTrue(any("@stranger" in x for x in lines), lines)
+        asked = [q.get("query") for q in self.fake.queries if q.get("query")]
+        self.assertIn("stranger", asked)
+
+    def test_a_control_that_goes_through_clears_the_delivery(self):
+        got = "\n".join(self._probe(deny_others=False)[0])
+        self.assertIn("ЗАЯВКА ПРИНЯТА", got)
+        self.assertIn("не даёт покупать только себе", got)
+
+    def test_a_control_that_is_refused_too_blames_the_session(self):
+        got = "\n".join(self._probe()[0])
+        self.assertIn("покупать нельзя вообще", got)
+
+    def test_it_is_not_run_when_the_purchase_already_worked(self):
+        """Успех — конец разбора; лишняя заявка на чужой ник ни к чему."""
+        lines, _gets = self._probe(deny=False)
+        self.assertFalse(any("Контрольная заявка" in x for x in lines), lines)
+
+    def test_the_same_nick_is_not_used_as_its_own_control(self):
+        lines, _gets = self._probe(control="durov")
+        self.assertFalse(any("Контрольная заявка" in x for x in lines), lines)
 
     def test_no_cookie_value_ever_reaches_the_report(self):
         """Это доступ к чужому аккаунту и кошельку — в отчёт уходит длина."""

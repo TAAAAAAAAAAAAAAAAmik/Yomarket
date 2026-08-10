@@ -606,7 +606,7 @@ async def fragment_debug(message: Message) -> None:
 
 @router.message(Command("stars_probe"))
 async def stars_probe(message: Message) -> None:
-    """/stars_probe <ник> [кол-во] — на каком шаге ломается покупка.
+    """/stars_probe <ник> [кол-во] [контрольный ник] — где ломается покупка.
 
     Ничего не оплачивает: доходит до заявки, а деньги двигает только
     подписанная транзакция после неё.
@@ -622,6 +622,10 @@ async def stars_probe(message: Message) -> None:
         qty = int(parts[2]) if len(parts) > 2 else 50
     except ValueError:
         qty = 50
+    # Третьим словом — чужой ник для контрольной заявки. Без него берётся
+    # @durov: заявка денег не двигает, но ник должен быть настоящим.
+    control = next((p.lstrip("@") for p in parts[2:] if not p.isdigit()),
+                   "durov")
     creds = get_fragment_creds(message.from_user.id) or {}
     if not creds.get("cookies"):
         await message.answer("⚠️ Куки Fragment не заданы")
@@ -632,7 +636,7 @@ async def stars_probe(message: Message) -> None:
         lines = await asyncio.wait_for(
             loop.run_in_executor(None, functools.partial(
                 probe_buy_sync, creds["cookies"], username, qty,
-                creds.get("api_hash", ""))),
+                creds.get("api_hash", ""), control)),
             # Вариантов шесть, на каждый по два хеша и по два запроса, плюс
             # чтение страниц. Прежних 120 с на это уже не хватает, а обрыв по
             # таймауту выглядит как отказ Fragment и путает следствие.
