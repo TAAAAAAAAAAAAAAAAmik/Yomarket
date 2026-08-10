@@ -1163,6 +1163,65 @@ class AskingWhatOtherMethodsAnswer(Case):
         self.assertTrue(any("не JSON" in x for x in lines), lines)
 
 
+class OneSessionForEverything(Case):
+    """Последнее расхождение с документацией — и самое незаметное.
+
+    Там одна `requests.Session()`: ею читается страница покупки, из неё
+    берётся хеш, ею же уходят все запросы. У нас страницу читала вторая
+    сессия — со своим User-Agent и своей банкой кук. Куки, которые Fragment
+    ставит при открытии страницы, оставались в ней, а хеш, выданный ей,
+    уходил в запрос от первой. Хеш Fragment выдаёт сессии.
+    """
+
+    def test_the_purchase_reads_the_hash_with_its_own_session(self):
+        """Иначе хеш принадлежит одной сессии, а запрос идёт от другой."""
+        seen: list[object] = []
+        real = F.collect_api_hashes_sync
+
+        def spy(cookies, report=None, facts=None, session=None):
+            seen.append(session)
+            return real(cookies, report, facts, session)
+
+        F.collect_api_hashes_sync = spy
+        try:
+            F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100)
+        finally:
+            F.collect_api_hashes_sync = real
+        self.assertTrue(seen, "хеш не читался вовсе")
+        self.assertIsNotNone(seen[0], "страницу читает не та сессия")
+
+    def test_a_stale_hash_is_refreshed_with_that_session_too(self):
+        """Иначе освежённый хеш опять окажется чужим."""
+        import inspect
+        src = inspect.getsource(F.buy_stars_sync)
+        self.assertNotIn("fetch_api_hash_sync(cookies)\n", src)
+
+    def test_the_page_may_be_read_with_any_session_when_asked(self):
+        """Диагностике нужны обе: и своя сессия, и общая."""
+        got = F.collect_api_hashes_sync(COOKIES, session=self.fake.session())
+        self.assertEqual(got, [REAL_HASH])
+
+    def test_the_probe_runs_the_whole_chain_in_one_session(self):
+        outer = self.fake
+        sess = outer.session()
+        sess.cookies = type("C", (), {
+            "update": staticmethod(lambda *a: None),
+            "__iter__": lambda self: iter(
+                [type("K", (), {"name": "stel_ssid"})(),
+                 type("K", (), {"name": "stel_dt"})()])})()
+        F._make_session = lambda cookies: sess
+        got = "\n".join(F._probe_single_session(COOKIES, "durov", 50))
+        self.assertIn("куки после неё: stel_dt, stel_ssid", got)
+        # Кука, которой у нас не было, — и есть возможное недостающее звено.
+        self.assertIn("Fragment поставил сам: stel_dt", got)
+        self.assertIn(f"({len(REAL_HASH)} знаков)", got)
+
+    def test_a_page_without_a_hash_stops_there_rather_than_guessing(self):
+        self.fake.page = "<html>пусто</html>"
+        got = "\n".join(F._probe_single_session(COOKIES, "durov", 50))
+        self.assertIn("дальше идти не с чем", got)
+
+
 class ChangingOneFieldOfTheRequestAtATime(Case):
     """Метод существует, на куки не смотрит — остаётся сам запрос.
 

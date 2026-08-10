@@ -247,10 +247,13 @@ def buy_stars_sync(
     session = _make_session(cookies)
     state = {"hash": api_hash or "", "refreshed": False}
     if not state["hash"]:
-        # Хеш всегда берётся со страницы покупки, как в документации.
-        # Зашитого значения здесь больше нет: чужой хеш — первая из пяти
-        # причин, по которым выдача не работала.
-        state["hash"] = fetch_api_hash_sync(cookies)
+        # Хеш берётся со страницы покупки — и берётся ЭТОЙ ЖЕ сессией, как в
+        # документации: там одна `requests.Session()` и на страницу, и на
+        # API. У нас страницу читала отдельная сессия со своим User-Agent, а
+        # куки, которые Fragment ставит на этой странице, оставались в ней и
+        # терялись. Хеш при этом уходил в запрос от другой сессии — а хеш
+        # Fragment выдаёт именно сессии.
+        state["hash"] = fetch_api_hash_sync(cookies, session=session)
         if not state["hash"]:
             return False, ("Не удалось прочитать hash со страницы "
                            "fragment.com/stars/buy — проверьте куки Fragment")
@@ -277,7 +280,8 @@ def buy_stars_sync(
         said = str(out.get("error") or "").lower()
         if "bad request" in said and not state["refreshed"]:
             state["refreshed"] = True
-            fresh = fetch_api_hash_sync(cookies)
+            # Той же сессией — иначе освежённый хеш опять окажется чужим.
+            fresh = fetch_api_hash_sync(cookies, session=session)
             if fresh and fresh != state["hash"]:
                 state["hash"] = fresh
                 logger.info("Fragment: refreshed api hash mid-flight")
@@ -511,18 +515,26 @@ def _script_urls(html: str) -> list[str]:
 
 
 def collect_api_hashes_sync(cookies: dict, report: list | None = None,
-                            facts: dict | None = None) -> list[str]:
+                            facts: dict | None = None,
+                            session: requests.Session | None = None
+                            ) -> list[str]:
     """Все хеши, какие видны на страницах Fragment, — в порядке доверия.
 
     Раньше брался первый совпавший, и этого не хватило: в разметке лежит не
     один «hash», и подойти к API может не тот, что нашёлся первым. Перебрать
     несколько дешевле, чем гадать.
 
+    `session` — чтобы читать страницу той же сессией, которой потом пойдут
+    запросы. В документации так и сделано: одна `requests.Session()` на
+    всё. У нас страницу читала отдельная сессия со своим User-Agent, а
+    куки, которые Fragment ставит на этой странице, оставались в ней и
+    пропадали. Хеш при этом уходил в запрос от другой сессии.
+
     `facts` — то, что вызывающему нужно решать, а не показывать: вошли ли мы.
     Вычитывать это обратно из текста отчёта значило бы управлять логикой по
     прозе, а она меняется от любой правки формулировки.
     """
-    session = _page_session(cookies or {})
+    session = session or _page_session(cookies or {})
     found: list[str] = []
     for url in _HASH_PAGES:
         try:
@@ -570,7 +582,8 @@ def collect_api_hashes_sync(cookies: dict, report: list | None = None,
     return found
 
 
-def fetch_api_hash_sync(cookies: dict, report: list | None = None) -> str:
+def fetch_api_hash_sync(cookies: dict, report: list | None = None,
+                        session: requests.Session | None = None) -> str:
     """The api hash Fragment issued to this session, read off its own page.
 
     Fragment stamps every request with a per-session hash, and a hash from
@@ -578,8 +591,11 @@ def fetch_api_hash_sync(cookies: dict, report: list | None = None) -> str:
     hardcoded one produced. It sits in the page's own JavaScript, so there is
     no reason to make a seller find it by hand, let alone open developer tools
     on a phone.
+
+    `session` передают, когда хеш и запросы должны идти одной сессией — как
+    в документации.
     """
-    got = collect_api_hashes_sync(cookies, report)
+    got = collect_api_hashes_sync(cookies, report, session=session)
     return got[0] if got else ""
 
 
@@ -1012,6 +1028,14 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
     out.append("Что меняет каждое поле заявки:")
     out += _probe_init_shapes(cookies, hashes[0], username, quantity)
 
+    # Ровно как в документации: одна сессия и на страницу, и на API. У нас
+    # страницу читала отдельная сессия со своим User-Agent, и куки, которые
+    # Fragment ставит при её открытии, терялись — а хеш он выдаёт сессии.
+    # Это последнее отличие от образца, и до сих пор оно не проверялось.
+    out.append("")
+    out.append("Одной сессией, как в документе:")
+    out += _probe_single_session(cookies, username, quantity)
+
     plain = {"User-Agent": "Mozilla/5.0"}
     rich = {"User-Agent": _USER_AGENTS[0][1],
             "X-Requested-With": "XMLHttpRequest",
@@ -1190,6 +1214,48 @@ def _probe_methods(cookies: dict, api_hash: str, username: str,
     out = []
     for method, args in checks:
         out.append(f"  {method}: {ask(method, args)}")
+    return out
+
+
+def _probe_single_session(cookies: dict, username: str,
+                          quantity: int) -> list[str]:
+    """Вся цепочка одной сессией — точь-в-точь как в документации.
+
+    Там одна `requests.Session()` с единственным заголовком User-Agent:
+    ею читается страница покупки, из неё берётся хеш, ею же уходят все
+    запросы. У нас страницу читала вторая сессия — со своим User-Agent и
+    своей банкой кук. Куки, которые Fragment ставит при открытии страницы,
+    в неё и оставались, а хеш, выданный ей, уходил в запрос от первой.
+    """
+    session = _make_session(cookies)
+    out: list[str] = []
+    try:
+        page = session.get("https://fragment.com/stars/buy", timeout=20)
+    except Exception as e:
+        return [f"  страница — ошибка {str(e)[:40]}"]
+    body = page.text or ""
+    # Что Fragment поставил сам, открывая страницу: если среди этих кук есть
+    # та, которой у нас не было, вот она и есть недостающее звено.
+    try:
+        got = sorted({c.name for c in session.cookies})
+    except Exception:
+        got = []
+    out.append(f"  страница: HTTP {page.status_code}, {len(body)} символов")
+    out.append(f"  куки после неё: {', '.join(got) or '—'}")
+    new = [n for n in got if n not in (cookies or {})]
+    if new:
+        out.append(f"  ↑ Fragment поставил сам: {', '.join(new)}")
+
+    h = ""
+    for pattern in _HASH_PATTERNS:
+        m = re.search(pattern, body)
+        if m:
+            h = m.group(1)
+            break
+    if not h:
+        return out + ["  хеша на странице нет — дальше идти не с чем"]
+    out.append(f"  хеш с этой страницы: …{h[-6:]} ({len(h)} знаков)")
+    out.append(f"  {_probe_two_calls(session, h, username, quantity)}")
     return out
 
 
