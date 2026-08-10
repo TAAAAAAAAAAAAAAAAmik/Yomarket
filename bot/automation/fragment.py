@@ -317,12 +317,11 @@ def buy_stars_sync(
                 "Fragment: «Access denied» — заявку на покупку он не "
                 "принимает. Поиск получателя при этом проходит, но он "
                 "проходит и без входа, так что правами это не считается.\n\n"
-                "Скорее всего к сессии не подключён TON-кошелёк: снимите "
-                "куки заново в браузере, где на fragment.com в правом "
-                "верхнем углу виден адрес кошелька, а не кнопка «Connect "
-                "TON». Здесь это ещё ни разу не проверялось на успешной "
-                "покупке — если после замены кук отказ повторится, "
-                "покажите /stars_probe.")
+                "Что уже проверено и причиной не является: форма запроса, "
+                "api-hash, свежесть кук и подключённый TON-кошелёк — с "
+                "живой сессией отказ тот же. Причина пока не найдена; "
+                "покажите вывод /stars_probe, там видно, на чём именно "
+                "Fragment останавливается.")
         return False, f"initBuyStarsRequest не дал req_id: {err}"
 
     # 3. wallet
@@ -619,6 +618,49 @@ def wallet_on_page_sync(cookies: dict, report: list | None = None) -> str:
         if found:
             return found[0]
     return ""
+
+
+# Что документация читает с профиля: имя, ник, кошелёк и две отметки
+# проверки. Отметки мы не смотрели ни разу — а «Access denied» на покупке
+# при живой сессии и работающих куках объясняется ими не хуже прочего.
+_PROFILE_MARKS = (
+    ("Telegram-ник", r"@([A-Za-z0-9_]{4,32})"),
+    ("Identity Verified", r"(Identity\s+Verified)"),
+    ("Wallet Verified", r"(Wallet\s+Verified)"),
+    ("Not Verified", r"(Not\s+Verified)"),
+    ("KYC", r"(KYC|verification required|Verify)"),
+)
+
+
+def profile_facts_sync(cookies: dict) -> list[str]:
+    """Что Fragment пишет о самом аккаунте на `/my/profile`.
+
+    Документация рабочего клиента читает отсюда пять вещей: имя, ник,
+    TON-кошелёк, Identity Verified и Wallet Verified. Первые три мы читали,
+    последние две — ни разу, хотя именно они решают, что аккаунту разрешено.
+    Отсутствие фразы в разметке доказательством не считается: на этих
+    страницах не видно и работающих имён методов.
+    """
+    out: list[str] = []
+    session = _page_session(cookies or {})
+    try:
+        r = session.get("https://fragment.com/my/profile", timeout=20)
+    except Exception as e:
+        return [f"профиль: {str(e)[:60]}"]
+    body = r.text or ""
+    out.append(f"профиль: HTTP {r.status_code}, {len(body)} символов")
+    if r.status_code != 200 or not body:
+        return out
+    if _looks_logged_out(body):
+        out.append("  страница отдана как гостю — остальное читать нечего")
+        return out
+    for label, pattern in _PROFILE_MARKS:
+        m = re.search(pattern, body, re.I)
+        out.append(f"  {label}: " + (f"есть — «{m.group(1)[:40]}»" if m
+                                     else "не встречается"))
+    addr = _ADDR_RE.findall(body) or _RAW_ADDR_RE.findall(body)
+    out.append("  кошелёк: " + (f"…{addr[0][-6:]}" if addr else "не видно"))
+    return out
 
 
 def wallet_address_sync(mnemonic: str, wallet_version: str = "v4r2") -> str:
@@ -982,7 +1024,16 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
     if live and live.lower() != username.lower():
         out.append("")
         out.append(f"Контрольная заявка на чужой ник @{live}:")
-        out += _probe_control(cookies, live, quantity, hashes[0])
+        out += _probe_control(cookies, live, quantity, hashes[0], username)
+
+    # То, что документация читает с профиля, а мы не читали ни разу:
+    # отметки проверки аккаунта. Живая сессия и работающие куки покупку не
+    # разрешили — значит дело в правах самого аккаунта либо в чём-то, чего
+    # мы ещё не видели. Профиль — единственное место, где Fragment о правах
+    # говорит словами.
+    out.append("")
+    out.append("Что Fragment пишет об аккаунте:")
+    out += [f"  {line}" for line in profile_facts_sync(cookies)]
 
     out.append("")
     out.append("Что меняет каждая кука:")
@@ -1078,8 +1129,15 @@ def _probe_two_calls(session, api_hash: str, username: str,
     return f"нашёл, заявка — {str(init.get('error') or init)[:40]}"
 
 
+# Кого пробовать контрольной заявкой, если заданный ник не нашёлся.
+# Fragment отвечает «Please enter a username assigned to a user» даже на
+# @durov, и почему — неизвестно; перебор дешевле догадок. В работе получатель
+# всегда покупатель, так что важно проверить хоть на кому-то, кто не «я».
+_CONTROL_FALLBACKS = ("telegram", "toncoin", "wallet", "durov")
+
+
 def _probe_control(cookies: dict, username: str, quantity: int,
-                   api_hash: str) -> list[str]:
+                   api_hash: str, myself_nick: str = "") -> list[str]:
     """Заявка на чужой ник — тем же способом, что и основная.
 
     Денег не двигает: списание происходит только при отправке подписанной
@@ -1094,23 +1152,38 @@ def _probe_control(cookies: dict, username: str, quantity: int,
                             params={"method": method, "hash": api_hash,
                                     **extra}, timeout=20)
 
+    # Заданный ник — первым, дальше запасные. Свой собственный из перебора
+    # исключён: на нём проверять нечего, это и есть основной случай.
+    nicks = [username] + [n for n in _CONTROL_FALLBACKS
+                          if n.lower() not in (username.lower(),
+                                               (myself_nick or "").lower())]
     search: dict = {}
     recipient = ""
-    for form in _query_forms(username):
-        try:
-            search = post("searchStarsRecipient", {"query": form}).json()
-        except Exception as e:
-            return [f"  поиск — ошибка {str(e)[:40]}"]
-        recipient = _extract_recipient(search)
+    tried: list[str] = []
+    for nick in nicks:
+        for form in _query_forms(nick):
+            try:
+                search = post("searchStarsRecipient", {"query": form}).json()
+            except Exception as e:
+                return [f"  поиск — ошибка {str(e)[:40]}"]
+            recipient = _extract_recipient(search)
+            if recipient:
+                break
         if recipient:
             break
+        tried.append(nick)
     if not recipient:
         return [f"  поиск — {str(search.get('error') or search)[:60]}",
-                "  Ник не нашёлся — заявку проверить не на ком. Задайте "
-                "другой третьим словом: /stars_probe NO0RD 50 иванов"]
+                "  Ни один ник не нашёлся: " + ", ".join(f"@{n}" for n in tried),
+                "  Задайте живой ник третьим словом — лучше всего свой второй "
+                "аккаунт: /stars_probe NO0RD 50 второйник"]
+
+    out: list[str] = []
+    if nick != username:
+        out.append(f"  @{username} не нашёлся, взял @{nick}")
     found = search.get("found")
     mine = bool(isinstance(found, dict) and found.get("myself"))
-    out = [f"  найден, myself: {'да' if mine else 'нет'}"]
+    out.append(f"  найден, myself: {'да' if mine else 'нет'}")
     try:
         resp = post("initBuyStarsRequest",
                     {"recipient": recipient, "quantity": quantity})
@@ -1121,6 +1194,12 @@ def _probe_control(cookies: dict, username: str, quantity: int,
         out.append("  ✅ ЗАЯВКА ПРИНЯТА — Fragment не даёт покупать только "
                    "себе. В работе получатель всегда покупатель, так что "
                    "выдаче это не мешает.")
+    elif mine:
+        # Нашли снова себя — сравнивать не с чем, и говорить «дело не в
+        # себе» нельзя: это и есть «себе».
+        out.append(f"  ❌ {str(init.get('error') or init)[:70]}")
+        out.append("  Но это снова ваш же аккаунт — версия «нельзя покупать "
+                   "себе» так и осталась непроверенной.")
     else:
         out.append(f"  ❌ {str(init.get('error') or init)[:70]}")
         out.append("  Отказ и на чужом нике — дело не в «себе»: этой сессии "

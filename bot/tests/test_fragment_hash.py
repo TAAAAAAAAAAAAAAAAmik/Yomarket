@@ -512,9 +512,8 @@ class WhenTheSessionCannotBuy(Case):
         ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
                                    api_hash=REAL_HASH)
         self.assertFalse(ok)
-        self.assertIn("кошел", msg.lower(), msg)
-        # Что делать руками — иначе совет не совет.
-        self.assertIn("куки заново", msg)
+        # Что делать дальше — иначе совет не совет.
+        self.assertIn("/stars_probe", msg)
 
     def test_finding_the_recipient_is_not_passed_off_as_proof_of_access(self):
         """Поиск проходит и без stel_token — проверено вычитанием."""
@@ -534,9 +533,9 @@ class WhenTheSessionCannotBuy(Case):
         self.assertNotIn("сессию он признаёт", msg)
         self.assertNotIn("сессия жива", msg)
 
-    def test_a_guess_is_not_dressed_up_as_a_finding(self):
-        """Заявка не проходила ещё ни разу — сказать «причина в кошельке»
-        как о факте нельзя."""
+    def test_a_disproved_guess_is_not_left_in_the_advice(self):
+        """Кошелёк проверен на живой сессии: кука работала, отказ тот же.
+        Совет «переподключите кошелёк» после этого — трата чужого времени."""
         outer = self.fake
 
         def post(url, params=None, data=None, **kw):
@@ -550,7 +549,24 @@ class WhenTheSessionCannotBuy(Case):
         F._make_session = lambda cookies: sess
         _ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
                                     100, api_hash=REAL_HASH)
-        self.assertIn("Скорее всего", msg)
+        self.assertNotIn("Скорее всего", msg)
+        self.assertIn("причиной не является", msg)
+
+    def test_it_does_not_claim_the_cause_is_known(self):
+        outer = self.fake
+
+        def post(url, params=None, data=None, **kw):
+            query = dict(params or {})
+            if query.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            return Reply({"ok": False, "error": "Access denied"})
+
+        sess = outer.session()
+        sess.post = post
+        F._make_session = lambda cookies: sess
+        _ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
+                                    100, api_hash=REAL_HASH)
+        self.assertIn("Причина пока не найдена", msg)
 
     def test_other_failures_keep_their_own_wording(self):
         outer = self.fake
@@ -1069,6 +1085,102 @@ class TheControlRequestTellsTheTwoRefusalsApart(Case):
         got = "\n".join(self._probe(control="ghost", only_at=True,
                                     deny_others=True)[0])
         self.assertIn("покупать нельзя вообще", got)
+
+
+class WhatFragmentSaysAboutTheAccount(Case):
+    """Документация читает с `/my/profile` пять вещей, мы — три.
+
+    Отметки Identity Verified и Wallet Verified не смотрели ни разу, хотя
+    именно они решают, что аккаунту разрешено. Живая сессия, работающие
+    куки, подключённый кошелёк — и всё равно «Access denied»: значит
+    смотреть надо туда, где Fragment говорит о правах словами.
+    """
+
+    PROFILE = ('<html><a href="/logout">out</a> @seller '
+               'Identity Verified · Wallet Verified '
+               'EQA24k42CMkz2G0SzJoSVjxkneLkcqY4V-4NvhXEtB_aX13S</html>')
+
+    def _facts(self, page):
+        self.fake.page = page
+        return "\n".join(F.profile_facts_sync(COOKIES))
+
+    def test_the_verification_marks_are_read(self):
+        got = self._facts(self.PROFILE)
+        self.assertIn("Identity Verified: есть", got)
+        self.assertIn("Wallet Verified: есть", got)
+
+    def test_a_missing_mark_is_said_plainly(self):
+        got = self._facts('<html><a href="/logout">out</a> @seller</html>')
+        self.assertIn("Identity Verified: не встречается", got)
+
+    def test_the_wallet_is_shown_by_its_tail_only(self):
+        got = self._facts(self.PROFILE)
+        self.assertIn("кошелёк: …_aX13S", got)
+        self.assertNotIn("EQA24k42", got)
+
+    def test_a_guest_profile_is_not_mined_for_facts(self):
+        """Иначе отчёт полон «не встречается» — и все они ни о чём."""
+        got = self._facts("<html>Connect TON</html>")
+        self.assertIn("отдана как гостю", got)
+        self.assertNotIn("Identity Verified:", got)
+
+    def test_the_page_that_is_read_is_the_one_from_the_document(self):
+        self._facts(self.PROFILE)
+        self.assertIn("https://fragment.com/my/profile", self.fake.gets)
+
+
+class TheControlNickIsHuntedDownNotGivenUpOn(Case):
+    """@durov Fragment не находит — «Please enter a username assigned to a
+    user». Почему, неизвестно; проба из-за этого два прогона подряд не
+    доходила до сути. Перебор запасных ников дешевле догадок о причине.
+    """
+
+    def _control(self, known=()):
+        outer = self.fake
+        sess = outer.session()
+        asked: list[str] = []
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if q.get("method") == "searchStarsRecipient":
+                nick = q.get("query", "").lstrip("@")
+                asked.append(nick)
+                if nick in known:
+                    return Reply({"ok": True, "found": {"recipient": "R"}})
+                return Reply({"ok": False, "error":
+                              "Please enter a username assigned to a user."})
+            return Reply({"ok": False, "error": "Access denied"})
+
+        sess.post = post
+        old = F.requests.Session
+        F.requests.Session = lambda: sess
+        try:
+            return F._probe_control(COOKIES, "durov", 50, REAL_HASH,
+                                    "NO0RD"), asked
+        finally:
+            F.requests.Session = old
+
+    def test_a_spare_nick_is_tried_when_the_given_one_is_not_found(self):
+        lines, asked = self._control(known={"telegram"})
+        self.assertIn("telegram", asked)
+        self.assertTrue(any("взял @telegram" in x for x in lines), lines)
+
+    def test_finding_one_gets_the_answer_we_came_for(self):
+        lines, _asked = self._control(known={"telegram"})
+        self.assertTrue(any("покупать нельзя вообще" in x for x in lines),
+                        lines)
+
+    def test_our_own_nick_is_never_used_as_the_control(self):
+        """На себе проверять нечего — это и есть основной случай."""
+        _lines, asked = self._control(known={"NO0RD"})
+        self.assertNotIn("NO0RD", asked)
+
+    def test_when_nobody_is_found_it_says_who_was_tried(self):
+        lines, _asked = self._control(known=())
+        text = "\n".join(lines)
+        self.assertIn("Ни один ник не нашёлся", text)
+        self.assertIn("@telegram", text)
+        self.assertIn("свой второй", text)
 
 
 class WhichCookieActuallyDoesAnything(Case):
