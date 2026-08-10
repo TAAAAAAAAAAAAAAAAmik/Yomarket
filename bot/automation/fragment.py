@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 FRAGMENT_API_URL = "https://fragment.com/api"
 TONCENTER_SEND = "https://toncenter.com/api/v2/sendBoc"
+# Запасной узел — он есть в документации, у нас его не было. Транзакция уже
+# подписана: если основной узел не ответил, деньги не ушли, а заказ считался
+# бы проваленным на ровном месте.
+TONCENTER_SEND_FALLBACK = "https://toncenter.net/api/v2/sendBoc"
 TONCENTER_RUN = "https://toncenter.com/api/v2/runGetMethod"
 MAINNET_CHAIN = "-239"
 # Зашитого хеша больше нет. Он был чужой, из образца, и это первая из пяти
@@ -66,18 +70,45 @@ def _api_call(session: requests.Session, api_hash: str, method: str,
 
 
 def _extract_recipient(resp: dict) -> str:
-    """Pull the recipient id out of a searchStarsRecipient response."""
+    """Получатель из ответа `searchStarsRecipient` — ровно `found.recipient`.
+
+    В документации значение одно: `data["found"]["recipient"]`. У нас рядом
+    стоял перебор `id`, `myself`, `value` «на всякий случай» — и `myself` там
+    настоящее поле, булево: у своего же аккаунта Fragment отвечает
+    `{"myself": true, "recipient": "..."}`. Стоило `recipient` не прийти — и
+    в заявку ушло бы `recipient=True`, а разбираться пришлось бы с ответом
+    «Access denied», который выглядит точно так же, как отказ по правам.
+    """
     if not isinstance(resp, dict):
         return ""
     found = resp.get("found")
-    if isinstance(found, dict):
-        for k in ("recipient", "id", "myself", "value"):
-            if found.get(k):
-                return str(found[k])
-    for k in ("recipient", "id"):
-        if resp.get(k):
-            return str(resp[k])
+    if isinstance(found, dict) and found.get("recipient"):
+        return str(found["recipient"])
+    if resp.get("recipient"):
+        return str(resp["recipient"])
     return ""
+
+
+def _query_forms(username: str) -> list[str]:
+    """Как документация ищет ник: «@Username, @username, Username, username».
+
+    Fragment отвечает не на любое написание, и рабочий клиент перебирает
+    четыре. Мы слали одно — то, что ввёл продавец, без «собаки». На своём
+    аккаунте это проходило, и гадать, почему у покупателя «получатель не
+    найден», пришлось бы вслепую.
+    """
+    bare = (username or "").strip().lstrip("@")
+    if not bare:
+        return []
+    forms = [f"@{bare}", bare]
+    low = bare.lower()
+    if low != bare:
+        forms += [f"@{low}", low]
+    out: list[str] = []
+    for f in forms:
+        if f not in out:
+            out.append(f)
+    return out
 
 
 def _wallet_from_mnemonic(mnemonic: str, version: str):
@@ -133,13 +164,22 @@ def _get_seqno(address_str: str) -> int:
 
 
 def _send_boc(boc_b64: str) -> bool:
-    try:
-        r = requests.post(TONCENTER_SEND, json={"boc": boc_b64}, timeout=20)
-        r.raise_for_status()
-        return bool(r.json().get("ok"))
-    except Exception as e:
-        logger.error("sendBoc failed: %s", e)
-        return False
+    """Отправить подписанную транзакцию. Второй узел — как в документации.
+
+    Повтор безопасен: тот же BOC с тем же seqno сеть примет один раз, а
+    второй отклонит как дубль. Опасно обратное — считать заказ проваленным
+    из-за одного не ответившего узла.
+    """
+    for url in (TONCENTER_SEND, TONCENTER_SEND_FALLBACK):
+        try:
+            r = requests.post(url, json={"boc": boc_b64}, timeout=20)
+            r.raise_for_status()
+            if r.json().get("ok"):
+                return True
+            logger.error("sendBoc: %s ответил без ok", url)
+        except Exception as e:
+            logger.error("sendBoc failed on %s: %s", url, e)
+    return False
 
 
 def get_wallet_balance_sync(
@@ -247,8 +287,14 @@ def buy_stars_sync(
     # 1. find recipient
     # Только `query` — так в документации. У нас сюда добавлялся ещё
     # `quantity` по наблюдению за формой на сайте; документ его не шлёт.
-    search = _post("searchStarsRecipient", {"query": username})
-    recipient = _extract_recipient(search)
+    # Написаний четыре, как в документации: Fragment отвечает не на любое.
+    search: dict = {}
+    recipient = ""
+    for form in _query_forms(username):
+        search = _post("searchStarsRecipient", {"query": form})
+        recipient = _extract_recipient(search)
+        if recipient:
+            break
     if not recipient:
         err = search.get("error") or search.get("error_message") or "получатель не найден"
         return False, f"@{username}: {err}. Проверьте username и cookies."
@@ -318,15 +364,31 @@ def buy_stars_sync(
             if sent:
                 break
             return False, "TonCenter отклонил транзакцию (проверьте баланс кошелька)"
-        _post("confirmReq", {"id": req_id, "boc": boc,
-                             "account": _json_account(raw_addr)})
-        sent += 1
+        # С этой секунды деньги ушли из кошелька. Дальше провал означает не
+        # «ничего не вышло», а «заплатили и не получили» — и повторять
+        # покупку нельзя: заплатим дважды.
         if report is not None:
+            report["sent_onchain"] = True
             try:
                 report["nano"] = int(report.get("nano", 0)) + int(msg["amount"])
                 report["ton"] = report["nano"] / 1_000_000_000
             except (TypeError, ValueError):
                 pass
+        confirm = _post("confirmReq", {"id": req_id, "boc": boc,
+                                       "account": _json_account(raw_addr)})
+        # Ответ подтверждения раньше выбрасывался. Именно им Fragment
+        # засчитывает оплату: без него TON уходит, а звёзды не начисляются —
+        # и бот всё равно рапортовал «✅ отправлены».
+        cerr = confirm.get("error") or confirm.get("error_message")
+        if cerr:
+            if report is not None:
+                report["confirm_error"] = str(cerr)[:120]
+            return False, (
+                f"⚠️ TON ушёл ({report.get('ton', 0) if report else 0:.4f}), "
+                f"но Fragment не засчитал оплату: {str(cerr)[:80]}. "
+                "Повтор не делаю — заплатили бы дважды. Проверьте начисление "
+                "на fragment.com и выдайте вручную, если звёзд нет.")
+        sent += 1
         # Wait for this tx to land (seqno advances) before sending the next
         if wait_confirm or i < len(valid_msgs) - 1:
             confirmed = _wait_seqno_advance(bounce_addr, seqno)

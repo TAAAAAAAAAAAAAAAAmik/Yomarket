@@ -155,7 +155,8 @@ class HowTheRequestIsSent(Case):
                          api_hash=REAL_HASH)
         first = self.fake.queries[0]
         self.assertEqual(first.get("method"), "searchStarsRecipient", first)
-        self.assertEqual(first.get("query"), "durov", first)
+        # Первым — «@ник»: так перечисляет написания документация.
+        self.assertEqual(first.get("query"), "@durov", first)
         self.assertEqual(first.get("hash"), REAL_HASH, first)
 
     def test_nothing_is_sent_in_the_body(self):
@@ -169,6 +170,219 @@ class HowTheRequestIsSent(Case):
         F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
                          api_hash=REAL_HASH)
         self.assertNotIn("quantity", self.fake.queries[0], self.fake.queries[0])
+
+
+class TheRecipientIsTakenOnlyFromItsOwnField(unittest.TestCase):
+    """`myself` — настоящее поле ответа, и оно булево.
+
+    Рядом с `recipient` у нас стоял перебор «на всякий случай»: recipient,
+    id, myself, value. У своего же аккаунта Fragment отвечает
+    `{"myself": true, "recipient": "..."}` — стоило `recipient` не прийти, и
+    в заявку ушло бы `recipient=True`. Ответ на такую заявку — «Access
+    denied», то есть ровно то, что мы неделю искали в правах и транспорте.
+    """
+
+    def test_the_recipient_field_is_used(self):
+        self.assertEqual(
+            F._extract_recipient({"found": {"recipient": "R1"}}), "R1")
+
+    def test_a_myself_flag_is_never_passed_off_as_a_recipient(self):
+        self.assertEqual(F._extract_recipient({"found": {"myself": True}}), "")
+
+    def test_myself_alongside_a_recipient_changes_nothing(self):
+        self.assertEqual(
+            F._extract_recipient({"found": {"myself": True,
+                                            "recipient": "R1"}}), "R1")
+
+    def test_nothing_found_means_nothing_returned(self):
+        self.assertEqual(F._extract_recipient({"ok": False}), "")
+
+
+class EveryWritingOfTheNickIsTried(Case):
+    """Документация перебирает «@Username, @username, Username, username».
+
+    Мы слали одно написание — то, что ввёл продавец. На своём аккаунте это
+    проходило, а «получатель не найден» у покупателя пришлось бы объяснять
+    вслепую.
+    """
+
+    def test_the_forms_follow_the_document(self):
+        self.assertEqual(F._query_forms("Durov"),
+                         ["@Durov", "Durov", "@durov", "durov"])
+
+    def test_a_lowercase_nick_needs_only_two(self):
+        self.assertEqual(F._query_forms("durov"), ["@durov", "durov"])
+
+    def test_the_at_sign_is_not_doubled(self):
+        self.assertEqual(F._query_forms("@durov"), ["@durov", "durov"])
+
+    def test_an_empty_nick_yields_nothing_to_try(self):
+        self.assertEqual(F._query_forms("  "), [])
+
+    def test_the_next_writing_is_tried_when_the_first_finds_no_one(self):
+        outer = self.fake
+        sess = outer.session()
+        real = sess.post
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if (q.get("method") == "searchStarsRecipient"
+                    and q.get("query") != "durov"):
+                outer.queries.append(q)
+                return Reply({"ok": False, "error": "Unknown recipient"})
+            return real(url, params=params, data=data, **kw)
+
+        sess.post = post
+        F._make_session = lambda cookies: sess
+        F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
+                         api_hash=REAL_HASH)
+        asked = [q.get("query") for q in outer.queries
+                 if q.get("method") == "searchStarsRecipient"]
+        self.assertEqual(asked, ["@durov", "durov"], asked)
+
+    def test_a_nick_found_at_once_costs_no_extra_requests(self):
+        F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
+                         api_hash=REAL_HASH)
+        asked = [q.get("query") for q in self.fake.queries
+                 if q.get("method") == "searchStarsRecipient"]
+        self.assertEqual(asked, ["@durov"], asked)
+
+
+class TheSecondTonNodeIsTriedToo(unittest.TestCase):
+    """Запасной узел есть в документации, у нас его не было.
+
+    Транзакция к этому моменту уже подписана, но ещё не отправлена: один
+    не ответивший узел проваливал заказ на ровном месте.
+    """
+
+    def setUp(self):
+        self.urls: list[str] = []
+        self._old = F.requests.post
+
+    def tearDown(self):
+        F.requests.post = self._old
+
+    def _answer(self, results):
+        def post(url, **kw):
+            self.urls.append(url)
+            return Reply(results[len(self.urls) - 1])
+
+        F.requests.post = post
+
+    def test_the_first_node_is_enough_when_it_answers(self):
+        self._answer([{"ok": True}])
+        self.assertTrue(F._send_boc("BOC"))
+        self.assertEqual(self.urls, [F.TONCENTER_SEND])
+
+    def test_the_second_is_tried_when_the_first_refuses(self):
+        self._answer([{"ok": False}, {"ok": True}])
+        self.assertTrue(F._send_boc("BOC"))
+        self.assertEqual(self.urls,
+                         [F.TONCENTER_SEND, F.TONCENTER_SEND_FALLBACK])
+
+    def test_both_refusing_is_still_a_refusal(self):
+        self._answer([{"ok": False}, {"ok": False}])
+        self.assertFalse(F._send_boc("BOC"))
+
+
+class AnswerOfConfirmReqIsNotThrownAway(Case):
+    """Именно `confirmReq` засчитывает оплату.
+
+    Его ответ выбрасывался: TON уходил, звёзды не начислялись, а бот
+    рапортовал «✅ отправлены». Худшая из возможных поломок этого проекта —
+    бодрый отчёт об успехе там, где покупатель остался без товара и без
+    денег продавца.
+    """
+
+    def _refuse_confirm(self, error="Wrong boc"):
+        outer = self.fake
+        sess = outer.session()
+        real = sess.post
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if q.get("method") == "initBuyStarsRequest":
+                return Reply({"ok": True, "req_id": "REQ-1"})
+            if q.get("method") == "getBuyStarsLink":
+                return Reply({"transaction": {"messages": [
+                    {"address": "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                     "amount": "1500000000", "payload": ""}]}})
+            if q.get("method") == "confirmReq":
+                return Reply({"ok": False, "error": error})
+            return real(url, params=params, data=data, **kw)
+
+        sess.post = post
+        F._make_session = lambda cookies: sess
+
+    def _buy(self):
+        report: dict = {}
+        saved = {name: getattr(F, name) for name in
+                 ("_build_signed_boc", "_send_boc", "_get_seqno",
+                  "_wait_seqno_advance", "_wallet_from_mnemonic")}
+        # tonsdk в окружении тестов нет, да и подписывать здесь нечего:
+        # проверяется, что делает бот с ответом Fragment, а не арифметика TON.
+        addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
+        F._wallet_from_mnemonic = lambda m, v: type("W", (), {"address": addr})()
+        F._build_signed_boc = lambda *a, **k: "BOC"
+        F._send_boc = lambda boc: True
+        F._get_seqno = lambda a: 5
+        F._wait_seqno_advance = lambda a, n: True
+        try:
+            ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
+                                       100, api_hash=REAL_HASH, report=report)
+        finally:
+            for name, value in saved.items():
+                setattr(F, name, value)
+        return ok, msg, report
+
+    def test_a_refused_confirmation_is_not_reported_as_delivered(self):
+        self._refuse_confirm()
+        ok, msg, _r = self._buy()
+        self.assertFalse(ok)
+        self.assertNotIn("✅", msg)
+
+    def test_the_seller_is_told_the_money_left(self):
+        self._refuse_confirm()
+        _ok, msg, _r = self._buy()
+        self.assertIn("TON ушёл", msg)
+
+    def test_the_reason_from_fragment_is_passed_on(self):
+        self._refuse_confirm("Payment not found")
+        _ok, msg, _r = self._buy()
+        self.assertIn("Payment not found", msg)
+
+    def test_the_payment_is_recorded_so_no_one_retries_it(self):
+        """Повтор купил бы звёзды второй раз за деньги продавца."""
+        self._refuse_confirm()
+        _ok, _msg, report = self._buy()
+        self.assertTrue(report.get("sent_onchain"))
+        self.assertIn("confirm_error", report)
+
+    def test_a_purchase_that_goes_through_still_says_so(self):
+        _ok, _msg, report = None, None, None
+        F._make_session = lambda cookies: self.fake.session()
+        outer = self.fake
+        sess = outer.session()
+        real = sess.post
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if q.get("method") == "initBuyStarsRequest":
+                return Reply({"ok": True, "req_id": "REQ-1"})
+            if q.get("method") == "getBuyStarsLink":
+                return Reply({"transaction": {"messages": [
+                    {"address": "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                     "amount": "1500000000", "payload": ""}]}})
+            if q.get("method") == "confirmReq":
+                return Reply({"ok": True})
+            return real(url, params=params, data=data, **kw)
+
+        sess.post = post
+        F._make_session = lambda cookies: sess
+        ok, msg, report = self._buy()
+        self.assertTrue(ok, msg)
+        self.assertIn("✅", msg)
+        self.assertNotIn("confirm_error", report)
 
 
 class AnAnswerOnTheMerits(Case):

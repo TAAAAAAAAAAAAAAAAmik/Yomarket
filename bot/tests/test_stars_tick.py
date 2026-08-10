@@ -24,12 +24,17 @@ logging.getLogger("tasks.manager").setLevel(logging.CRITICAL)
 
 
 class Harness:
-    def __init__(self, test, *, settings, balance_ton=10.0, buy=(True, "ok")):
+    def __init__(self, test, *, settings, balance_ton=10.0, buy=(True, "ok"),
+                 buy_report=None):
         self.test = test
         self.uid = 4242
         self.settings = settings
         self.balance_ton = balance_ton
         self.buy_result = buy
+        # Что покупка успела записать в `report` до того, как сорвалась.
+        # Через него она сообщает единственный факт, которого не видно по
+        # (ok, текст): деньги уже ушли из кошелька.
+        self.buy_report = buy_report or {}
         self.bought: list = []
         self.chat_sent: list = []
         self.notified: list = []
@@ -49,6 +54,8 @@ class Harness:
 
         def buy(cookies, mnemonic, username, quantity, *a, **kw):
             self.bought.append((username, quantity))
+            if isinstance(kw.get("report"), dict):
+                kw["report"].update(self.buy_report)
             return self.buy_result
 
         self._patch(fragment, "get_wallet_balance_sync", balance)
@@ -330,6 +337,66 @@ class RetryingAfterAFailure(unittest.TestCase):
         s = self._settings(pending={"77": entry})
         asyncio.run(tm._stars_pending_sweep(1, None, s, now))
         self.assertGreater(float(entry["retry_at"]), now)
+
+
+class APurchaseAlreadyPaidForIsNeverRepeated(unittest.TestCase):
+    """Повтор после списания покупает звёзды второй раз за деньги продавца.
+
+    Провал покупки до сих пор значил одно: «ничего не вышло, пробуем снова».
+    Но `confirmReq` идёт уже после того, как TON ушёл из кошелька, и его
+    отказ — это «заплатили и не получили». Сюда же попадает обрыв по
+    таймауту: ожидание seqno длится до двух минут и рвётся уже после оплаты.
+    """
+
+    def _settings(self):
+        return settings_for(pending={"7": {"quantity": 500, "chat_id": "c1",
+                                           "asked_at": time.time()}})
+
+    PAID = {"sent_onchain": True, "ton": 1.85,
+            "confirm_error": "Payment not found"}
+
+    def test_it_does_not_buy_again(self):
+        s = self._settings()
+        with Harness(self, settings=s, buy=(False, "не подтверждено"),
+                     buy_report=self.PAID) as h:
+            h.reply("7", "@durov")
+            h.sweep(time.time() + 100000)
+        self.assertEqual(len(h.bought), 1, h.bought)
+
+    def test_the_order_does_not_go_back_into_the_queue(self):
+        s = self._settings()
+        with Harness(self, settings=s, buy=(False, "не подтверждено"),
+                     buy_report=self.PAID) as h:
+            h.reply("7", "@durov")
+        self.assertNotIn("7", plugin(s)["pending"])
+        self.assertIn("7", plugin(s)["stuck"])
+
+    def test_the_seller_is_told_the_money_left_and_how_much(self):
+        s = self._settings()
+        with Harness(self, settings=s, buy=(False, "не подтверждено"),
+                     buy_report=self.PAID) as h:
+            h.reply("7", "@durov")
+        said = " ".join(h.notified)
+        self.assertIn("оплата ушла", said)
+        self.assertIn("1.85", said)
+
+    def test_the_buyer_is_not_promised_a_retry(self):
+        """Шаблон «не получилось, пробуем ещё раз» здесь означал бы обещание
+        второй покупки, которой не будет."""
+        s = self._settings()
+        with Harness(self, settings=s, buy=(False, "не подтверждено"),
+                     buy_report=self.PAID) as h:
+            h.reply("7", "@durov")
+        self.assertEqual([t for _c, t in h.chat_sent
+                          if "ещё раз" in t or "повтор" in t.lower()], [])
+
+    def test_a_failure_before_any_payment_is_still_retried(self):
+        """Иначе одна сетевая ошибка хоронила бы заказ."""
+        s = self._settings()
+        with Harness(self, settings=s, buy=(False, "сеть недоступна")) as h:
+            h.reply("7", "@durov")
+        self.assertIn("7", plugin(s)["pending"])
+        self.assertNotIn("7", plugin(s).get("stuck", {}))
 
 if __name__ == "__main__":
     unittest.main()
