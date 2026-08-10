@@ -1015,12 +1015,14 @@ class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
         got = "\n".join(self._probe()[0])
         self.assertEqual(got.count("ответ заявки: HTTP"), 1, got)
 
-    def test_a_variant_opens_the_buy_page_with_the_same_session(self):
-        """Рабочий клиент берёт хеш той же сессией, которой покупает; у нас
-        это были разные сессии, и куки, обновлённые страницей, терялись."""
-        lines, gets = self._probe()
-        self.assertTrue(any("сначала открыть" in x for x in lines), lines)
-        self.assertIn("https://fragment.com/stars/buy", gets)
+    def test_the_closed_transport_search_is_not_run_again(self):
+        """Шесть форм запроса дали побайтово один ответ, а различие ответов
+        по методам показало, что дело и не в правах. Гонять их каждый раз —
+        держать в отчёте полтора десятка одинаковых строк и прятать за ними
+        то, что ещё живо."""
+        lines, _gets = self._probe()
+        self.assertFalse([x for x in lines if "тело запроса" in x], lines)
+        self.assertTrue(any("как в образце" in x for x in lines), lines)
 
     def test_a_working_variant_stops_the_search(self):
         lines, _gets = self._probe(deny=False)
@@ -1159,6 +1161,66 @@ class AskingWhatOtherMethodsAnswer(Case):
         F._make_session = lambda cookies: sess
         lines = F._probe_methods(COOKIES, REAL_HASH, "durov", 50)
         self.assertTrue(any("не JSON" in x for x in lines), lines)
+
+
+class ChangingOneFieldOfTheRequestAtATime(Case):
+    """Метод существует, на куки не смотрит — остаётся сам запрос.
+
+    Fragment отвечает «Invalid method» на выдуманное имя и «Session
+    expired» соседним методам на мёртвой сессии, а `initBuyStarsRequest`
+    и там и там говорит «Access denied». Значит проверять надо поля. А
+    если ответ одинаков даже на пустой запрос — до полей он не доходит, и
+    это тоже ответ, только другой.
+    """
+
+    def _shapes(self, answer=None, by_args=None):
+        outer = self.fake
+        sess = outer.session()
+        sent: list[dict] = []
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if q.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R" * 64}})
+            sent.append(q)
+            if by_args:
+                for key, reply in by_args.items():
+                    if key in q:
+                        return Reply(reply)
+            return Reply(answer or {"ok": False, "error": "Access denied"})
+
+        sess.post = post
+        F._make_session = lambda cookies: sess
+        return F._probe_init_shapes(COOKIES, REAL_HASH, "durov", 50), sent
+
+    def test_an_empty_request_is_among_the_shapes(self):
+        _lines, sent = self._shapes()
+        bare = [q for q in sent if set(q) == {"method", "hash"}]
+        self.assertTrue(bare, sent)
+
+    def test_one_answer_for_everything_is_named_as_such(self):
+        lines, _sent = self._shapes()
+        self.assertTrue(any("до разбора полей Fragment не доходит" in x
+                            for x in lines), lines)
+
+    def test_a_differing_answer_is_not_called_the_same(self):
+        lines, _sent = self._shapes(
+            by_args={"show_sender": {"ok": False, "error": "Bad request"}})
+        self.assertFalse([x for x in lines if "не доходит" in x], lines)
+
+    def test_a_shape_that_works_stops_the_search_and_says_which(self):
+        lines, _sent = self._shapes(
+            by_args={"show_sender": {"ok": True, "req_id": "R1"}})
+        self.assertTrue(any("ПРИНЯТО" in x and "show_sender" in x
+                            for x in lines), lines)
+
+    def test_without_a_recipient_there_is_nothing_to_compare(self):
+        outer = self.fake
+        sess = outer.session()
+        sess.post = lambda *a, **kw: Reply({"ok": False, "error": "nope"})
+        F._make_session = lambda cookies: sess
+        got = F._probe_init_shapes(COOKIES, REAL_HASH, "durov", 50)
+        self.assertIn("сравнивать не с чем", got[0])
 
 
 class CheckingOneNickOnDemand(Case):

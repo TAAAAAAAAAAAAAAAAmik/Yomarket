@@ -1003,24 +1003,26 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
     out.append("Что отвечают другие методы:")
     out += _probe_methods(cookies, hashes[0], username, quantity)
 
+    # Fragment различает «Invalid method», «Session expired» и «Access
+    # denied» — значит метод существует, и отказ не про мёртвую сессию:
+    # соседние методы на той же сессии отвечают иначе. Остаётся сам запрос.
+    # Меняем в нём по одному полю и смотрим, меняется ли ответ. Если не
+    # меняется ни от чего — Fragment до разбора параметров не доходит.
+    out.append("")
+    out.append("Что меняет каждое поле заявки:")
+    out += _probe_init_shapes(cookies, hashes[0], username, quantity)
+
     plain = {"User-Agent": "Mozilla/5.0"}
     rich = {"User-Agent": _USER_AGENTS[0][1],
             "X-Requested-With": "XMLHttpRequest",
             "Origin": "https://fragment.com",
             "Referer": "https://fragment.com/stars"}
 
-    # (название, всё-в-строке-запроса, заголовки, слать ли quantity в поиске,
-    #  открывать ли сначала страницу покупки той же сессией)
+    # Перебор транспорта закрыт: шесть форм запроса дали побайтово один
+    # ответ, а различие ответов по методам показало, что дело и не в правах.
+    # Оставлена одна форма — та, что в документации, — как точка отсчёта.
     variants = (
         ("как в образце", True, plain, False, False),
-        # Рабочий клиент берёт хеш той же сессией, которой потом покупает, —
-        # у нас хеш читает одна сессия, а запрос шлёт другая, и куки,
-        # обновлённые страницей, теряются. Отличие настоящее и непроверенное.
-        ("как в образце, сначала открыть /stars/buy", True, plain, False, True),
-        ("строка запроса + наши заголовки", True, rich, False, False),
-        ("тело запроса, без quantity", False, rich, False, False),
-        ("тело запроса, с quantity", False, rich, True, False),
-        ("тело запроса, простые заголовки", False, plain, True, False),
     )
 
     def call(session, in_query, h, method, args):
@@ -1188,6 +1190,71 @@ def _probe_methods(cookies: dict, api_hash: str, username: str,
     out = []
     for method, args in checks:
         out.append(f"  {method}: {ask(method, args)}")
+    return out
+
+
+def _probe_init_shapes(cookies: dict, api_hash: str, username: str,
+                       quantity: int) -> list[str]:
+    """Меняем в заявке по одному полю и смотрим, меняется ли ответ.
+
+    Fragment отвечает «Invalid method» на выдуманное имя и «Session
+    expired» соседним методам на мёртвой сессии — а `initBuyStarsRequest`
+    и там и там говорит «Access denied». На куки он, значит, не смотрит:
+    его не устраивает сам запрос. Осталось узнать, доходит ли он вообще до
+    разбора полей. Если ответ одинаков и на пустой запрос, и на мусор в
+    получателе — не доходит, и искать надо не в полях.
+
+    Ничего не оплачивается: заявка денег не двигает.
+    """
+    session = _make_session(cookies)
+    recipient = ""
+    forms = _query_forms(username)
+    if forms:
+        try:
+            got = session.post(
+                FRAGMENT_API_URL,
+                params={"method": "searchStarsRecipient", "hash": api_hash,
+                        "query": forms[0]}, timeout=20).json()
+            recipient = _extract_recipient(got)
+        except Exception:
+            recipient = ""
+    if not recipient:
+        return ["  получателя не нашли — сравнивать не с чем"]
+
+    shapes = (
+        ("как сейчас", {"recipient": recipient, "quantity": quantity}),
+        ("без quantity", {"recipient": recipient}),
+        ("без recipient", {"quantity": quantity}),
+        ("совсем пусто", {}),
+        ("мусор в recipient", {"recipient": "zzz", "quantity": quantity}),
+        ("quantity = 0", {"recipient": recipient, "quantity": 0}),
+        ("quantity = 1000", {"recipient": recipient, "quantity": 1000}),
+        # Поля, которые документация шлёт на соседнем шаге. Здесь их быть
+        # не должно — но если ответ от них меняется, значит Fragment всё же
+        # разбирает запрос, и это уже подсказка.
+        ("+ show_sender", {"recipient": recipient, "quantity": quantity,
+                           "show_sender": 1}),
+    )
+    out: list[str] = []
+    answers: list[str] = []
+    for label, args in shapes:
+        try:
+            data = session.post(
+                FRAGMENT_API_URL,
+                params={"method": "initBuyStarsRequest", "hash": api_hash,
+                        **args}, timeout=20).json()
+        except Exception as e:
+            out.append(f"  {label}: ошибка {str(e)[:30]}")
+            continue
+        if isinstance(data, dict) and (data.get("req_id") or data.get("id")):
+            out.append(f"  ✅ {label}: ПРИНЯТО — вот рабочая форма")
+            return out
+        said = str((data or {}).get("error") or data)[:50]
+        answers.append(said)
+        out.append(f"  {label}: {said}")
+    if answers and len(set(answers)) == 1:
+        out.append("  ↑ ответ один и тот же на всё, включая пустой запрос: "
+                   "до разбора полей Fragment не доходит, и дело не в них.")
     return out
 
 
