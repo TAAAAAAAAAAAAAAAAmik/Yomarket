@@ -1207,16 +1207,35 @@ def _probe_control(cookies: dict, username: str, quantity: int,
     return out
 
 
+# Что ищем в коде самого сайта. Простыми подстроками, без кавычек и без
+# «method:» рядом: прежний поиск требовал и того и другого и не нашёл даже
+# searchStarsRecipient — метод, который у нас работает. Отрицательный
+# результат тогда ничего не значил, и два прогона ушли впустую.
+_SITE_NEEDLES = ("StarsRecipient", "BuyStars", "initBuy", "confirmReq",
+                 "ajInit", "stars/buy", "quantity")
+# Сколько скриптов читать. Шести не хватало: вызовы API у Fragment лежат не
+# в первых подключённых файлах.
+_MAX_SCRIPTS = 25
+
+
+def _window(text: str, at: int, width: int = 110) -> str:
+    """Кусок кода вокруг находки, в одну строку.
+
+    Нам нужны имена соседних параметров — по ним видно, чего мы не шлём.
+    """
+    start = max(0, at - width // 2)
+    chunk = text[start:at + width // 2]
+    return " ".join(chunk.split())
+
+
 def probe_page_api_sync(cookies: dict) -> list[str]:
-    """Что страница покупки говорит о своих же запросах.
+    """Как сайт зовёт свой API — по его собственному коду.
 
-    Пять вариантов формы запроса получили один и тот же «Access denied», а
-    поиск получателя прошёл в каждом — значит дело не в том, как мы шлём.
-    Образец, по которому написан код, мог устареть: Fragment мог
-    переименовать метод или начать требовать поле, которого мы не шлём.
-
-    Имена методов лежат не в разметке, а в подключаемых скриптах, поэтому
-    смотреть надо и в них: в самой странице их может не быть вовсе.
+    Шесть вариантов формы запроса получили один и тот же «Access denied», а
+    поиск получателя прошёл в каждом. Значит дело не в том, как мы шлём, и
+    догадываться дальше не о чем: надо прочитать, что именно шлёт сама
+    страница покупки. Имена методов и соседние параметры лежат в
+    подключаемых скриптах, и читать надо все, а не первые шесть.
     """
     out: list[str] = []
     session = _page_session(cookies or {})
@@ -1230,47 +1249,36 @@ def probe_page_api_sync(cookies: dict) -> list[str]:
     out.append(f"страница: {len(body)} символов")
 
     sources = [("страница", body)]
-    # Скрипты страницы — там и живут вызовы API.
-    for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', body)[:6]:
-        url = src if src.startswith("http") else (
-            "https://fragment.com" + (src if src.startswith("/") else "/" + src))
+    urls = _script_urls(body)
+    out.append(f"скриптов подключено: {len(urls)}")
+    for url in urls[:_MAX_SCRIPTS]:
         try:
             js = session.get(url, timeout=20)
-        except Exception:
+        except Exception as e:
+            out.append(f"  {url.rsplit('/', 1)[-1][:28]}: {str(e)[:30]}")
             continue
         if js.status_code == 200 and js.text:
-            sources.append((url.rsplit("/", 1)[-1][:32], js.text))
-    out.append(f"скриптов прочитано: {len(sources) - 1}")
+            sources.append((url.rsplit("/", 1)[-1][:28], js.text))
+    out.append(f"прочитано: {len(sources) - 1}")
 
-    seen_methods: set[str] = set()
+    hits = 0
     for name, text in sources:
-        methods = set(re.findall(
-            r"""method['"]?\s*[:=]\s*['"]([A-Za-z][A-Za-z0-9_]{3,40})['"]""",
-            text))
-        # Fragment зовёт методы и короче — просто по имени в кавычках рядом
-        # с ajax-вызовом; отбираем то, что похоже на его словарь.
-        methods |= set(re.findall(r"['\"]((?:get|init|search|confirm|update)"
-                                  r"[A-Z][A-Za-z0-9]{3,40})['\"]", text))
-        fresh = sorted(m for m in methods if m not in seen_methods)
-        seen_methods |= methods
-        if fresh:
-            out.append(f"{name}: " + ", ".join(fresh[:14]))
-
-    stars = sorted(m for m in seen_methods if "star" in m.lower())
-    out.append("методы про звёзды: " + (", ".join(stars) if stars
-                                        else "не нашёл ни одного"))
-    for name in ("searchStarsRecipient", "initBuyStarsRequest",
-                 "getBuyStarsLink"):
-        out.append(f"{name}: " + ("есть" if name in seen_methods
-                                  else "не видно в разметке"))
-    if "searchStarsRecipient" not in seen_methods:
-        # Иначе этот раздел врёт: «initBuyStarsRequest нигде не упоминается»
-        # читается как «метода больше нет», хотя рядом не упоминается и
-        # searchStarsRecipient — который работает. Значит имён здесь просто
-        # не видно, и вывода из их отсутствия сделать нельзя никакого.
-        out.append("↑ здесь не видно и searchStarsRecipient, который "
-                   "работает. Значит имён методов на этих страницах нет "
-                   "вовсе, и об их существовании отсюда судить нельзя.")
+        for needle in _SITE_NEEDLES:
+            at = text.find(needle)
+            if at < 0:
+                continue
+            hits += 1
+            out.append(f"{name} · {needle}:")
+            out.append(f"  …{_window(text, at)}…")
+            if hits >= 12:
+                out.append("(дальше обрезано — хватит и этого)")
+                return out
+    if not hits:
+        # Отрицательный результат теперь что-то значит: искали простыми
+        # подстроками по всем скриптам, а не по кавычкам в первых шести.
+        out.append("Ни одной из искомых строк нет ни на странице, ни в "
+                   "скриптах. Значит покупка на сайте работает не через "
+                   "этот код — либо страница отдана нам не та, что браузеру.")
     return out
 
 

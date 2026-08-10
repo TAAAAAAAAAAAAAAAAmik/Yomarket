@@ -584,7 +584,7 @@ async def stars_check_creds(callback: CallbackQuery) -> None:
 @router.message(Command("fragment_debug"))
 async def fragment_debug(message: Message) -> None:
     """/fragment_debug — почему Fragment не признаёт сессию. Только чтение."""
-    from automation.fragment import probe_session_sync, probe_page_api_sync
+    from automation.fragment import probe_session_sync
 
     creds = get_fragment_creds(message.from_user.id) or {}
     if not creds.get("cookies"):
@@ -597,18 +597,38 @@ async def fragment_debug(message: Message) -> None:
         lines = await asyncio.wait_for(
             loop.run_in_executor(None, probe_session_sync, creds["cookies"]),
             timeout=90)
-        # Разбор страницы переехал сюда из /stars_probe: там он занимал
-        # место в отчёте, ничего не решая, а здесь речь как раз о сессии.
-        lines = list(lines) + ["", "— что говорит страница —"] + list(
-            await asyncio.wait_for(
-                loop.run_in_executor(None, probe_page_api_sync,
-                                     creds["cookies"]),
-                timeout=60))
     except Exception as e:
         await status.edit_text(f"❌ {html.escape(str(e)[:200])}")
         return
     body = "\n".join(html.escape(str(x)) for x in lines)[:3500]
     await status.edit_text(f"🔍 <b>Сессия Fragment</b>\n<code>{body}</code>")
+
+
+@router.message(Command("fragment_js"))
+async def fragment_js(message: Message) -> None:
+    """/fragment_js — как сайт зовёт свой API, по его же коду. Только чтение.
+
+    Отдельной командой, а не хвостом к другой: ответ длинный, а в общем
+    отчёте он обрезался ровно на том месте, ради которого затевался.
+    """
+    from automation.fragment import probe_page_api_sync
+
+    creds = get_fragment_creds(message.from_user.id) or {}
+    if not creds.get("cookies"):
+        await message.answer("⚠️ Куки Fragment не заданы: Плагины → AutoStars "
+                             "→ 🔑 Данные Fragment")
+        return
+    status = await message.answer("⏳ Читаю страницу покупки и её скрипты…")
+    loop = asyncio.get_event_loop()
+    try:
+        lines = await asyncio.wait_for(
+            loop.run_in_executor(None, probe_page_api_sync, creds["cookies"]),
+            timeout=180)
+    except Exception as e:
+        await status.edit_text(f"❌ {html.escape(str(e)[:200])}")
+        return
+    body = "\n".join(html.escape(str(x)) for x in lines)[:3800]
+    await status.edit_text(f"🔍 <b>Код страницы покупки</b>\n<code>{body}</code>")
 
 
 @router.message(Command("stars_probe"))

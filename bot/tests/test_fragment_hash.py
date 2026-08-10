@@ -1087,6 +1087,86 @@ class TheControlRequestTellsTheTwoRefusalsApart(Case):
         self.assertIn("покупать нельзя вообще", got)
 
 
+class ReadingHowTheSiteCallsItsOwnApi(Case):
+    """Прежний разбор искал имена методов по кавычкам в первых шести
+    скриптах — и не нашёл даже `searchStarsRecipient`, который у нас
+    работает. Отрицательный результат тогда не значил ничего, а выглядел
+    как «метода больше нет»: два прогона ушли на объяснение пустоты.
+    """
+
+    def _read(self, page, scripts=None):
+        scripts = scripts or {}
+        outer = self.fake
+
+        class Sess:
+            headers: dict = {}
+            cookies = type("C", (), {"update": staticmethod(lambda *a: None)})()
+
+            @staticmethod
+            def get(url, **kw):
+                if url.endswith("/stars/buy"):
+                    return Reply(None, 200, page)
+                return Reply(None, 200, scripts.get(url, ""))
+
+        old = F._page_session
+        F._page_session = lambda cookies: Sess()
+        try:
+            return F.probe_page_api_sync(COOKIES)
+        finally:
+            F._page_session = old
+        del outer
+
+    def test_a_method_name_is_found_without_quotes_around_it(self):
+        """У Fragment имя может стоять в data-атрибуте, а не в кавычках JS."""
+        page = '<html data-method=searchStarsRecipient>x</html>'
+        got = "\n".join(self._read(page))
+        self.assertIn("StarsRecipient", got)
+
+    def test_the_surrounding_code_is_shown_not_just_the_name(self):
+        """Нужны имена соседних параметров — по ним видно, чего мы не шлём."""
+        page = '<html>ajax("initBuyStars", {mode: "gift", quantity: 50})</html>'
+        got = "\n".join(self._read(page))
+        self.assertIn("mode", got)
+
+    def test_it_reads_more_than_six_scripts(self):
+        urls = [f"https://fragment.com/js/f{i}.js" for i in range(10)]
+        page = "".join(f'<script src="/js/f{i}.js"></script>'
+                       for i in range(10))
+        scripts = {u: "" for u in urls}
+        scripts[urls[9]] = 'call("initBuyStarsRequest", p)'
+        got = "\n".join(self._read(page, scripts))
+        self.assertIn("initBuy", got)
+
+    def test_finding_nothing_now_means_something(self):
+        got = "\n".join(self._read("<html>пусто</html>"))
+        self.assertIn("Ни одной из искомых строк", got)
+
+    def test_a_script_that_will_not_load_is_named_not_skipped(self):
+        class Sess:
+            headers: dict = {}
+            cookies = type("C", (), {"update": staticmethod(lambda *a: None)})()
+
+            @staticmethod
+            def get(url, **kw):
+                if url.endswith("/stars/buy"):
+                    return Reply(None, 200,
+                                 '<script src="/js/dead.js"></script>')
+                raise RuntimeError("timeout")
+
+        old = F._page_session
+        F._page_session = lambda cookies: Sess()
+        try:
+            got = "\n".join(F.probe_page_api_sync(COOKIES))
+        finally:
+            F._page_session = old
+        self.assertIn("dead.js", got)
+
+    def test_the_report_does_not_run_away_with_the_whole_file(self):
+        page = "<html>" + ("initBuy " * 500) + "</html>"
+        got = self._read(page)
+        self.assertLess(len("\n".join(got)), 3000, got)
+
+
 class WhatFragmentSaysAboutTheAccount(Case):
     """Документация читает с `/my/profile` пять вещей, мы — три.
 
