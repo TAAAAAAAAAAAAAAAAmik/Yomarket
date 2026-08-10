@@ -912,7 +912,12 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
         hashes.insert(0, stored)
     if not hashes:
         return ["не нашёл ни одного api-hash на страницах Fragment"]
-    out.append(f"Хешей найдено: {len(hashes)}")
+    # Длину печатаем, а не только хвост. У рабочего образца хеш — ровно
+    # 18 знаков (af142ec36cafbbfa89). Среди наших шаблонов есть и «csrf», и
+    # «token»: под видом api-hash легко подобрать что-то чужой длины, и
+    # поиск такое может стерпеть, а покупка — нет. Хвоста для этого мало.
+    out.append("Хешей найдено: " + ", ".join(
+        f"…{h[-6:]} ({len(h)} знаков)" for h in hashes))
 
     plain = {"User-Agent": "Mozilla/5.0"}
     rich = {"User-Agent": _USER_AGENTS[0][1],

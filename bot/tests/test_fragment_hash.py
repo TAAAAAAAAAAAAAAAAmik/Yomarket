@@ -1030,6 +1030,13 @@ class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
         got = "\n".join(self._probe()[0])
         self.assertIn("stel_token (120)", got)
 
+    def test_the_length_of_each_hash_is_shown(self):
+        """У рабочего образца хеш ровно 18 знаков. Среди наших шаблонов есть
+        «csrf» и «token» — под видом api-hash легко подобрать чужое, и поиск
+        такое может стерпеть, а покупка нет. По хвосту этого не увидеть."""
+        got = "\n".join(self._probe()[0])
+        self.assertIn(f"({len(REAL_HASH)} знаков)", got)
+
     def test_a_self_purchase_is_named_as_such(self):
         """`myself: True` в ответе поиска — это не деталь: покупка себе и
         покупка чужому могут разрешаться по-разному."""
