@@ -1094,6 +1094,84 @@ class TheControlRequestTellsTheTwoRefusalsApart(Case):
         self.assertIn("покупать нельзя вообще", got)
 
 
+class CheckingOneNickOnDemand(Case):
+    """«Ник не находится» и «покупка запрещена» — разные беды.
+
+    По прогонам на собственном аккаунте их не различить: на себе поиск
+    проходит всегда. Отдельная кнопка позволяет спросить Fragment про любой
+    живой ник за секунду — и увидеть, на каком именно шаге он говорит нет.
+    """
+
+    def _check(self, *, found=True, myself=False, init_ok=False,
+               nick="durov", search_error="No Telegram users found."):
+        outer = self.fake
+        sess = outer.session()
+        asked: list[str] = []
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if q.get("method") == "searchStarsRecipient":
+                asked.append(q.get("query", ""))
+                if not found:
+                    return Reply({"ok": False, "error": search_error})
+                got = {"recipient": "R" * 64}
+                if myself:
+                    got["myself"] = True
+                return Reply({"ok": True, "found": got})
+            if init_ok:
+                return Reply({"ok": True, "req_id": "REQ-1"})
+            return Reply({"ok": False, "error": "Access denied"})
+
+        sess.post = post
+        F._make_session = lambda cookies: sess
+        return F.probe_recipient_sync(COOKIES, nick, 50, REAL_HASH), asked
+
+    def test_a_found_nick_says_so_and_which_writing_worked(self):
+        lines, _asked = self._check()
+        self.assertIn("найден", lines[0])
+        self.assertIn("@durov", lines[0])
+
+    def test_every_writing_is_tried_before_giving_up(self):
+        _lines, asked = self._check(found=False, nick="Durov")
+        self.assertEqual(asked, ["@Durov", "Durov", "@durov", "durov"], asked)
+
+    def test_a_missing_nick_carries_fragments_own_words(self):
+        got = "\n".join(self._check(found=False)[0])
+        self.assertIn("No Telegram users found.", got)
+
+    def test_a_missing_nick_is_not_explained_by_guesswork(self):
+        """Fragment одинаково отвечает и на несуществующий ник, и на того,
+        кому звёзды слать нельзя. Выбирать за него мы не станем."""
+        got = "\n".join(self._check(found=False)[0])
+        self.assertIn("Fragment не уточняет", got)
+
+    def test_ones_own_account_is_flagged(self):
+        got = "\n".join(self._check(myself=True)[0])
+        self.assertIn("ваш собственный аккаунт", got)
+
+    def test_someone_elses_account_is_not(self):
+        got = "\n".join(self._check(myself=False)[0])
+        self.assertNotIn("собственный аккаунт", got)
+
+    def test_the_request_is_made_and_its_answer_shown(self):
+        got = "\n".join(self._check()[0])
+        self.assertIn("Access denied", got)
+
+    def test_an_accepted_request_says_no_money_moved(self):
+        got = "\n".join(self._check(init_ok=True)[0])
+        self.assertIn("Заявка на 50⭐ принята", got)
+        self.assertIn("не списано", got)
+
+    def test_without_cookies_it_says_that_and_asks_nothing(self):
+        got = F.probe_recipient_sync({}, "durov")
+        self.assertIn("Куки Fragment не заданы", got[0])
+
+    def test_an_unreadable_hash_is_blamed_on_the_cookies(self):
+        self.fake.page = "<html>пусто</html>"
+        got = "\n".join(F.probe_recipient_sync(COOKIES, "durov"))
+        self.assertIn("истекли куки", got)
+
+
 class ReadingHowTheSiteCallsItsOwnApi(Case):
     """Прежний разбор искал имена методов по кавычкам в первых шести
     скриптах — и не нашёл даже `searchStarsRecipient`, который у нас

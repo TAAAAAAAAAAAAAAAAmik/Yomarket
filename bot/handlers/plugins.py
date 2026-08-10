@@ -64,6 +64,7 @@ class PluginState(StatesGroup):
     # AutoStars
     stars_manual_buyer = State()
     stars_manual_amount = State()
+    stars_whois = State()
     stars_set_amount = State()
     stars_set_note = State()
     stars_set_cookies = State()
@@ -127,6 +128,9 @@ def _stars_keyboard(settings: dict) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="🚀 Ручная выдача", callback_data="plugins:stars:manual")
     builder.button(text="📦 Выдать накопленные", callback_data="plugins:stars:accumulated")
+    # Проверка ника — рядом с выдачей, а не в настройках: ею пользуются
+    # перед каждой ручной выдачей на незнакомый ник.
+    builder.button(text="🔎 Проверить ник", callback_data="plugins:stars:whois")
     builder.button(text="💎 Прибыль", callback_data="plugins:stars:profit")
     builder.button(text="💰 Баланс", callback_data="plugins:stars:balance")
     builder.button(text="🔔 Уведомления", callback_data="plugins:stars:notifs")
@@ -134,7 +138,7 @@ def _stars_keyboard(settings: dict) -> InlineKeyboardMarkup:
     builder.button(text="▶️ Включить" if not enabled else "⏸ Выключить", callback_data="plugins:stars:toggle")
     builder.button(text="⚙️ Настройки", callback_data="plugins:stars:settings")
     builder.button(text="⬅️ Назад", callback_data="plugins:menu")
-    builder.adjust(2, 2, 2, 1, 2)
+    builder.adjust(2, 1, 2, 2, 1, 2)
     return builder.as_markup()
 
 
@@ -843,6 +847,53 @@ async def stars_set_note_input(message: Message, state: FSMContext) -> None:
     save_settings(uid, settings)
     await state.clear()
     await message.answer(f"✅ Заметка сохранена: <i>{note or '—'}</i>", reply_markup=_stars_settings_keyboard(settings))
+
+
+@router.callback_query(F.data == "plugins:stars:whois")
+async def stars_whois_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(PluginState.stars_whois)
+    await callback.message.edit_text(
+        "🔎 <b>Проверить ник</b>\n\n"
+        "Введите @username получателя — проверю, находит ли его Fragment и "
+        "примет ли на него заявку.\n\n"
+        "<i>Ничего не оплачивается: деньги уходят только при отправке "
+        "подписанной транзакции, а до неё здесь дело не доходит.</i>",
+        reply_markup=_cancel_kb("plugins:auto_stars"),
+    )
+    await callback.answer()
+
+
+@router.message(PluginState.stars_whois)
+async def stars_whois_input(message: Message, state: FSMContext) -> None:
+    from automation.fragment import probe_recipient_sync
+
+    nick = (message.text or "").strip()
+    await state.clear()
+    creds = get_fragment_creds(message.from_user.id) or {}
+    if not creds.get("cookies"):
+        await message.answer("⚠️ Куки Fragment не заданы: Плагины → AutoStars "
+                             "→ ⚙️ Настройки → 🔑 Данные Fragment")
+        return
+    qty = get_settings(message.from_user.id)["plugins"]["auto_stars"].get(
+        "amount", 50)
+    status = await message.answer("⏳ Спрашиваю Fragment…")
+    loop = asyncio.get_event_loop()
+    try:
+        lines = await asyncio.wait_for(
+            loop.run_in_executor(None, functools.partial(
+                probe_recipient_sync, creds["cookies"], nick, qty,
+                creds.get("api_hash", ""))),
+            timeout=90)
+    except Exception as e:
+        await status.edit_text(f"❌ {html.escape(str(e)[:200])}")
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="🔁 Ещё ник", callback_data="plugins:stars:whois")
+    b.button(text="⬅️ AutoStars", callback_data="plugins:auto_stars")
+    b.adjust(1)
+    body = "\n".join(html.escape(str(x)) for x in lines)[:3500]
+    await status.edit_text(f"🔎 <b>Проверка получателя</b>\n\n{body}",
+                           reply_markup=b.as_markup())
 
 
 @router.callback_query(F.data == "plugins:stars:manual")

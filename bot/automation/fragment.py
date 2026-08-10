@@ -861,6 +861,82 @@ def probe_session_sync(cookies: dict) -> list[str]:
     return out
 
 
+def probe_recipient_sync(cookies: dict, username: str, quantity: int = 50,
+                         api_hash: str = "") -> list[str]:
+    """Найдёт ли Fragment этого получателя и примет ли на него заявку.
+
+    Отдельно от большой пробы и без перебора вариантов: одна пара запросов,
+    ответ за секунду. Нужна затем, что «ник не находится» и «покупка
+    запрещена» — разные беды с разным лечением, а по одному прогону на
+    собственном аккаунте их не различить: на себе поиск проходит всегда.
+
+    Заявка денег не двигает: списание происходит только при отправке
+    подписанной транзакции, до неё здесь дело не доходит.
+    """
+    nick = (username or "").strip().lstrip("@")
+    if not cookies:
+        return ["Куки Fragment не заданы"]
+    if not nick:
+        return ["Пустой ник"]
+
+    h = (api_hash or "").strip() or fetch_api_hash_sync(cookies)
+    if not h:
+        return ["Не удалось прочитать api-hash со страницы Fragment — "
+                "скорее всего истекли куки"]
+
+    session = _make_session(cookies)
+    out: list[str] = []
+    search: dict = {}
+    recipient = ""
+    used = ""
+    for form in _query_forms(nick):
+        try:
+            search = session.post(
+                FRAGMENT_API_URL,
+                params={"method": "searchStarsRecipient", "hash": h,
+                        "query": form}, timeout=20).json()
+        except Exception as e:
+            return [f"Поиск не дошёл до Fragment: {str(e)[:60]}"]
+        recipient = _extract_recipient(search)
+        if recipient:
+            used = form
+            break
+
+    if not recipient:
+        err = str(search.get("error") or search.get("error_message")
+                  or search)[:120]
+        return [f"❌ @{nick} — не найден",
+                f"Fragment ответил: {err}",
+                "",
+                "Пробовали написания: " + ", ".join(_query_forms(nick)),
+                "Так отвечают и на несуществующий ник, и на тот, кому "
+                "звёзды слать нельзя. Что именно — Fragment не уточняет."]
+
+    found = search.get("found") if isinstance(search.get("found"), dict) else {}
+    out.append(f"✅ @{nick} — найден (написание «{used}»)")
+    if found.get("myself"):
+        out.append("⚠️ Это ваш собственный аккаунт — покупку себе Fragment "
+                   "может разрешать иначе, чем чужому.")
+    out.append(f"recipient: {len(recipient)} знаков")
+
+    try:
+        init = session.post(
+            FRAGMENT_API_URL,
+            params={"method": "initBuyStarsRequest", "hash": h,
+                    "recipient": recipient, "quantity": quantity},
+            timeout=20).json()
+    except Exception as e:
+        return out + [f"Заявка не дошла: {str(e)[:60]}"]
+    out.append("")
+    if init.get("req_id") or init.get("id"):
+        out.append(f"✅ Заявка на {quantity}⭐ принята — Fragment готов "
+                   "продать. Денег пока не списано.")
+    else:
+        out.append(f"❌ Заявка на {quantity}⭐ — "
+                   f"{str(init.get('error') or init)[:100]}")
+    return out
+
+
 def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
                    api_hash: str = "", control: str = "durov") -> list[str]:
     """Где именно ломается покупка — перебором того, чем запросы отличаются.

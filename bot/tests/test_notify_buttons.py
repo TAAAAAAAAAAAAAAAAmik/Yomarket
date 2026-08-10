@@ -338,5 +338,27 @@ class TakingIntoWorkReportsWhatActuallyHappened(unittest.TestCase):
         self.assertIn("взят в работу автоматически", card)
 
 
+class TheAutoStarsScreenHasNoDeadButtons(unittest.TestCase):
+    """Экран AutoStars — тот, откуда идёт выдача за чужие деньги.
+
+    Кнопку сюда добавляют чаще всего, а маршрут забывают: нажатие тогда
+    молча ловит fallback, и продавец видит пустоту вместо ответа.
+    """
+
+    def _kb(self):
+        from handlers.plugins import _stars_keyboard
+        return _stars_keyboard({"plugins": {"auto_stars": {"enabled": True}}})
+
+    def test_every_button_leads_somewhere(self):
+        for data in presses(self._kb()):
+            self.assertIsNotNone(handler_of(data), f"мёртвая кнопка: {data}")
+
+    def test_the_nick_check_is_on_the_screen(self):
+        self.assertIn("plugins:stars:whois", presses(self._kb()))
+
+    def test_the_nick_check_is_wired(self):
+        self.assertIsNotNone(handler_of("plugins:stars:whois"))
+
+
 if __name__ == "__main__":
     unittest.main()
