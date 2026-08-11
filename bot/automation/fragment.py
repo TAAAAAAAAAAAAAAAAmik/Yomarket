@@ -1114,7 +1114,8 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
     # это ровно «не тот хеш для этого метода».
     out.append("")
     out.append("Заявка каждым найденным хешем:")
-    out += _probe_every_hash(cookies, username, quantity, proxy, stored)
+    out += _probe_every_hash(cookies, username, quantity, proxy, stored,
+                             extra=hashes)
 
     # Ровно как в документации: одна сессия и на страницу, и на API. У нас
     # страницу читала отдельная сессия со своим User-Agent, и куки, которые
@@ -1348,7 +1349,8 @@ def _probe_single_session(cookies: dict, username: str,
 
 
 def _probe_every_hash(cookies: dict, username: str, quantity: int,
-                      proxy: str = "", stored: str = "") -> list[str]:
+                      proxy: str = "", stored: str = "",
+                      extra: list[str] | None = None) -> list[str]:
     """Заявка каждым хешем, какой удалось найти, — включая непроверенные.
 
     Прежний перебор шёл от поиска: хеш, на котором поиск не проходит,
@@ -1371,6 +1373,13 @@ def _probe_every_hash(cookies: dict, username: str, quantity: int,
     # Первым — заданный руками: если продавец снял хеш в браузере, где
     # покупка проходит, проверять надо в первую очередь его.
     found: list[str] = [stored.strip()] if (stored or "").strip() else []
+    # Дальше — то, что уже нашла общая проверка. Без этого раздел работал
+    # вхолостую: страницы читаются двумя сессиями с разными User-Agent,
+    # Fragment отдаёт им разную разметку, и второй кандидат виден только
+    # одной из них. В отчёте стояло «найдено два», а до заявки доходил один.
+    for h in (extra or []):
+        if h and h not in found:
+            found.append(h)
     for text in [body] + _scripts_of(session, body):
         for pattern in _HASH_PATTERNS:
             for m in re.finditer(pattern, text):

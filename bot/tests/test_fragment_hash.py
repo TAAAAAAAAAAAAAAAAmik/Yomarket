@@ -1519,6 +1519,26 @@ class EveryHashIsTriedOnThePurchaseToo(Case):
                      f'{{"hash":"{self.BUY}"}}'})
         self.assertGreater(len(asked), 1, asked)
 
+    def test_candidates_found_elsewhere_are_tried_too(self):
+        """Страницы читают две сессии с разными User-Agent, и Fragment
+        отдаёт им разную разметку: второй кандидат виден только одной.
+        В отчёте стояло «найдено два», а до заявки доходил один."""
+        outer = self.fake
+        sess = outer.session()
+        asked: list[str] = []
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if q.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            asked.append(q.get("hash", ""))
+            return Reply({"ok": False, "error": "Access denied"})
+
+        sess.post = post
+        F._make_session = lambda cookies, proxy="": sess
+        F._probe_every_hash(COOKIES, "durov", 50, extra=["seen-elsewhere"])
+        self.assertIn("seen-elsewhere", asked, asked)
+
     def test_the_recipient_is_taken_with_whichever_hash_gives_it(self):
         lines, _asked = self._try()
         self.assertFalse(any("получателя не нашёл" in x for x in lines), lines)
