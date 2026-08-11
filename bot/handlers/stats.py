@@ -501,6 +501,45 @@ def _review_kb(i: int, total: int, more: bool) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+@router.message(Command("reviews_debug"))
+async def reviews_debug(message: Message) -> None:
+    """/reviews_debug — какие поля панель кладёт в строку отзыва.
+
+    Отзывы пришли без текста. Имена полей у панели свои, и подбирать их
+    списком мы уже пробовали; читаем, что там на самом деле.
+    """
+    from storage import get_panel_creds
+    from automation.panel import panel_review_fields_sync
+    import asyncio as _aio
+
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Вход в панель не выполнен: "
+                             "Настройки → 🌐 Панель продавца")
+        return
+    status = await message.answer("⏳ Читаю строку отзыва…")
+    loop = _aio.get_event_loop()
+    try:
+        ok, got = await _aio.wait_for(
+            loop.run_in_executor(None, panel_review_fields_sync,
+                                 creds["cookies"], ""),
+            timeout=60)
+    except Exception as e:
+        await status.edit_text(f"❌ {_esc(str(e)[:200])}")
+        return
+    if not ok or not isinstance(got, dict):
+        await status.edit_text(f"❌ {_esc(str(got)[:400])}")
+        return
+    lines = [f"🔍 <b>Поля отзыва</b> · ресурс <code>{_esc(got['resource'])}</code>",
+             ""]
+    for f in got.get("fields") or []:
+        lines.append(f"<code>{_esc(f['attribute'])}</code> "
+                     f"({f['component']}, {f['len']} симв.)")
+        if f["value"]:
+            lines.append(f"   {_esc(f['value'])}")
+    await status.edit_text("\n".join(lines)[:3800] or "полей нет")
+
+
 @router.callback_query(F.data.startswith("stats:rev:"))
 async def show_review_at(callback: CallbackQuery) -> None:
     try:

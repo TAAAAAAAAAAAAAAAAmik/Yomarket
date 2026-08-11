@@ -165,6 +165,57 @@ class WhenThereIsNothingToShow(Screen):
         self.assertNotIn("Отзывов пока нет", cb.text)
 
 
+class FindingTheTextWhateverTheFieldIsCalled(unittest.TestCase):
+    """Отзывы пришли без текста, хотя текст в строке был.
+
+    Имена полей у панели свои, и список ключей их не покрыл. Хуже того,
+    поле `user_comment` подходило сразу под «автора» и под «текст», а
+    автор проверялся первым — и съедал отзыв молча.
+    """
+
+    def parse(self, fields, rating=5):
+        from automation.panel import _parse_review
+        rows = [{"attribute": "rating", "value": rating}] + [
+            {"attribute": a, "value": v} for a, v in fields]
+        return _parse_review({"id": 1, "fields": rows})
+
+    def test_a_plain_comment_field_is_the_text(self):
+        got = self.parse([("comment", "Всё пришло быстро")])
+        self.assertEqual(got["text"], "Всё пришло быстро")
+
+    def test_a_field_that_looks_like_both_goes_to_the_text(self):
+        """`user_comment` подходит и под автора, и под текст."""
+        got = self.parse([("user_comment", "Спасибо, всё ок")])
+        self.assertEqual(got["text"], "Спасибо, всё ок")
+
+    def test_the_author_still_lands_in_the_author(self):
+        got = self.parse([("user_name", "Иван"), ("comment", "Хорошо")])
+        self.assertEqual(got["author"], "Иван")
+        self.assertEqual(got["text"], "Хорошо")
+
+    def test_an_unknown_field_name_is_taken_as_the_text(self):
+        """Отзыв — самый длинный текст в своей записи."""
+        got = self.parse([("otzyv_ot_pokupatelya",
+                           "Продавец молодец, рекомендую")])
+        self.assertEqual(got["text"], "Продавец молодец, рекомендую")
+
+    def test_the_longest_one_wins_not_the_first(self):
+        got = self.parse([("zzz", "ок"), ("yyy", "Долго ждал, но всё дошло")])
+        self.assertEqual(got["text"], "Долго ждал, но всё дошло")
+
+    def test_numbers_are_not_mistaken_for_a_review(self):
+        got = self.parse([("some_id", "348211")])
+        self.assertEqual(got["text"], "")
+
+    def test_a_row_without_a_rating_gets_no_invented_text(self):
+        """Иначе категория с полем `name` начинает считаться отзывом — та
+        самая ошибка, из-за которой раньше принимали за отзывы что попало."""
+        from automation.panel import _parse_review
+        got = _parse_review({"id": 1, "fields": [
+            {"attribute": "name", "value": "категория"}]})
+        self.assertEqual(got["text"], "")
+
+
 class TheReaderReportsWhatItDidNotRead(unittest.TestCase):
     def test_the_panel_helper_returns_the_more_flag(self):
         """Без него экран не может честно посчитать «из N»."""

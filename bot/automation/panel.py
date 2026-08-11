@@ -4144,9 +4144,19 @@ _AUTHOR_KEYS = ("user", "author", "buyer", "customer", "client", "покупат
 
 
 def _parse_review(row: dict) -> dict:
-    """Одна строка отзыва: оценка, текст, автор, дата, товар."""
+    """Одна строка отзыва: оценка, текст, автор, дата, товар.
+
+    Текст ищется по именам полей — а имена у панели свои, и угадать их
+    списком не вышло: отзывы приходили без текста при том, что текст в
+    строке был. Поэтому две правки. Первая: поле, похожее сразу на автора
+    и на текст (`user_comment` подходит под оба списка), больше не
+    съедается автором молча — сначала пробуется как текст. Вторая: если по
+    именам не нашлось ничего, берётся самое длинное строковое поле строки.
+    Отзыв — это самый длинный текст в своей записи; хуже пустоты не будет.
+    """
     out = {"id": _row_id(row), "rating": None, "text": "", "author": "",
            "ts": None, "title": ""}
+    spare: list[tuple[int, str]] = []
     for f in _fields_of(row):
         attr = str(f.get("attribute") or "").lower()
         value = _field_text(f)
@@ -4162,6 +4172,11 @@ def _parse_review(row: dict) -> dict:
             if ts:
                 out["ts"] = ts
                 continue
+        # Текст — раньше автора: `user_comment` подходит под оба списка, и
+        # при прежнем порядке уходил в автора, а отзыв оставался пустым.
+        if not out["text"] and any(k in attr for k in _TEXT_KEYS):
+            out["text"] = value[:400]
+            continue
         if not out["author"] and any(k in attr for k in _AUTHOR_KEYS):
             out["author"] = value[:40]
             continue
@@ -4169,9 +4184,62 @@ def _parse_review(row: dict) -> dict:
                                                         "lot", "товар")):
             out["title"] = value[:60]
             continue
-        if not out["text"] and any(k in attr for k in _TEXT_KEYS):
-            out["text"] = value[:400]
+        if value and not _num(value):
+            spare.append((len(value), value))
+    # Запасной вариант — только для строки, которая уже опознана как отзыв
+    # по оценке. Иначе любая строка любого ресурса получает «текст» из
+    # своего самого длинного поля, и категория с полем `name` начинает
+    # считаться отзывом: ровно та ошибка, из-за которой раньше принимали за
+    # отзывы что попало.
+    if not out["text"] and out["rating"] is not None and spare:
+        out["text"] = max(spare)[1][:400]
     return out
+
+
+def panel_review_fields_sync(cookie_string: str,
+                             resource: str = "") -> tuple[bool, object]:
+    """Какие поля панель кладёт в строку отзыва — именами и значениями.
+
+    Отзывы пришли без текста, а имена полей у панели свои. Угадывать их
+    списком мы уже попробовали; читать, что там на самом деле, дешевле.
+    Только чтение: одна страница, одна строка.
+    """
+    try:
+        session = _make_panel_requests_session(cookie_string)
+        hdrs = _panel_xsrf_headers(session, cookie_string)
+    except Exception as e:
+        return False, f"сессия панели: {str(e)[:80]}"
+    tried: list[str] = []
+    for res in ([resource] if resource else list(_REVIEW_RESOURCES)):
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/{res}",
+                            params={"perPage": "1", "page": "1"},
+                            headers=hdrs, timeout=(6, 20),
+                            allow_redirects=False)
+        except Exception as e:
+            tried.append(f"{res}: {str(e)[:40]}")
+            continue
+        if r.status_code == 401:
+            return False, "401: сессия панели истекла — войдите снова"
+        if r.status_code != 200:
+            tried.append(f"{res}: HTTP {r.status_code}")
+            continue
+        try:
+            rows = (r.json() or {}).get("resources") or []
+        except Exception:
+            tried.append(f"{res}: ответ не разобран")
+            continue
+        if not rows:
+            tried.append(f"{res}: пусто")
+            continue
+        out = []
+        for f in _fields_of(rows[0]):
+            value = _field_text(f)
+            out.append({"attribute": str(f.get("attribute") or ""),
+                        "component": str(f.get("component") or "")[:30],
+                        "len": len(value), "value": value[:120]})
+        return True, {"resource": res, "fields": out}
+    return False, "; ".join(tried)[:300] or "ни один ресурс не ответил"
 
 
 def panel_reviews_sync(cookie_string: str, resource: str = "",
