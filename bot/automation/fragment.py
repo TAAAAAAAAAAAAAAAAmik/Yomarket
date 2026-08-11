@@ -59,6 +59,24 @@ def _apply_proxy(session: requests.Session, proxy: str) -> requests.Session:
     return session
 
 
+def proxy_problem(proxy: str) -> str:
+    """Что мешает пользоваться этим прокси. Пусто — ничего.
+
+    Без этой проверки socks5 падает уже внутри запроса, и продавец видит
+    «Missing dependencies for SOCKS support» вместо ответа — английский код
+    ошибки на экране это отписка, а не сообщение.
+    """
+    url = (proxy or "").strip().lower()
+    if url.startswith("socks"):
+        try:
+            import socks  # noqa: F401
+        except ImportError:
+            return ("для socks5 нужен пакет PySocks — он добавлен в "
+                    "requirements.txt, но этот бот собран без него. "
+                    "Пока возьмите адрес вида http://…")
+    return ""
+
+
 def proxy_label(proxy: str) -> str:
     """Как показать прокси в отчёте: только хост и порт.
 

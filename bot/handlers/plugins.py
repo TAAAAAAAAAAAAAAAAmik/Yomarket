@@ -793,6 +793,12 @@ async def stars_set_proxy_input(message: Message, state: FSMContext) -> None:
             "<code>http://логин:пароль@хост:порт</code>.",
             reply_markup=_creds_kb(ready, cookies))
         return
+    from automation.fragment import proxy_problem
+    trouble = proxy_problem(raw)
+    if trouble:
+        await message.answer(f"❌ Не сохраняю: {trouble}",
+                             reply_markup=_creds_kb(ready, cookies))
+        return
     save_fragment_creds(uid, {"proxy": raw})
     await message.answer(
         f"✅ Прокси сохранён: <code>{html.escape(proxy_label(raw))}</code>\n\n"

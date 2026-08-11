@@ -1210,6 +1210,31 @@ class GoingOutThroughTheSellersOwnAddress(unittest.TestCase):
     def test_no_proxy_is_said_plainly(self):
         self.assertEqual(F.proxy_label(""), "не задан")
 
+    def test_socks_without_the_package_is_refused_in_russian(self):
+        """Иначе продавец увидит «Missing dependencies for SOCKS support»
+        внутри запроса — английский код ошибки на экране это отписка."""
+        import builtins
+        real = builtins.__import__
+
+        def no_socks(name, *a, **kw):
+            if name == "socks":
+                raise ImportError("no socks")
+            return real(name, *a, **kw)
+
+        builtins.__import__ = no_socks
+        try:
+            said = F.proxy_problem("socks5://u:p@1.2.3.4:1080")
+        finally:
+            builtins.__import__ = real
+        self.assertIn("PySocks", said)
+        self.assertIn("http://", said)
+
+    def test_an_http_proxy_is_never_refused_for_that(self):
+        self.assertEqual(F.proxy_problem(self.PROXY), "")
+
+    def test_no_proxy_has_no_problem_either(self):
+        self.assertEqual(F.proxy_problem(""), "")
+
     def test_the_purchase_goes_through_it(self):
         seen: list[str] = []
         real = F._make_session
