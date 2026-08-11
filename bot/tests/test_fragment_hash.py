@@ -525,8 +525,10 @@ class WhenTheSessionCannotBuy(Case):
         ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
                                    api_hash=REAL_HASH)
         self.assertFalse(ok)
-        # Что делать дальше — иначе совет не совет.
-        self.assertIn("/stars_probe", msg)
+        # Что делать дальше — иначе совет не совет. И это должен быть
+        # оставшийся невыполненный пункт, а не уже проверенное.
+        self.assertIn("Wallet Verified", msg)
+        self.assertIn("my/profile", msg)
 
     def test_finding_the_recipient_is_not_passed_off_as_proof_of_access(self):
         """Поиск проходит и без stel_token — проверено вычитанием."""
@@ -565,7 +567,7 @@ class WhenTheSessionCannotBuy(Case):
         self.assertNotIn("Скорее всего", msg)
         self.assertIn("причиной не является", msg)
 
-    def test_it_does_not_claim_the_cause_is_known(self):
+    def test_the_remaining_lead_is_not_called_the_cause(self):
         outer = self.fake
 
         def post(url, params=None, data=None, **kw):
@@ -579,7 +581,8 @@ class WhenTheSessionCannotBuy(Case):
         F._make_session = lambda cookies, proxy='': sess
         _ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
                                     100, api_hash=REAL_HASH)
-        self.assertIn("Причина пока не найдена", msg)
+        self.assertIn("невыполненный пункт", msg)
+        self.assertNotIn("причина в", msg.lower())
 
     def test_other_failures_keep_their_own_wording(self):
         outer = self.fake
