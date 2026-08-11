@@ -271,9 +271,33 @@ def _note_refusal(uid: int, action: str, status: str) -> None:
         save_settings(uid, s)
 
 
+def refusal_reason(action: str, status: str) -> str:
+    """Почему отказали — по ситуации, а не одной фразой на все случаи.
+
+    «Заказ в другом статусе» одинаково описывает уже подтверждённый заказ,
+    закрытый и неоплаченный, а делать с ними надо разное. Незнакомый статус
+    не подгоняется под знакомый: про него честнее сказать общее.
+    """
+    from orderfields import BACK, DONE, UNPAID
+    key = str(status or "").strip().lower()
+    what = _ACTION_RU.get(action, action)
+    if key in ("confirmed", "closed") or (key in DONE and action == "confirm"):
+        return "заказ уже подтверждён — второй раз не нужно."
+    if key in ("refunded", "returned", "refund"):
+        return "по заказу оформлен возврат, он закрыт."
+    if key in ("cancelled", "canceled", "rejected", "failed", "expired"):
+        return "заказ закрыт маркетплейсом."
+    if key in UNPAID:
+        return ("заказ ещё не оплачен. Деньги за него маркетплейс не "
+                "получил, поэтому и закрывать нечего.")
+    if key in BACK:
+        return "заказ закрыт."
+    return f"в этом статусе маркетплейс не даёт {what} — ни боту, ни вручную."
+
+
 async def _why_refused(uid: int, api: YooMarketAPI, oid: str,
                        action: str, err: str) -> str:
-    """Дочитать настоящий статус заказа после отказа и назвать его.
+    """Дочитать настоящий статус заказа после отказа и объяснить его.
 
     Ответ «заказ сейчас в другом статусе» без названия статуса — половина
     ответа: продавцу всё равно идти смотреть на сайт.
@@ -290,10 +314,31 @@ async def _why_refused(uid: int, api: YooMarketAPI, oid: str,
     if not status:
         return ""
     _note_refusal(uid, action, status)
-    what = _ACTION_RU.get(action, action)
-    return (f"\n\nСейчас заказ: <b>{status_ru(status)}</b>. "
-            f"В этом статусе маркетплейс не даёт {what} — "
-            "ни боту, ни вручную.")
+    return (f"\n\nСейчас заказ: <b>{status_ru(status)}</b> — "
+            f"{refusal_reason(action, status)}")
+
+
+def known_status(uid: int, oid: str) -> str:
+    """Статус заказа по памяти опроса. Пусто — заказа он ещё не видел."""
+    s = get_settings(uid)
+    known = s.get("known_orders") or {}
+    got = known.get(str(oid)) or known.get(oid)
+    if got:
+        return str(got)
+    det = (s.get("known_order_details") or {}).get(str(oid)) or {}
+    return str(det.get("status") or "")
+
+
+@router.callback_query(OrderCallback.filter(F.action == "confirm_anyway"))
+async def confirm_anyway(callback: CallbackQuery,
+                         callback_data: OrderCallback,
+                         api: YooMarketAPI) -> None:
+    """Подтвердить неоплаченный заказ, когда продавец настоял.
+
+    Предупреждение — не запрет: бывает, что деньги дошли, а опрос ещё не
+    успел это увидеть. Решает продавец, но вслепую он этого не делает.
+    """
+    await _do_order_action(callback, callback_data.order_id, "confirm", api)
 
 
 @router.callback_query(OrderCallback.filter(F.action.in_({"work", "confirm", "refund"})))
@@ -302,15 +347,49 @@ async def handle_order_action(
     callback_data: OrderCallback,
     api: YooMarketAPI,
 ) -> None:
+    oid, action = callback_data.order_id, callback_data.action
+    # Подтвердить неоплаченный заказ — заявить покупателю и площадке, что
+    # сделка закрыта, пока денег нет. Маркетплейс это, скорее всего,
+    # отклонит, но узнавать об этом из английского кода после нажатия —
+    # плохой способ. Предупреждаем до, а решение оставляем продавцу:
+    # деньги могли дойти между проходами опроса.
+    if action == "confirm":
+        from orderfields import is_paid, status_ru
+        status = known_status(callback.from_user.id, oid)
+        if status and not is_paid(status):
+            b = InlineKeyboardBuilder()
+            b.button(text="✅ Всё равно подтвердить",
+                     callback_data=OrderCallback(
+                         order_id=oid, action="confirm_anyway").pack())
+            b.button(text="🔍 Детали заказа", callback_data=OrderCallback(
+                order_id=oid, action="view").pack())
+            b.button(text="⬅️ Заказы", callback_data="menu:orders")
+            b.adjust(1)
+            await callback.message.edit_text(
+                f"⚠️ <b>Заказ #{_esc(oid)} не оплачен</b>\n\n"
+                f"Сейчас: <b>{status_ru(status)}</b>\n\n"
+                "Подтверждение означает, что сделка закрыта, — а денег за "
+                "неё маркетплейс ещё не получил. Скорее всего он и не даст "
+                "подтвердить.\n\n"
+                "<i>Если оплата только что прошла, бот мог ещё не увидеть "
+                "её: проверьте «Детали заказа».</i>",
+                reply_markup=b.as_markup())
+            await callback.answer()
+            return
+    await _do_order_action(callback, oid, action, api)
+
+
+async def _do_order_action(callback: CallbackQuery, oid: str, action: str,
+                           api: YooMarketAPI) -> None:
     labels = {"work": "▶️ Заказ взят в работу", "confirm": "✅ Заказ подтверждён", "refund": "↩️ Возврат оформлен"}
     try:
-        if callback_data.action == "work":
-            await api.work_order(callback_data.order_id)
-        elif callback_data.action == "confirm":
-            await api.confirm_order(callback_data.order_id)
+        if action == "work":
+            await api.work_order(oid)
+        elif action == "confirm":
+            await api.confirm_order(oid)
         else:
-            await api.refund_order(callback_data.order_id)
-        text = f"{labels[callback_data.action]} — заказ #{callback_data.order_id}"
+            await api.refund_order(oid)
+        text = f"{labels[action]} — заказ #{oid}"
     except Exception as e:
         # Текст ошибки идёт в HTML-сообщение, а приходит он с маркетплейса:
         # одиночный «<» роняет всю отправку, и продавец видит вечно
@@ -324,12 +403,11 @@ async def handle_order_action(
         # Дочитываем и показываем, в каком он на самом деле, и запоминаем
         # отказ: кнопку, которая в этом статусе не работает, предлагать
         # второй раз незачем.
-        text += await _why_refused(callback.from_user.id, api,
-                                   callback_data.order_id,
-                                   callback_data.action, str(e))
+        text += await _why_refused(callback.from_user.id, api, oid, action,
+                                   str(e))
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔍 Детали заказа", callback_data=OrderCallback(order_id=callback_data.order_id, action="view").pack())
+    builder.button(text="🔍 Детали заказа", callback_data=OrderCallback(order_id=oid, action="view").pack())
     builder.button(text="⬅️ Заказы", callback_data="menu:orders")
     builder.adjust(1)
     await callback.message.edit_text(text, reply_markup=builder.as_markup())

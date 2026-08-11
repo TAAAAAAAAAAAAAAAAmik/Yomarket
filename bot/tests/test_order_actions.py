@@ -75,11 +75,15 @@ class TheRefusalNamesTheActualStatus(unittest.TestCase):
         got = self._why()
         self.assertIn("Возврат", got)
 
-    def test_the_action_is_named_in_russian_too(self):
-        self.assertIn("подтвердить", self._why())
+    def test_the_reason_fits_the_situation(self):
+        """«Заказ в другом статусе» одинаково описывает подтверждённый,
+        закрытый и неоплаченный — а делать с ними надо разное."""
+        self.assertIn("оформлен возврат", self._why())
 
-    def test_it_does_not_send_the_seller_to_do_it_by_hand(self):
-        self.assertIn("ни вручную", self._why())
+    def test_an_unknown_status_gets_the_general_wording(self):
+        """Незнакомый статус не подгоняется под знакомый."""
+        got = self._why(status="quantum_superposition")
+        self.assertIn("ни вручную", got)
 
     def test_another_error_is_left_alone(self):
         """Дочитывать заказ на каждую ошибку — лишний запрос и лишний шум."""
@@ -98,6 +102,118 @@ class TheRefusalNamesTheActualStatus(unittest.TestCase):
         self._why()
         self.assertEqual(
             self.saved["action_refusals"]["confirm"].count("refunded"), 1)
+
+
+class EachRefusalIsExplainedByItsOwnSituation(unittest.TestCase):
+    """Продавцу нужно разное действие в каждом случае, а фраза была одна."""
+
+    def _say(self, status):
+        return O.refusal_reason("confirm", status)
+
+    def test_an_already_confirmed_order_says_so(self):
+        self.assertIn("уже подтверждён", self._say("confirmed"))
+
+    def test_a_completed_order_is_not_offered_for_confirming_twice(self):
+        self.assertIn("уже подтверждён", self._say("success"))
+
+    def test_a_refunded_order_says_the_money_went_back(self):
+        self.assertIn("возврат", self._say("refunded"))
+
+    def test_a_cancelled_order_says_it_is_closed(self):
+        self.assertIn("закрыт", self._say("cancelled"))
+
+    def test_an_unpaid_order_says_there_is_no_money_yet(self):
+        got = self._say("new")
+        self.assertIn("не оплачен", got)
+        self.assertNotIn("уже подтверждён", got)
+
+    def test_an_unknown_status_is_not_dressed_up_as_a_known_one(self):
+        got = self._say("нечто")
+        self.assertIn("ни вручную", got)
+
+
+class AnUnpaidOrderIsWarnedAboutBeforeTheRequest(unittest.TestCase):
+    """Подтвердить неоплаченный — заявить, что сделка закрыта, пока денег
+    нет. Узнавать об этом из английского кода после нажатия поздно.
+
+    Но это предупреждение, а не запрет: оплата могла дойти между проходами
+    опроса, и решает продавец.
+    """
+
+    def setUp(self):
+        self.state = {"known_orders": {"77": "new"}}
+        self._get = O.get_settings
+        O.get_settings = lambda uid: self.state
+
+    def tearDown(self):
+        O.get_settings = self._get
+
+    class CB:
+        def __init__(self):
+            self.text = ""
+            self.kb = None
+            self.message = self
+
+        async def edit_text(self, text, reply_markup=None, **kw):
+            self.text, self.kb = text, reply_markup
+
+        async def answer(self, *a, **kw):
+            pass
+
+        from_user = type("U", (), {"id": 1})()
+
+    class API:
+        def __init__(self):
+            self.confirmed = []
+
+        async def confirm_order(self, oid):
+            self.confirmed.append(oid)
+            return {"ok": True}
+
+    def _press(self, action="confirm"):
+        from keyboards.main import OrderCallback
+        cb, api = self.CB(), self.API()
+        asyncio.run(O.handle_order_action(
+            cb, OrderCallback(order_id="77", action=action), api))
+        return cb, api
+
+    def test_nothing_is_sent_to_the_marketplace_yet(self):
+        _cb, api = self._press()
+        self.assertEqual(api.confirmed, [])
+
+    def test_the_seller_is_told_why(self):
+        cb, _api = self._press()
+        self.assertIn("не оплачен", cb.text)
+
+    def test_a_way_through_is_offered(self):
+        """Запрет здесь был бы неправ: деньги могли дойти только что."""
+        cb, _api = self._press()
+        self.assertTrue(any("confirm_anyway" in b.callback_data
+                            for row in cb.kb.inline_keyboard for b in row),
+                        cb.kb)
+
+    def test_insisting_actually_sends_it(self):
+        from keyboards.main import OrderCallback
+        cb, api = self.CB(), self.API()
+        asyncio.run(O.confirm_anyway(
+            cb, OrderCallback(order_id="77", action="confirm_anyway"), api))
+        self.assertEqual(api.confirmed, ["77"])
+
+    def test_a_paid_order_goes_straight_through(self):
+        self.state["known_orders"]["77"] = "paid"
+        _cb, api = self._press()
+        self.assertEqual(api.confirmed, ["77"])
+
+    def test_an_order_the_poller_never_saw_is_not_blocked(self):
+        """Молчание памяти — не доказательство неоплаты."""
+        self.state["known_orders"] = {}
+        _cb, api = self._press()
+        self.assertEqual(api.confirmed, ["77"])
+
+    def test_a_refund_is_not_held_up_by_this(self):
+        """Возврат неоплаченного — как раз нормальный случай."""
+        cb, _api = self._press(action="refund")
+        self.assertNotIn("не оплачен", cb.text)
 
 
 class AButtonThatCannotWorkIsNotOffered(unittest.TestCase):
