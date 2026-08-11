@@ -51,6 +51,29 @@ class TheShapesThePanelActuallyUses(unittest.TestCase):
         self.assertEqual(P("-150,5"), -150.5)
 
 
+class TwoAmountsInOneFieldAreNotGluedTogether(unittest.TestCase):
+    """Поле «Баланс» на странице магазина содержит две суммы.
+
+    Пробелы снимались ДО того, как выделено число, и «5 862,26 ₽ · 338 242 ₽»
+    читалось как 586226338242 — баланс в полтриллиона на экране продавца.
+    Прочерк хотя бы честен; выдуманная сумма хуже, чем её отсутствие.
+    """
+
+    def test_only_the_first_amount_is_taken(self):
+        self.assertEqual(P("5 862,26 ₽ · 338 242 ₽"), 5862.26)
+
+    def test_with_words_between_them_too(self):
+        self.assertEqual(P("Баланс: 5 862,26 ₽ Заморожено: 338 242 ₽"),
+                         5862.26)
+
+    def test_thousands_of_the_first_are_not_lost(self):
+        """Обрыв на разрядах был бы обратной ошибкой: 5 вместо 5 862."""
+        self.assertEqual(P("12 345 ₽ и ещё 678 ₽"), 12345.0)
+
+    def test_a_group_that_is_not_three_digits_ends_the_number(self):
+        self.assertEqual(P("5 862 26"), 5862.0)
+
+
 class SeparatorsBothWays(unittest.TestCase):
     """«1,234.56» и «1 234,56» — одно и то же число, записанное по-разному."""
 
