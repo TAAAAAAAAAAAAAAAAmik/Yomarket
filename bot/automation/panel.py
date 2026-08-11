@@ -4195,6 +4195,10 @@ def panel_reviews_sync(cookie_string: str, resource: str = "",
     tried: list[str] = []
     for res in candidates:
         rows: list[dict] = []
+        # Дочитали ли до конца. Без этого «1 из 100» на магазине с тысячей
+        # отзывов — вранье в чистом виде: столько мы прочитали, а не столько
+        # их есть.
+        more = False
         for page in range(1, max(1, pages) + 1):
             try:
                 r = session.get(
@@ -4221,6 +4225,9 @@ def panel_reviews_sync(cookie_string: str, resource: str = "",
             rows.extend(chunk)
             if len(chunk) < per_page:
                 break
+            # Страница пришла полной, а страницы кончились — значит дальше
+            # ещё есть.
+            more = page >= max(1, pages)
         if not rows:
             if not any(res in x for x in tried):
                 tried.append(f"{res}: пусто")
@@ -4231,7 +4238,7 @@ def panel_reviews_sync(cookie_string: str, resource: str = "",
         real = [x for x in reviews if x["rating"] is not None or x["text"]]
         tried.append(f"{res}: {len(rows)} строк, похожих на отзыв {len(real)}")
         if real:
-            return True, {"resource": res, "reviews": real}
+            return True, {"resource": res, "reviews": real, "more": more}
     return False, "; ".join(tried)[:400] or "ни один ресурс не ответил"
 
 

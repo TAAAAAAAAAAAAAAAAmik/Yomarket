@@ -9,7 +9,8 @@ from datetime import datetime, timedelta
 
 from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from aiogram.types import (BufferedInputFile, CallbackQuery,
+                           InlineKeyboardMarkup, Message)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
@@ -436,67 +437,125 @@ async def export_orders(callback: CallbackQuery, api: YooMarketAPI) -> None:
 
 @router.callback_query(F.data == "stats:reviews")
 async def reviews_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    await callback.message.edit_text("⏳ Загружаю отзывы...")
+    await _show_review(callback, 0, refresh=True)
 
-    b = InlineKeyboardBuilder()
-    b.button(text="🔄 Обновить", callback_data="stats:reviews")
-    b.button(text="⬅️ Статистика", callback_data="menu:stats")
-    b.adjust(2)
 
-    if not api:
-        await callback.message.edit_text(
-            "⭐ <b>Отзывы</b>\n\n❌ API токен не настроен",
-            reply_markup=b.as_markup(),
-        )
-        await callback.answer()
-        return
+# Отзывы читаются из панели одним запросом на несколько страниц, а листает
+# продавец по одному. Перечитывать панель на каждое нажатие — секунда
+# ожидания на кнопку; держим прочитанное недолго и обновляем по кнопке.
+_REVIEWS: dict[int, tuple[float, list, bool, str]] = {}
+_REVIEWS_TTL = 300
 
-    # Отзывов в Integration API нет — читаем из панели, как и статистику.
+
+async def _load_reviews(uid: int, refresh: bool
+                        ) -> tuple[list, bool, str]:
+    """(отзывы, есть ли ещё непрочитанные, ошибка)."""
+    hit = _REVIEWS.get(uid)
+    if hit and not refresh and time.time() - hit[0] < _REVIEWS_TTL:
+        return hit[1], hit[2], hit[3]
+
     from storage import get_panel_creds
     from automation.panel import panel_reviews_sync
-    creds = get_panel_creds(callback.from_user.id)
+    creds = get_panel_creds(uid)
     if not creds or not creds.get("cookies"):
+        return [], False, ("Отзывы бот читает из панели, а вход в неё не "
+                           "выполнен.\nНастройки → 🌐 Панель продавца.")
+    import asyncio as _aio
+    loop = _aio.get_event_loop()
+    try:
+        ok, got = await _aio.wait_for(
+            loop.run_in_executor(None, panel_reviews_sync,
+                                 creds["cookies"], "", 6, 50),
+            timeout=90)
+    except Exception as e:
+        return [], False, f"Панель не ответила: {str(e)[:120]}"
+    if not ok or not isinstance(got, dict):
+        # Что именно не нашлось — видно, а не «отзывов пока нет».
+        return [], False, f"Не нашёл отзывы в панели.\n{str(got)[:300]}"
+    rows = got.get("reviews") or []
+    more = bool(got.get("more"))
+    _REVIEWS[uid] = (time.time(), rows, more, "")
+    return rows, more, ""
+
+
+def _stars(rating) -> str:
+    if isinstance(rating, (int, float)) and 1 <= rating <= 5:
+        full = int(rating)
+        return "⭐" * full + "☆" * (5 - full) + f"  {rating:g}/5"
+    return "оценки нет"
+
+
+def _review_kb(i: int, total: int, more: bool) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    row = 0
+    if i > 0:
+        b.button(text="⏮ Самый новый", callback_data="stats:rev:0")
+        b.button(text="◀️ Новее", callback_data=f"stats:rev:{i - 1}")
+        row += 2
+    if i + 1 < total:
+        b.button(text="Старее ▶️", callback_data=f"stats:rev:{i + 1}")
+        row += 1
+    b.button(text="🔄 Обновить", callback_data="stats:reviews")
+    b.button(text="⬅️ Статистика", callback_data="menu:stats")
+    b.adjust(*([row] if row else []), 2)
+    return b.as_markup()
+
+
+@router.callback_query(F.data.startswith("stats:rev:"))
+async def show_review_at(callback: CallbackQuery) -> None:
+    try:
+        i = int(callback.data.rsplit(":", 1)[-1])
+    except ValueError:
+        i = 0
+    await _show_review(callback, i)
+
+
+async def _show_review(callback: CallbackQuery, i: int,
+                       refresh: bool = False) -> None:
+    """Один отзыв на экран: ник, оценка, текст — и листание.
+
+    Списком по десять они читались как лента: понять, кто и что написал,
+    можно было только вглядываясь. Порядок — от самого нового, как их
+    отдаёт панель.
+    """
+    if refresh:
+        await callback.message.edit_text("⏳ Загружаю отзывы…")
+    rows, more, err = await _load_reviews(callback.from_user.id, refresh)
+    if err:
         await callback.message.edit_text(
-            "⭐ <b>Отзывы</b>\n\n"
-            "Отзывы бот читает из панели, а вход в неё не выполнен.\n"
-            "Настройки → 🌐 Панель продавца.",
-            reply_markup=b.as_markup())
+            f"⭐ <b>Отзывы</b>\n\n{_esc(err)}",
+            reply_markup=_review_kb(0, 0, False))
+        await callback.answer()
+        return
+    if not rows:
+        await callback.message.edit_text(
+            "⭐ <b>Отзывы</b>\n\nОтзывов пока нет.",
+            reply_markup=_review_kb(0, 0, False))
         await callback.answer()
         return
 
-    try:
-        import asyncio as _aio
-        loop = _aio.get_event_loop()
-        ok, got = await _aio.wait_for(
-            loop.run_in_executor(None, panel_reviews_sync, creds["cookies"]),
-            timeout=60)
-        if not ok or not isinstance(got, dict):
-            # Что именно не нашлось — видно, а не «отзывов пока нет».
-            text = ("⭐ <b>Отзывы</b>\n\nНе нашёл отзывы в панели.\n"
-                    f"<code>{_esc(str(got)[:300])}</code>")
-        else:
-            reviews = got.get("reviews") or []
-            if not reviews:
-                text = "⭐ <b>Отзывы</b>\n\nОтзывов пока нет."
-            else:
-                lines = [f"⭐ <b>Отзывы</b> (последние "
-                         f"{min(len(reviews), 10)} из {len(reviews)})\n"]
-                for r in reviews[:10]:
-                    rating = r.get("rating")
-                    stars = ("⭐" * int(rating)
-                             if isinstance(rating, (int, float))
-                             and 1 <= rating <= 5 else "—")
-                    lines.append(f"{stars} <b>{_esc(r.get('author') or 'Покупатель')}</b>")
-                    if r.get("title"):
-                        lines.append(f"   📦 {_esc(r['title'])}")
-                    if r.get("text"):
-                        lines.append(f"   <i>{_esc(r['text'][:150])}</i>")
-                    lines.append("")
-                text = "\n".join(lines)
-    except Exception as e:
-        text = f"⭐ <b>Отзывы</b>\n\n❌ Ошибка: {e}"
+    i = max(0, min(i, len(rows) - 1))
+    r = rows[i] if isinstance(rows[i], dict) else {}
+    # «из N» — это сколько прочитано, а не сколько их в магазине. Если
+    # страницы кончились раньше отзывов, так и пишем: иначе счётчик врёт.
+    total = f"{len(rows)}+" if more else str(len(rows))
+    body = [f"⭐ <b>Отзыв {i + 1} из {total}</b>"]
+    if more and i + 1 == len(rows):
+        body.append("<i>Более старые не загружены — панель отдаёт их "
+                    "постранично.</i>")
+    body += ["",
+             f"👤 <b>{_esc(r.get('author') or 'Покупатель')}</b>",
+             _stars(r.get("rating"))]
+    if r.get("title"):
+        body.append(f"📦 {_esc(r['title'])}")
+    when = r.get("ts")
+    if when:
+        body.append(f"🕐 {_lt.fmt(float(when), get_settings(callback.from_user.id))}")
+    body.append("")
+    body.append(_esc(r.get("text") or "").strip() or "<i>без текста</i>")
 
-    await callback.message.edit_text(text, reply_markup=b.as_markup())
+    await callback.message.edit_text("\n".join(body)[:3900],
+                                     reply_markup=_review_kb(i, len(rows), more))
     await callback.answer()
 
 
