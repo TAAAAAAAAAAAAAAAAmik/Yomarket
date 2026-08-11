@@ -652,12 +652,24 @@ def profile_facts_sync(cookies: dict) -> list[str]:
     if _looks_logged_out(body):
         out.append("  страница отдана как гостю — остальное читать нечего")
         return out
+    seen: dict[str, bool] = {}
     for label, pattern in _PROFILE_MARKS:
         m = re.search(pattern, body, re.I)
+        seen[label] = bool(m)
         out.append(f"  {label}: " + (f"есть — «{m.group(1)[:40]}»" if m
                                      else "не встречается"))
     addr = _ADDR_RE.findall(body) or _RAW_ADDR_RE.findall(body)
     out.append("  кошелёк: " + (f"…{addr[0][-6:]}" if addr else "не видно"))
+    # Одна отметка есть, второй нет — это не шум разметки: обе фразы
+    # Fragment пишет одинаково, и раз одну мы видим, то увидели бы и
+    # вторую. Кошелёк при этом привязан — «привязан» и «проверен» у
+    # Fragment разные вещи, и покупку разрешает, судя по всему, вторая.
+    if seen.get("Identity Verified") and not seen.get("Wallet Verified"):
+        out.append("  ⚠️ Личность проверена, а кошелёк — нет. Из всего, что "
+                   "мы видели, это единственное невыполненное условие. "
+                   "Проверьте кошелёк на fragment.com/my/profile и "
+                   "повторите — фактом это станет только после удавшейся "
+                   "покупки.")
     return out
 
 

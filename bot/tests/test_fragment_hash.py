@@ -1576,6 +1576,27 @@ class WhatFragmentSaysAboutTheAccount(Case):
         self._facts(self.PROFILE)
         self.assertIn("https://fragment.com/my/profile", self.fake.gets)
 
+    def test_a_verified_identity_with_an_unverified_wallet_is_flagged(self):
+        """Обе фразы Fragment пишет одинаково: раз одну видно, вторую тоже
+        было бы видно. Значит это не шум разметки, а разные состояния."""
+        page = ('<html><a href="/logout">out</a> @seller Identity Verified '
+                'EQA24k42CMkz2G0SzJoSVjxkneLkcqY4V-4NvhXEtB_aX13S</html>')
+        got = self._facts(page)
+        self.assertIn("Личность проверена, а кошелёк — нет", got)
+
+    def test_both_verified_raises_nothing(self):
+        self.assertNotIn("Личность проверена", self._facts(self.PROFILE))
+
+    def test_neither_verified_raises_nothing_either(self):
+        """Тогда непонятно, читаются ли отметки вообще, — и молчание честнее."""
+        page = '<html><a href="/logout">out</a> @seller</html>'
+        self.assertNotIn("Личность проверена", self._facts(page))
+
+    def test_the_lead_is_not_dressed_up_as_the_answer(self):
+        page = ('<html><a href="/logout">out</a> @seller Identity Verified'
+                '</html>')
+        self.assertIn("фактом это станет только после", self._facts(page))
+
 
 class TheControlNickIsHuntedDownNotGivenUpOn(Case):
     """@durov Fragment не находит — «Please enter a username assigned to a
