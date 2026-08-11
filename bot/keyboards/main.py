@@ -90,17 +90,41 @@ def ads_list_keyboard(
     return builder.as_markup()
 
 
-def order_actions_keyboard(order_id: str, chat_id: str = "") -> InlineKeyboardMarkup:
+def order_actions_keyboard(order_id: str, chat_id: str = "",
+                           status: str = "",
+                           refused: dict[str, list[str]] | None = None
+                           ) -> InlineKeyboardMarkup:
+    """Кнопки заказа. `refused` — статусы, в которых маркетплейс уже отказал.
+
+    Кнопка, которая в этом статусе заведомо ответит «Incorrect Order
+    Status», — то же обещание невозможного, что и совет ответить в закрытый
+    чат. Список отказов накапливается наблюдениями, а не догадками: пока
+    отказа не было, кнопка на месте.
+    """
     builder = InlineKeyboardBuilder()
+    now = str(status or "").strip().lower()
+    refused = refused or {}
+
+    def allowed(action: str) -> bool:
+        return not (now and now in [str(x).lower()
+                                    for x in (refused.get(action) or [])])
+
     # «В работу» убрана: что POST /orders/{id}/work делает на этом
     # маркетплейсе, не подтверждено — на тестовом заказе покупатель сразу
     # увидел «магазин сообщил, что выполнил заказ». Автопринятие в Автопилоте
     # остаётся, там это осознанный выбор с показом настоящего статуса.
-    builder.button(text="✅ Подтвердить", callback_data=OrderCallback(order_id=order_id, action="confirm").pack())
-    builder.button(text="↩️ Возврат", callback_data=OrderCallback(order_id=order_id, action="refund").pack())
+    rows: list[int] = []
+    shown = 0
+    if allowed("confirm"):
+        builder.button(text="✅ Подтвердить", callback_data=OrderCallback(order_id=order_id, action="confirm").pack())
+        shown += 1
+    if allowed("refund"):
+        builder.button(text="↩️ Возврат", callback_data=OrderCallback(order_id=order_id, action="refund").pack())
+        shown += 1
     builder.button(text="💬 Чат по заказу", callback_data=ChatCallback(chat_id=chat_id or order_id).pack())
     builder.button(text="⬅️ Назад", callback_data="menu:orders")
-    builder.adjust(2, 1, 1)
+    rows = ([shown] if shown else []) + [1, 1]
+    builder.adjust(*rows)
     return builder.as_markup()
 
 

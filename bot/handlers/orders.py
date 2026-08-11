@@ -212,7 +212,9 @@ async def show_order_detail(
             if value and str(value).strip() not in ("", "—"):
                 rows.append(f"{label} {_esc(str(value)[:200])}")
         text = f"🛒 <b>Заказ #{_esc(oid)}</b>\n\n" + "\n".join(rows)
-        keyboard = order_actions_keyboard(str(oid), chat_id)
+        keyboard = order_actions_keyboard(
+            str(oid), chat_id, d["status"],
+            get_settings(callback.from_user.id).get("action_refusals") or {})
     except Exception as e:
         text = f"❌ Ошибка: {e}"
         keyboard = back_keyboard()
@@ -240,6 +242,60 @@ async def ask_refund(
     await callback.answer()
 
 
+_ACTION_RU = {"work": "взять в работу", "confirm": "подтвердить",
+              "refund": "оформить возврат"}
+
+
+def refused_statuses(uid: int, action: str) -> list[str]:
+    """Статусы, в которых маркетплейс уже отказывал в этом действии.
+
+    Список наблюдений, а не догадок: пополняется только настоящим отказом.
+    Нужен, чтобы не предлагать кнопку, которая заведомо не сработает, —
+    «не советуйте невозможного» относится и к кнопкам, не только к тексту.
+    """
+    from storage import get_settings
+    seen = (get_settings(uid).get("action_refusals") or {}).get(action)
+    return list(seen or [])
+
+
+def _note_refusal(uid: int, action: str, status: str) -> None:
+    from storage import get_settings, save_settings
+    key = str(status or "").strip().lower()
+    if not key:
+        return
+    s = get_settings(uid)
+    seen = s.setdefault("action_refusals", {}).setdefault(action, [])
+    if key not in seen:
+        seen.append(key)
+        del seen[8:]
+        save_settings(uid, s)
+
+
+async def _why_refused(uid: int, api: YooMarketAPI, oid: str,
+                       action: str, err: str) -> str:
+    """Дочитать настоящий статус заказа после отказа и назвать его.
+
+    Ответ «заказ сейчас в другом статусе» без названия статуса — половина
+    ответа: продавцу всё равно идти смотреть на сайт.
+    """
+    if "incorrect_status" not in (err or "").lower():
+        return ""
+    from orderfields import order_status, status_ru
+    try:
+        data = await api.get_order(oid)
+    except Exception:
+        return ""
+    order = data.get("data") if isinstance(data, dict) else None
+    status = order_status(order if isinstance(order, dict) else data or {})
+    if not status:
+        return ""
+    _note_refusal(uid, action, status)
+    what = _ACTION_RU.get(action, action)
+    return (f"\n\nСейчас заказ: <b>{status_ru(status)}</b>. "
+            f"В этом статусе маркетплейс не даёт {what} — "
+            "ни боту, ни вручную.")
+
+
 @router.callback_query(OrderCallback.filter(F.action.in_({"work", "confirm", "refund"})))
 async def handle_order_action(
     callback: CallbackQuery,
@@ -264,6 +320,13 @@ async def handle_order_action(
         from autoreply import explain_error
         why, _fixable = explain_error(str(e))
         text = f"❌ Не получилось: {_html.escape(why)}"
+        # «Заказ в другом статусе» без названия статуса — половина ответа.
+        # Дочитываем и показываем, в каком он на самом деле, и запоминаем
+        # отказ: кнопку, которая в этом статусе не работает, предлагать
+        # второй раз незачем.
+        text += await _why_refused(callback.from_user.id, api,
+                                   callback_data.order_id,
+                                   callback_data.action, str(e))
 
     builder = InlineKeyboardBuilder()
     builder.button(text="🔍 Детали заказа", callback_data=OrderCallback(order_id=callback_data.order_id, action="view").pack())
