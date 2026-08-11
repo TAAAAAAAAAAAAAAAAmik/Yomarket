@@ -966,6 +966,9 @@ async def wd_execute(callback: CallbackQuery, api: YooMarketAPI) -> None:
     s = get_settings(uid)
     aw = s.get("auto_withdraw", {})
     values = {**(aw.get("panel_values") or {}), "amount": amount}
+    # Отметка времени до запроса: по ней потом отличается свежая заявка от
+    # старой, уже лежавшей в журнале.
+    started = time.time()
     await callback.answer("⏳ Оформляю вывод...")
     await callback.message.edit_text("⏳ Отправляю заявку на вывод...")
     res, err = await _run_panel(uid, panel_withdraw_sync,
@@ -982,9 +985,39 @@ async def wd_execute(callback: CallbackQuery, api: YooMarketAPI) -> None:
     b.button(text="📜 История", callback_data="balance:history")
     b.button(text="💰 Баланс", callback_data="menu:balance")
     b.adjust(2)
+    tail = await _payout_readback(uid, started) if ok else ""
     await callback.message.edit_text(
-        (f"✅ {_esc(msg)}" if ok else f"❌ {_esc(msg)}"),
+        (f"✅ {_esc(msg)}{tail}" if ok else f"❌ {_esc(msg)}"),
         reply_markup=b.as_markup())
+
+
+async def _payout_readback(uid: int, since: float) -> str:
+    """Видно ли заявку в журнале панели — перечитыванием, а не по коду ответа.
+
+    Первое правило проекта: HTTP 200 не доказательство. Здесь оно дороже
+    всего — «бот сказал «отправлено», а в панели пусто» это чужие деньги.
+    Но и обратное враньё запрещено: заявка на выплату баланс сразу не
+    уменьшает, она ждёт модерации. Поэтому три исхода названы по-разному,
+    и «не вижу» не выдаётся за «не создана».
+    """
+    from stats_source import events_for, invalidate
+    invalidate(uid)
+    try:
+        events, source, perr = await events_for(uid, force=True)
+    except Exception as e:
+        return ("\n\n<i>Журнал панели перечитать не удалось "
+                f"({_esc(str(e)[:60])}) — проверьте раздел выплат сами.</i>")
+    if source != "panel":
+        return ("\n\n<i>Журнал панели недоступен"
+                + (f" ({_esc(perr[:60])})" if perr else "")
+                + " — заявку проверьте в панели сами.</i>")
+    fresh = [e for e in events
+             if e.get("kind") == "payout" and float(e.get("ts") or 0) >= since]
+    if fresh:
+        return "\n\n✅ Заявка видна в журнале панели."
+    return ("\n\n<i>В журнале панели заявка пока не видна. Так бывает: она "
+            "появляется не сразу. Если через несколько минут её там нет — "
+            "вывод не создан, и это надо решать в панели.</i>")
 
 
 def _one_btn(text: str, cb: str) -> InlineKeyboardMarkup:

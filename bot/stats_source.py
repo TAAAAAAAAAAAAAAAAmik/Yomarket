@@ -73,15 +73,37 @@ async def _panel_events(uid: int) -> tuple[list[dict], str]:
     return dated, ""
 
 
+def _created_ts(raw) -> float:
+    """Когда заказ создан, в секундах эпохи. 0 — разобрать не вышло."""
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        v = float(raw)
+        return v / 1000 if v > 1e11 else v
+    if not isinstance(raw, str) or not raw.strip():
+        return 0.0
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+
+
 def local_events(settings: dict) -> list[dict]:
-    """The bot's own order history in the same event shape."""
+    """The bot's own order history in the same event shape.
+
+    Время берётся из даты заказа на маркетплейсе, а `seen_at` — только
+    запасное. Раньше было наоборот, и на первом же проходе вся история
+    магазина получала сегодняшнюю дату: «Сегодня» показывало выручку за
+    все месяцы сразу. Продавец с панелью этого не видел — цифры берутся
+    оттуда, — а продавец без панели видел ровно этот обман.
+    """
     known: dict = settings.get("known_orders", {})
     details: dict = settings.get("known_order_details", {})
     out: list[dict] = []
     for oid, det in details.items():
         if not isinstance(det, dict):
             continue
-        seen = det.get("seen_at") or 0
+        seen = _created_ts(det.get("created")) or det.get("seen_at") or 0
         st = str(known.get(oid) or known.get(str(oid)) or "")
         try:
             price = float(str(det.get("price", 0)) or 0)
