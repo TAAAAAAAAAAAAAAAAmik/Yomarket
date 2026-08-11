@@ -27,7 +27,7 @@ class Report(unittest.TestCase):
         self._balance = M.shop_balance
         self.settings = {"daily_report": {"enabled": True, "hour": 0}}
 
-        async def balance(uid, api):
+        async def balance(uid, api, why=None):
             return 1500.0, "1 500 ₽"
 
         M.shop_balance = balance
@@ -80,6 +80,42 @@ class TheSummaryIsBuiltAtAll(Report):
         got = self._text([self.sale(500), old])
         self.assertIn("500", got)
         self.assertNotIn("999", got)
+
+
+class AnUnreadableBalanceSaysWhy(Report):
+    """«Баланс сейчас: —» без причины — это «ничего не произошло» без
+    объяснения. Панель причину называет, её просто теряли по дороге:
+    `shop_balance` получала её и выбрасывала.
+    """
+
+    def _with_reason(self, reason):
+        async def balance(uid, api, why=None):
+            if why is not None:
+                why.append(reason)
+            return 0.0, "—"
+
+        M.shop_balance = balance
+        return self._text([self.sale()])
+
+    def test_the_reason_is_printed_next_to_the_dash(self):
+        got = self._with_reason("401: сессия панели истекла")
+        self.assertIn("—", got)
+        self.assertIn("сессия панели истекла", got)
+
+    def test_a_readable_balance_says_nothing_extra(self):
+        got = self._text([self.sale()])
+        self.assertIn("1 500 ₽", got)
+        self.assertNotIn("панель:", got)
+
+    def test_the_reason_is_escaped_before_it_reaches_html(self):
+        """Причина приходит с панели: одиночный «<» роняет всю отправку."""
+        got = self._with_reason("поля: <name>, <balance>")
+        self.assertIn("&lt;name&gt;", got)
+
+    def test_the_helper_hands_the_reason_over_at_all(self):
+        # Настоящую функцию, а не подменённую в setUp.
+        import inspect
+        self.assertIn("why.append", inspect.getsource(self._balance))
 
 
 class WhenTheSummaryCannotBeBuilt(unittest.TestCase):

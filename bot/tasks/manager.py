@@ -41,12 +41,18 @@ _RESTORE_MAX_PER_PASS = 40
 _RESTORE_BARRED_TTL = 7 * 86400
 
 
-async def shop_balance(user_id: int, api) -> tuple[float, str]:
+async def shop_balance(user_id: int, api,
+                       why: list | None = None) -> tuple[float, str]:
     """The shop's balance → (amount, formatted) — «—» when it can't be read.
 
     The Integration API has none: /check answers identity only, so every
     caller reading it saw zero and reported it as fact. The panel holds the
     figure, and it is the one withdrawal acts on.
+
+    `why` — куда положить причину, если сумму прочитать не удалось. Без неё
+    экраны показывали голый прочерк: «Баланс сейчас: —» в итогах дня и ни
+    слова о том, почему. Панель причину называет, её просто выбрасывали по
+    дороге.
     """
     try:
         amount, text = await api.get_balance()
@@ -55,11 +61,14 @@ async def shop_balance(user_id: int, api) -> tuple[float, str]:
     except Exception:
         pass
     from handlers.balance import _panel_balance
+    err = ""
     try:
-        shown, _err = await _panel_balance(user_id)
-    except Exception:
-        shown = None
+        shown, err = await _panel_balance(user_id)
+    except Exception as e:
+        shown, err = None, str(e)[:150]
     if shown is None:
+        if why is not None:
+            why.append(err or "панель не назвала причину")
         return 0.0, "—"
     try:
         return float(shown), f"{float(shown):.0f} ₽"
@@ -2716,11 +2725,12 @@ class TaskManager:
             if bs.get("spent_day") == _lt.today_str(settings):
                 spent_today = float(bs.get("spent_today", 0) or 0)
 
+        bal_why: list[str] = []
         try:
-            _bal, balance_str = await shop_balance(user_id, api)
+            _bal, balance_str = await shop_balance(user_id, api, bal_why)
         except Exception as e:
             logger.warning("Daily report balance for %s: %s", user_id, e)
-            balance_str = "—"
+            balance_str, bal_why = "—", [str(e)[:150]]
 
         net = st["revenue"] - spent_today
         body = [
@@ -2741,6 +2751,11 @@ class TaskManager:
             body.append(f"💸 Выведено: <b>{_money(st['payouts'])} ₽</b>")
         body.append("")
         body.append(f"💰 Баланс сейчас: <b>{balance_str}</b>")
+        # Прочерк без причины — это «ничего не произошло» без объяснения.
+        # Причину панель называет, её просто теряли по дороге.
+        if balance_str == "—" and bal_why:
+            import html as _hb
+            body.append(f"<i>панель: {_hb.escape(bal_why[0][:150])}</i>")
         if not st["orders"]:
             body.append("")
             body.append("<i>Сегодня продаж не было.</i>")
