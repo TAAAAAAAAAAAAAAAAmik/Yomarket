@@ -104,6 +104,42 @@ def _shape(data, limit: int = 12) -> str:
     return type(data).__name__
 
 
+async def _run_panel(uid, fn, *args):
+    """Выполнить блокирующий вызов панели и распаковать его (ok, payload).
+
+    Функция была удалена 05.08 вместе с соседней, а четыре её вызова и
+    импорт из `stats_source` остались. Ловилось это только в бою и молча:
+    статистика на каждый экран получала ImportError, уходила в запасной
+    источник и подписывалась «история бота — cannot import name
+    '_run_panel'», а баланс, реквизиты и вывод падали на NameError.
+    Из-за этого же цифры не сходились с панелью: их туда просто не спрашивали.
+
+    Все `panel_*` возвращают (ok, data). Отдавать этот кортеж как есть
+    нельзя: вызывающий проверял `isinstance(res, list)` против кортежа,
+    проверка не срабатывала, и весь сырой ответ уезжал в сообщение длиннее
+    телеграмного предела — «загружаю…» так и оставалось на экране.
+    """
+    import asyncio as _a
+    from storage import get_panel_creds
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
+        return None, "нужен вход в панель продавца"
+    loop = _a.get_event_loop()
+    try:
+        result = await _a.wait_for(
+            loop.run_in_executor(None, fn, creds["cookies"], *args),
+            timeout=60)
+    except _a.TimeoutError:
+        return None, "панель не ответила за 60 секунд"
+    except Exception as e:
+        return None, str(e)[:150] or type(e).__name__
+    if (isinstance(result, tuple) and len(result) == 2
+            and isinstance(result[0], bool)):
+        ok, payload = result
+        return (payload, "") if ok else (None, str(payload)[:250])
+    return result, ""
+
+
 async def _panel_balance(uid: int) -> tuple[str | None, str]:
     """The balance as the panel reports it → (formatted, error).
 
