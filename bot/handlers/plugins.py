@@ -51,6 +51,7 @@ async def deliver_stars(uid: int, username: str, quantity: int) -> tuple[bool, s
                 creds.get("wallet_version", "v4r2"),
                 # Пусто — бот подберёт хеш сам; чужой даёт «Bad request».
                 creds.get("api_hash", ""),
+                proxy=creds.get("proxy", ""),
             ),
             timeout=180,
         )
@@ -70,6 +71,7 @@ class PluginState(StatesGroup):
     stars_set_cookies = State()
     stars_set_one_cookie = State()
     stars_set_hash = State()
+    stars_set_proxy = State()
     stars_set_mnemonic = State()
     stars_set_keyword = State()
     stars_set_reply = State()
@@ -248,12 +250,13 @@ def _creds_kb(has: bool, cookies: dict | None = None) -> InlineKeyboardMarkup:
         b.button(text=f"{mark} {label}", callback_data=f"plugins:stars:ck:{i}")
     b.button(text="🔐 Seed-фраза TON", callback_data="plugins:stars:set_mnemonic")
     b.button(text="#️⃣ api-hash (обычно сам)", callback_data="plugins:stars:set_hash")
+    b.button(text="🌐 Прокси", callback_data="plugins:stars:set_proxy")
     b.button(text="📋 Вставить всё строкой", callback_data="plugins:stars:set_cookies")
     if has:
         b.button(text="🧪 Проверить вход", callback_data="plugins:stars:check_creds")
         b.button(text="🗑 Удалить данные", callback_data="plugins:stars:del_creds")
     b.button(text="⬅️ Назад", callback_data="plugins:stars:settings")
-    b.adjust(1, 1, 1, 1, 1, 1, 2, 1)
+    b.adjust(1, 1, 1, 1, 1, 1, 1, 2, 1)
     return b.as_markup()
 
 
@@ -272,6 +275,9 @@ async def stars_creds(callback: CallbackQuery, state: FSMContext) -> None:
     lines.append(f"{'🟢' if has_m else '🔴'} 🔐 Seed-фраза TON")
     lines.append(f"{'🟢' if creds.get('api_hash') else '⚪'} #️⃣ api-hash "
                  f"{'(задан)' if creds.get('api_hash') else '(подберётся сам)'}")
+    from automation.fragment import proxy_label
+    lines.append(f"{'🟢' if creds.get('proxy') else '⚪'} 🌐 Прокси: "
+                 f"{html.escape(proxy_label(creds.get('proxy', '')))}")
     extra = [k for k in cookies if k not in dict(FRAGMENT_COOKIES)]
     if extra:
         lines.append(f"\n<i>Ещё сохранено cookies: {len(extra)}</i>")
@@ -667,7 +673,8 @@ async def stars_probe(message: Message) -> None:
         lines = await asyncio.wait_for(
             loop.run_in_executor(None, functools.partial(
                 probe_buy_sync, creds["cookies"], username, qty,
-                creds.get("api_hash", ""), control)),
+                creds.get("api_hash", ""), control,
+                creds.get("proxy", ""))),
             # Вариантов шесть, на каждый по два хеша и по два запроса, плюс
             # чтение страниц. Прежних 120 с на это уже не хватает, а обрыв по
             # таймауту выглядит как отказ Fragment и путает следствие.
@@ -729,6 +736,68 @@ async def stars_set_hash_input(message: Message, state: FSMContext) -> None:
              and bool(creds.get("mnemonic")))
     await message.answer(
         f"✅ api-hash сохранён.\n\nПроверьте вход кнопкой «🧪 Проверить вход».",
+        reply_markup=_creds_kb(ready, cookies))
+
+
+@router.callback_query(F.data == "plugins:stars:set_proxy")
+async def stars_set_proxy_prompt(callback: CallbackQuery,
+                                 state: FSMContext) -> None:
+    from automation.fragment import proxy_label
+
+    creds = get_fragment_creds(callback.from_user.id) or {}
+    cur = proxy_label(creds.get("proxy", ""))
+    await state.set_state(PluginState.stars_set_proxy)
+    await callback.message.edit_text(
+        "🌐 <b>Прокси для Fragment</b>\n\n"
+        f"Сейчас: <code>{html.escape(cur)}</code>\n\n"
+        "Fragment выдаёт сессию браузеру на вашем адресе, а бот живёт в "
+        "дата-центре. Похоже, из-за этого куки у бота «протухают» за "
+        "полчаса, а покупка отказывает с первой секунды. Прокси с обычным "
+        "домашним или мобильным адресом это проверяет и, если версия верна, "
+        "чинит.\n\n"
+        "Формат:\n"
+        "<code>http://логин:пароль@хост:порт</code>\n"
+        "<code>socks5://логин:пароль@хост:порт</code>\n\n"
+        "Отправьте <code>-</code>, чтобы убрать прокси.\n\n"
+        "⚠️ Логин и пароль нигде не показываются — в отчётах видны только "
+        "хост и порт.",
+        reply_markup=_cancel_kb("plugins:stars:creds"),
+    )
+    await callback.answer()
+
+
+@router.message(PluginState.stars_set_proxy)
+async def stars_set_proxy_input(message: Message, state: FSMContext) -> None:
+    from automation.fragment import proxy_label
+
+    raw = (message.text or "").strip()
+    await state.clear()
+    uid = message.from_user.id
+    # Строка с прокси несёт логин и пароль — в переписке ей не место.
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    creds = get_fragment_creds(uid) or {}
+    cookies = creds.get("cookies") or {}
+    ready = (all(cookies.get(n) for n, _l in FRAGMENT_COOKIES)
+             and bool(creds.get("mnemonic")))
+    if raw in ("-", "—", "нет"):
+        save_fragment_creds(uid, {"proxy": ""})
+        await message.answer("✅ Прокси убран.",
+                             reply_markup=_creds_kb(ready, cookies))
+        return
+    if not re.match(r"^(https?|socks5h?)://\S+:\d{2,5}/?$", raw):
+        await message.answer(
+            "❌ Не похоже на адрес прокси. Нужен вид "
+            "<code>http://логин:пароль@хост:порт</code>.",
+            reply_markup=_creds_kb(ready, cookies))
+        return
+    save_fragment_creds(uid, {"proxy": raw})
+    await message.answer(
+        f"✅ Прокси сохранён: <code>{html.escape(proxy_label(raw))}</code>\n\n"
+        "Проверьте командой /stars_probe — в первой строке отчёта будет "
+        "видно, с какого адреса бот выходит наружу.",
         reply_markup=_creds_kb(ready, cookies))
 
 
@@ -882,7 +951,7 @@ async def stars_whois_input(message: Message, state: FSMContext) -> None:
         lines = await asyncio.wait_for(
             loop.run_in_executor(None, functools.partial(
                 probe_recipient_sync, creds["cookies"], nick, qty,
-                creds.get("api_hash", ""))),
+                creds.get("api_hash", ""), creds.get("proxy", ""))),
             timeout=90)
     except Exception as e:
         await status.edit_text(f"❌ {html.escape(str(e)[:200])}")

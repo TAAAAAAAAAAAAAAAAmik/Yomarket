@@ -44,14 +44,66 @@ def _fix_base64(s: str) -> str:
     return s + ("=" * (-len(s) % 4))
 
 
-def _make_session(cookies: dict) -> requests.Session:
+def _apply_proxy(session: requests.Session, proxy: str) -> requests.Session:
+    """Пустить запросы через прокси продавца, если он его задал.
+
+    Fragment выдаёт сессию браузеру на конкретном адресе, а бот живёт в
+    дата-центре. Признаки сходятся: куки, снятые на телефоне, у нас
+    «протухают» за полчаса, а покупка отказывает с первой секунды, хотя
+    страница показывает вход. Проверяется это одним способом — послать
+    запросы с адреса продавца.
+    """
+    url = (proxy or "").strip()
+    if url:
+        session.proxies.update({"http": url, "https": url})
+    return session
+
+
+def proxy_label(proxy: str) -> str:
+    """Как показать прокси в отчёте: только хост и порт.
+
+    В строке прокси обычно логин и пароль. Печатать их нельзя — это те же
+    чужие доступы, что и куки.
+    """
+    url = (proxy or "").strip()
+    if not url:
+        return "не задан"
+    tail = url.rsplit("@", 1)[-1]
+    return tail.split("//")[-1][:40] or "задан"
+
+
+# Куда сходить, чтобы узнать свой адрес. Два — на случай, если один не
+# отвечает: строка «адрес не узнать» в отчёте бесполезна.
+_IP_SERVICES = ("https://api.ipify.org", "https://ifconfig.me/ip")
+
+
+def outbound_ip(proxy: str = "") -> str:
+    """С какого адреса нас видит интернет. Пусто — не удалось узнать.
+
+    Сессия берётся через `_make_session` не для кук, а чтобы у тестов была
+    одна точка подмены: с прямым `requests.Session()` прогон уходил в
+    настоящую сеть и растягивался на полминуты.
+    """
+    for url in _IP_SERVICES:
+        try:
+            s = _make_session({}, proxy)
+            r = s.get(url, timeout=10)
+            ip = (r.text or "").strip()
+            if r.status_code == 200 and 6 < len(ip) < 46:
+                return ip
+        except Exception:
+            continue
+    return "адрес не узнать"
+
+
+def _make_session(cookies: dict, proxy: str = "") -> requests.Session:
     s = requests.Session()
     s.cookies.update(cookies or {})
     # Заголовки — как в документации рабочего клиента: только User-Agent.
     # Свои X-Requested-With / Origin / Referer убраны: они добавлялись по
     # догадке, а сверять поведение надо с тем, что заведомо работает.
     s.headers.update({"User-Agent": "Mozilla/5.0"})
-    return s
+    return _apply_proxy(s, proxy)
 
 
 def _api_call(session: requests.Session, api_hash: str, method: str,
@@ -242,6 +294,7 @@ def buy_stars_sync(
     api_hash: str = "",
     wait_confirm: bool = True,
     report: dict | None = None,
+    proxy: str = "",
 ) -> tuple[bool, str]:
     """Покупка звёзд — по документации рабочего клиента, шаг в шаг.
 
@@ -271,8 +324,10 @@ def buy_stars_sync(
     except (TypeError, ValueError):
         return False, "Некорректное количество звёзд"
 
-    # 1. Сессия: куки и единственный заголовок User-Agent.
-    session = _make_session(cookies)
+    # 1. Сессия: куки и единственный заголовок User-Agent. Прокси — то
+    # единственное, что документ не описывает, но и не запрещает: он у
+    # автора образца и не нужен, потому что тот работает со своей машины.
+    session = _make_session(cookies, proxy)
 
     def post(method: str, args: dict) -> dict:
         """Один запрос: всё в строке запроса, как в разделах 3–8."""
@@ -440,7 +495,7 @@ def _wait_seqno_advance(address: str, from_seqno: int) -> bool:
     return False
 
 
-def _page_session(cookies: dict) -> requests.Session:
+def _page_session(cookies: dict, proxy: str = "") -> requests.Session:
     """Сессия для обычной страницы, а не для API.
 
     У API-сессии стоит `X-Requested-With: XMLHttpRequest` — с ним Fragment
@@ -456,7 +511,7 @@ def _page_session(cookies: dict) -> requests.Session:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ru,en;q=0.9",
     })
-    return s
+    return _apply_proxy(s, proxy)
 
 
 _HASH_PATTERNS = (
@@ -872,7 +927,7 @@ def probe_session_sync(cookies: dict) -> list[str]:
 
 
 def probe_recipient_sync(cookies: dict, username: str, quantity: int = 50,
-                         api_hash: str = "") -> list[str]:
+                         api_hash: str = "", proxy: str = "") -> list[str]:
     """Найдёт ли Fragment этого получателя и примет ли на него заявку.
 
     Отдельно от большой пробы и без перебора вариантов: одна пара запросов,
@@ -889,12 +944,13 @@ def probe_recipient_sync(cookies: dict, username: str, quantity: int = 50,
     if not nick:
         return ["Пустой ник"]
 
-    h = (api_hash or "").strip() or fetch_api_hash_sync(cookies)
+    session = _make_session(cookies, proxy)
+    h = (api_hash or "").strip() or fetch_api_hash_sync(
+        cookies, session=_page_session(cookies, proxy))
     if not h:
         return ["Не удалось прочитать api-hash со страницы Fragment — "
                 "скорее всего истекли куки"]
 
-    session = _make_session(cookies)
     out: list[str] = []
     search: dict = {}
     recipient = ""
@@ -948,7 +1004,8 @@ def probe_recipient_sync(cookies: dict, username: str, quantity: int = 50,
 
 
 def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
-                   api_hash: str = "", control: str = "durov") -> list[str]:
+                   api_hash: str = "", control: str = "durov",
+                   proxy: str = "") -> list[str]:
     """Где именно ломается покупка — перебором того, чем запросы отличаются.
 
     Рабочий образец шлёт всё в строке запроса и ставит только User-Agent;
@@ -969,6 +1026,11 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
     names = ", ".join(f"{k} ({len(str(v))})"
                       for k, v in sorted((cookies or {}).items()))
     out.append("Куки: " + (names or "нет"))
+    # С какого адреса нас видит интернет. Куки Fragment выдаёт браузеру на
+    # конкретном адресе, а бот живёт в дата-центре — и пока этот адрес не
+    # напечатан, «прокси задан» ничего не значит: он мог и не примениться.
+    out.append(f"Прокси: {proxy_label(proxy)} · выходим с "
+               f"{outbound_ip(proxy)}")
 
     # Признан ли вход — то единственное, чего проба до сих пор не показывала.
     # Поиск получателя Fragment отдаёт и гостю, покупку — нет. Пока эта
@@ -976,7 +1038,8 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
     # транспортом, и тем, что сессии просто нельзя покупать.
     facts: dict = {}
     pages: list[str] = []
-    hashes = collect_api_hashes_sync(cookies, pages, facts) or []
+    hashes = collect_api_hashes_sync(
+        cookies, pages, facts, session=_page_session(cookies, proxy)) or []
     if "signed_in" in facts:
         out.append("Вход: " + ("✅ признан (есть выход/личный раздел)"
                                if facts["signed_in"]

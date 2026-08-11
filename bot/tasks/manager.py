@@ -2043,7 +2043,8 @@ class TaskManager:
                         # Пусто — значит бот подберёт хеш сам. Прописывать сюда
                         # чужой хеш нельзя: Fragment отвечает «Bad request».
                         creds.get("api_hash", ""),
-                        report=spend),
+                        report=spend,
+                        proxy=creds.get("proxy", "")),
                 ),
                 timeout=180,
             )

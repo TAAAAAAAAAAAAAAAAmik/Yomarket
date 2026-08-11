@@ -93,8 +93,8 @@ class Case(unittest.TestCase):
         # The page is fetched with its own session — without the XHR header, or
         # Fragment answers as XHR and the scripts holding the hash are absent.
         self._old_page = F._page_session
-        F._make_session = lambda cookies: self.fake.session()
-        F._page_session = lambda cookies: self.fake.session()
+        F._make_session = lambda cookies, proxy='': self.fake.session()
+        F._page_session = lambda cookies, proxy='': self.fake.session()
 
     def tearDown(self):
         F._make_session = self._old
@@ -233,7 +233,7 @@ class EveryWritingOfTheNickIsTried(Case):
             return real(url, params=params, data=data, **kw)
 
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
                          api_hash=REAL_HASH)
         asked = [q.get("query") for q in outer.queries
@@ -312,7 +312,7 @@ class AnswerOfConfirmReqIsNotThrownAway(Case):
             return real(url, params=params, data=data, **kw)
 
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
 
     def _buy(self):
         report: dict = {}
@@ -360,7 +360,7 @@ class AnswerOfConfirmReqIsNotThrownAway(Case):
 
     def test_a_purchase_that_goes_through_still_says_so(self):
         _ok, _msg, report = None, None, None
-        F._make_session = lambda cookies: self.fake.session()
+        F._make_session = lambda cookies, proxy='': self.fake.session()
         outer = self.fake
         sess = outer.session()
         real = sess.post
@@ -378,7 +378,7 @@ class AnswerOfConfirmReqIsNotThrownAway(Case):
             return real(url, params=params, data=data, **kw)
 
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         ok, msg, report = self._buy()
         self.assertTrue(ok, msg)
         self.assertIn("✅", msg)
@@ -406,7 +406,7 @@ class AnAnswerOnTheMerits(Case):
 
         sess = outer.session()
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
 
     def test_a_live_session_is_not_called_broken(self):
         self._picky()
@@ -521,7 +521,7 @@ class WhenTheSessionCannotBuy(Case):
 
         sess = outer.session()
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
                                    api_hash=REAL_HASH)
         self.assertFalse(ok)
@@ -540,7 +540,7 @@ class WhenTheSessionCannotBuy(Case):
 
         sess = outer.session()
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         _ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
                                     100, api_hash=REAL_HASH)
         self.assertNotIn("сессию он признаёт", msg)
@@ -559,7 +559,7 @@ class WhenTheSessionCannotBuy(Case):
 
         sess = outer.session()
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         _ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
                                     100, api_hash=REAL_HASH)
         self.assertNotIn("Скорее всего", msg)
@@ -576,7 +576,7 @@ class WhenTheSessionCannotBuy(Case):
 
         sess = outer.session()
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         _ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
                                     100, api_hash=REAL_HASH)
         self.assertIn("Причина пока не найдена", msg)
@@ -592,7 +592,7 @@ class WhenTheSessionCannotBuy(Case):
 
         sess = outer.session()
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         _ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
                                     api_hash=REAL_HASH)
         self.assertIn("Quantity too small", msg)
@@ -641,7 +641,7 @@ class ComparingWallets(unittest.TestCase):
                 return Reply(None, 200, f'<div data-address="{addr}"></div>')
 
         old = F._page_session
-        F._page_session = lambda cookies: Sess()
+        F._page_session = lambda cookies, proxy='': Sess()
         try:
             self.assertEqual(F.wallet_on_page_sync(COOKIES), addr)
         finally:
@@ -654,7 +654,7 @@ class ComparingWallets(unittest.TestCase):
                 return Reply(None, 200, "<div>Connect TON</div>")
 
         old = F._page_session
-        F._page_session = lambda cookies: Sess()
+        F._page_session = lambda cookies, proxy='': Sess()
         try:
             self.assertEqual(F.wallet_on_page_sync(COOKIES), "")
         finally:
@@ -855,7 +855,7 @@ class TextThatTelegramMustAccept(unittest.TestCase):
         sess = outer.session()
         sess.post = post
         old = F._make_session
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         try:
             _ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
                                         100, api_hash=REAL_HASH)
@@ -1133,7 +1133,7 @@ class AskingWhatOtherMethodsAnswer(Case):
             return Reply(answers.get(method, answers.get("*", {"ok": True})))
 
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         return F._probe_methods(COOKIES, REAL_HASH, "durov", 50), seen
 
     def test_a_made_up_method_is_asked_about_too(self):
@@ -1171,9 +1171,104 @@ class AskingWhatOtherMethodsAnswer(Case):
             return Reply(None, 403, "<html>nope</html>")
 
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         lines = F._probe_methods(COOKIES, REAL_HASH, "durov", 50)
         self.assertTrue(any("не JSON" in x for x in lines), lines)
+
+
+class GoingOutThroughTheSellersOwnAddress(unittest.TestCase):
+    """Прокси — проверка версии, что дело в адресе, с которого мы ходим.
+
+    Fragment выдаёт сессию браузеру на конкретном адресе, а бот живёт в
+    дата-центре. Сходится и то, что куки у бота «протухают» за полчаса, и
+    то, что покупка отказывает с первой секунды при живой странице.
+
+    Строка прокси несёт логин и пароль — те же чужие доступы, что и куки.
+    В отчёт уходят только хост и порт.
+    """
+
+    PROXY = "http://user:s3cr3t@1.2.3.4:8080"
+
+    def test_a_proxy_is_applied_to_the_api_session(self):
+        s = F._make_session({"a": "1"}, self.PROXY)
+        self.assertEqual(s.proxies.get("https"), self.PROXY)
+
+    def test_a_proxy_is_applied_to_the_page_session_too(self):
+        """Иначе страницу с хешем читаем с одного адреса, а покупаем с другого."""
+        s = F._page_session({"a": "1"}, self.PROXY)
+        self.assertEqual(s.proxies.get("https"), self.PROXY)
+
+    def test_without_a_proxy_nothing_is_set(self):
+        self.assertEqual(F._make_session({"a": "1"}).proxies, {})
+
+    def test_the_label_hides_the_password(self):
+        label = F.proxy_label(self.PROXY)
+        self.assertNotIn("s3cr3t", label)
+        self.assertNotIn("user", label)
+        self.assertIn("1.2.3.4:8080", label)
+
+    def test_no_proxy_is_said_plainly(self):
+        self.assertEqual(F.proxy_label(""), "не задан")
+
+    def test_the_purchase_goes_through_it(self):
+        seen: list[str] = []
+        real = F._make_session
+        F._make_session = lambda cookies, proxy="": seen.append(proxy) or real(
+            cookies, proxy)
+        try:
+            F.buy_stars_sync({"c": "1"}, " ".join(["w"] * 24), "durov", 100,
+                             proxy=self.PROXY)
+        finally:
+            F._make_session = real
+        self.assertEqual(seen, [self.PROXY], seen)
+
+
+class TellingWhichAddressWeGoOutFrom(unittest.TestCase):
+    """«Прокси задан» ничего не значит: он мог и не примениться.
+
+    Пока в отчёте не напечатан адрес, с которого нас видит интернет,
+    проверить версию про дата-центр нечем — и очередной прогон уйдёт в
+    спор о том, работал прокси или нет.
+    """
+
+    def setUp(self):
+        self._old = F.requests.Session
+
+    def tearDown(self):
+        F.requests.Session = self._old
+
+    def _answer(self, replies):
+        calls = {"n": 0}
+
+        class Sess:
+            proxies: dict = {}
+            headers: dict = {}
+            cookies = type("C", (), {"update": staticmethod(lambda *a: None)})()
+
+            def get(self, url, **kw):
+                i = calls["n"]
+                calls["n"] += 1
+                if isinstance(replies[i], Exception):
+                    raise replies[i]
+                return Reply(None, 200, replies[i])
+
+        F.requests.Session = Sess
+
+    def test_the_address_is_reported(self):
+        self._answer(["203.0.113.7"])
+        self.assertEqual(F.outbound_ip(), "203.0.113.7")
+
+    def test_a_dead_service_falls_through_to_the_next(self):
+        self._answer([RuntimeError("down"), "203.0.113.7"])
+        self.assertEqual(F.outbound_ip(), "203.0.113.7")
+
+    def test_nothing_readable_is_said_plainly_not_guessed(self):
+        self._answer([RuntimeError("down"), RuntimeError("down")])
+        self.assertEqual(F.outbound_ip(), "адрес не узнать")
+
+    def test_an_html_error_page_is_not_taken_for_an_address(self):
+        self._answer(["<html>" + "x" * 500 + "</html>", "203.0.113.7"])
+        self.assertEqual(F.outbound_ip(), "203.0.113.7")
 
 
 class OnlyTheFirstMessageIsPaid(Case):
@@ -1207,7 +1302,7 @@ class OnlyTheFirstMessageIsPaid(Case):
                   "_make_session")}
         addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
         F._wallet_from_mnemonic = lambda m, v: type("W", (), {"address": addr})()
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         F._build_signed_boc = lambda w, to, amount, p, s: sent.append(
             (to, amount)) or "BOC"
         F._send_boc = lambda boc: True
@@ -1277,10 +1372,10 @@ class OneSessionForEverything(Case):
             return real_post(url, **kw)
 
         sess.get, sess.post = get, post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         # Отдельную «страничную» сессию ломаем: если покупка полезет за
         # хешем через неё, тест это увидит.
-        F._page_session = lambda cookies: None
+        F._page_session = lambda cookies, proxy='': None
         F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100)
         self.assertEqual(used[0], "get", used)
         self.assertIn("post", used)
@@ -1304,7 +1399,7 @@ class OneSessionForEverything(Case):
             "__iter__": lambda self: iter(
                 [type("K", (), {"name": "stel_ssid"})(),
                  type("K", (), {"name": "stel_dt"})()])})()
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         got = "\n".join(F._probe_single_session(COOKIES, "durov", 50))
         self.assertIn("куки после неё: stel_dt, stel_ssid", got)
         # Кука, которой у нас не было, — и есть возможное недостающее звено.
@@ -1344,7 +1439,7 @@ class ChangingOneFieldOfTheRequestAtATime(Case):
             return Reply(answer or {"ok": False, "error": "Access denied"})
 
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         return F._probe_init_shapes(COOKIES, REAL_HASH, "durov", 50), sent
 
     def test_an_empty_request_is_among_the_shapes(self):
@@ -1372,7 +1467,7 @@ class ChangingOneFieldOfTheRequestAtATime(Case):
         outer = self.fake
         sess = outer.session()
         sess.post = lambda *a, **kw: Reply({"ok": False, "error": "nope"})
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         got = F._probe_init_shapes(COOKIES, REAL_HASH, "durov", 50)
         self.assertIn("сравнивать не с чем", got[0])
 
@@ -1406,7 +1501,7 @@ class CheckingOneNickOnDemand(Case):
             return Reply({"ok": False, "error": "Access denied"})
 
         sess.post = post
-        F._make_session = lambda cookies: sess
+        F._make_session = lambda cookies, proxy='': sess
         return F.probe_recipient_sync(COOKIES, nick, 50, REAL_HASH), asked
 
     def test_a_found_nick_says_so_and_which_writing_worked(self):
@@ -1477,7 +1572,7 @@ class ReadingHowTheSiteCallsItsOwnApi(Case):
                 return Reply(None, 200, scripts.get(url, ""))
 
         old = F._page_session
-        F._page_session = lambda cookies: Sess()
+        F._page_session = lambda cookies, proxy='': Sess()
         try:
             return F.probe_page_api_sync(COOKIES)
         finally:
@@ -1522,7 +1617,7 @@ class ReadingHowTheSiteCallsItsOwnApi(Case):
                 raise RuntimeError("timeout")
 
         old = F._page_session
-        F._page_session = lambda cookies: Sess()
+        F._page_session = lambda cookies, proxy='': Sess()
         try:
             got = "\n".join(F.probe_page_api_sync(COOKIES))
         finally:
