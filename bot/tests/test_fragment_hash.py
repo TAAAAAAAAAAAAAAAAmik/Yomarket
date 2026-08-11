@@ -465,38 +465,54 @@ class WhenItCannotBeFound(Case):
         self.assertIn("cookies", str(res))
 
 
-class TheHashAlwaysComesFromThePage(Case):
-    """Раньше сохранённый хеш брался как есть, а на «Bad request» покупка
-    один раз перечитывала страницу и повторяла запрос. Повтор был наш, не
-    описанный, и держался на догадке, что отказ означает именно устаревший
-    хеш. Хеш Fragment выдаёт сессии — значит его и надо читать каждый раз,
-    а сохранённый годится только на случай, если на странице его нет.
+class AHashSetByHandWins(Case):
+    """Смысл поля «api-hash» ровно в том, чтобы перебить автоматику.
+
+    После переписывания страница стала важнее сохранённого значения, и
+    поле обесценилось: хеш, снятый в браузере, где покупка проходит, до
+    запроса просто не доходил. Задан руками — значит задан осознанно.
     """
 
-    def test_the_page_is_read_even_when_a_hash_is_stored(self):
+    def test_the_stored_hash_is_the_one_that_goes_out(self):
+        self.fake.good_hash = "by-hand"
         F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
-                         api_hash="stale-one")
-        self.assertEqual(self.fake.gets,
-                         ["https://fragment.com/stars/buy"], self.fake.gets)
+                         api_hash="by-hand")
+        used = [p.get("hash") for p in self.fake.posts]
+        self.assertEqual(set(used), {"by-hand"}, used)
 
-    def test_the_page_hash_wins_over_the_stored_one(self):
+    def test_the_page_is_not_even_read_then(self):
+        """Лишний запрос к странице — лишний повод Fragment насторожиться."""
+        self.fake.good_hash = "by-hand"
         F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
-                         api_hash="stale-one")
+                         api_hash="by-hand")
+        self.assertEqual(self.fake.gets, [], self.fake.gets)
+
+    def test_without_one_the_page_still_gives_it(self):
+        F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100)
         used = [p.get("hash") for p in self.fake.posts]
         self.assertEqual(set(used), {REAL_HASH}, used)
-
-    def test_the_stored_one_is_used_when_the_page_has_none(self):
-        """Иначе выдача встанет там, где ещё можно попробовать."""
-        self.fake.page = "<html>" + SIGNED_IN + "пусто</html>"
-        self.fake.good_hash = "stale-one"
-        F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
-                         api_hash="stale-one")
-        used = [p.get("hash") for p in self.fake.posts]
-        self.assertEqual(set(used), {"stale-one"}, used)
 
     def test_the_page_is_read_once_not_per_method(self):
         F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100)
         self.assertEqual(len(self.fake.gets), 1, self.fake.gets)
+
+    def test_the_probe_tries_the_stored_one_first(self):
+        """Если продавец снял хеш в браузере, где покупка проходит,
+        проверять надо в первую очередь его."""
+        sess = self.fake.session()
+        asked: list[str] = []
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if q.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            asked.append(q.get("hash", ""))
+            return Reply({"ok": False, "error": "Access denied"})
+
+        sess.post = post
+        F._make_session = lambda cookies, proxy="": sess
+        F._probe_every_hash(COOKIES, "durov", 50, "", "by-hand")
+        self.assertEqual(asked[0], "by-hand", asked)
 
 
 class WhenTheSessionCannotBuy(Case):

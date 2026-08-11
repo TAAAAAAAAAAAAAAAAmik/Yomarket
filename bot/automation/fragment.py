@@ -361,23 +361,24 @@ def buy_stars_sync(
             return {"error": "не JSON от Fragment"}
         return data if isinstance(data, dict) else {"error": str(data)[:80]}
 
-    # 2. Хеш — со страницы покупки, той же сессией. Читается всегда, как в
-    # документации: хеш Fragment выдаёт сессии, и сохранённый в настройках
-    # к нашей сессии отношения не имеет. Он остаётся только запасным — на
-    # случай, если страница почему-то без хеша.
-    h = ""
-    try:
-        page = session.get("https://fragment.com/stars/buy", timeout=30)
-        body = page.text or ""
-    except Exception as e:
-        return False, f"Страница fragment.com/stars/buy: {str(e)[:80]}"
-    for pattern in _HASH_PATTERNS:
-        m = re.search(pattern, body)
-        if m:
-            h = m.group(1)
-            break
+    # 2. Хеш. Если продавец задал его руками — берём его и не спорим: это
+    # осознанная подстановка, и смысл поля ровно в том, чтобы перебить
+    # автоматику. Своё «страница всегда важнее» тут её обесценивало: хеш,
+    # снятый в браузере, где покупка проходит, просто не доходил до запроса.
+    # Не задан — читаем со страницы покупки, той же сессией, как в
+    # документации.
+    h = (api_hash or "").strip()
     if not h:
-        h = (api_hash or "").strip()
+        try:
+            page = session.get("https://fragment.com/stars/buy", timeout=30)
+            body = page.text or ""
+        except Exception as e:
+            return False, f"Страница fragment.com/stars/buy: {str(e)[:80]}"
+        for pattern in _HASH_PATTERNS:
+            m = re.search(pattern, body)
+            if m:
+                h = m.group(1)
+                break
     if not h:
         return False, ("Не удалось прочитать hash со страницы "
                        "fragment.com/stars/buy — проверьте куки Fragment")
@@ -1113,7 +1114,7 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
     # это ровно «не тот хеш для этого метода».
     out.append("")
     out.append("Заявка каждым найденным хешем:")
-    out += _probe_every_hash(cookies, username, quantity, proxy)
+    out += _probe_every_hash(cookies, username, quantity, proxy, stored)
 
     # Ровно как в документации: одна сессия и на страницу, и на API. У нас
     # страницу читала отдельная сессия со своим User-Agent, и куки, которые
@@ -1347,7 +1348,7 @@ def _probe_single_session(cookies: dict, username: str,
 
 
 def _probe_every_hash(cookies: dict, username: str, quantity: int,
-                      proxy: str = "") -> list[str]:
+                      proxy: str = "", stored: str = "") -> list[str]:
     """Заявка каждым хешем, какой удалось найти, — включая непроверенные.
 
     Прежний перебор шёл от поиска: хеш, на котором поиск не проходит,
@@ -1367,7 +1368,9 @@ def _probe_every_hash(cookies: dict, username: str, quantity: int,
     except Exception as e:
         return [f"  страница — ошибка {str(e)[:40]}"]
 
-    found: list[str] = []
+    # Первым — заданный руками: если продавец снял хеш в браузере, где
+    # покупка проходит, проверять надо в первую очередь его.
+    found: list[str] = [stored.strip()] if (stored or "").strip() else []
     for text in [body] + _scripts_of(session, body):
         for pattern in _HASH_PATTERNS:
             for m in re.finditer(pattern, text):
