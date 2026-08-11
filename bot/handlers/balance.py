@@ -176,7 +176,9 @@ async def _panel_balance(uid: int) -> tuple[str | None, str]:
     except Exception as e:
         return None, f"магазин: {shop_err} · balances: {str(e)[:50]}"
     if not ok or not isinstance(rows, list):
-        return None, f"магазин: {shop_err}"
+        # И причину второй попытки тоже: «магазин: …» без неё выглядит так,
+        # будто balances вообще не спрашивали.
+        return None, f"магазин: {shop_err} · balances: {str(rows)[:120]}"
 
     # Several rows can exist (one per currency); the roubles one is the balance
     # a seller means, and any single row is unambiguous on its own.
@@ -191,7 +193,19 @@ async def _panel_balance(uid: int) -> tuple[str | None, str]:
         best = best if best is not None else amt
     if best is not None:
         return f"{best:.2f}".rstrip("0").rstrip("."), ""
-    return None, "панель не показала сумму"
+    # Дошли сюда — значит `balances` ответил, но суммы в строках нет. Прежний
+    # текст «панель не показала сумму» выбрасывал разбор страницы магазина,
+    # где как раз перечислены найденные поля, — то есть ровно то, ради чего
+    # эту причину и печатают. Показываем обе попытки и то, что в строках было.
+    seen = []
+    for row in rows[:3]:
+        fields = [str(f.get("name") or f.get("attribute"))
+                  for f in ((row.get("raw") or {}).get("fields") or [])
+                  if isinstance(f, dict)]
+        seen.append(f"строка {row.get('id')}: "
+                    + (", ".join(n for n in fields if n) or "без полей"))
+    return None, (f"магазин: {shop_err} · balances: строк {len(rows)}, "
+                  "суммы ни в одной; " + "; ".join(seen))[:400]
 
 
 def _parse_check(data: dict) -> tuple[str, str, str | None]:
