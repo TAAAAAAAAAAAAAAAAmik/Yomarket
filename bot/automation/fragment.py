@@ -1106,6 +1106,15 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
     out.append("Что меняет каждое поле заявки:")
     out += _probe_init_shapes(cookies, hashes[0], username, quantity)
 
+    # Дыра в прежней пробе: перебор вариантов начинался с поиска, и хеш,
+    # на котором поиск не проходит, отбрасывался целиком — заявку им не
+    # пробовали ни разу. А у Fragment хеш вполне может быть свой на каждый
+    # раздел: тогда поиску годится один, покупке другой, и «Access denied»
+    # это ровно «не тот хеш для этого метода».
+    out.append("")
+    out.append("Заявка каждым найденным хешем:")
+    out += _probe_every_hash(cookies, username, quantity, proxy)
+
     # Ровно как в документации: одна сессия и на страницу, и на API. У нас
     # страницу читала отдельная сессия со своим User-Agent, и куки, которые
     # Fragment ставит при её открытии, терялись — а хеш он выдаёт сессии.
@@ -1334,6 +1343,89 @@ def _probe_single_session(cookies: dict, username: str,
         return out + ["  хеша на странице нет — дальше идти не с чем"]
     out.append(f"  хеш с этой страницы: …{h[-6:]} ({len(h)} знаков)")
     out.append(f"  {_probe_two_calls(session, h, username, quantity)}")
+    return out
+
+
+def _probe_every_hash(cookies: dict, username: str, quantity: int,
+                      proxy: str = "") -> list[str]:
+    """Заявка каждым хешем, какой удалось найти, — включая непроверенные.
+
+    Прежний перебор шёл от поиска: хеш, на котором поиск не проходит,
+    отбрасывался вместе с заявкой. Значит второй кандидат ни разу не
+    пробовался на покупке. У Fragment хеш вполне может быть свой на каждый
+    раздел — тогда поиску годится один, покупке другой, а «Access denied»
+    означает просто «не тот хеш для этого метода».
+
+    Заодно кандидаты собираются глубже: не только со страницы, но и из всех
+    её скриптов. Раньше скрипты читались, только если на странице не нашлось
+    ничего, — а нашлось там как раз то, что для покупки не годится.
+    """
+    session = _make_session(cookies, proxy)
+    try:
+        body = (session.get("https://fragment.com/stars/buy",
+                            timeout=30).text or "")
+    except Exception as e:
+        return [f"  страница — ошибка {str(e)[:40]}"]
+
+    found: list[str] = []
+    for text in [body] + _scripts_of(session, body):
+        for pattern in _HASH_PATTERNS:
+            for m in re.finditer(pattern, text):
+                if m.group(1) and m.group(1) not in found:
+                    found.append(m.group(1))
+    if not found:
+        return ["  хешей на странице нет"]
+
+    # Получателя добываем любым хешем, который его отдаёт: он нужен всем
+    # заявкам одинаковый, и брать его чем попало здесь не грех.
+    recipient = ""
+    for h in found:
+        for form in _query_forms(username):
+            try:
+                got = session.post(
+                    FRAGMENT_API_URL,
+                    params={"method": "searchStarsRecipient", "hash": h,
+                            "query": form}, timeout=20).json()
+            except Exception:
+                continue
+            recipient = _extract_recipient(got)
+            if recipient:
+                break
+        if recipient:
+            break
+    if not recipient:
+        return [f"  кандидатов {len(found)}, но получателя не нашёл ни один"]
+
+    out = [f"  кандидатов в хеш: {len(found)}"]
+    for h in found[:8]:
+        try:
+            data = session.post(
+                FRAGMENT_API_URL,
+                params={"method": "initBuyStarsRequest", "hash": h,
+                        "recipient": recipient, "quantity": quantity},
+                timeout=20).json()
+        except Exception as e:
+            out.append(f"  …{h[-6:]} ({len(h)}): ошибка {str(e)[:30]}")
+            continue
+        if isinstance(data, dict) and data.get("req_id"):
+            out.append(f"  ✅ …{h[-6:]} ({len(h)} знаков): ЗАЯВКА ПРИНЯТА — "
+                       "вот он, рабочий хеш")
+            return out
+        out.append(f"  …{h[-6:]} ({len(h)}): "
+                   f"{str((data or {}).get('error') or data)[:40]}")
+    return out
+
+
+def _scripts_of(session, html: str) -> list[str]:
+    """Тексты подключённых скриптов страницы — сколько удалось прочитать."""
+    out: list[str] = []
+    for url in _script_urls(html)[:_MAX_SCRIPTS]:
+        try:
+            r = session.get(url, timeout=15)
+        except Exception:
+            continue
+        if r.status_code == 200 and r.text:
+            out.append(r.text)
     return out
 
 

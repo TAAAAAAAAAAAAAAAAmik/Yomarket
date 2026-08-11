@@ -1440,6 +1440,83 @@ class OneSessionForEverything(Case):
         self.assertIn("дальше идти не с чем", got)
 
 
+class EveryHashIsTriedOnThePurchaseToo(Case):
+    """Дыра в прежней пробе: перебор шёл от поиска.
+
+    Хеш, на котором поиск не проходит, отбрасывался вместе с заявкой —
+    значит второй кандидат ни разу не пробовался на покупке. У Fragment
+    хеш вполне может быть свой на каждый раздел: поиску годится один,
+    покупке другой, а «Access denied» тогда означает просто «не тот хеш
+    для этого метода». Сайт с этого же аккаунта звёзды выдаёт — значит
+    дело именно в нашем запросе.
+    """
+
+    GOOD, BUY = "aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    def _try(self, *, buy_hash=None, scripts=None):
+        """buy_hash — тот, которым заявка проходит. None — не проходит ни один."""
+        page = (SIGNED_IN + '<script src="/js/a.js"></script>'
+                + f'<script>var a = "/api?hash={self.GOOD}";</script>')
+        scripts = scripts if scripts is not None else {}
+        sess = self.fake.session()
+        asked: list[str] = []
+
+        def get(url, **kw):
+            if url.endswith("/stars/buy"):
+                return Reply(None, 200, page)
+            return Reply(None, 200, scripts.get(url, ""))
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if q.get("method") == "searchStarsRecipient":
+                if q.get("hash") != self.GOOD:
+                    return Reply({"ok": False, "error": "Bad request"})
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            asked.append(q.get("hash", ""))
+            if buy_hash and q.get("hash") == buy_hash:
+                return Reply({"ok": True, "req_id": "REQ-1"})
+            return Reply({"ok": False, "error": "Access denied"})
+
+        sess.get, sess.post = get, post
+        F._make_session = lambda cookies, proxy="": sess
+        return F._probe_every_hash(COOKIES, "durov", 50), asked
+
+    def test_a_hash_that_fails_the_search_is_still_tried_on_the_purchase(self):
+        _lines, asked = self._try(
+            scripts={"https://fragment.com/js/a.js":
+                     f'{{"hash":"{self.BUY}"}}'})
+        self.assertIn(self.BUY, asked, asked)
+
+    def test_a_working_buy_hash_is_named_outright(self):
+        lines, _asked = self._try(
+            buy_hash=self.BUY,
+            scripts={"https://fragment.com/js/a.js":
+                     f'{{"hash":"{self.BUY}"}}'})
+        self.assertTrue(any("ЗАЯВКА ПРИНЯТА" in x for x in lines), lines)
+        self.assertTrue(any(self.BUY[-6:] in x for x in lines), lines)
+
+    def test_scripts_are_searched_even_when_the_page_has_a_hash(self):
+        """Раньше скрипты читались только при пустой странице — а на
+        странице лежал как раз тот хеш, что для покупки не годится."""
+        _lines, asked = self._try(
+            scripts={"https://fragment.com/js/a.js":
+                     f'{{"hash":"{self.BUY}"}}'})
+        self.assertGreater(len(asked), 1, asked)
+
+    def test_the_recipient_is_taken_with_whichever_hash_gives_it(self):
+        lines, _asked = self._try()
+        self.assertFalse(any("получателя не нашёл" in x for x in lines), lines)
+
+    def test_with_no_recipient_at_all_it_says_so(self):
+        sess = self.fake.session()
+        sess.get = lambda url, **kw: Reply(
+            None, 200, SIGNED_IN + f'<script>var a="/api?hash={self.GOOD}";</script>')
+        sess.post = lambda *a, **kw: Reply({"ok": False, "error": "nope"})
+        F._make_session = lambda cookies, proxy="": sess
+        got = F._probe_every_hash(COOKIES, "durov", 50)
+        self.assertIn("получателя не нашёл ни один", got[0])
+
+
 class ChangingOneFieldOfTheRequestAtATime(Case):
     """Метод существует, на куки не смотрит — остаётся сам запрос.
 
