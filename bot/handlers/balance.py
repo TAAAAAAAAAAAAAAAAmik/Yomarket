@@ -48,26 +48,15 @@ _PENDING_KEYS = ("pending_balance", "pending", "hold", "frozen")
 
 
 def _money(value):
-    """A number out of whatever shape the marketplace wrapped it in.
+    """Число из того, во что маркетплейс завернул сумму. None — не число.
 
-    This API returns money as {"amount": 99.99, "currency": "RUB"} — the ad
-    price arrives that way. Read as a plain value it stringifies to the whole
-    dict, which is neither a balance nor a number.
+    Разбор один на весь бот — в `orderfields.parse_amount`. Здешняя версия
+    убирала пробелы и запятые, но не символ валюты: «1 234,56 ₽»
+    становилось «1234.56₽», float падал молча, и баланс показывался
+    прочерком при том, что панель его прислала.
     """
-    if isinstance(value, dict):
-        for k in ("amount", "value", "sum", "balance"):
-            if k in value and value[k] not in (None, ""):
-                value = value[k]
-                break
-        else:
-            return None
-    if isinstance(value, bool) or value in (None, ""):
-        return None
-    try:
-        return float(str(value).replace(" ", "").replace("\u00a0", "")
-                     .replace(",", "."))
-    except (TypeError, ValueError):
-        return None
+    from orderfields import parse_amount
+    return parse_amount(value)
 
 
 def _deep_find(node, keys, depth: int = 4):

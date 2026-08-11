@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import re
+
 from collections import deque
 
 # Ветки, в которых лежит покупатель. Их не трогаем, когда ищем товар и сумму.
@@ -287,6 +289,53 @@ def is_paid(status) -> bool:
     return key in PAID
 BACK = ("refunded", "returned", "refund", "cancelled", "canceled", "rejected",
         "failed", "expired")
+
+
+def parse_amount(value):
+    """Число из того, во что маркетплейс или панель его завернули. None — не число.
+
+    Баланс не показывался при том, что поле «Баланс» бот находил и на
+    странице магазина, и в строках `balances`. Ломалось на разборе: чистка
+    убирала пробелы и запятые, а «1 234,56 ₽» превращалось в «1234.56₽», на
+    котором `float` падает молча. Символ валюты, слово «руб», узкий пробел —
+    каждый из них хоронил сумму целиком.
+
+    Разделители: если в строке есть и точка, и запятая — десятичным считается
+    последний, остальное разряды. Если только запятая и после неё две цифры —
+    это тоже десятичная запятая, иначе разряды.
+    """
+    if isinstance(value, dict):
+        for key in ("amount", "value", "sum", "balance", "total"):
+            if value.get(key) not in (None, ""):
+                return parse_amount(value[key])
+        return None
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value)
+    # Любые пробелы, включая неразрывный и узкий: панель ставит их в разрядах.
+    text = re.sub(r"[\s   ]", "", text)
+    # Всё, что не цифра, знак и разделитель: ₽, руб., RUB, <span> и прочее.
+    text = re.sub(r"[^0-9.,+-]", "", text)
+    if not re.search(r"\d", text):
+        return None
+
+    if "." in text and "," in text:
+        dec = max(text.rfind("."), text.rfind(","))
+        text = re.sub(r"[.,]", "", text[:dec]) + "." + text[dec + 1:]
+    elif "," in text:
+        tail = text.rsplit(",", 1)[1]
+        text = (text.replace(",", ".") if len(tail) in (1, 2)
+                else text.replace(",", ""))
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
 
 
 def money(value: float | None) -> str:

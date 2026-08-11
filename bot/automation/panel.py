@@ -3794,10 +3794,17 @@ def panel_shop_balance_sync(cookie_string: str,
             raw = _strip_html(f.get("value"))
             if raw in (None, ""):
                 continue
-            try:
-                amount = float(str(raw).replace(" ", "").replace(" ", "")
-                               .replace("₽", "").replace(",", "."))
-            except (TypeError, ValueError):
+            # Разбор один на весь бот. Здешний убирал пробелы, «₽» и запятые
+            # по списку — и спотыкался обо всё остальное: «руб.», узкий
+            # пробел, разряды точкой. Поле «Баланс» находилось, значение не
+            # разбиралось, и продавец видел прочерк.
+            from orderfields import parse_amount
+            amount = parse_amount(raw)
+            if amount is None:
+                # Найденное, но неразобранное — самое обидное молчание:
+                # поле то самое, а сумма потеряна. Называем значение.
+                tried.append(f"{sid}: поле «{f.get('name')}» = «{raw[:40]}» "
+                             "не разобрано как число")
                 continue
             return True, {"amount": amount,
                           "field": str(f.get("name") or f.get("attribute")),
