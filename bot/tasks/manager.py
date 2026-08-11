@@ -2725,8 +2725,12 @@ class TaskManager:
         net = st["revenue"] - spent_today
         body = [
             f"🛒 Заказов за день: <b>{st['orders']}</b>",
+            # `summarize` называет это поле `refunds`. Опечатка «refunded»
+            # роняла отчёт на KeyError, а исключение ловилось строкой выше и
+            # уходило в лог контейнера — то есть итоги дня не приходили
+            # никогда и молча. Пункт B5 чеклиста ровно про этот случай.
             f"✅ Продаж: <b>{st['sales']}</b>"
-            + (f"   ↩️ Возвраты: {st['refunded']}" if st['refunded'] else ""),
+            + (f"   ↩️ Возвраты: {st['refunds']}" if st['refunds'] else ""),
             "",
             f"💵 Выручка: <b>{_money(st['revenue'])} ₽</b>",
         ]
@@ -3220,6 +3224,24 @@ class TaskManager:
                         settings["daily_report"]["last_report_day"] = today_str
                     except Exception as e:
                         logger.warning("Daily report error for user %s: %s", user_id, e)
+                        # Отчёт, который не пришёл, продавцу невидим: он
+                        # решит, что за день не было продаж. Так и жила
+                        # опечатка `refunded` — сводка падала на KeyError,
+                        # исключение уходило в лог контейнера, и «итоги дня»
+                        # не приходили молча. Раз в день говорим об этом.
+                        if settings["daily_report"].get("last_fail_day") != today_str:
+                            settings["daily_report"]["last_fail_day"] = today_str
+                            try:
+                                import html as _h
+                                await self._notify(
+                                    user_id,
+                                    "⚠️ <b>Итоги дня не собрались</b>\n\n"
+                                    f"Причина: <code>{_h.escape(str(e)[:150])}"
+                                    "</code>\n\n"
+                                    "Цифры за день целы — они в разделе "
+                                    "«Статистика». Сломалась только сводка.")
+                            except Exception:
+                                pass
 
             # --- Reviews monitor ---
             rm = settings.get("reviews_monitor", {})
