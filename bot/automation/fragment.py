@@ -100,10 +100,12 @@ def _query_forms(username: str) -> list[str]:
     bare = (username or "").strip().lstrip("@")
     if not bare:
         return []
-    forms = [f"@{bare}", bare]
+    # Порядок ровно как в документации: @Username, @username, Username,
+    # username. У нас он был свой — сначала оба написания «как ввели»,
+    # потом оба в нижнем регистре. Разница видна только на нике со
+    # заглавными, но сверяться так сверяться.
     low = bare.lower()
-    if low != bare:
-        forms += [f"@{low}", low]
+    forms = [f"@{bare}", f"@{low}", bare, low]
     out: list[str] = []
     for f in forms:
         if f not in out:
@@ -123,7 +125,21 @@ def _wallet_from_mnemonic(mnemonic: str, version: str):
 
 
 def _build_signed_boc(wallet, to_addr: str, amount_nano, payload_b64: str, seqno: int) -> str:
-    """Build and sign a transfer carrying Fragment's payload cell."""
+    """Перевод с комментарием — как в `build_boc_with_comment` образца.
+
+    Образец не передаёт ячейку Fragment как есть: он раскодирует её в текст
+    и собирает комментарий заново — 32 нулевых бита, потом байты текста.
+    Мы передавали ячейку без изменений. Это наш вариант, а не описанный, и
+    поэтому он убран.
+
+    Замечание, которое стоит помнить, если шаг когда-нибудь не сойдётся:
+    `get_top_upped_array()` отдаёт вместе с текстом и четыре нулевых байта
+    заголовка, а `.strip()` их не снимает — это не пробелы. То есть
+    комментарий получается с лишним нулевым префиксом. У автора образца
+    покупка при этом доходит до конца, и вероятная причина в том, что
+    Fragment сверяет платёж по самому BOC: `confirmReq` шлёт ему BOC
+    целиком. Проверить это можно будет только на удавшейся покупке.
+    """
     from tonsdk.utils import Address, to_nano
     from tonsdk.boc import Cell
 
@@ -132,7 +148,12 @@ def _build_signed_boc(wallet, to_addr: str, amount_nano, payload_b64: str, seqno
     payload_cell = None
     if payload_b64:
         try:
-            payload_cell = Cell.one_from_boc(base64.b64decode(_fix_base64(payload_b64)))
+            src = Cell.one_from_boc(base64.b64decode(_fix_base64(payload_b64)))
+            text = src.bits.get_top_upped_array().decode("utf-8",
+                                                         errors="ignore").strip()
+            payload_cell = Cell()
+            payload_cell.bits.write_uint(0, 32)
+            payload_cell.bits.write_bytes(text.encode("utf-8"))
         except Exception as e:
             logger.warning("payload decode failed, sending without payload: %s", e)
             payload_cell = None
@@ -222,14 +243,22 @@ def buy_stars_sync(
     wait_confirm: bool = True,
     report: dict | None = None,
 ) -> tuple[bool, str]:
-    """
-    Buy `quantity` Telegram Stars for `username`. Returns (ok, human_message).
-    Blocking — run in an executor. Secrets are never logged.
+    """Покупка звёзд — по документации рабочего клиента, шаг в шаг.
 
-    `report` собирает то, что иначе теряется в тексте: сколько TON реально
-    ушло. Без этого «прибыль» считалась бы по курсу из головы, а не по
-    сумме, которую подписал кошелёк.
+    Собрано заново и намеренно линейно: восемь шагов раздела 9 в том же
+    порядке и с теми же полями. Прежняя версия обросла нашими домыслами —
+    перебор страниц с хешем, повтор с освежённым хешем, оплата всех
+    сообщений подряд, своя сборка комментария, — и каждый такой домысел
+    приходилось потом опровергать отдельным прогоном. Здесь их нет.
+
+    Своё оставлено только там, где документ молчит, а бот обязан не врать:
+    ответ `confirmReq` проверяется, а факт списания записывается в `report`,
+    чтобы менеджер не повторил покупку, за которую уже заплачено.
+
+    Блокирующая — звать через executor. Секреты не логируются.
     """
+    import json
+
     username = (username or "").strip().lstrip("@")
     if not username:
         return False, "Пустой username"
@@ -241,180 +270,162 @@ def buy_stars_sync(
         quantity = int(quantity)
     except (TypeError, ValueError):
         return False, "Некорректное количество звёзд"
-    if quantity < 50:
-        return False, "Fragment принимает заказы от 50 звёзд"
 
+    # 1. Сессия: куки и единственный заголовок User-Agent.
     session = _make_session(cookies)
-    state = {"hash": api_hash or "", "refreshed": False}
-    if not state["hash"]:
-        # Хеш берётся со страницы покупки — и берётся ЭТОЙ ЖЕ сессией, как в
-        # документации: там одна `requests.Session()` и на страницу, и на
-        # API. У нас страницу читала отдельная сессия со своим User-Agent, а
-        # куки, которые Fragment ставит на этой странице, оставались в ней и
-        # терялись. Хеш при этом уходил в запрос от другой сессии — а хеш
-        # Fragment выдаёт именно сессии.
-        state["hash"] = fetch_api_hash_sync(cookies, session=session)
-        if not state["hash"]:
-            return False, ("Не удалось прочитать hash со страницы "
-                           "fragment.com/stars/buy — проверьте куки Fragment")
 
-    def _raw(method: str, extra: dict) -> dict:
+    def post(method: str, args: dict) -> dict:
+        """Один запрос: всё в строке запроса, как в разделах 3–8."""
         try:
-            r = _api_call(session, state["hash"], method, extra)
+            r = session.post(FRAGMENT_API_URL,
+                             params={"method": method, "hash": h, **args},
+                             timeout=30)
             r.raise_for_status()
-            return r.json()
+            data = r.json()
         except requests.exceptions.RequestException as e:
-            return {"ok": False, "error": f"сеть: {str(e)[:80]}"}
+            return {"error": f"сеть: {str(e)[:80]}"}
         except ValueError:
-            return {"ok": False, "error": "не JSON от Fragment"}
+            return {"error": "не JSON от Fragment"}
+        return data if isinstance(data, dict) else {"error": str(data)[:80]}
 
-    def _post(method: str, extra: dict) -> dict:
-        """One API call, retried once with a fresh hash if the old one is stale.
+    # 2. Хеш — со страницы покупки, той же сессией. Читается всегда, как в
+    # документации: хеш Fragment выдаёт сессии, и сохранённый в настройках
+    # к нашей сессии отношения не имеет. Он остаётся только запасным — на
+    # случай, если страница почему-то без хеша.
+    h = ""
+    try:
+        page = session.get("https://fragment.com/stars/buy", timeout=30)
+        body = page.text or ""
+    except Exception as e:
+        return False, f"Страница fragment.com/stars/buy: {str(e)[:80]}"
+    for pattern in _HASH_PATTERNS:
+        m = re.search(pattern, body)
+        if m:
+            h = m.group(1)
+            break
+    if not h:
+        h = (api_hash or "").strip()
+    if not h:
+        return False, ("Не удалось прочитать hash со страницы "
+                       "fragment.com/stars/buy — проверьте куки Fragment")
 
-        Fragment issues a hash per session and answers a foreign one with «Bad
-        request». Left unhandled, that turned every delivery into a failure the
-        seller could do nothing about — the hash is not something they were
-        ever asked for.
-        """
-        out = _raw(method, extra)
-        said = str(out.get("error") or "").lower()
-        if "bad request" in said and not state["refreshed"]:
-            state["refreshed"] = True
-            # Той же сессией — иначе освежённый хеш опять окажется чужим.
-            fresh = fetch_api_hash_sync(cookies, session=session)
-            if fresh and fresh != state["hash"]:
-                state["hash"] = fresh
-                logger.info("Fragment: refreshed api hash mid-flight")
-                return _raw(method, extra)
-        return out
-
-    # 1. find recipient
-    # Только `query` — так в документации. У нас сюда добавлялся ещё
-    # `quantity` по наблюдению за формой на сайте; документ его не шлёт.
-    # Написаний четыре, как в документации: Fragment отвечает не на любое.
+    # 3. Получатель. Написания перебираются, как в разделе 3.
     search: dict = {}
     recipient = ""
     for form in _query_forms(username):
-        search = _post("searchStarsRecipient", {"query": form})
+        search = post("searchStarsRecipient", {"query": form})
         recipient = _extract_recipient(search)
         if recipient:
             break
     if not recipient:
-        err = search.get("error") or search.get("error_message") or "получатель не найден"
+        err = search.get("error") or search.get("error_message") or "не найден"
         return False, f"@{username}: {err}. Проверьте username и cookies."
 
-    # 2. init request
-    init = _post("initBuyStarsRequest", {"recipient": recipient,
-                                         "quantity": quantity})
-    req_id = init.get("req_id") or init.get("id")
+    # 4. Заявка → req_id.
+    init = post("initBuyStarsRequest", {"recipient": recipient,
+                                        "quantity": quantity})
+    req_id = init.get("req_id")
     if not req_id:
         err = str(init.get("error") or init.get("error_message")
                   or str(init)[:120])
         if "access denied" in err.lower():
-            # Поиск получателя проходит и вовсе без stel_token — проверено
-            # вычитанием: он ничего не доказывает про права. Покупку же
-            # Fragment не разрешил ни разу, и единственная кука, которая в
-            # опыте не меняла ничего, — stel_ton_token. Поэтому советуем
-            # переподключить кошелёк, но фактом это не называем: заявка не
-            # проходила ещё ни разу, и сравнить «до и после» не с чем.
             return False, (
                 "Fragment: «Access denied» — заявку на покупку он не "
                 "принимает. Поиск получателя при этом проходит, но он "
                 "проходит и без входа, так что правами это не считается.\n\n"
                 "Что уже проверено и причиной не является: форма запроса, "
-                "api-hash, свежесть кук и подключённый TON-кошелёк — с "
-                "живой сессией отказ тот же. Причина пока не найдена; "
-                "покажите вывод /stars_probe, там видно, на чём именно "
-                "Fragment останавливается.")
+                "api-hash, свежесть кук, подключённый TON-кошелёк и то, "
+                "себе или чужому. Причина пока не найдена; покажите вывод "
+                "/stars_probe.")
         return False, f"initBuyStarsRequest не дал req_id: {err}"
 
-    # 3. wallet
+    # 5. Кошелёк: сырой адрес для `account`, обычный — для seqno.
     try:
         wallet = _wallet_from_mnemonic(mnemonic, wallet_version)
-        raw_addr = wallet.address.to_string(False, False, False)      # 0:hex
-        bounce_addr = wallet.address.to_string(True, True, True)      # EQ...
+        raw_addr = wallet.address.to_string(False)
+        bounce_addr = wallet.address.to_string(True, True, True)
     except Exception as e:
         return False, f"Ошибка кошелька (проверьте seed-фразу): {str(e)[:80]}"
 
-    # 4. transaction link
-    link = _post("getBuyStarsLink", {
-        "id": req_id, "transaction": 1, "show_sender": 1,
-        "account": _json_account(raw_addr),
-        "device": _json_device(),
+    account = json.dumps({"address": raw_addr, "chain": MAINNET_CHAIN})
+    device = json.dumps({
+        "platform": "browser",
+        "appName": "telegram-wallet",
+        "appVersion": "1",
+        "maxProtocolVersion": 2,
+        "features": ["SendTransaction",
+                     {"name": "SendTransaction", "maxMessages": 4}],
     })
-    messages = _extract_messages(link)
+
+    # 6. Данные TON-транзакции.
+    link = post("getBuyStarsLink", {"id": req_id, "transaction": 1,
+                                    "show_sender": 1, "account": account,
+                                    "device": device})
+    tx = link.get("transaction") or {}
+    messages = tx.get("messages") or []
     if not messages:
         err = link.get("error") or link.get("error_message") or str(link)[:150]
         return False, f"getBuyStarsLink не дал транзакцию: {err}"
 
-    # 5. sign + send each message, confirm
+    # Раздел 6 документа: берётся первое сообщение. Мы платили по всем
+    # подряд — это была наша предусмотрительность, и на лишнем сообщении
+    # она списала бы деньги второй раз.
+    msg = messages[0]
+    try:
+        destination = msg["address"]
+        amount_nano = int(msg["amount"])
+        payload = msg.get("payload", "")
+    except (KeyError, TypeError, ValueError):
+        return False, f"Fragment вернул сообщение без адреса или суммы: {str(msg)[:100]}"
+
+    # 7. Подпись и отправка.
     try:
         seqno = _get_seqno(bounce_addr)
     except Exception as e:
         return False, f"Не удалось получить seqno кошелька: {str(e)[:80]}"
+    try:
+        boc = _build_signed_boc(wallet, destination, amount_nano, payload, seqno)
+    except Exception as e:
+        return False, f"Ошибка сборки транзакции: {str(e)[:100]}"
+    if not _send_boc(boc):
+        return False, "TonCenter отклонил транзакцию (проверьте баланс кошелька)"
 
-    valid_msgs = [m for m in messages
-                  if m.get("address") and m.get("amount") is not None]
-    if not valid_msgs:
-        return False, "Fragment не вернул ни одного платёжного сообщения"
+    # Деньги ушли. Дальше любой провал означает «заплатили и не получили»,
+    # и повторять покупку нельзя — заплатим дважды. Документ об этом молчит,
+    # но молчать об этом продавцу нельзя.
+    if report is not None:
+        report["sent_onchain"] = True
+        report["nano"] = amount_nano
+        report["ton"] = amount_nano / 1_000_000_000
+        if len(messages) > 1:
+            report["extra_messages"] = len(messages) - 1
 
-    # Each external message needs the previous one confirmed on-chain before the
-    # next seqno is accepted, so send sequentially and wait for seqno to advance
-    # between messages (a Stars purchase is normally a single message).
-    sent = 0
-    for i, msg in enumerate(valid_msgs):
-        try:
-            boc = _build_signed_boc(
-                wallet, msg["address"], msg["amount"], msg.get("payload", ""), seqno)
-        except Exception as e:
-            if sent:
-                break
-            return False, f"Ошибка сборки транзакции: {str(e)[:100]}"
-        if not _send_boc(boc):
-            if sent:
-                break
-            return False, "TonCenter отклонил транзакцию (проверьте баланс кошелька)"
-        # С этой секунды деньги ушли из кошелька. Дальше провал означает не
-        # «ничего не вышло», а «заплатили и не получили» — и повторять
-        # покупку нельзя: заплатим дважды.
-        if report is not None:
-            report["sent_onchain"] = True
-            try:
-                report["nano"] = int(report.get("nano", 0)) + int(msg["amount"])
-                report["ton"] = report["nano"] / 1_000_000_000
-            except (TypeError, ValueError):
-                pass
-        confirm = _post("confirmReq", {"id": req_id, "boc": boc,
-                                       "account": _json_account(raw_addr)})
-        # Ответ подтверждения раньше выбрасывался. Именно им Fragment
-        # засчитывает оплату: без него TON уходит, а звёзды не начисляются —
-        # и бот всё равно рапортовал «✅ отправлены».
-        cerr = confirm.get("error") or confirm.get("error_message")
-        if cerr:
-            if report is not None:
-                report["confirm_error"] = str(cerr)[:120]
-            return False, (
-                f"⚠️ TON ушёл ({report.get('ton', 0) if report else 0:.4f}), "
-                f"но Fragment не засчитал оплату: {str(cerr)[:80]}. "
-                "Повтор не делаю — заплатили бы дважды. Проверьте начисление "
-                "на fragment.com и выдайте вручную, если звёзд нет.")
-        sent += 1
-        # Wait for this tx to land (seqno advances) before sending the next
-        if wait_confirm or i < len(valid_msgs) - 1:
-            confirmed = _wait_seqno_advance(bounce_addr, seqno)
-            if confirmed:
-                seqno += 1
-            elif i < len(valid_msgs) - 1:
-                # can't safely send the next message without confirmation
-                return True, (f"⏳ {quantity}⭐ для @{username}: часть транзакций "
-                              "отправлена, подтверждение в сети ещё идёт")
-
-    if not sent:
-        return False, "Не удалось отправить ни одной транзакции"
+    # Документ ждёт seqno до confirmReq — так и делаем.
     if wait_confirm:
-        return True, f"✅ {quantity}⭐ отправлены на @{username} (подтверждено в TON)"
-    return True, f"✅ {quantity}⭐ отправлены на @{username}"
+        _wait_seqno_advance(bounce_addr, seqno)
 
+    # 8. Подтверждение. Его ответ и решает, засчитана ли оплата.
+    confirm = post("confirmReq", {"id": req_id, "boc": boc,
+                                  "account": account})
+    cerr = confirm.get("error") or confirm.get("error_message")
+    if cerr:
+        if report is not None:
+            report["confirm_error"] = str(cerr)[:120]
+        return False, (
+            f"⚠️ TON ушёл ({amount_nano / 1_000_000_000:.4f}), но Fragment "
+            f"не засчитал оплату: {str(cerr)[:80]}. Повтор не делаю — "
+            "заплатили бы дважды. Проверьте начисление на fragment.com и "
+            "выдайте вручную, если звёзд нет.")
+
+    tail = ""
+    if len(messages) > 1:
+        tail = (f"\n⚠️ Fragment попросил ещё {len(messages) - 1} перевод(а) — "
+                "оплачен только первый, как в документации. Проверьте, "
+                "начислились ли звёзды.")
+    if wait_confirm:
+        return True, (f"✅ {quantity}⭐ отправлены на @{username} "
+                      f"(подтверждено в TON){tail}")
+    return True, f"✅ {quantity}⭐ отправлены на @{username}{tail}"
 
 def _wait_seqno_advance(address: str, from_seqno: int) -> bool:
     """Poll until wallet seqno exceeds from_seqno. Returns True if advanced."""
@@ -427,35 +438,6 @@ def _wait_seqno_advance(address: str, from_seqno: int) -> bool:
             pass
         time.sleep(SEQNO_POLL_SECS)
     return False
-
-
-def _json_account(raw_addr: str) -> str:
-    import json
-    return json.dumps({"address": raw_addr, "chain": MAINNET_CHAIN})
-
-
-def _json_device() -> str:
-    import json
-    return json.dumps({
-        "platform": "browser",
-        "appName": "telegram-wallet",
-        "appVersion": "1",
-        "maxProtocolVersion": 2,
-        "features": ["SendTransaction",
-                     {"name": "SendTransaction", "maxMessages": 4}],
-    })
-
-
-def _extract_messages(link: dict) -> list[dict]:
-    """Pull transaction messages out of a getBuyStarsLink response."""
-    if not isinstance(link, dict):
-        return []
-    tx = link.get("transaction")
-    if isinstance(tx, dict) and isinstance(tx.get("messages"), list):
-        return [m for m in tx["messages"] if isinstance(m, dict)]
-    if isinstance(link.get("messages"), list):
-        return [m for m in link["messages"] if isinstance(m, dict)]
-    return []
 
 
 def _page_session(cookies: dict) -> requests.Session:

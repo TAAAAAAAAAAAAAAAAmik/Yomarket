@@ -208,7 +208,7 @@ class EveryWritingOfTheNickIsTried(Case):
 
     def test_the_forms_follow_the_document(self):
         self.assertEqual(F._query_forms("Durov"),
-                         ["@Durov", "Durov", "@durov", "durov"])
+                         ["@Durov", "@durov", "Durov", "durov"])
 
     def test_a_lowercase_nick_needs_only_two(self):
         self.assertEqual(F._query_forms("durov"), ["@durov", "durov"])
@@ -465,25 +465,38 @@ class WhenItCannotBeFound(Case):
         self.assertIn("cookies", str(res))
 
 
-class BuyingWithAStaleHash(Case):
-    def test_the_purchase_recovers_instead_of_failing(self):
-        """A delivery must not die on a hash the seller was never asked for."""
+class TheHashAlwaysComesFromThePage(Case):
+    """Раньше сохранённый хеш брался как есть, а на «Bad request» покупка
+    один раз перечитывала страницу и повторяла запрос. Повтор был наш, не
+    описанный, и держался на догадке, что отказ означает именно устаревший
+    хеш. Хеш Fragment выдаёт сессии — значит его и надо читать каждый раз,
+    а сохранённый годится только на случай, если на странице его нет.
+    """
+
+    def test_the_page_is_read_even_when_a_hash_is_stored(self):
+        F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
+                         api_hash="stale-one")
+        self.assertEqual(self.fake.gets,
+                         ["https://fragment.com/stars/buy"], self.fake.gets)
+
+    def test_the_page_hash_wins_over_the_stored_one(self):
         F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
                          api_hash="stale-one")
         used = [p.get("hash") for p in self.fake.posts]
-        self.assertIn(REAL_HASH, used, f"never retried with a fresh hash: {used}")
+        self.assertEqual(set(used), {REAL_HASH}, used)
 
-    def test_it_refreshes_once_and_not_on_every_call(self):
-        self.fake.good_hash = "never-matches"
+    def test_the_stored_one_is_used_when_the_page_has_none(self):
+        """Иначе выдача встанет там, где ещё можно попробовать."""
+        self.fake.page = "<html>" + SIGNED_IN + "пусто</html>"
+        self.fake.good_hash = "stale-one"
         F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
                          api_hash="stale-one")
-        self.assertEqual(len(self.fake.gets), 1,
-                         "the page must not be re-read for every method")
+        used = [p.get("hash") for p in self.fake.posts]
+        self.assertEqual(set(used), {"stale-one"}, used)
 
-    def test_a_working_hash_costs_no_extra_requests(self):
-        F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
-                         api_hash=REAL_HASH)
-        self.assertEqual(self.fake.gets, [])
+    def test_the_page_is_read_once_not_per_method(self):
+        F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100)
+        self.assertEqual(len(self.fake.gets), 1, self.fake.gets)
 
 
 class WhenTheSessionCannotBuy(Case):
@@ -1163,6 +1176,81 @@ class AskingWhatOtherMethodsAnswer(Case):
         self.assertTrue(any("не JSON" in x for x in lines), lines)
 
 
+class OnlyTheFirstMessageIsPaid(Case):
+    """Документация берёт ровно `messages[0]`.
+
+    Мы платили по всем подряд, ожидая seqno между переводами. Это была наша
+    предусмотрительность, а не описанное поведение: на лишнем сообщении она
+    списала бы деньги продавца второй раз. Молчать о лишних сообщениях тоже
+    нельзя — решать, доплачивать ли, не нам.
+    """
+
+    def _buy(self, messages):
+        outer = self.fake
+        sess = outer.session()
+        sent: list[tuple] = []
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if q.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            if q.get("method") == "initBuyStarsRequest":
+                return Reply({"ok": True, "req_id": "REQ-1"})
+            if q.get("method") == "getBuyStarsLink":
+                return Reply({"transaction": {"messages": messages}})
+            return Reply({"ok": True})
+
+        sess.post = post
+        saved = {n: getattr(F, n) for n in
+                 ("_build_signed_boc", "_send_boc", "_get_seqno",
+                  "_wait_seqno_advance", "_wallet_from_mnemonic",
+                  "_make_session")}
+        addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
+        F._wallet_from_mnemonic = lambda m, v: type("W", (), {"address": addr})()
+        F._make_session = lambda cookies: sess
+        F._build_signed_boc = lambda w, to, amount, p, s: sent.append(
+            (to, amount)) or "BOC"
+        F._send_boc = lambda boc: True
+        F._get_seqno = lambda a: 5
+        F._wait_seqno_advance = lambda a, n: True
+        report: dict = {}
+        try:
+            ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
+                                       100, api_hash=REAL_HASH, report=report)
+        finally:
+            for name, value in saved.items():
+                setattr(F, name, value)
+        return ok, msg, report, sent
+
+    TWO = [{"address": "EQ" + "A" * 46, "amount": "1500000000", "payload": ""},
+           {"address": "EQ" + "B" * 46, "amount": "900000000", "payload": ""}]
+
+    def test_a_single_message_is_paid_as_before(self):
+        ok, _msg, report, sent = self._buy(self.TWO[:1])
+        self.assertTrue(ok)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(report["nano"], 1500000000)
+
+    def test_a_second_message_is_not_paid(self):
+        _ok, _msg, _report, sent = self._buy(self.TWO)
+        self.assertEqual(len(sent), 1, sent)
+        self.assertEqual(sent[0][1], 1500000000)
+
+    def test_the_seller_is_told_there_were_more(self):
+        _ok, msg, _report, _sent = self._buy(self.TWO)
+        self.assertIn("ещё 1", msg)
+        self.assertIn("оплачен только первый", msg)
+
+    def test_a_single_message_says_nothing_extra(self):
+        _ok, msg, _report, _sent = self._buy(self.TWO[:1])
+        self.assertNotIn("оплачен только первый", msg)
+
+    def test_the_spend_counts_only_what_was_paid(self):
+        """Иначе «Прибыль» посчитает деньги, которые не уходили."""
+        _ok, _msg, report, _sent = self._buy(self.TWO)
+        self.assertEqual(report["nano"], 1500000000)
+
+
 class OneSessionForEverything(Case):
     """Последнее расхождение с документацией — и самое незаметное.
 
@@ -1173,28 +1261,35 @@ class OneSessionForEverything(Case):
     уходил в запрос от первой. Хеш Fragment выдаёт сессии.
     """
 
-    def test_the_purchase_reads_the_hash_with_its_own_session(self):
+    def test_the_purchase_reads_the_page_with_the_session_that_buys(self):
         """Иначе хеш принадлежит одной сессии, а запрос идёт от другой."""
-        seen: list[object] = []
-        real = F.collect_api_hashes_sync
+        outer = self.fake
+        sess = outer.session()
+        used: list[str] = []
+        real_get, real_post = sess.get, sess.post
 
-        def spy(cookies, report=None, facts=None, session=None):
-            seen.append(session)
-            return real(cookies, report, facts, session)
+        def get(url, **kw):
+            used.append("get")
+            return real_get(url, **kw)
 
-        F.collect_api_hashes_sync = spy
-        try:
-            F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100)
-        finally:
-            F.collect_api_hashes_sync = real
-        self.assertTrue(seen, "хеш не читался вовсе")
-        self.assertIsNotNone(seen[0], "страницу читает не та сессия")
+        def post(url, **kw):
+            used.append("post")
+            return real_post(url, **kw)
 
-    def test_a_stale_hash_is_refreshed_with_that_session_too(self):
-        """Иначе освежённый хеш опять окажется чужим."""
+        sess.get, sess.post = get, post
+        F._make_session = lambda cookies: sess
+        # Отдельную «страничную» сессию ломаем: если покупка полезет за
+        # хешем через неё, тест это увидит.
+        F._page_session = lambda cookies: None
+        F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100)
+        self.assertEqual(used[0], "get", used)
+        self.assertIn("post", used)
+
+    def test_no_second_session_is_created_for_the_page(self):
         import inspect
         src = inspect.getsource(F.buy_stars_sync)
-        self.assertNotIn("fetch_api_hash_sync(cookies)\n", src)
+        self.assertNotIn("_page_session", src)
+        self.assertNotIn("fetch_api_hash_sync", src)
 
     def test_the_page_may_be_read_with_any_session_when_asked(self):
         """Диагностике нужны обе: и своя сессия, и общая."""
@@ -1321,7 +1416,7 @@ class CheckingOneNickOnDemand(Case):
 
     def test_every_writing_is_tried_before_giving_up(self):
         _lines, asked = self._check(found=False, nick="Durov")
-        self.assertEqual(asked, ["@Durov", "Durov", "@durov", "durov"], asked)
+        self.assertEqual(asked, ["@Durov", "@durov", "Durov", "durov"], asked)
 
     def test_a_missing_nick_carries_fragments_own_words(self):
         got = "\n".join(self._check(found=False)[0])
