@@ -200,5 +200,27 @@ class TheScreenLetsHimPickAZone(unittest.TestCase):
         self.assertIn(lt.now(store).strftime("%H:%M"), cb.message.texts[-1])
 
 
+class TheClockIsVisibleWithoutHuntingForIt(unittest.TestCase):
+    """От часового пояса зависят час итогов дня, окно ночного режима и
+    граница суток в статистике, а увидеть его можно было только внутри
+    «Настроек». Вопрос «какое время в боте» не должен требовать хождения
+    по экранам: /version отвечает на все такие вопросы разом.
+    """
+
+    def test_version_shows_the_sellers_own_clock(self):
+        import inspect
+        from handlers import start as S
+        src = inspect.getsource(S.cmd_version)
+        self.assertIn("Ваше время", src)
+        self.assertIn("offset_label", src)
+
+    def test_the_line_actually_reaches_the_message(self):
+        """Строку легко собрать и забыть подставить."""
+        import inspect
+        from handlers import start as S
+        src = inspect.getsource(S.cmd_version)
+        self.assertIn("{time_line}", src)
+
+
 if __name__ == "__main__":
     unittest.main()

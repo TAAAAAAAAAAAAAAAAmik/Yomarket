@@ -12,7 +12,7 @@ from storage import delete_token, get_token, save_token, get_settings, save_sett
 router = Router()
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-08-10-daily-report"
+BOT_VERSION = "2026-08-11-clock-in-version"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -123,6 +123,14 @@ async def cmd_version(message: Message) -> None:
     panel = storage.get_panel_creds(uid)
     panel_line = f"🌐 Куки панели: {'✅ есть' if panel and panel.get('cookies') else '❌ нет'}"
 
+    # Время видно только внутри «Настроек», а зависит от него многое: час
+    # итогов дня, окно ночного режима, граница суток в статистике. Вопрос
+    # «какое время в боте» не должен требовать хождения по экранам.
+    import localtime as _lt
+    _s = storage.get_settings(uid)
+    time_line = (f"🕐 Ваше время: <b>{_lt.now(_s).strftime('%d.%m %H:%M')}</b>"
+                 f" · {_lt.offset_label(_s)}")
+
     uptime = int((_time.time() - STARTED_AT) / 60)
     await message.answer(
         f"🤖 <b>Версия:</b> <code>{BOT_VERSION}</code>\n"
@@ -133,7 +141,7 @@ async def cmd_version(message: Message) -> None:
         f"приходят по столько же раз.</i>\n\n"
         + "\n".join(storage_lines)
         + f"\n{redis_line}\n\n"
-        + f"{token_line}\n{panel_line}"
+        + f"{token_line}\n{panel_line}\n{time_line}"
     )
 
 
