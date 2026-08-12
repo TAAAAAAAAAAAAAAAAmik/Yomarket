@@ -342,6 +342,46 @@ class TheSectionComesFromTheNeighbours(unittest.TestCase):
         rows = self.rows(("Аккаунт Steam", 999))
         self.assertEqual(M.section_of_neighbours(rows, "50 звезд"), (None, 0))
 
+    def test_a_yo_in_the_neighbours_title_is_the_same_word(self):
+        """«50 звезд» у нас, «50 звёзд» у соседей — из-за этой буквы раздел
+        набрал ноль голосов при ста двадцати четырёх подходящих строках."""
+        rows = self.rows(("50 звёзд", 512), ("50 звёзд", 512))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
+
+    def test_a_word_stem_is_enough_when_endings_differ(self):
+        rows = self.rows(("50 звёздочек Telegram", 512),
+                         ("50 звёздочек Telegram", 512))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
+
+    def test_a_different_number_is_a_different_product(self):
+        """«500 звезд» стоит, может быть, там же — но это не наш товар, и
+        голосовать за раздел он не должен."""
+        rows = self.rows(("500 звёздочек", 777), ("50 звёздочек", 512))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
+
+
+class TheWholeFeedIsTheLastResort(unittest.TestCase):
+    """Искали по словам своего названия — значит выдача целиком про наш
+    товар, даже если ни одна строка не опозналась дословно. Но брать её
+    раздел можно, только если он там и правда главный: иначе это не вывод,
+    а совпадение."""
+
+    def rows(self, *pairs):
+        return [{"id": i, "title": t, "category_id": c, "shop": {"name": "x"}}
+                for i, (t, c) in enumerate(pairs)]
+
+    def test_a_clear_majority_is_taken(self):
+        rows = self.rows(("что-то", 512), ("иное", 512), ("третье", 512))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
+
+    def test_a_scattered_feed_gives_nothing(self):
+        rows = self.rows(("а", 1), ("б", 2), ("в", 3), ("г", 4))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд"), (None, 0))
+
+    def test_two_votes_are_not_enough(self):
+        rows = self.rows(("а", 512), ("б", 512))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд"), (None, 0))
+
     def test_rows_without_a_section_do_not_vote(self):
         rows = self.rows(("50 звезд", None), ("50 звезд", 512))
         self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")

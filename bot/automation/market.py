@@ -598,8 +598,68 @@ def search_own_listing(market_id: str | int, title: str = "",
     if got:
         facts["by"] = "магазин и название"
         return got, facts
+    # Почему соседи не проголосовали — вопрос, который встанет следующим.
+    # Причин ровно две, и они требуют разного: подходящих строк не нашлось
+    # совсем, или нашлись, но раздела в них нет. Различать это по нулю
+    # голосов невозможно.
+    same, how = neighbours_of(seen, title)
+    facts["neighbours"] = len(same)
+    facts["matched_by"] = how
+    facts["with_section"] = len(section_votes(same))
+    facts["row_keys"] = sorted(seen[0].keys())[:14] if seen else []
     facts["section"], facts["section_votes"] = section_of_neighbours(seen, title)
     return got, facts
+
+
+def _title_has(row_title: str, words: list) -> bool:
+    """Есть ли в чужом названии все наши слова.
+
+    Числа сверяются целиком, слова — подстрокой. Иначе «500 звёздочек»
+    содержит «50» куском и притворяется нашим товаром, а «50 звезд» и
+    «500 звезд» — разные лоты в одном разделе.
+    """
+    low = _norm(row_title)
+    nums = set(re.findall(r"\d+", str(row_title or "")))
+    for w in words:
+        if w.isdigit():
+            if w not in nums:
+                return False
+        elif w not in low:
+            return False
+    return True
+
+
+def neighbours_of(rows: list, title: str) -> tuple[list, str]:
+    """Строки того же товара у других магазинов. (строки, чем совпало)
+
+    Три сита подряд, от строгого к широкому: названия у соседей украшены
+    по-своему, и требовать точного совпадения — значит не найти никого.
+    """
+    want = _norm(title)
+    if not want or not rows:
+        return [], ""
+    same = [r for r in rows if _norm(_row_title(r)) == want]
+    if same:
+        return same, "точное название"
+    words = [_norm(w) for w in search_words(title) if _norm(w)]
+    if words:
+        same = [r for r in rows if _title_has(_row_title(r), words)]
+        if same:
+            return same, "все слова названия"
+        # Корни слов: «звезд» против «звёздочек», «аккаунт» против
+        # «аккаунты». Число при этом обязано совпасть — оно и отличает
+        # «50 звезд» от «500 звезд».
+        nums = {w for w in words if w.isdigit()}
+        stems = [w[:4] for w in words if not w.isdigit() and len(w) >= 4]
+        if nums and stems:
+            # Число целиком, а не куском: «500 звёздочек» содержит «50»
+            # подстрокой и притворилось бы нашим товаром.
+            same = [r for r in rows
+                    if nums <= set(re.findall(r"\d+", _row_title(r)))
+                    and any(st in _norm(_row_title(r)) for st in stems)]
+            if same:
+                return same, "число и корень слова"
+    return [], ""
 
 
 def section_of_neighbours(rows: list, title: str) -> tuple[object, int]:
@@ -616,24 +676,34 @@ def section_of_neighbours(rows: list, title: str) -> tuple[object, int]:
     Догадкой это не остаётся: адрес потом открывается и в нём ищется наша
     строка. Не нашлась — бот так и скажет, а не запишет нас в чужой раздел.
     """
-    want = _norm(title)
-    if not want or not rows:
+    same, _how = neighbours_of(rows, title)
+    votes = section_votes(same)
+    if votes:
+        best = max(votes.items(), key=lambda kv: kv[1])
+        return best[0], best[1]
+
+    # Ни одна строка не опозналась как тот же товар — но искали-то мы по
+    # словам своего названия, так что выдача целиком про него. Берём самый
+    # частый раздел по всей выдаче, но только если он там и правда главный:
+    # три голоса и больше трети всех размеченных строк. Иначе это не вывод,
+    # а совпадение, и лучше честно ничего.
+    wide = section_votes(rows)
+    if not wide:
         return None, 0
-    same = [r for r in rows if _norm(_row_title(r)) == want]
-    if not same:
-        # Точного совпадения нет — берём строки, где есть все наши слова.
-        words = [_norm(w) for w in search_words(title)]
-        same = [r for r in rows
-                if words and all(w in _norm(_row_title(r)) for w in words)]
+    best = max(wide.items(), key=lambda kv: kv[1])
+    if best[1] >= 3 and best[1] * 3 >= sum(wide.values()):
+        return best[0], best[1]
+    return None, 0
+
+
+def section_votes(rows: list) -> dict:
+    """{номер раздела: сколько строк за него} — только строки с разделом."""
     votes: dict = {}
-    for r in same:
+    for r in rows:
         cid = _category_id_of(r)
         if cid not in (None, ""):
             votes[str(cid)] = votes.get(str(cid), 0) + 1
-    if not votes:
-        return None, 0
-    best = max(votes.items(), key=lambda kv: kv[1])
-    return best[0], best[1]
+    return votes
 
 
 def find_own_listing(market_id: str | int, title: str = "",
@@ -1175,7 +1245,14 @@ def fetch_listing(url: str, shop: str = "", category_id=None):
 
 
 def _norm(s: str) -> str:
-    return re.sub(r"[^\w]+", "", str(s or "")).lower()
+    """Строка для сравнения: без знаков, в нижнем регистре, «ё» как «е».
+
+    «ё» стоила отдельного круга. Наш товар называется «50 звезд», соседи по
+    разделу пишут «50 звёзд» — для сравнения это были разные слова, и
+    раздел по соседям набрал ноль голосов при ста двадцати четырёх
+    подходящих строках на экране.
+    """
+    return re.sub(r"[^\w]+", "", str(s or "")).lower().replace("ё", "е")
 
 
 def find_position(offers: list[dict], *, ad_id: str = "",
