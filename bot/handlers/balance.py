@@ -208,6 +208,26 @@ async def _panel_balance(uid: int) -> tuple[str | None, str]:
                   "суммы ни в одной; " + "; ".join(seen))[:400]
 
 
+def _other_account_hint(uid: int) -> str:
+    """Строка про вход в панель у соседнего аккаунта, или пусто.
+
+    Куки панели — свои у каждого магазина. После переключения баланс
+    пропадает не потому, что он ноль, а потому что в панель второго
+    магазина никто не входил. Продавец же видит «баланс не показывается» и
+    ищет поломку там, где её нет.
+    """
+    from storage import accounts_with_panel, get_accounts, get_active_account
+    if len(get_accounts(uid)) < 2:
+        return ""
+    others = [n for n in accounts_with_panel(uid) if n != get_active_account(uid)]
+    if not others:
+        return ""
+    active = get_active_account(uid) or "текущий"
+    return (f"\n<i>Сейчас активен аккаунт «{_esc(active)}». Вход в панель "
+            f"есть у: {_esc(', '.join(others))}. У каждого магазина своя "
+            f"панель — войдите ещё раз, уже под этим.</i>")
+
+
 def _parse_check(data: dict) -> tuple[str, str, str | None]:
     """Parse /check response → (name, balance, pending)."""
     logger.info("CHECK raw response: %s", data)
@@ -378,6 +398,7 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
         if not has_panel:
             lines.append("<i>Баланс есть только в панели. Войдите: "
                          "«Настройки» → «Панель продавца».</i>")
+            lines.append(_other_account_hint(callback.from_user.id))
         await callback.message.edit_text("\n".join(lines), reply_markup=_kb())
         await callback.answer()
         return

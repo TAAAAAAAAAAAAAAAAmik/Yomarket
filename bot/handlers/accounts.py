@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -133,6 +134,60 @@ async def _refresh_shop(uid: int) -> str:
         return get_shop_name(uid) or ""
 
 
+def _esc(t) -> str:
+    return (str(t or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+@router.message(Command("accounts_debug"))
+async def accounts_debug(message: Message) -> None:
+    """/accounts_debug — что на самом деле лежит под каждым аккаунтом.
+
+    Продавец добавил второй магазин, а в меню осталось название первого.
+    Гадать, чьи данные под каким ключом, здесь нельзя: у трёх хранилищ
+    (настройки, куки панели, Fragment) свои ключи, и разъехаться они могут
+    по-разному. Команда только читает и **значений секретов не печатает** —
+    ни куки, ни seed-фразу: видно лишь, есть они или нет.
+    """
+    import storage as S
+
+    uid = message.from_user.id
+    accounts = list(S.get_accounts(uid))
+    active = S.get_active_account(uid)
+    settings_blob = S._load_settings()
+    panel_blob = S._load_panel_creds()
+    frag_blob = S._load_fragment_creds()
+
+    lines = [f"👥 <b>Аккаунты</b> — {len(accounts)}, активен "
+             f"<code>{_esc(active) or '—'}</code>", ""]
+    for name in accounts:
+        key = f"{uid}::{name}"
+        raw = settings_blob.get(key) or {}
+        shop = str(raw.get("shop_name") or "")
+        panel = (panel_blob.get(key) or {}).get("cookies")
+        frag = frag_blob.get(key) or {}
+        lines.append(f"{'✅' if name == active else '▫️'} <b>{_esc(name)}</b>"
+                     f"  <code>{_esc(key)}</code>")
+        lines.append(f"   магазин: {_esc(shop) or '<i>не определён</i>'}")
+        lines.append(f"   настройки: {'есть' if key in settings_blob else 'нет'}"
+                     f" · панель: {'есть' if panel else 'нет'}"
+                     f" · Fragment: {'куки' if frag.get('cookies') else 'нет'}"
+                     f"{' + seed' if frag.get('mnemonic') else ''}")
+
+    # Долистовая запись: она и разъезжалась. Перенос теперь идёт первому
+    # аккаунту, а не активному, но старую разъехавшуюся картину надо видеть.
+    stray = [b for b, blob in (("настройки", settings_blob),
+                               ("панель", panel_blob),
+                               ("Fragment", frag_blob))
+             if str(uid) in blob]
+    lines += ["", ("⚠️ Есть записи под голым номером (до аккаунтов): "
+                   + ", ".join(stray) + ". Они уйдут первому аккаунту."
+                   ) if stray else "Записей до аккаунтов не осталось."]
+    lines += ["", "<i>Значения кук и seed-фразы здесь не печатаются — "
+              "только есть они или нет.</i>"]
+    await message.answer("\n".join(lines)[:3900])
+
+
 @router.callback_query(F.data == "acc:add")
 async def add_account_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AccountState.waiting_name)
@@ -198,8 +253,12 @@ async def add_account_token(message: Message, state: FSMContext, **data) -> None
     uid = message.from_user.id
     add_account(uid, name, token, make_active=True)
 
+    # `title` — то самое имя: /check отвечает {status, shop:{id,title}, …}.
+    # Без него сюда попадало название аккаунта, придуманное продавцом, и в
+    # меню магазин назывался «Магазин 2» вместо своего настоящего имени.
     shop = info.get("shop") or info.get("data") or info
-    shop_name = (shop.get("name") or shop.get("shop_name") or name) if isinstance(shop, dict) else name
+    shop_name = (shop.get("name") or shop.get("shop_name") or shop.get("title")
+                 or name) if isinstance(shop, dict) else name
     save_shop_name(uid, str(shop_name))
 
     task_manager = data.get("task_manager")

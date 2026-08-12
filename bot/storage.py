@@ -497,15 +497,50 @@ def _account_key(user_id: int) -> str:
     return f"{user_id}::{account}" if account else str(user_id)
 
 
+def _first_account_key(user_id: int) -> str:
+    """Ключ ПЕРВОГО аккаунта — того, кому принадлежат данные до аккаунтов.
+
+    Хранилища трёх видов (настройки, куки панели, данные Fragment) заведены
+    ещё до многомагазинности, под голым `uid`. Перенос этих записей шёл
+    **в активный аккаунт** — и в этом была ошибка: `add_account` делает
+    новый аккаунт активным сразу, поэтому «первое чтение после переноса»
+    наступало уже под вторым магазином. Второму доставались чужое название
+    магазина, чужие куки панели и **чужая seed-фраза TON**.
+
+    Так и вышло: продавец добавил второй магазин, а в меню осталось имя
+    первого. Название — самое безобидное из трёх.
+
+    Первый аккаунт — первый ключ в словаре: `save_token` заводит его до
+    того, как появится второй, а порядок словаря сохраняется и в JSON,
+    и в PostgreSQL.
+    """
+    first = next(iter(get_accounts(user_id)), "")
+    return f"{user_id}::{first}" if first else str(user_id)
+
+
+def _take_legacy(data: dict, user_id: int) -> bool:
+    """Перенести долистовую запись первому аккаунту. True — если переносили.
+
+    Данные не перетираются: если у первого аккаунта уже что-то есть,
+    старая запись просто убирается.
+    """
+    legacy = str(user_id)
+    if legacy not in data:
+        return False
+    target = _first_account_key(user_id)
+    if target == legacy:
+        return False
+    moved = data.pop(legacy)
+    if target not in data:
+        data[target] = moved
+    return True
+
+
 def get_settings(user_id: int) -> dict:
     all_settings = _load_settings()
-    key = _account_key(user_id)
-    if key not in all_settings and str(user_id) in all_settings:
-        # migrate legacy per-uid settings to the active account's key
-        all_settings[key] = all_settings.pop(str(user_id))
+    if _take_legacy(all_settings, user_id):
         _save_all_settings(all_settings)
-    raw = all_settings.get(key, {})
-    return _merge_defaults(raw)
+    return _merge_defaults(all_settings.get(_account_key(user_id), {}))
 
 
 def save_settings(user_id: int, settings: dict) -> None:
@@ -543,11 +578,24 @@ def _save_panel_data(data: dict) -> None:
 def get_panel_creds(user_id: int) -> dict | None:
     """Panel cookies for the ACTIVE account (per-account, legacy migrated)."""
     data = _load_panel_creds()
-    key = _account_key(user_id)
-    if key not in data and str(user_id) in data:
-        data[key] = data.pop(str(user_id))
+    if _take_legacy(data, user_id):
         _save_panel_data(data)
-    return data.get(key)
+    return data.get(_account_key(user_id))
+
+
+def accounts_with_panel(user_id: int) -> list[str]:
+    """Аккаунты, у которых есть вход в панель.
+
+    Вход в панель — свой у каждого магазина, и «баланс не показывается»
+    после переключения обычно значит именно это. Назвать аккаунт, где вход
+    есть, дешевле, чем оставить продавца гадать.
+    """
+    data = _load_panel_creds()
+    out = []
+    for name in get_accounts(user_id):
+        if (data.get(f"{user_id}::{name}") or {}).get("cookies"):
+            out.append(name)
+    return out
 
 
 def save_panel_creds(user_id: int, creds: dict) -> None:
@@ -581,12 +629,11 @@ def _save_fragment_data(data: dict) -> None:
 
 def get_fragment_creds(user_id: int) -> dict | None:
     data = _load_fragment_creds()
-    key = _account_key(user_id)
-    # migrate legacy per-uid entry to the active-account key (like settings/panel)
-    if key not in data and str(user_id) in data:
-        data[key] = data.pop(str(user_id))
+    # Перенос — первому аккаунту, а не активному. Здесь лежит seed-фраза
+    # TON: отдать её другому магазину значит отдать доступ к кошельку.
+    if _take_legacy(data, user_id):
         _save_fragment_data(data)
-    return data.get(key)
+    return data.get(_account_key(user_id))
 
 
 def save_fragment_creds(user_id: int, creds: dict) -> None:
