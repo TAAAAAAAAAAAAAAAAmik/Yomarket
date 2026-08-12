@@ -157,10 +157,15 @@ async def _panel_balance(uid: int) -> tuple[str | None, str]:
 
     # Where the panel actually shows it: the shop's own page. The `balances`
     # resource was the earlier guess and answers nothing on this panel.
+    #
+    # Имя магазина — чтобы читать баланс СВОЕГО. Одна панельная сессия видит
+    # все магазины продавца, и без имени бот брал первый попавшийся: под
+    # вторым аккаунтом показал бы деньги первого.
+    from storage import get_shop_name
     try:
         ok, got = await _a.wait_for(
             loop.run_in_executor(None, panel_shop_balance_sync,
-                                 creds["cookies"], ""),
+                                 creds["cookies"], "", get_shop_name(uid)),
             timeout=45)
     except Exception as e:
         ok, got = False, f"не ответила: {str(e)[:60]}"

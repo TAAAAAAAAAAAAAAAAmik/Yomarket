@@ -37,7 +37,13 @@ class Reason(unittest.TestCase):
         P.panel_balances_sync = self._rows
 
     def run_it(self, shop, rows):
-        P.panel_shop_balance_sync = lambda ck, sid="": shop
+        self.asked = []
+
+        def fake_shop(ck, sid="", shop_name=""):
+            self.asked.append((sid, shop_name))
+            return shop
+
+        P.panel_shop_balance_sync = fake_shop
         P.panel_balances_sync = lambda ck: rows
         return asyncio.run(B._panel_balance(1))
 

@@ -3721,22 +3721,45 @@ def panel_resource_census_sync(cookie_string: str, needle: str = "") -> str:
     return "\n".join(lines) or "панель не отдала ни одного ресурса"
 
 
-def panel_shop_balance_sync(cookie_string: str,
-                            shop_id: str = "") -> tuple[bool, object]:
+def _row_label(row: dict) -> str:
+    """Как строка списка называет себя — заголовком или полем с именем."""
+    title = str(row.get("title") or "").strip()
+    if title:
+        return _strip_html(title)
+    for f in _fields_of(row):
+        attr = str(f.get("attribute") or "").lower()
+        if attr in ("name", "title", "shop_name"):
+            got = _field_text(f)
+            if got:
+                return got
+    return ""
+
+
+def panel_shop_balance_sync(cookie_string: str, shop_id: str = "",
+                            shop_name: str = "") -> tuple[bool, object]:
     """Blocking: the shop's balance, read where the panel actually shows it.
 
     The seller's own screenshot settled this: the figure lives on the shop's
     page — /resources/shops/{id} — not in a `balances` resource, which is what
     the code had been asking for. Returns (True, {"amount": float, "field":
-    name, "shop": id}) or (False, reason).
+    name, "shop": id, "shop_name": …}) or (False, reason).
 
     The detail record is fetched rather than the list row: Nova's index omits
     most fields, and the balance is one of the omitted ones on this panel.
+
+    **Магазин выбирается, а не угадывается.** Раньше перебирались все
+    магазины подряд и бралась первая же страница с полем баланса. Пока
+    магазин один, это незаметно; у продавца с двумя аккаунтами бот показал
+    бы под вторым магазином деньги первого. Цифра из чужого магазина хуже
+    прочерка: прочерк видно, а её нет. Поэтому имя магазина приходит из
+    `/check` того же аккаунта, и если по нему не сошлось ни одного —
+    возвращается отказ со списком найденных, а не первый попавшийся.
     """
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
 
     ids = [str(shop_id)] if shop_id else []
+    labels: dict[str, str] = {}
     if not ids:
         try:
             r = session.get(f"{PANEL_URL}/nova-api/shops",
@@ -3760,8 +3783,23 @@ def panel_shop_balance_sync(cookie_string: str,
                 rid = rid.get("value", rid.get("id"))
             if rid is not None:
                 ids.append(str(rid))
+                labels[str(rid)] = _row_label(row)
         if not ids:
             return False, "в панели нет ни одного магазина"
+
+        if len(ids) > 1:
+            want = str(shop_name or "").strip().lower()
+            hit = [i for i in ids if want and want in labels.get(i, "").lower()]
+            if len(hit) == 1:
+                ids = hit
+            else:
+                # Один аккаунт — один магазин. Не знаем который — молчим об
+                # этом вслух, а не подставляем чужие деньги.
+                found = ", ".join(f"«{labels.get(i) or i}»" for i in ids[:6])
+                return False, (
+                    f"в панели {len(ids)} магазина ({found}), а какой из них "
+                    f"«{shop_name or '—'}» — непонятно. Показывать чужой "
+                    f"баланс нельзя. Проверьте /accounts_debug.")
 
     tried = []
     for sid in ids[:5]:
@@ -3793,6 +3831,11 @@ def panel_shop_balance_sync(cookie_string: str,
                 continue
             raw = _strip_html(f.get("value"))
             if raw in (None, ""):
+                # Пустое поле баланса — не «поля нет». У нового магазина с
+                # нулём на счету панель отдаёт пусто, и молчаливый пропуск
+                # заканчивался отчётом «поля — …», то есть «баланса не
+                # нашлось» там, где он нашёлся и пуст.
+                tried.append(f"{sid}: поле «{f.get('name')}» пустое")
                 continue
             # Разбор один на весь бот. Здешний убирал пробелы, «₽» и запятые
             # по списку — и спотыкался обо всё остальное: «руб.», узкий
@@ -3808,7 +3851,7 @@ def panel_shop_balance_sync(cookie_string: str,
                 continue
             return True, {"amount": amount,
                           "field": str(f.get("name") or f.get("attribute")),
-                          "shop": sid}
+                          "shop": sid, "shop_name": labels.get(sid, "")}
         # Nothing matched: report what the page does offer, so the field can be
         # named instead of guessed at again.
         names = [str(f.get("name") or f.get("attribute"))
