@@ -732,9 +732,13 @@ async def pos_add_all(callback: CallbackQuery) -> None:
             f"✅ Добавлено: {len(added)}   ❔ Не нашёл: {len(missed)}\n\n"
             f"<i>Каждый товар — отдельный обход витрины, это не быстро.</i>",
             _cancel_kb("pos:menu"))
-        chosen, pos, _seen, _urls = await _find_listing_page(uid, ad)
+        chosen, pos, _seen, urls = await _find_listing_page(uid, ad)
         if not chosen:
-            missed.append(ad["title"])
+            # Две причины — два разных действия продавца, и в общем списке
+            # они выглядели одинаково. «Раздел не определился» лечится
+            # выбором раздела руками; «раздел есть, а нас в нём нет» —
+            # значит товар снят с публикации или стоит в другом разделе.
+            missed.append((ad["title"], bool(urls)))
             continue
         s = get_settings(uid)
         pp = s.setdefault("promo_position", {})
@@ -752,14 +756,28 @@ async def pos_add_all(callback: CallbackQuery) -> None:
     lines = [f"📍 <b>Готово</b>\n",
              f"✅ Под наблюдением новых: <b>{len(added)}</b>"]
     if missed:
+        no_section = [t for t, had_urls in missed if not had_urls]
+        not_there = [t for t, had_urls in missed if had_urls]
         lines.append(f"❔ Не нашёл на витрине: <b>{len(missed)}</b>")
-        for title in missed[:5]:
-            lines.append(f"• {_esc(title[:40])}")
-        if len(missed) > 5:
-            lines.append(f"…и ещё {len(missed) - 5}")
-        lines.append("")
-        lines.append("<i>Их можно добавить по одному — там бот покажет "
-                     "каталог и даст выбрать раздел руками.</i>")
+        if no_section:
+            lines.append("")
+            lines.append(f"<b>Не понял раздел витрины — {len(no_section)}:</b>")
+            for title in no_section[:4]:
+                lines.append(f"• {_esc(title[:40])}")
+            if len(no_section) > 4:
+                lines.append(f"…и ещё {len(no_section) - 4}")
+            lines.append("<i>Добавьте по одному: бот покажет каталог, "
+                         "и раздел выбирается кнопками.</i>")
+        if not_there:
+            lines.append("")
+            lines.append(f"<b>Раздел нашёл, а товара в нём нет — "
+                         f"{len(not_there)}:</b>")
+            for title in not_there[:4]:
+                lines.append(f"• {_esc(title[:40])}")
+            if len(not_there) > 4:
+                lines.append(f"…и ещё {len(not_there) - 4}")
+            lines.append("<i>Обычно это снятый с публикации товар или "
+                         "другой раздел. Каталогом тоже решается.</i>")
     await _pos_edit(callback.message, "\n".join(lines), _pos_kb(s))
 
 
