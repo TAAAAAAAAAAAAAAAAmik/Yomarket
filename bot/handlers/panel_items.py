@@ -1584,12 +1584,24 @@ async def pos_find(message: Message) -> None:
         lines += [f"наша строка: id={got.get('id')} "
                   f"slug={got.get('slug') or '—'}"]
     else:
-        lines.append("первые строки выдачи (номер | магазин):")
+        shops = facts.get("shops") or []
+        lines.append(f"магазинов в выдаче: {len(shops)}, "
+                     f"наш среди них: {'ДА' if facts.get('ours_seen') else 'НЕТ'}")
+        lines.append("")
+        lines.append("магазины выдачи:")
+        for sh in shops[:14]:
+            lines.append(f"  {sh}")
+        if len(shops) > 14:
+            lines.append(f"  …и ещё {len(shops) - 14}")
+        lines += ["", "первые строки (номер | магазин):"]
         for rid, sel in zip(facts["ids"], facts["sellers"]):
             lines.append(f"  {rid} | {sel or '—'}")
-        lines += ["", "Если наш магазин в списке есть, а номер другой — "
-                  "номера витрины и API из разных пространств, и искать "
-                  "надо по магазину."]
+        lines += ["",
+                  "Наш магазин в списке ЕСТЬ → номера витрины и API из разных "
+                  "пространств, ищем по магазину.",
+                  "Наш магазин в списке НЕТ → либо на витрине он назван иначе "
+                  "(сравните имена выше с «магазин в боте»), либо слова "
+                  "поиска слишком общие и мы глубже в выдаче."]
     text = _html.escape("\n".join(lines))
     await status.edit_text(f"<code>{text[:3800]}</code>")
 

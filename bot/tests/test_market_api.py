@@ -365,9 +365,21 @@ class FindingOurOwn(unittest.TestCase):
         requests.get = self._old
 
     def test_a_decorated_title_still_yields_something_searchable(self):
-        self.assertEqual(M.search_key("🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫"),
-                         "АВТОВЫДАЧА")
+        self.assertIn("АВТОВЫДАЧА",
+                      M.search_keys("🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫"))
         self.assertEqual(M.search_keys("⭐⭐⭐"), [])
+
+    def test_the_number_in_the_title_is_tried_first(self):
+        """Названия здесь устроены как «50 звезд», «100 звезд», «500 звезд»:
+        различает их число. Отсев «короче трёх букв» его выбрасывал, у товара
+        «50 звезд» оставалось одно слово «звезд», и витрина отдавала сорок
+        пять чужих строк без нашей."""
+        self.assertEqual(M.search_key("50 звезд"), "50")
+        self.assertIn("звезд", M.search_keys("50 звезд"))
+
+    def test_the_whole_title_is_the_last_resort(self):
+        """Отдельные слова бывают общими до бесполезности."""
+        self.assertEqual(M.search_keys("50 звезд")[-1], "50 звезд")
 
     def test_words_are_searched_one_at_a_time_not_as_a_phrase(self):
         """«💖Аккаунт 💖Баланс: 4.000.000 ₽» has «Аккаунт» and «4.000.000»
@@ -392,7 +404,10 @@ class FindingOurOwn(unittest.TestCase):
 
     def test_the_search_uses_the_words_out_of_the_title(self):
         M.find_own_listing(196439, "🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫")
-        self.assertEqual(self.asked[0].get("keyword"), "АВТОВЫДАЧА")
+        # Число — первым: оно и различает «100 ЗВЁЗД» от «500 ЗВЁЗД».
+        # Дальше слов не понадобилось — строка нашлась сразу; что при
+        # промахе перебираются все, проверяет соседний тест.
+        self.assertEqual(self.asked[0].get("keyword"), "100")
 
     def test_the_address_is_built_from_the_row_we_found(self):
         urls = M.listing_urls_for(196439, title="🏮АВТОВЫДАЧА🏮 💫100 ЗВЁЗД💫")

@@ -145,6 +145,89 @@ class TheSearchReportsWhatItDid(unittest.TestCase):
         self.assertEqual(facts["rows"], 0)
 
 
+class WhatTheSellersOwnCaseShowed(unittest.TestCase):
+    """Товар «50 звезд», магазин Spike. `/pos_find` напечатал:
+
+        слова поиска: звезд
+        строк вернулось: 45
+        нашли по: НЕ НАШЛИ
+
+    Слово было одно — «звезд». Цифра «50» отбрасывалась отсевом «короче
+    трёх букв», а в этом магазине названия ровно так и устроены: «50
+    звезд», «100 звезд», «500 звезд», и различает их число. По слову
+    «звезд» витрина отдала сорок пять чужих строк, нашей среди них не было.
+    """
+
+    def test_the_number_survives_the_filter(self):
+        self.assertIn("50", M.search_words("50 звезд"))
+
+    def test_and_it_is_tried_before_the_common_word(self):
+        keys = M.search_keys("50 звезд")
+        self.assertLess(keys.index("50"), keys.index("звезд"))
+
+    def test_the_whole_title_is_tried_as_well(self):
+        self.assertIn("50 звезд", M.search_keys("50 звезд"))
+
+    def test_a_two_letter_word_is_still_dropped(self):
+        """Отсев был не напрасен: «по», «за», «на» ищут всё подряд."""
+        self.assertNotIn("на", M.search_words("на аккаунт"))
+
+    def test_a_single_digit_alone_is_not_a_search_key(self):
+        self.assertNotIn("5", M.search_words("5 аккаунтов"))
+
+
+class TheDiagnosticAnswersTheNextQuestion(unittest.TestCase):
+    """«Нас не было в выдаче» и «мы там под другим именем» — разные беды, и
+    продавцу для них нужно разное."""
+
+    def setUp(self):
+        self._card = M.product_card
+        M.product_card = lambda mid: {}
+        import requests
+        self._req = requests.get
+
+    def tearDown(self):
+        M.product_card = self._card
+        import requests
+        requests.get = self._req
+
+    def fake(self, rows):
+        import requests
+
+        class R:
+            status_code = 200
+
+            def json(self_inner):
+                return {"data": rows}
+
+        requests.get = lambda *a, **kw: R()
+
+    def test_it_lists_the_shops_it_saw(self):
+        self.fake([row(1, "50 звезд", "Fgo shop"),
+                   row(2, "50 звезд", "Пинкод-Маркет")])
+        _got, facts = M.search_own_listing(229402, "50 звезд", OURS)
+        self.assertIn("Fgo shop", facts["shops"])
+        self.assertIn("Пинкод-Маркет", facts["shops"])
+
+    def test_it_says_our_shop_was_not_among_them(self):
+        self.fake([row(1, "50 звезд", "Fgo shop")])
+        _got, facts = M.search_own_listing(229402, "50 звезд", OURS)
+        self.assertFalse(facts["ours_seen"])
+
+    def test_and_says_when_it_was(self):
+        self.fake([row(1, "50 звезд", OURS)])
+        got, facts = M.search_own_listing(229402, "50 звезд", OURS)
+        self.assertTrue(facts["ours_seen"])
+        self.assertTrue(got)
+
+    def test_the_screen_prints_both_the_verdict_and_the_names(self):
+        import inspect
+        from handlers import panel_items as PI
+        src = inspect.getsource(PI.pos_find)
+        self.assertIn("ours_seen", src)
+        self.assertIn("магазины выдачи", src)
+
+
 class TheFlowPassesTheShopName(unittest.TestCase):
     def test_the_address_builder_takes_a_seller(self):
         import inspect

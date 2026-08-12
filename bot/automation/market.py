@@ -434,22 +434,34 @@ def product_card(market_id: str | int) -> dict:
 
 
 def search_words(title: str) -> list:
-    """The searchable words of a title, longest first.
+    """The searchable words of a title, most distinctive first.
 
     Titles are written to catch the eye — «💖Аккаунт 💖Баланс: 4.000.000 ₽⚡» —
     and the decorations are not searchable. What is left are the words a buyer
     would actually type.
+
+    **Числа идут первыми и не отбрасываются за короткость.** Отсев «короче
+    трёх букв» съедал ровно то, что отличает один лот от другого: у товара
+    «50 звезд» оставалось одно слово «звезд», по которому витрина отдала
+    сорок пять чужих строк, а нашей среди них не было. Продавец получил
+    «не нашёл на витрине» на товар, который там стоит. В этом магазине
+    названия так и устроены — «50 звезд», «100 звезд», «500 звезд», — и
+    различает их число.
     """
     words = re.findall(r"[\w.]+", str(title or ""), re.UNICODE)
     seen, out = set(), []
     for w in words:
         w = w.strip(".")
         low = w.lower()
-        if len(w) < 3 or low in seen:
+        if not w or low in seen:
+            continue
+        digits = any(ch.isdigit() for ch in w)
+        if len(w) < 3 and not (digits and len(w) >= 2):
             continue
         seen.add(low)
         out.append(w)
-    return sorted(out, key=len, reverse=True)
+    return sorted(out, key=lambda w: (not any(ch.isdigit() for ch in w),
+                                      -len(w)))
 
 
 def search_keys(title: str) -> list:
@@ -472,6 +484,12 @@ def search_keys(title: str) -> list:
         pair = " ".join(dict.fromkeys(ordered))[:60]
         if pair and pair not in keys:
             keys.append(pair)
+    # Последним — всё название без украшений. Отдельные слова бывают общими
+    # до бесполезности («звезд» вернуло сорок пять чужих строк), а название
+    # целиком продавец и покупатель видят одинаково.
+    whole = " ".join(re.findall(r"[\w.]+", str(title), re.UNICODE))[:60].strip()
+    if whole and whole not in keys:
+        keys.append(whole)
     return keys
 
 
@@ -570,6 +588,12 @@ def search_own_listing(market_id: str | int, title: str = "",
     facts["rows"] = len(seen)
     facts["ids"] = [str(r.get("id")) for r in seen[:8]]
     facts["sellers"] = [_seller_of(r) for r in seen[:8]]
+    # Главный вопрос при промахе: нас в этой выдаче не было вовсе — или мы
+    # там были под другим именем? Без списка магазинов это неразличимо, а
+    # действия продавца в двух случаях разные.
+    facts["shops"] = sorted({_seller_of(r) for r in seen if _seller_of(r)})
+    facts["ours_seen"] = bool(seller) and any(
+        _norm(seller) in _norm(s) for s in facts["shops"])
     got = pick_ours(seen, title, seller)
     if got:
         facts["by"] = "магазин и название"
