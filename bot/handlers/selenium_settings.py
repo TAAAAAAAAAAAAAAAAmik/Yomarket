@@ -791,12 +791,23 @@ async def _my_ads(uid: int, reload: bool = False) -> list:
     if not token:
         return []
     api = YooMarketAPI(token)
+    names: dict = {}
     try:
         await api.start()
         data = await api.get_ads()
+        # Название раздела API рядом с объявлением не кладёт — только номер,
+        # и номер этот из своего пространства: 5221 в каталоге витрины нет.
+        # Зато у API есть справочник разделов, и название в нём общее с
+        # витриной: это таксономия маркетплейса, а не строка магазина.
+        want = {int(a["category_id"]) for a in (data.get("data")
+                                                or data.get("items") or [])
+                if str(a.get("category_id") or "").isdigit()}
+        if want:
+            names = await api.find_categories(want)
     except Exception as e:
         logger.warning("my ads for %s: %s", uid, e)
-        return []
+        if not isinstance(locals().get("data"), dict):
+            return []
     finally:
         try:
             await api.close()
@@ -810,7 +821,7 @@ async def _my_ads(uid: int, reload: bool = False) -> list:
     ads = [{"id": str(a.get("id")),
             "title": str(a.get("title") or a.get("name") or a.get("id")),
             "category_id": a.get("category_id") or a.get("categoryId"),
-            "category": _cat_name_of(a)}
+            "category": _cat_name_of(a) or _from_reference(a, names)}
            for a in (data.get("data") or data.get("items") or []) if a.get("id")]
     _MY_ADS_CACHE[uid] = ads
     return ads
@@ -822,6 +833,12 @@ def _cat_name_of(ad: dict) -> str:
     if isinstance(node, dict):
         return str(node.get("title") or node.get("name") or "")
     return str(node or "")
+
+
+def _from_reference(ad: dict, names: dict) -> str:
+    """Название раздела из справочника /categories по его номеру."""
+    raw = str(ad.get("category_id") or "")
+    return str(names.get(int(raw))) if raw.isdigit() and int(raw) in names else ""
 
 
 @router.callback_query(F.data == "pos:addlist")

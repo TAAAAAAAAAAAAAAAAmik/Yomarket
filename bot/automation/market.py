@@ -597,7 +597,43 @@ def search_own_listing(market_id: str | int, title: str = "",
     got = pick_ours(seen, title, seller)
     if got:
         facts["by"] = "магазин и название"
+        return got, facts
+    facts["section"], facts["section_votes"] = section_of_neighbours(seen, title)
     return got, facts
+
+
+def section_of_neighbours(rows: list, title: str) -> tuple[object, int]:
+    """Раздел витрины по ЧУЖИМ строкам того же товара. (номер, голосов)
+
+    Своей строки в выдаче может не быть вовсе: у «50 звезд» витрина отдала
+    124 строки от тридцати магазинов, и нашего среди них нет — конкурентов
+    сотни, а листается три страницы. Искать себя дальше бессмысленно.
+
+    Но раздел-то нам и нужен, а не своя строка. Соседи, продающие ровно
+    тот же товар, стоят в **том же разделе** — и их строки витрина отдала
+    сотнями. Берём раздел, за который их больше всего.
+
+    Догадкой это не остаётся: адрес потом открывается и в нём ищется наша
+    строка. Не нашлась — бот так и скажет, а не запишет нас в чужой раздел.
+    """
+    want = _norm(title)
+    if not want or not rows:
+        return None, 0
+    same = [r for r in rows if _norm(_row_title(r)) == want]
+    if not same:
+        # Точного совпадения нет — берём строки, где есть все наши слова.
+        words = [_norm(w) for w in search_words(title)]
+        same = [r for r in rows
+                if words and all(w in _norm(_row_title(r)) for w in words)]
+    votes: dict = {}
+    for r in same:
+        cid = _category_id_of(r)
+        if cid not in (None, ""):
+            votes[str(cid)] = votes.get(str(cid), 0) + 1
+    if not votes:
+        return None, 0
+    best = max(votes.items(), key=lambda kv: kv[1])
+    return best[0], best[1]
 
 
 def find_own_listing(market_id: str | int, title: str = "",
@@ -788,9 +824,19 @@ def listing_urls_for(market_id: str | int, card: dict | None = None,
     """
     # Имя магазина — чтобы узнать свою строку, когда номер витрины не совпал
     # с номером объявления. Без него поиск находил нашу строку и выбрасывал.
-    card = card if card is not None else find_own_listing(market_id, title,
-                                                          seller)
+    facts: dict = {}
+    if card is None:
+        card, facts = search_own_listing(market_id, title, seller)
     if not card:
+        # Своей строки в выдаче нет — конкурентов сотни, а листается три
+        # страницы. Но раздел нам и нужен, а не своя строка: соседи с тем
+        # же товаром стоят в том же разделе.
+        path = category_slugs_for(facts.get("section"))
+        if path:
+            out = [f"{MARKET_URL}/categories/" + "/".join(path[-2:])]
+            if len(path) > 1:
+                out.append(f"{MARKET_URL}/categories/{path[-1]}")
+            return out
         return []
     out = []
     # First and best: the catalogue itself, looked up by the category id the

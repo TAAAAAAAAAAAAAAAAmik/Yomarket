@@ -290,6 +290,134 @@ class TheSectionComesFromTheAdItself(unittest.TestCase):
         self.assertIn('"category_id"', src)
 
 
+class TheSectionComesFromTheNeighbours(unittest.TestCase):
+    """Третий вывод `/pos_find` не оставил от прежних путей ничего:
+
+        раздел из API: id=5221 название=—
+          по номеру → НЕТ в каталоге витрины
+          по названию → НЕТ
+        строк вернулось: 124
+        магазинов в выдаче: 30, наш среди них: НЕТ
+
+    Своей строки в выдаче нет и не будет: конкурентов сотни, листается три
+    страницы. Но нам нужна не своя строка, а **раздел** — а соседи,
+    продающие ровно тот же товар, стоят в том же разделе, и их строк витрина
+    отдала сто двадцать четыре.
+
+    Догадкой это не остаётся: адрес потом открывается и в нём ищется наша
+    строка. Не нашлась — бот так и скажет.
+    """
+
+    def rows(self, *pairs):
+        out = []
+        for i, (title, cid) in enumerate(pairs):
+            r = row(1000 + i, title, f"Магазин {i}")
+            r["category_id"] = cid
+            out.append(r)
+        return out
+
+    def test_the_section_most_neighbours_agree_on_wins(self):
+        rows = self.rows(("50 звезд", 512), ("50 звезд", 512),
+                         ("50 звезд", 999))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
+
+    def test_it_says_how_many_agreed(self):
+        rows = self.rows(("50 звезд", 512), ("50 звезд", 512))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[1], 2)
+
+    def test_a_different_product_does_not_vote(self):
+        """«100 звезд» — другой раздел не обязан, но и голосовать не должен."""
+        rows = self.rows(("50 звезд", 512), ("100 звезд", 777),
+                         ("100 звезд", 777))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
+
+    def test_a_decorated_neighbour_still_counts(self):
+        """Точных совпадений может не быть вовсе — тогда годятся строки, где
+        есть все наши слова."""
+        rows = self.rows(("⚡50 звезд Telegram⚡", 512),
+                         ("Аккаунт Steam", 999))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
+
+    def test_nothing_relevant_is_an_honest_nothing(self):
+        rows = self.rows(("Аккаунт Steam", 999))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд"), (None, 0))
+
+    def test_rows_without_a_section_do_not_vote(self):
+        rows = self.rows(("50 звезд", None), ("50 звезд", 512))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
+
+
+class TheAddressIsBuiltFromTheNeighboursSection(unittest.TestCase):
+    TREE = [{"id": 7, "slug": "telegram", "title": "Telegram", "children": [
+        {"id": 512, "slug": "zvezdy", "title": "Звёзды"}]}]
+
+    def setUp(self):
+        self._tree, self._search = M.category_tree, M.search_own_listing
+        M.category_tree = lambda: self.TREE
+
+    def tearDown(self):
+        M.category_tree, M.search_own_listing = self._tree, self._search
+
+    def test_our_row_missing_but_the_section_known(self):
+        M.search_own_listing = lambda mid, t="", s="": ({}, {"section": "512"})
+        urls = M.listing_urls_for(229402, None, "50 звезд", "Spike")
+        self.assertIn("https://yoomarket.net/categories/telegram/zvezdy", urls)
+
+    def test_end_to_end_from_the_real_search(self):
+        """Сквозь настоящий `search_own_listing`: ровно случай продавца —
+        своей строки в выдаче нет, чужие с тем же товаром есть."""
+        import requests
+        old_get, old_card = requests.get, M.product_card
+        M.product_card = lambda mid: {}
+        neighbours = [{"id": 22424, "title": "50 звезд", "category_id": 512,
+                       "shop": {"name": "Empathy"}},
+                      {"id": 86474, "title": "50 звезд", "category_id": 512,
+                       "shop": {"name": "Fgo shop"}}]
+
+        class R:
+            status_code = 200
+
+            def json(self_inner):
+                return {"data": neighbours}
+
+        requests.get = lambda *a, **kw: R()
+        try:
+            urls = M.listing_urls_for(229402, None, "50 звезд", "Spike")
+        finally:
+            requests.get, M.product_card = old_get, old_card
+        self.assertIn("https://yoomarket.net/categories/telegram/zvezdy", urls)
+
+    def test_neither_the_row_nor_the_section_gives_nothing(self):
+        """Пусто — честный ответ. Дальше продавцу предлагают каталог."""
+        M.search_own_listing = lambda mid, t="", s="": ({}, {"section": None})
+        self.assertEqual(M.listing_urls_for(229402, None, "50 звезд"), [])
+
+
+class TheReferenceFillsTheMissingCategoryName(unittest.TestCase):
+    """API кладёт рядом с объявлением только номер раздела, и номер этот из
+    своего пространства: 5221 в каталоге витрины нет. Название общее — но
+    его надо дочитать из справочника /categories."""
+
+    def test_the_ad_list_resolves_names_from_the_reference(self):
+        import inspect
+        from handlers import selenium_settings as SS
+        src = inspect.getsource(SS._my_ads)
+        self.assertIn("find_categories", src)
+        # И результат справочника доходит до объявления, а не остаётся
+        # прочитанным впустую.
+        self.assertIn("_from_reference(a, names)", src)
+
+    def test_a_resolved_name_reaches_the_ad(self):
+        from handlers import selenium_settings as SS
+        self.assertEqual(
+            SS._from_reference({"category_id": 5221}, {5221: "Звёзды"}),
+            "Звёзды")
+
+    def test_an_unresolved_id_is_an_empty_name_not_the_number(self):
+        from handlers import selenium_settings as SS
+        self.assertEqual(SS._from_reference({"category_id": 5221}, {}), "")
+
+
 class TheCatalogueLookupByName(unittest.TestCase):
     TREE = [{"id": 7, "slug": "telegram", "title": "Telegram", "children": [
         {"id": 512, "slug": "zvezdy", "title": "Звёзды"}]},
@@ -328,7 +456,7 @@ class TheFlowPassesTheShopName(unittest.TestCase):
 
     def test_and_hands_it_to_the_search(self):
         import inspect
-        self.assertIn("find_own_listing(market_id, title,\n",
+        self.assertIn("search_own_listing(market_id, title, seller)",
                       inspect.getsource(M.listing_urls_for))
 
     def test_the_screen_gives_the_shop_name_to_the_builder(self):

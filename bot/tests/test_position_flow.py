@@ -247,6 +247,8 @@ class AddingFromOwnListings(FlowCase):
         self.patch(Y, "YooMarketAPI", FakeApi)
         self.patch(M, "find_own_listing",
                    lambda mid, title="", seller="": self.CARD)
+        self.patch(M, "search_own_listing",
+                   lambda mid, title="", seller="": (self.CARD, {}))
         # The catalogue knows «virty» as a section of black-russia,
         # and knows nothing about the reverse.
         self.patch(M, "category_meta",
@@ -356,6 +358,8 @@ class AddingFromOwnListings(FlowCase):
         """A different failure from «the page did not show it», and it needs a
         different thing from the seller — so it must not read the same."""
         self.patch(M, "find_own_listing", lambda mid, title="", seller="": {})
+        self.patch(M, "search_own_listing",
+                   lambda mid, title="", seller="": ({}, {}))
         cb = self.pick()
         self.assertEqual(self.watches(), [])
         said = "\n".join(cb.message.sent)

@@ -1592,7 +1592,9 @@ async def pos_find(message: Message) -> None:
              "",
              f"слова поиска: {', '.join(facts['keys']) or '—'}",
              f"строк вернулось: {facts['rows']}",
-             f"нашли по: {facts['by'] or 'НЕ НАШЛИ'}", ""]
+             f"нашли по: {facts['by'] or 'НЕ НАШЛИ'}",
+             f"раздел по соседям: {facts.get('section') or '—'}"
+             f" (голосов: {facts.get('section_votes') or 0})", ""]
     if facts.get("error"):
         lines += [f"ошибка запроса: {facts['error']}", ""]
     if got:
