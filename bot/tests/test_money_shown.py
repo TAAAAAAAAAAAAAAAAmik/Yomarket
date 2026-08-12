@@ -41,6 +41,15 @@ class TheFormatterItself(unittest.TestCase):
     def test_a_round_sum_has_no_trailing_zeroes(self):
         self.assertEqual(M(1234.0), "1 234")
 
+    def test_the_real_shop_balance_reads_as_roubles_not_thousands(self):
+        """«586 226» выглядит как полмиллиона. Это 586 рублей."""
+        self.assertEqual(M(586.226), "586,226")
+
+    def test_the_third_decimal_is_not_rounded_away(self):
+        """Панель показывает три знака; «586,23 ₽» с ней уже расходится, а
+        совпадение с панелью — весь смысл этого экрана."""
+        self.assertNotEqual(M(586.226), "586,23")
+
     def test_nothing_is_an_empty_string_not_a_zero(self):
         self.assertEqual(M(None), "")
 
@@ -51,6 +60,14 @@ class TheBalanceScreen(unittest.TestCase):
 
     def test_a_panel_string_is_parsed_first(self):
         self.assertEqual(B._shown("1 234,56 ₽"), "1 234,56")
+
+    def test_the_panels_own_balance_comes_back_as_the_panel_wrote_it(self):
+        self.assertEqual(B._shown("586,226 ₽"), "586,226")
+
+    def test_the_kopecks_survive_the_round_trip_through_a_bare_string(self):
+        """Между чтением панели и экраном сумма живёт строкой с точкой —
+        `.2f` округлял её там до 586.23 ещё до показа."""
+        self.assertEqual(B._shown(B._plain(586.226)), "586,226")
 
     def test_something_unparseable_is_shown_as_it_came(self):
         """Лучше показать непонятное, чем подменить его пустотой."""

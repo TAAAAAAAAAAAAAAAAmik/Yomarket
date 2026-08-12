@@ -83,14 +83,46 @@ class SeparatorsBothWays(unittest.TestCase):
     def test_space_thousands_comma_decimal(self):
         self.assertEqual(P("1 234,56"), 1234.56)
 
-    def test_comma_as_thousands_alone(self):
-        self.assertEqual(P("1,234"), 1234.0)
-
     def test_comma_as_decimal_alone(self):
         self.assertEqual(P("1,23"), 1.23)
 
     def test_dot_decimal_alone(self):
         self.assertEqual(P("1234.5"), 1234.5)
+
+
+class ACommaIsAlwaysKopecks(unittest.TestCase):
+    """Разряды эта панель отбивает пробелом, а запятая у неё десятичная.
+
+    Правило «после запятой три цифры — значит разряды» выглядело разумным и
+    было догадкой. Настоящий баланс магазина — «586,226 ₽», пятьсот
+    восемьдесят шесть рублей. Догадка показала 586 226 ₽: в тысячу раз
+    больше, чем есть, и снова на экране продавца.
+
+    Тот же порядок в `_num` (`automation/panel.py`) — там это выяснили с
+    продавцом раньше, а здесь завели по-своему. Расходиться им нельзя.
+    """
+
+    def test_the_real_shop_balance(self):
+        self.assertEqual(P("586,226 ₽"), 586.226)
+
+    def test_and_next_to_the_second_amount_of_the_same_field(self):
+        self.assertEqual(P("586,226 ₽ 338 242 ₽"), 586.226)
+
+    def test_three_digits_after_the_comma_are_not_thousands(self):
+        self.assertEqual(P("1,234"), 1.234)
+
+    def test_thousands_still_come_from_a_space(self):
+        self.assertEqual(P("1 234"), 1234.0)
+
+    def test_a_dot_in_the_number_makes_the_comma_thousands_again(self):
+        """«1,234.56» иначе не разобрать — это единственное исключение."""
+        self.assertEqual(P("1,234.56"), 1234.56)
+
+    def test_both_readers_agree(self):
+        """Второй разбор живёт в панели и запятую всегда считал десятичной."""
+        from automation.panel import _num
+        for text in ("586,226", "1,234", "1 234", "12 345,67"):
+            self.assertEqual(P(text), _num(text), text)
 
 
 class ThingsThatAreNotAmounts(unittest.TestCase):

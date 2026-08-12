@@ -59,6 +59,17 @@ def _money(value):
     return parse_amount(value)
 
 
+def _plain(value) -> str:
+    """Число строкой — без разрядов, но и без потери копеек.
+
+    Эту строку ещё будут превращать во `float` перед выводом средств, так
+    что пробел в разрядах здесь недопустим. А `.2f` округлял «586,226 ₽» до
+    586.23 и расходился с панелью на экране, который ровно для совпадения
+    с ней и существует.
+    """
+    return f"{float(value):.3f}".rstrip("0").rstrip(".")
+
+
 def _deep_find(node, keys, depth: int = 4):
     """First value under any of `keys`, searched breadth-first.
 
@@ -155,7 +166,7 @@ async def _panel_balance(uid: int) -> tuple[str | None, str]:
         ok, got = False, f"не ответила: {str(e)[:60]}"
     if ok and isinstance(got, dict):
         amt = got.get("amount")
-        return f"{amt:.2f}".rstrip("0").rstrip("."), ""
+        return _plain(amt), ""
     shop_err = str(got)[:200]
 
     try:
@@ -178,10 +189,10 @@ async def _panel_balance(uid: int) -> tuple[str | None, str]:
             continue
         cur = str(row.get("currency") or "").lower()
         if "rub" in cur or "руб" in cur or "₽" in cur or not cur:
-            return f"{amt:.2f}".rstrip("0").rstrip("."), ""
+            return _plain(amt), ""
         best = best if best is not None else amt
     if best is not None:
-        return f"{best:.2f}".rstrip("0").rstrip("."), ""
+        return _plain(best), ""
     # Дошли сюда — значит `balances` ответил, но суммы в строках нет. Прежний
     # текст «панель не показала сумму» выбрасывал разбор страницы магазина,
     # где как раз перечислены найденные поля, — то есть ровно то, ради чего
@@ -214,9 +225,9 @@ def _parse_check(data: dict) -> tuple[str, str, str | None]:
 
     # Empty, not "0": a balance the response never carried is not a balance of
     # zero, and showing zero for it reads as «денег нет» instead of «не нашёл».
-    bal_str = f"{balance:.2f}".rstrip("0").rstrip(".") if balance is not None else ""
+    bal_str = _plain(balance) if balance is not None else ""
     pend = _money(pending) if pending is not None else None
-    pend_str = (f"{pend:.2f}".rstrip("0").rstrip(".")) if pend else None
+    pend_str = _plain(pend) if pend else None
     return str(name), bal_str, pend_str
 
 
