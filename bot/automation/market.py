@@ -559,6 +559,7 @@ def search_own_listing(market_id: str | int, title: str = "",
 
     want = str(market_id)
     seen: list[dict] = []
+    by_word: list[dict] = []          # строки, пришедшие не по одному числу
     for key in search_keys(title):
         facts["keys"].append(key)
         # A few pages per key: the words that survive a decorated title are not
@@ -585,6 +586,11 @@ def search_own_listing(market_id: str | int, title: str = "",
                     facts["rows"] += 1
                     return row, facts
                 seen.append(row)
+                # По какому слову пришла строка — не мелочь. Ключ «50»
+                # приводит танковую голду и всё, где есть полсотни чего
+                # угодно; голосовать за раздел такие строки не должны.
+                if not key.strip().isdigit():
+                    by_word.append(row)
     facts["rows"] = len(seen)
     facts["ids"] = [str(r.get("id")) for r in seen[:8]]
     facts["sellers"] = [_seller_of(r) for r in seen[:8]]
@@ -602,12 +608,14 @@ def search_own_listing(market_id: str | int, title: str = "",
     # Причин ровно две, и они требуют разного: подходящих строк не нашлось
     # совсем, или нашлись, но раздела в них нет. Различать это по нулю
     # голосов невозможно.
-    same, how = neighbours_of(seen, title)
+    same, how = neighbours_of(by_word, title)
     facts["neighbours"] = len(same)
     facts["matched_by"] = how
-    facts["with_section"] = len(section_votes(same))
+    facts["by_word_rows"] = len(by_word)
+    facts["with_section"] = sum(section_votes(same).values())
     facts["row_keys"] = sorted(seen[0].keys())[:14] if seen else []
-    facts["section"], facts["section_votes"] = section_of_neighbours(seen, title)
+    facts["section"], facts["section_votes"] = section_of_neighbours(by_word,
+                                                                     title)
     return got, facts
 
 
@@ -659,6 +667,15 @@ def neighbours_of(rows: list, title: str) -> tuple[list, str]:
                     and any(st in _norm(_row_title(r)) for st in stems)]
             if same:
                 return same, "число и корень слова"
+        # И, наконец, по одним корням слов, без числа. Мы ищем **раздел**, а
+        # не свой лот: сосед может продавать звёзды пачками на выбор и не
+        # писать в названии никакого числа, а стоять при этом там же, где
+        # мы. Число тут только мешало.
+        if stems:
+            same = [r for r in rows
+                    if all(st in _norm(_row_title(r)) for st in stems)]
+            if same:
+                return same, "корни слов без числа"
     return [], ""
 
 
@@ -678,22 +695,10 @@ def section_of_neighbours(rows: list, title: str) -> tuple[object, int]:
     """
     same, _how = neighbours_of(rows, title)
     votes = section_votes(same)
-    if votes:
-        best = max(votes.items(), key=lambda kv: kv[1])
-        return best[0], best[1]
-
-    # Ни одна строка не опозналась как тот же товар — но искали-то мы по
-    # словам своего названия, так что выдача целиком про него. Берём самый
-    # частый раздел по всей выдаче, но только если он там и правда главный:
-    # три голоса и больше трети всех размеченных строк. Иначе это не вывод,
-    # а совпадение, и лучше честно ничего.
-    wide = section_votes(rows)
-    if not wide:
+    if not votes:
         return None, 0
-    best = max(wide.items(), key=lambda kv: kv[1])
-    if best[1] >= 3 and best[1] * 3 >= sum(wide.values()):
-        return best[0], best[1]
-    return None, 0
+    best = max(votes.items(), key=lambda kv: kv[1])
+    return best[0], best[1]
 
 
 def section_votes(rows: list) -> dict:

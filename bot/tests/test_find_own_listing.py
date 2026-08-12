@@ -360,27 +360,115 @@ class TheSectionComesFromTheNeighbours(unittest.TestCase):
         self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
 
 
-class TheWholeFeedIsTheLastResort(unittest.TestCase):
-    """Искали по словам своего названия — значит выдача целиком про наш
-    товар, даже если ни одна строка не опозналась дословно. Но брать её
-    раздел можно, только если он там и правда главный: иначе это не вывод,
-    а совпадение."""
+class TheWholeFeedIsNotEvidence(unittest.TestCase):
+    """Запас «взять самый частый раздел по всей выдаче» просуществовал один
+    деплой и был снят.
+
+    По ключу «50» витрина приводит танковую голду и всё, где есть полсотни
+    чего угодно. Большинство в такой выдаче оказалось за `tanks-blitz`, и
+    бот уверенно пошёл искать «50 звезд» среди танков: прочитал 675
+    предложений и ответил «в этом разделе товара нет».
+
+    Ответ честный, но повод был выдуманный. Такой вывод хуже отсутствия
+    вывода: он тратит время и уводит от настоящей причины.
+    """
 
     def rows(self, *pairs):
         return [{"id": i, "title": t, "category_id": c, "shop": {"name": "x"}}
                 for i, (t, c) in enumerate(pairs)]
 
-    def test_a_clear_majority_is_taken(self):
-        rows = self.rows(("что-то", 512), ("иное", 512), ("третье", 512))
-        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
+    def test_a_feed_of_strangers_gives_nothing(self):
+        rows = self.rows(("50 голды", 900), ("50 боёв", 900), ("50 премок", 900))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд"), (None, 0))
 
-    def test_a_scattered_feed_gives_nothing(self):
+    def test_a_scattered_feed_gives_nothing_either(self):
         rows = self.rows(("а", 1), ("б", 2), ("в", 3), ("г", 4))
         self.assertEqual(M.section_of_neighbours(rows, "50 звезд"), (None, 0))
 
-    def test_two_votes_are_not_enough(self):
-        rows = self.rows(("а", 512), ("б", 512))
-        self.assertEqual(M.section_of_neighbours(rows, "50 звезд"), (None, 0))
+    def test_only_rows_about_our_product_vote(self):
+        rows = self.rows(("50 голды", 900), ("50 голды", 900),
+                         ("50 голды", 900), ("звёзды Telegram", 512))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
+
+
+class RowsFoundByTheBareNumberDoNotVote(unittest.TestCase):
+    """Ключ «50» приводит танковую голду и всё, где есть полсотни чего
+    угодно. Именно эти строки и составили большинство, отправившее бота
+    искать «50 звезд» среди танков.
+
+    Голосовать за раздел должны строки, найденные по СЛОВУ. Число как
+    отдельный ключ полезно для поиска своего лота и вредно для вывода о
+    разделе.
+    """
+
+    def setUp(self):
+        import requests
+        self._get, self._card = requests.get, M.product_card
+        M.product_card = lambda mid: {}
+
+        by_key = {
+            # По одному числу приходит всё, где есть полсотни чего угодно —
+            # в том числе чужие «звёзды» из другого раздела.
+            "50": [{"id": 1, "title": "50 звёзд Warface", "category_id": 900,
+                    "shop": {"name": "Танки"}}] * 5,
+            "звезд": [{"id": 2, "title": "Звёзды Telegram", "category_id": 512,
+                       "shop": {"name": "Сосед"}}],
+        }
+
+        class R:
+            def __init__(self_inner, rows):
+                self_inner.rows, self_inner.status_code = rows, 200
+
+            def json(self_inner):
+                return {"data": self_inner.rows}
+
+        def fake(url, params=None, **kw):
+            key = (params or {}).get("keyword", "")
+            page = int((params or {}).get("page", 1))
+            return R(by_key.get(key, []) if page == 1 else [])
+
+        requests.get = fake
+
+    def tearDown(self):
+        import requests
+        requests.get, M.product_card = self._get, self._card
+
+    def test_the_section_comes_from_the_word_not_the_number(self):
+        _got, facts = M.search_own_listing(229402, "50 звезд", OURS)
+        self.assertEqual(facts["section"], "512")
+
+    def test_the_tank_section_does_not_win_by_headcount(self):
+        _got, facts = M.search_own_listing(229402, "50 звезд", OURS)
+        self.assertNotEqual(facts["section"], "900")
+
+    def test_the_numeric_rows_are_still_searched_for_our_own_lot(self):
+        """Отсев касается только голосования: своё объявление по числу
+        находить по-прежнему можно и нужно."""
+        _got, facts = M.search_own_listing(229402, "50 звезд", OURS)
+        self.assertGreater(facts["rows"], facts["by_word_rows"])
+
+
+class ANeighbourNeedNotRepeatOurNumber(unittest.TestCase):
+    """Мы ищем **раздел**, а не свой лот. Сосед может продавать звёзды
+    пачками на выбор и не писать в названии числа — а стоять там же, где
+    мы. Требование числа отсекало ровно таких соседей."""
+
+    def rows(self, *pairs):
+        return [{"id": i, "title": t, "category_id": c, "shop": {"name": "x"}}
+                for i, (t, c) in enumerate(pairs)]
+
+    def test_a_numberless_neighbour_still_names_the_section(self):
+        rows = self.rows(("Звёзды Telegram", 512), ("Звёзды Telegram", 512))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
+
+    def test_it_is_reported_as_the_looser_match(self):
+        rows = self.rows(("Звёзды Telegram", 512))
+        self.assertEqual(M.neighbours_of(rows, "50 звезд")[1],
+                         "корни слов без числа")
+
+    def test_an_exact_match_still_wins_over_it(self):
+        rows = self.rows(("Звёзды Telegram", 777), ("50 звёзд", 512))
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "512")
 
     def test_rows_without_a_section_do_not_vote(self):
         rows = self.rows(("50 звезд", None), ("50 звезд", 512))
