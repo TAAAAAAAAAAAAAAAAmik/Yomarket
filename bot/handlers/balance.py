@@ -221,7 +221,20 @@ def _parse_check(data: dict) -> tuple[str, str, str | None]:
 
 
 from orderfields import DONE as _DONE
-_RUB = lambda v: f"{int(round(v)):,}".replace(",", " ")   # 1234 → "1 234"
+from orderfields import money as _RUB       # 1234 → «1 234», 1234.5 → «1 234,5»
+
+
+def _shown(value) -> str:
+    """Сумму на экран — с разрядами. «586226 ₽» читается пересчётом цифр.
+
+    Разбор и показ разведены нарочно: наружу из `_panel_balance` уходит
+    голое число, которое ещё будут превращать во `float` перед выводом
+    средств. Пробел в разрядах там сломал бы `float`, и баланс стал бы
+    нулём — «выводить нечего» при полном счёте.
+    """
+    from orderfields import parse_amount
+    num = parse_amount(value)
+    return _RUB(num) if num is not None else str(value)
 
 
 def _earned(details: dict, known: dict, since: float) -> tuple[int, int]:
@@ -361,10 +374,10 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
     if balance not in (None, "", "—"):
         text = (
             f"🏪 <b>{name}</b>\n\n"
-            f"💰 Баланс: <b>{balance} ₽</b>\n"
+            f"💰 Баланс: <b>{_shown(balance)} ₽</b>\n"
         )
         if pending:
-            text += f"⏳ В ожидании: <b>{pending} ₽</b>\n"
+            text += f"⏳ В ожидании: <b>{_shown(pending)} ₽</b>\n"
         # Tie the number to what produced it — a balance with no sales context
         # is just a figure
         text += _activity_block(callback.from_user.id)
@@ -428,7 +441,9 @@ async def _ask_amount(message, uid: int, api: YooMarketAPI,
     b.button(text="❌ Отмена", callback_data="menu:balance")
     b.adjust(1)
     await message.edit_text(
-        f"💸 <b>Вывод средств</b>\n\nДоступно: <b>{bal_str} ₽</b>\n\n"
+        # `shop_balance` отдаёт строку уже со знаком рубля. Второй здесь
+        # давал «586226 ₽ ₽».
+        f"💸 <b>Вывод средств</b>\n\nДоступно: <b>{bal_str}</b>\n\n"
         "Пришлите сумму в ₽ или нажмите «Вывести всё»:",
         reply_markup=b.as_markup())
 
@@ -469,7 +484,7 @@ async def withdraw_all(callback: CallbackQuery, state: FSMContext,
     if not amount or amount < 1:
         # Ноль на экране подтверждения — заявка в никуда.
         await callback.message.edit_text(
-            f"💸 <b>Вывод средств</b>\n\nНа счету <b>{bal_str} ₽</b> — "
+            f"💸 <b>Вывод средств</b>\n\nНа счету <b>{bal_str}</b> — "
             "выводить нечего.",
             reply_markup=_setup_first_kb())
         return
@@ -967,13 +982,15 @@ async def _confirm_payout(message, uid: int, amount: int) -> None:
         f"{k}={_mask(v) if k in ('card', 'wallet', 'phone', 'steam_wallet') else v}"
         for k, v in vals.items() if k != "system")
     b = InlineKeyboardBuilder()
-    b.button(text=f"✅ Вывести {amount} ₽", callback_data=f"wd:go:{amount}")
+    b.button(text=f"✅ Вывести {_RUB(amount)} ₽", callback_data=f"wd:go:{amount}")
     b.button(text="❌ Отмена", callback_data="menu:balance")
     b.adjust(1)
     send = getattr(message, "edit_text", None) or message.answer
     await send(
         f"⚠️ <b>Подтвердите вывод</b>\n\n"
-        f"Сумма: <b>{amount} ₽</b>\n"
+        # Разряды именно здесь важнее всего: экран последний перед деньгами,
+        # и «5862 ₽» от «58620 ₽» без пробела отличаются одним взглядом.
+        f"Сумма: <b>{_RUB(amount)} ₽</b>\n"
         f"Реквизиты: {_esc(masked) or '—'}\n\n"
         f"Заявка уйдёт в панель. Проверьте реквизиты — ошибку не отменить.",
         reply_markup=b.as_markup())
@@ -1148,7 +1165,7 @@ async def withdrawal_history(callback: CallbackQuery, api: YooMarketAPI) -> None
             s = get_settings(callback.from_user.id)
             for w in hist[:25]:
                 amt = w.get("amount", 0)
-                amt_str = f"{amt:.0f} ₽" if amt else "всё"
+                amt_str = f"{_RUB(amt)} ₽" if amt else "всё"
                 wtype = "🤖" if w.get("type") == "auto" else "✋"
                 st = "✅" if w.get("status") == "requested" else "❌"
                 try:

@@ -4148,6 +4148,7 @@ _REVIEW_RESOURCES = ("reviews", "review", "feedbacks", "feedback",
 _RATING_KEYS = ("rating", "stars", "score", "mark", "ball", "оценк")
 _TEXT_KEYS = ("text", "comment", "body", "message", "content", "отзыв")
 _AUTHOR_KEYS = ("user", "author", "buyer", "customer", "client", "покупател")
+_TITLE_KEYS = ("ad", "item", "product", "lot", "товар")
 
 
 def _parse_review(row: dict) -> dict:
@@ -4160,12 +4161,25 @@ def _parse_review(row: dict) -> dict:
     съедается автором молча — сначала пробуется как текст. Вторая: если по
     именам не нашлось ничего, берётся самое длинное строковое поле строки.
     Отзыв — это самый длинный текст в своей записи; хуже пустоты не будет.
+
+    Имена полей — не единственный признак. У Nova есть `component`, и он
+    говорит о поле больше, чем его название: `belongs-to` и `morph-to` —
+    это **ссылка на другую запись** (на покупателя, на товар), а не текст;
+    `textarea` и `markdown` — наоборот, свободный текст, как бы поле ни
+    звалось. Без этого отзыв без текста приходил продавцу так:
+
+        👤 Покупатель ⭐⭐⭐⭐⭐
+        «Andrej Prokopjew»
+
+    — имя покупателя, выданное за текст отзыва, потому что запасной
+    вариант брал самое длинное поле, а им оказалась ссылка на автора.
     """
     out = {"id": _row_id(row), "rating": None, "text": "", "author": "",
            "ts": None, "title": ""}
     spare: list[tuple[int, str]] = []
     for f in _fields_of(row):
         attr = str(f.get("attribute") or "").lower()
+        comp = str(f.get("component") or "").lower()
         value = _field_text(f)
         if out["rating"] is None and any(k in attr for k in _RATING_KEYS):
             num = _num(value)
@@ -4179,6 +4193,23 @@ def _parse_review(row: dict) -> dict:
             if ts:
                 out["ts"] = ts
                 continue
+        # Ссылка на другую запись. Текстом отзыва она быть не может ни при
+        # каком имени поля, поэтому в запасные кандидаты не попадает.
+        if "belongs-to" in comp or "morph-to" in comp:
+            if not out["author"] and any(k in attr for k in _AUTHOR_KEYS):
+                out["author"] = value[:40]
+            elif not out["title"] and any(k in attr for k in _TITLE_KEYS):
+                out["title"] = value[:60]
+            elif not out["author"]:
+                out["author"] = value[:40]
+            elif not out["title"]:
+                out["title"] = value[:60]
+            continue
+        # Свободный текст по устройству поля, а не по названию: у отзыва это
+        # обычно `textarea`, и назвать его панель может как угодно.
+        if not out["text"] and ("textarea" in comp or "markdown" in comp):
+            out["text"] = value[:400]
+            continue
         # Текст — раньше автора: `user_comment` подходит под оба списка, и
         # при прежнем порядке уходил в автора, а отзыв оставался пустым.
         if not out["text"] and any(k in attr for k in _TEXT_KEYS):
@@ -4187,8 +4218,7 @@ def _parse_review(row: dict) -> dict:
         if not out["author"] and any(k in attr for k in _AUTHOR_KEYS):
             out["author"] = value[:40]
             continue
-        if not out["title"] and any(k in attr for k in ("ad", "item", "product",
-                                                        "lot", "товар")):
+        if not out["title"] and any(k in attr for k in _TITLE_KEYS):
             out["title"] = value[:60]
             continue
         if value and not _num(value):

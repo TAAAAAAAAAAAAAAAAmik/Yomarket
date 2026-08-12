@@ -71,7 +71,11 @@ async def shop_balance(user_id: int, api,
             why.append(err or "панель не назвала причину")
         return 0.0, "—"
     try:
-        return float(shown), f"{float(shown):.0f} ₽"
+        # Разряды обязательны: «586226 ₽» на экране приходится пересчитывать
+        # глазами по три цифры, и ошибиться разрядом здесь — это ошибиться
+        # в сумме вывода.
+        from orderfields import money as _fmt_money
+        return float(shown), f"{_fmt_money(float(shown))} ₽"
     except (TypeError, ValueError):
         return 0.0, str(shown)
 
@@ -2582,8 +2586,10 @@ class TaskManager:
             body = [f"👤 {_esc(rev.get('author') or 'Покупатель')}  {stars}"]
             if rev.get("title"):
                 body.append(f"📦 {_esc(rev['title'])}")
-            if rev.get("text"):
-                body += ["", f"<i>«{_esc(rev['text'][:300])}»</i>"]
+            # «Без текста» сказано вслух: отзыв с одной оценкой — обычное
+            # дело, а уведомление, оборванное на нике, выглядит как сбой.
+            body += ["", f"<i>«{_esc(rev['text'][:300])}»</i>"] \
+                if rev.get("text") else ["", "<i>без текста</i>"]
             await self._notify(user_id, _card("⭐ <b>НОВЫЙ ОТЗЫВ</b>", body))
         if len(fresh) > 5:
             return f"⭐ Ещё {len(fresh) - 5} новых отзывов"

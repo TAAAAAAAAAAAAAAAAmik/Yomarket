@@ -216,6 +216,70 @@ class FindingTheTextWhateverTheFieldIsCalled(unittest.TestCase):
         self.assertEqual(got["text"], "")
 
 
+class ALinkToAnotherRecordIsNotTheReviewText(unittest.TestCase):
+    """Продавцу пришло уведомление:
+
+        ⭐ НОВЫЙ ОТЗЫВ
+        👤 Покупатель ⭐⭐⭐⭐⭐
+        «Andrej Prokopjew»
+
+    Имя покупателя, выданное за текст отзыва. Отзыв был без текста, а
+    запасной вариант взял самое длинное поле строки — им оказалась ссылка
+    на автора. По имени поля этого не поймать: оно у панели своё. Зато у
+    Nova есть `component`, и он говорит прямо: `belongs-to` — ссылка на
+    другую запись, `textarea` — свободный текст.
+    """
+
+    def parse(self, fields, rating=5):
+        from automation.panel import _parse_review
+        rows = [{"attribute": "rating", "value": rating}] + [
+            dict(f) for f in fields]
+        return _parse_review({"id": 1, "fields": rows})
+
+    def test_a_relation_never_becomes_the_review_text(self):
+        got = self.parse([{"attribute": "sender", "component": "belongs-to-field",
+                           "value": "Andrej Prokopjew"}])
+        self.assertEqual(got["text"], "")
+
+    def test_and_it_is_shown_as_the_author_instead(self):
+        got = self.parse([{"attribute": "sender", "component": "belongs-to-field",
+                           "value": "Andrej Prokopjew"}])
+        self.assertEqual(got["author"], "Andrej Prokopjew")
+
+    def test_a_textarea_is_the_text_whatever_it_is_called(self):
+        """Короткий отзыв рядом с длинным чужим полем: «самое длинное поле»
+        выбрало бы не его."""
+        got = self.parse([
+            {"attribute": "zzz", "component": "textarea-field", "value": "Ок"},
+            {"attribute": "qqq", "component": "text-field",
+             "value": "техническая пометка панели подлиннее"}])
+        self.assertEqual(got["text"], "Ок")
+
+    def test_the_relation_does_not_steal_a_real_text(self):
+        got = self.parse([
+            {"attribute": "sender", "component": "belongs-to-field",
+             "value": "Andrej Prokopjew"},
+            {"attribute": "comment", "component": "textarea-field",
+             "value": "Быстро и без вопросов"}])
+        self.assertEqual(got["author"], "Andrej Prokopjew")
+        self.assertEqual(got["text"], "Быстро и без вопросов")
+
+    def test_a_named_product_relation_stays_the_product(self):
+        got = self.parse([
+            {"attribute": "item", "component": "belongs-to-field",
+             "value": "1000 Stars"},
+            {"attribute": "buyer", "component": "belongs-to-field",
+             "value": "Andrej Prokopjew"}])
+        self.assertEqual(got["title"], "1000 Stars")
+        self.assertEqual(got["author"], "Andrej Prokopjew")
+
+    def test_the_notification_says_a_review_has_no_text(self):
+        """Уведомление, оборванное на нике, выглядит как сбой бота."""
+        import inspect
+        from tasks import manager as M
+        self.assertIn("без текста", inspect.getsource(M.TaskManager._check_reviews))
+
+
 class TheReaderReportsWhatItDidNotRead(unittest.TestCase):
     def test_the_panel_helper_returns_the_more_flag(self):
         """Без него экран не может честно посчитать «из N»."""
