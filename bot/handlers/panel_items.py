@@ -1599,6 +1599,7 @@ async def pos_find(message: Message) -> None:
              f"раздел по соседям: {facts.get('section') or '—'}"
              f" (голосов: {facts.get('section_votes') or 0})",
              f"поля строки витрины: {', '.join(facts.get('row_keys') or []) or '—'}",
+             f"раздел в строке витрины: {facts.get('row_section') or '—'}",
              ""]
     if facts.get("error"):
         lines += [f"ошибка запроса: {facts['error']}", ""]

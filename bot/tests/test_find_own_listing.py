@@ -448,6 +448,68 @@ class RowsFoundByTheBareNumberDoNotVote(unittest.TestCase):
         self.assertGreater(facts["rows"], facts["by_word_rows"])
 
 
+class TheSectionInTheRowIsNotANumber(unittest.TestCase):
+    """`/pos_find` напечатал поля строки витрины, и всё стало на места:
+
+        соседей по товару: 13 (совпало по: все слова названия)
+        из них с разделом: 0
+        поля строки витрины: category, id, images, price, rating, shop,
+                             slug, status, thumbnail, title, type
+
+    Соседи нашлись — тринадцать. Раздела «нет» у всех тринадцати. А поле
+    `category` в строке есть: просто это **не число**, а чтение раздела
+    искало только числовые ключи и молча возвращало пусто. Раздел был на
+    виду и не читался.
+    """
+
+    TREE = [{"id": 7, "slug": "telegram", "title": "Telegram", "children": [
+        {"id": 512, "slug": "zvezdy", "title": "Звёзды"}]}]
+
+    def setUp(self):
+        self._tree = M.category_tree
+        M.category_tree = lambda: self.TREE
+
+    def tearDown(self):
+        M.category_tree = self._tree
+
+    def test_a_string_category_is_read(self):
+        self.assertEqual(M.section_ref_of({"category": "zvezdy"}), "zvezdy")
+
+    def test_a_numeric_category_still_wins(self):
+        self.assertEqual(
+            M.section_ref_of({"category": "zvezdy", "category_id": 512}), 512)
+
+    def test_an_empty_category_is_nothing(self):
+        self.assertIsNone(M.section_ref_of({"category": "  "}))
+        self.assertIsNone(M.section_ref_of({}))
+
+    def test_neighbours_with_a_string_section_do_vote(self):
+        rows = [{"id": i, "title": "50 звёзд", "category": "zvezdy",
+                 "shop": {"name": "Сосед"}} for i in range(3)]
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "zvezdy")
+
+    def test_the_slug_becomes_the_whole_chain(self):
+        self.assertEqual(M.slugs_for_section("zvezdy"), ["telegram", "zvezdy"])
+
+    def test_a_number_still_works_the_old_way(self):
+        self.assertEqual(M.slugs_for_section(512), ["telegram", "zvezdy"])
+
+    def test_a_name_works_too(self):
+        self.assertEqual(M.slugs_for_section("Звёзды"), ["telegram", "zvezdy"])
+
+    def test_something_unknown_gives_nothing(self):
+        self.assertEqual(M.slugs_for_section("чего-нет"), [])
+
+    def test_the_address_is_built_from_a_string_section(self):
+        old = M.search_own_listing
+        M.search_own_listing = lambda mid, t="", s="": ({}, {"section": "zvezdy"})
+        try:
+            urls = M.listing_urls_for(229402, None, "50 звезд", "Spike")
+        finally:
+            M.search_own_listing = old
+        self.assertIn("https://yoomarket.net/categories/telegram/zvezdy", urls)
+
+
 class ANeighbourNeedNotRepeatOurNumber(unittest.TestCase):
     """Мы ищем **раздел**, а не свой лот. Сосед может продавать звёзды
     пачками на выбор и не писать в названии числа — а стоять там же, где

@@ -614,6 +614,7 @@ def search_own_listing(market_id: str | int, title: str = "",
     facts["by_word_rows"] = len(by_word)
     facts["with_section"] = sum(section_votes(same).values())
     facts["row_keys"] = sorted(seen[0].keys())[:14] if seen else []
+    facts["row_section"] = section_ref_of(seen[0]) if seen else None
     facts["section"], facts["section_votes"] = section_of_neighbours(by_word,
                                                                      title)
     return got, facts
@@ -701,13 +702,28 @@ def section_of_neighbours(rows: list, title: str) -> tuple[object, int]:
     return best[0], best[1]
 
 
+def section_ref_of(row: dict):
+    """Раздел строки витрины — номером, slug'ом или названием, как отдан.
+
+    Числовой ключ проверяется первым, но `category` у этой витрины строка,
+    и раньше она молча пропадала.
+    """
+    cid = _category_id_of(row)
+    if cid not in (None, ""):
+        return cid
+    node = row.get("category") or row.get("subcategory")
+    if isinstance(node, str) and node.strip():
+        return node.strip()
+    return None
+
+
 def section_votes(rows: list) -> dict:
-    """{номер раздела: сколько строк за него} — только строки с разделом."""
+    """{раздел: сколько строк за него} — только строки с разделом."""
     votes: dict = {}
     for r in rows:
-        cid = _category_id_of(r)
-        if cid not in (None, ""):
-            votes[str(cid)] = votes.get(str(cid), 0) + 1
+        ref = section_ref_of(r)
+        if ref not in (None, ""):
+            votes[str(ref)] = votes.get(str(ref), 0) + 1
     return votes
 
 
@@ -759,6 +775,39 @@ def category_tree() -> list:
         return []
     rows = body.get("data") if isinstance(body, dict) else body
     return rows if isinstance(rows, list) else []
+
+
+def _find_by_slug(nodes, want, trail=()) -> list:
+    """Цепочка slug'ов до раздела с таким slug, снаружи внутрь."""
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict):
+            continue
+        slug = str(node.get("slug") or "")
+        here = list(trail) + ([slug] if slug else [])
+        if slug and slug == str(want):
+            return here
+        for key in ("children", "subcategories", "items", "categories"):
+            got = _find_by_slug(node.get(key), want, here)
+            if got:
+                return got
+    return []
+
+
+def slugs_for_section(ref) -> list:
+    """Цепочка slug'ов раздела по чему угодно: номеру, slug'у, названию.
+
+    Строка витрины кладёт раздел в поле `category`, и это **не число**:
+    `_category_id_of` искал только числовые ключи и возвращал пусто у всех
+    тринадцати найденных соседей — «из них с разделом: 0» при полном
+    списке полей `category, id, images, price, rating, shop, slug, …`.
+    Раздел был на виду и не читался.
+    """
+    if ref in (None, ""):
+        return []
+    text = str(ref).strip()
+    if text.isdigit():
+        return _find_by_id(category_tree(), text)
+    return _find_by_slug(category_tree(), text) or category_slugs_by_title(text)
 
 
 def _find_by_id(nodes, want, trail=()) -> list:
@@ -906,7 +955,7 @@ def listing_urls_for(market_id: str | int, card: dict | None = None,
         # Своей строки в выдаче нет — конкурентов сотни, а листается три
         # страницы. Но раздел нам и нужен, а не своя строка: соседи с тем
         # же товаром стоят в том же разделе.
-        path = category_slugs_for(facts.get("section"))
+        path = slugs_for_section(facts.get("section"))
         if path:
             out = [f"{MARKET_URL}/categories/" + "/".join(path[-2:])]
             if len(path) > 1:
@@ -918,7 +967,7 @@ def listing_urls_for(market_id: str | int, card: dict | None = None,
     # row carries. A row does not have to name the whole path — the one we saw
     # gave the game and nothing else, and an address for the whole game puts
     # our listing hundreds of places down a list it does not belong in.
-    path = category_slugs_for(_category_id_of(card))
+    path = slugs_for_section(section_ref_of(card))
     if path:
         out.append(f"{MARKET_URL}/categories/" + "/".join(path[-2:]))
 
