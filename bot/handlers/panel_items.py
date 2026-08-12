@@ -1528,6 +1528,78 @@ async def pos_api(message: Message) -> None:
     await status.delete()
 
 
+@router.message(Command("pos_find"))
+async def pos_find(message: Message) -> None:
+    """/pos_find <часть названия> — как витрина отвечает на поиск нашего товара.
+
+    Продавец: «бот не может найти сам объявления». Дальше начиналась
+    догадка — и это ровно тот случай, когда её надо заменить фактами.
+    Печатается: какие слова бот пробовал, сколько строк вернула витрина, и
+    какие у этих строк номера, магазины и названия. По ним сразу видно
+    главное: совпадает ли номер объявления с номером строки на витрине.
+
+    Только чтение: обычный поиск, ничего не меняется и не тратится.
+    """
+    import html as _html
+
+    from automation.market import search_own_listing
+    from storage import get_shop_name
+
+    query = (message.text or "").split(maxsplit=1)
+    query = query[1].strip() if len(query) > 1 else ""
+    ads = await _my_ads_for(message.from_user.id)
+    if not ads:
+        await message.answer("Не смог прочитать список объявлений — нужен "
+                             "API-токен: /start")
+        return
+    picked = [a for a in ads
+              if not query or query.lower() in a["title"].lower()
+              or query == a["id"]]
+    if not picked:
+        await message.answer(
+            f"Среди {len(ads)} объявлений нет ни одного со словом "
+            f"«{_html.escape(query)}». Без слова возьму первое.")
+        return
+    ad = picked[0]
+
+    status = await message.answer(f"⏳ Ищу на витрине «{_html.escape(ad['title'][:40])}»…")
+    shop = get_shop_name(message.from_user.id) or ""
+    try:
+        got, facts = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, search_own_listing, ad["id"], ad["title"], shop),
+            timeout=120)
+    except Exception as e:
+        await status.edit_text(f"❌ {_html.escape(str(e)[:200])}")
+        return
+
+    lines = [f"объявление: {ad['id']} — {ad['title'][:50]}",
+             f"магазин в боте: {shop or '— (не определён)'}",
+             f"слова поиска: {', '.join(facts['keys']) or '—'}",
+             f"строк вернулось: {facts['rows']}",
+             f"нашли по: {facts['by'] or 'НЕ НАШЛИ'}", ""]
+    if facts.get("error"):
+        lines += [f"ошибка запроса: {facts['error']}", ""]
+    if got:
+        lines += [f"наша строка: id={got.get('id')} "
+                  f"slug={got.get('slug') or '—'}"]
+    else:
+        lines.append("первые строки выдачи (номер | магазин):")
+        for rid, sel in zip(facts["ids"], facts["sellers"]):
+            lines.append(f"  {rid} | {sel or '—'}")
+        lines += ["", "Если наш магазин в списке есть, а номер другой — "
+                  "номера витрины и API из разных пространств, и искать "
+                  "надо по магазину."]
+    text = _html.escape("\n".join(lines))
+    await status.edit_text(f"<code>{text[:3800]}</code>")
+
+
+async def _my_ads_for(uid: int) -> list:
+    """Объявления магазина — тем же путём, что и экран позиций."""
+    from handlers.selenium_settings import _my_ads
+    return await _my_ads(uid)
+
+
 async def _pos_debug_watches(message: Message) -> None:
     """Dry-run every watch: position, thresholds and the decision — no charge.
 

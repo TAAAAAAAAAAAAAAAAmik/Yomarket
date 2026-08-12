@@ -481,20 +481,68 @@ def search_key(title: str) -> str:
     return keys[0] if keys else ""
 
 
-def find_own_listing(market_id: str | int, title: str = "") -> dict:
-    """Our listing as it appears on the storefront, found by searching for it.
+def _row_title(row: dict) -> str:
+    return _text(row.get("title") or row.get("name") or "")
 
-    `/api/products/{id}` is not something this marketplace answers, so the id
-    alone gets us nowhere. The search does work — it is the same endpoint the
-    listing pages use — so the title finds the row and the row carries the
-    category the address is built from.
+
+def pick_ours(rows: list, title: str = "", seller: str = "") -> dict:
+    """Наша строка среди найденных поиском — по магазину и названию.
+
+    Сверялся только номер. А номер объявления в Integration API и номер
+    строки на витрине — **разные пространства**: когда они не совпадают,
+    поиск находил нашу же строку и выбрасывал её, а продавец получал
+    «Не нашёл этот товар в поиске витрины» на товар, который там стоит.
+
+    Ниже по течению, в `find_position`, магазин и название учитывались
+    давно. То есть первый шаг был строже второго — и падал именно он.
+
+    Порядок тот же, что и там, и по той же причине: список выдачи — это
+    копии одного товара у разных продавцов, названия почти одинаковые, и
+    сверка по названию первой привела бы к чужой строке. Магазин отделяет
+    нашу, название разбирает ничью внутри неё.
+    """
+    if not rows:
+        return {}
+    want_t, want_s = _norm(title), _norm(seller)
+    if want_s:
+        mine = [r for r in rows if want_s in _norm(_seller_of(r))]
+        if mine:
+            if want_t:
+                for pick in ([r for r in mine if _norm(_row_title(r)) == want_t],
+                             [r for r in mine if want_t in _norm(_row_title(r))]):
+                    if pick:
+                        return pick[0]
+            if len(mine) == 1:
+                return mine[0]
+            # Несколько наших строк, и ни одна не по названию — какая из них
+            # та самая, неизвестно. Взять первую значит выбрать не тот раздел
+            # и потом объяснять, почему «мы там не стоим».
+            return {}
+    if want_t:
+        exact = [r for r in rows if _norm(_row_title(r)) == want_t]
+        if len(exact) == 1:
+            return exact[0]
+    return {}
+
+
+def search_own_listing(market_id: str | int, title: str = "",
+                       seller: str = "") -> tuple[dict, dict]:
+    """(строка, факты) — наша строка на витрине и как её искали.
+
+    Факты отдельно, чтобы диагностика печатала их, а не разбирала прозу:
+    какие слова пробовали, сколько строк вернулось, чем в итоге совпало.
     """
     import requests
+    facts = {"keys": [], "rows": 0, "by": "", "ids": [], "sellers": []}
     card = product_card(market_id)
     if card:
-        return card
+        facts["by"] = "карточка по номеру"
+        return card, facts
+
     want = str(market_id)
+    seen: list[dict] = []
     for key in search_keys(title):
+        facts["keys"].append(key)
         # A few pages per key: the words that survive a decorated title are not
         # always distinctive — «Быстрая выдача» matches half a category.
         for page in range(1, 4):
@@ -506,14 +554,38 @@ def find_own_listing(market_id: str | int, title: str = "") -> dict:
                 body = r.json() if r.status_code == 200 else {}
             except Exception as e:
                 logger.info("search for own listing %s: %s", market_id, e)
-                return {}
+                facts["error"] = str(e)[:80]
+                break
             rows = body.get("data") if isinstance(body, dict) else None
             if not isinstance(rows, list) or not rows:
                 break                       # this key is exhausted, try another
             for row in rows:
-                if isinstance(row, dict) and str(row.get("id")) == want:
-                    return row
-    return {}
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("id")) == want:
+                    facts["by"] = "номер"
+                    facts["rows"] += 1
+                    return row, facts
+                seen.append(row)
+    facts["rows"] = len(seen)
+    facts["ids"] = [str(r.get("id")) for r in seen[:8]]
+    facts["sellers"] = [_seller_of(r) for r in seen[:8]]
+    got = pick_ours(seen, title, seller)
+    if got:
+        facts["by"] = "магазин и название"
+    return got, facts
+
+
+def find_own_listing(market_id: str | int, title: str = "",
+                     seller: str = "") -> dict:
+    """Our listing as it appears on the storefront, found by searching for it.
+
+    `/api/products/{id}` is not something this marketplace answers, so the id
+    alone gets us nowhere. The search does work — it is the same endpoint the
+    listing pages use — so the title finds the row and the row carries the
+    category the address is built from.
+    """
+    return search_own_listing(market_id, title, seller)[0]
 
 
 def _slug_chain(node, depth: int = 0) -> list:
@@ -644,7 +716,7 @@ def _category_id_of(card: dict):
 
 
 def listing_urls_for(market_id: str | int, card: dict | None = None,
-                     title: str = "") -> list:
+                     title: str = "", seller: str = "") -> list:
     """Storefront addresses a listing of ours could live at, likeliest first.
 
     Saves the seller from opening the marketplace, finding their own item and
@@ -657,7 +729,10 @@ def listing_urls_for(market_id: str | int, card: dict | None = None,
     round. Guessing would be a coin toss; the caller settles it by asking each
     address whether our listing is actually in it.
     """
-    card = card if card is not None else find_own_listing(market_id, title)
+    # Имя магазина — чтобы узнать свою строку, когда номер витрины не совпал
+    # с номером объявления. Без него поиск находил нашу строку и выбрасывал.
+    card = card if card is not None else find_own_listing(market_id, title,
+                                                          seller)
     if not card:
         return []
     out = []

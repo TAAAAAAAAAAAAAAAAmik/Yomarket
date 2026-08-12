@@ -246,7 +246,7 @@ class AddingFromOwnListings(FlowCase):
         import api.yoomarket as Y
         self.patch(Y, "YooMarketAPI", FakeApi)
         self.patch(M, "find_own_listing",
-                   lambda mid, title="": self.CARD)
+                   lambda mid, title="", seller="": self.CARD)
         # The catalogue knows «virty» as a section of black-russia,
         # and knows nothing about the reverse.
         self.patch(M, "category_meta",
@@ -355,7 +355,7 @@ class AddingFromOwnListings(FlowCase):
     def test_a_listing_the_search_cannot_find_says_so_specifically(self):
         """A different failure from «the page did not show it», and it needs a
         different thing from the seller — so it must not read the same."""
-        self.patch(M, "find_own_listing", lambda mid, title="": {})
+        self.patch(M, "find_own_listing", lambda mid, title="", seller="": {})
         cb = self.pick()
         self.assertEqual(self.watches(), [])
         said = "\n".join(cb.message.sent)

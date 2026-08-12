@@ -862,7 +862,7 @@ async def _find_listing_page(uid: int, ad: dict) -> tuple[str, int, int, list]:
     try:
         urls = await asyncio.wait_for(
             loop.run_in_executor(None, listing_urls_for, ad["id"], None,
-                                 ad["title"]),
+                                 ad["title"], shop),
             timeout=90)
     except Exception as e:
         logger.warning("listing urls for %s: %s", ad["id"], e)
