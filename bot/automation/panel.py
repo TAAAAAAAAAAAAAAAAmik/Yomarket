@@ -443,6 +443,38 @@ def _make_panel_requests_session(cookie_string: str):
     return session
 
 
+_PANEL_EXPIRED = ("сессия панели истекла — войдите заново: "
+                  "Настройки → 🌐 Панель продавца")
+
+
+def _panel_expired(r) -> str:
+    """Ответ панели, означающий «сессия кончилась» — по-русски. Иначе пусто.
+
+    Проверялся один код — 401. Laravel на истёкшей сессии отвечает ещё и
+    419 («Page Expired», просроченный CSRF), и редиректом на /login, а
+    редиректы мы намеренно не ходим — и продавец видел на экране
+    «shops → 302». Английский код вместо объяснения — ровно та отписка,
+    которую проект запрещает.
+
+    Стоило дня: баланс второго магазина «не показывался», и поломку искали
+    в многомагазинности, пока продавец сам не догадался, что сессия просто
+    истекла. Бот это знал и не сказал.
+
+    Строка была выписана в шестнадцати местах; починка одного оставляла
+    пятнадцать как были. Теперь проверка одна.
+    """
+    code = getattr(r, "status_code", 0)
+    if code in (401, 419):
+        return _PANEL_EXPIRED
+    if code in (301, 302, 303, 307, 308):
+        dest = str((getattr(r, "headers", None) or {}).get("Location") or "")
+        # Куда угодно, кроме логина, — это не про сессию, и врать не надо:
+        # совет «войдите заново» тому, кто и так внутри, хуже молчания.
+        if not dest or "login" in dest.lower() or "auth" in dest.lower():
+            return _PANEL_EXPIRED
+    return ""
+
+
 def _parse_nova_fields_payload(cf: dict) -> list[dict]:
     """Extract the field list from a Nova creation-fields response.
     Handles list, numeric-keyed dict, and panel-nested shapes."""
@@ -501,8 +533,8 @@ def panel_get_item_form_sync(cookie_string: str) -> tuple[bool, object]:
         except Exception as e:
             last_err = str(e)[:60]
             continue
-        if r.status_code == 401:
-            return False, "401: сессия панели истекла — войдите снова"
+        if (dead := _panel_expired(r)):
+            return False, dead
         if r.status_code != 200:
             continue
         try:
@@ -717,8 +749,8 @@ def _get_update_fields(session, hdrs, item_id: str,
             f"?editing=true&editMode=update",
             headers=hdrs, timeout=(6, 10), allow_redirects=False,
         )
-        if r.status_code == 401:
-            return [], "401: сессия истекла"
+        if (dead := _panel_expired(r)):
+            return [], dead
         if r.status_code != 200:
             return [], f"update-fields: {r.status_code}"
         cf = r.json()
@@ -1574,8 +1606,8 @@ def panel_promo_fields_sync(
         )
     except Exception as e:
         return False, f"не получил список действий: {str(e)[:60]}"
-    if r.status_code == 401:
-        return False, "401: сессия панели истекла — войдите снова"
+    if (dead := _panel_expired(r)):
+        return False, dead
     if r.status_code != 200:
         return False, f"actions: {r.status_code}"
     try:
@@ -1731,8 +1763,8 @@ def panel_bump_item_sync(
             headers=hdrs, timeout=(6, 10), allow_redirects=False,
         )
         trace.append(f"actions: {r.status_code}")
-        if r.status_code == 401:
-            return False, "401: сессия панели истекла — войдите снова"
+        if (dead := _panel_expired(r)):
+            return False, dead
         if r.status_code == 200:
             data = r.json()
             if isinstance(data, dict):
@@ -1956,8 +1988,8 @@ def panel_balances_sync(cookie_string: str) -> tuple[bool, object]:
                         timeout=(6, 12), allow_redirects=False)
     except Exception as e:
         return False, str(e)[:80]
-    if r.status_code == 401:
-        return False, "401: сессия панели истекла — войдите снова"
+    if (dead := _panel_expired(r)):
+        return False, dead
     if r.status_code != 200:
         return False, f"balances → {r.status_code}"
     try:
@@ -2014,8 +2046,8 @@ def panel_withdraw_fields_sync(
                         timeout=(6, 10), allow_redirects=False)
     except Exception as e:
         return False, f"не получил действия баланса: {str(e)[:60]}"
-    if r.status_code == 401:
-        return False, "401: сессия панели истекла — войдите снова"
+    if (dead := _panel_expired(r)):
+        return False, dead
     if r.status_code != 200:
         return False, f"actions: {r.status_code}"
     try:
@@ -2273,8 +2305,8 @@ def panel_withdraw_sync(
     except Exception as e:
         return False, f"запрос не прошёл: {str(e)[:80]}"
 
-    if r.status_code == 401:
-        return False, "401: сессия панели истекла — войдите снова"
+    if (dead := _panel_expired(r)):
+        return False, dead
     if r.status_code in (200, 201, 204):
         # A refused action also returns 200 with the reason in the body — the
         # same trap «Премиум» had, so the answer is inspected, not the code.
@@ -2553,8 +2585,8 @@ def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
         )
     except Exception as e:
         return False, f"ошибка запроса: {str(e)[:60]}"
-    if r.status_code == 401:
-        return False, "401: сессия панели истекла — войдите снова"
+    if (dead := _panel_expired(r)):
+        return False, dead
     if r.status_code != 200:
         return False, f"HTTP {r.status_code}: {r.text[:150]}"
     try:
@@ -2940,7 +2972,7 @@ def panel_create_product_sync(
             debug.append(f"{res}: connect error {str(e)[:40]}")
             continue
 
-        if cf_resp.status_code == 401:
+        if _panel_expired(cf_resp):
             return False, (
                 "⚠️ <b>Панель не принимает сохранённые куки</b> "
                 f"(401 на <code>{res}/creation-fields</code>).\n\n"
@@ -3136,7 +3168,7 @@ def panel_create_product_sync(
                 f"Отправлено: <code>{_json.dumps(payload, ensure_ascii=False)[:200]}</code>"
             )
 
-        if post_resp.status_code == 401:
+        if _panel_expired(post_resp):
             return False, (
                 "⚠️ <b>Панель не принимает сохранённые куки</b> "
                 f"(401 на POST <code>{res}</code>).\n\n"
@@ -3767,8 +3799,8 @@ def panel_shop_balance_sync(cookie_string: str, shop_id: str = "",
                             timeout=(6, 12), allow_redirects=False)
         except Exception as e:
             return False, f"shops: {str(e)[:60]}"
-        if r.status_code == 401:
-            return False, "401: сессия панели истекла — войдите снова"
+        if (dead := _panel_expired(r)):
+            return False, dead
         if r.status_code != 200:
             return False, f"shops → {r.status_code}"
         try:
@@ -4142,8 +4174,8 @@ def panel_operations_sync(cookie_string: str, resource: str = "operations",
         except Exception as e:
             reason = f"{resource}: {str(e)[:60]}"
             break
-        if r.status_code == 401:
-            return False, "401: сессия панели истекла — войдите снова"
+        if (dead := _panel_expired(r)):
+            return False, dead
         if r.status_code != 200:
             reason = f"{resource} → {r.status_code}"
             break
@@ -4299,8 +4331,8 @@ def panel_review_fields_sync(cookie_string: str,
         except Exception as e:
             tried.append(f"{res}: {str(e)[:40]}")
             continue
-        if r.status_code == 401:
-            return False, "401: сессия панели истекла — войдите снова"
+        if (dead := _panel_expired(r)):
+            return False, dead
         if r.status_code != 200:
             tried.append(f"{res}: HTTP {r.status_code}")
             continue
@@ -4357,8 +4389,8 @@ def panel_reviews_sync(cookie_string: str, resource: str = "",
             except Exception as e:
                 tried.append(f"{res}: {str(e)[:40]}")
                 break
-            if r.status_code == 401:
-                return False, "401: сессия панели истекла — войдите снова"
+            if (dead := _panel_expired(r)):
+                return False, dead
             if r.status_code != 200:
                 tried.append(f"{res}: HTTP {r.status_code}")
                 break
@@ -4435,8 +4467,8 @@ def panel_shop_metrics_sync(cookie_string: str,
                             headers=hdrs, timeout=(6, 12), allow_redirects=False)
         except Exception as e:
             return False, f"shops: {str(e)[:60]}"
-        if r.status_code == 401:
-            return False, "401: сессия панели истекла — войдите снова"
+        if (dead := _panel_expired(r)):
+            return False, dead
         if r.status_code != 200:
             return False, f"shops → {r.status_code}"
         try:
