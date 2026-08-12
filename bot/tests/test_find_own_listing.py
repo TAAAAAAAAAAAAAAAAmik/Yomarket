@@ -228,6 +228,98 @@ class TheDiagnosticAnswersTheNextQuestion(unittest.TestCase):
         self.assertIn("магазины выдачи", src)
 
 
+class TheSectionComesFromTheAdItself(unittest.TestCase):
+    """Второй вывод `/pos_find` закрыл поиск по витрине как путь вообще:
+
+        строк вернулось: 124
+        магазинов в выдаче: 32, наш среди них: НЕТ
+
+    Искать свой товар в чужой выдаче — заведомо слабый способ добраться до
+    раздела. А раздел лежит в самом объявлении: Integration API кладёт его
+    в `category_id`, и это поле бот выбрасывал, оставляя себе только номер
+    и название.
+    """
+
+    TREE = [{"id": 7, "slug": "telegram", "title": "Telegram", "children": [
+        {"id": 512, "slug": "zvezdy", "title": "Звёзды"}]}]
+
+    def setUp(self):
+        from handlers import selenium_settings as SS
+        self.SS = SS
+        self._tree = M.category_tree
+        self._search = M.listing_urls_for
+        M.category_tree = lambda: self.TREE
+        M.listing_urls_for = lambda *a, **kw: ["ПОИСК-ПО-ВИТРИНЕ"]
+
+    def tearDown(self):
+        M.category_tree = self._tree
+        M.listing_urls_for = self._search
+
+    def test_the_address_is_built_from_the_ads_category_id(self):
+        urls = self.SS._urls_for_ad({"id": "229402", "title": "50 звезд",
+                                     "category_id": 512, "category": ""})
+        self.assertIn("https://yoomarket.net/categories/telegram/zvezdy", urls)
+
+    def test_and_the_storefront_search_is_not_used_at_all(self):
+        urls = self.SS._urls_for_ad({"id": "229402", "title": "50 звезд",
+                                     "category_id": 512, "category": ""})
+        self.assertNotIn("ПОИСК-ПО-ВИТРИНЕ", urls)
+
+    def test_the_section_alone_is_offered_as_well(self):
+        """Товар может стоять в разделе без игры над ним."""
+        urls = self.SS._urls_for_ad({"id": "1", "title": "x",
+                                     "category_id": 512, "category": ""})
+        self.assertIn("https://yoomarket.net/categories/zvezdy", urls)
+
+    def test_the_name_rescues_an_id_from_another_space(self):
+        """С номерами товаров пространства уже разошлись; с номерами
+        разделов может быть так же, а название общее."""
+        urls = self.SS._urls_for_ad({"id": "1", "title": "50 звезд",
+                                     "category_id": 999999,
+                                     "category": "Звёзды"})
+        self.assertIn("https://yoomarket.net/categories/telegram/zvezdy", urls)
+
+    def test_the_search_is_still_there_when_neither_works(self):
+        urls = self.SS._urls_for_ad({"id": "1", "title": "50 звезд",
+                                     "category_id": None, "category": ""})
+        self.assertEqual(urls, ["ПОИСК-ПО-ВИТРИНЕ"])
+
+    def test_the_ad_list_keeps_the_category(self):
+        import inspect
+        src = inspect.getsource(self.SS._my_ads)
+        self.assertIn('"category_id"', src)
+
+
+class TheCatalogueLookupByName(unittest.TestCase):
+    TREE = [{"id": 7, "slug": "telegram", "title": "Telegram", "children": [
+        {"id": 512, "slug": "zvezdy", "title": "Звёзды"}]},
+        {"id": 8, "slug": "steam", "title": "Steam"}]
+
+    def setUp(self):
+        self._tree = M.category_tree
+        M.category_tree = lambda: self.TREE
+
+    def tearDown(self):
+        M.category_tree = self._tree
+
+    def test_a_nested_section_gives_the_whole_chain(self):
+        self.assertEqual(M.category_slugs_by_title("Звёзды"),
+                         ["telegram", "zvezdy"])
+
+    def test_case_does_not_matter(self):
+        self.assertEqual(M.category_slugs_by_title("звёзды"),
+                         ["telegram", "zvezdy"])
+
+    def test_a_top_level_section_works_too(self):
+        self.assertEqual(M.category_slugs_by_title("Steam"), ["steam"])
+
+    def test_an_unknown_name_gives_nothing_rather_than_a_guess(self):
+        self.assertEqual(M.category_slugs_by_title("Чего нет"), [])
+
+    def test_an_empty_name_is_not_a_match_for_everything(self):
+        self.assertEqual(M.category_slugs_by_title(""), [])
+
+
 class TheFlowPassesTheShopName(unittest.TestCase):
     def test_the_address_builder_takes_a_seller(self):
         import inspect
@@ -242,8 +334,7 @@ class TheFlowPassesTheShopName(unittest.TestCase):
     def test_the_screen_gives_the_shop_name_to_the_builder(self):
         import inspect
         from handlers import selenium_settings as SS
-        src = inspect.getsource(SS._find_listing_page)
-        self.assertIn('ad["title"], shop', src)
+        self.assertIn('ad["title"], shop', inspect.getsource(SS._urls_for_ad))
 
     def test_the_diagnostic_exists_and_is_unique(self):
         import ast

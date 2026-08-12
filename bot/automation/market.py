@@ -722,6 +722,39 @@ def category_slugs_for(cat_id) -> list:
     return _find_by_id(category_tree(), cat_id)
 
 
+def category_slugs_by_title(name: str) -> list:
+    """Раздел витрины по его названию: «Звёзды» → ['telegram', 'zvezdy'].
+
+    Запасной путь к разделу, когда номера не сходятся. Номера товаров у
+    Integration API и у витрины из разных пространств — это уже стоило
+    продавцу «не нашёл на витрине» на товар, который там стоит. С номерами
+    разделов может быть так же, а вот название раздела у обоих одно: это
+    таксономия маркетплейса, а не строка конкретного магазина.
+    """
+    want = _norm(name)
+    if not want:
+        return []
+    best: list = []
+
+    def walk(nodes, trail):
+        nonlocal best
+        for n in nodes if isinstance(nodes, list) else []:
+            if not isinstance(n, dict):
+                continue
+            here = trail + ([str(n["slug"])] if n.get("slug") else [])
+            title = _norm(str(n.get("title") or n.get("name") or ""))
+            # Точное совпадение побеждает; раздел глубже — точнее раздела
+            # выше, поэтому длинная цепочка вытесняет короткую.
+            if title and title == want and (not best or len(here) > len(best)):
+                best = here
+            for key in ("children", "subcategories", "items", "categories"):
+                if n.get(key):
+                    walk(n[key], here)
+
+    walk(category_tree(), [])
+    return best
+
+
 def _category_id_of(card: dict):
     """The category a listing row says it belongs to."""
     for key in ("category_id", "categoryId", "subcategory_id"):

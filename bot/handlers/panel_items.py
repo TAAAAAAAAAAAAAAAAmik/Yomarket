@@ -1573,8 +1573,23 @@ async def pos_find(message: Message) -> None:
         await status.edit_text(f"❌ {_html.escape(str(e)[:200])}")
         return
 
+    # Путь через раздел объявления — главный, и печатается первым: если он
+    # сработал, поиск по витрине вообще не нужен.
+    from automation.market import category_slugs_by_title, category_slugs_for
+    loop = asyncio.get_event_loop()
+    by_id = await loop.run_in_executor(None, category_slugs_for,
+                                       ad.get("category_id"))
+    by_name = await loop.run_in_executor(None, category_slugs_by_title,
+                                         ad.get("category") or "")
+
     lines = [f"объявление: {ad['id']} — {ad['title'][:50]}",
              f"магазин в боте: {shop or '— (не определён)'}",
+             "",
+             f"раздел из API: id={ad.get('category_id')} "
+             f"название={ad.get('category') or '—'}",
+             f"  по номеру → {'/'.join(by_id) if by_id else 'НЕТ в каталоге витрины'}",
+             f"  по названию → {'/'.join(by_name) if by_name else 'НЕТ'}",
+             "",
              f"слова поиска: {', '.join(facts['keys']) or '—'}",
              f"строк вернулось: {facts['rows']}",
              f"нашли по: {facts['by'] or 'НЕ НАШЛИ'}", ""]

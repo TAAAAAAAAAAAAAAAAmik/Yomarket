@@ -802,11 +802,26 @@ async def _my_ads(uid: int, reload: bool = False) -> list:
             await api.close()
         except Exception:
             pass
-    ads = [{"id": str(a.get("id")), "title": str(a.get("title")
-                                                 or a.get("name") or a.get("id"))}
+    # `category_id` — самое ценное поле этого ответа: раздел витрины
+    # строится прямо из него, и искать свой товар в чужой выдаче не нужно.
+    # Раньше это поле выбрасывалось, и раздел добывался поиском по названию:
+    # у товара «50 звезд» витрина отдала 124 строки от 32 магазинов, нашего
+    # среди них не было, и бот сдавался на товаре, который стоит на витрине.
+    ads = [{"id": str(a.get("id")),
+            "title": str(a.get("title") or a.get("name") or a.get("id")),
+            "category_id": a.get("category_id") or a.get("categoryId"),
+            "category": _cat_name_of(a)}
            for a in (data.get("data") or data.get("items") or []) if a.get("id")]
     _MY_ADS_CACHE[uid] = ads
     return ads
+
+
+def _cat_name_of(ad: dict) -> str:
+    """Название раздела, если API положил его рядом с номером."""
+    node = ad.get("category") or ad.get("subcategory")
+    if isinstance(node, dict):
+        return str(node.get("title") or node.get("name") or "")
+    return str(node or "")
 
 
 @router.callback_query(F.data == "pos:addlist")
@@ -841,6 +856,37 @@ async def pos_add_list(callback: CallbackQuery) -> None:
         b.as_markup())
 
 
+def _urls_for_ad(ad: dict, shop: str = "") -> list:
+    """Адреса витрины для нашего объявления — тремя путями, по убыванию силы.
+
+    Блокирующая; вызывается из потока.
+
+    1. **Номер раздела из самого объявления.** Integration API кладёт его в
+       `category_id`, а бот это поле выбрасывал.
+    2. **Название раздела.** Если номера разделов у API и у витрины из
+       разных пространств — как оказалось с номерами товаров, — то название
+       всё равно общее: это таксономия маркетплейса, а не строка магазина.
+    3. **Поиск своего товара на витрине.** Был единственным путём и оказался
+       самым слабым: у товара «50 звезд» витрина отдала 124 строки от 32
+       магазинов, нашего среди них не было.
+
+    Каждый следующий пробуется, только если предыдущий не дал ничего.
+    """
+    from automation.market import (category_slugs_by_title, category_slugs_for,
+                                   listing_urls_for, MARKET_URL)
+    out: list = []
+    for path in (category_slugs_for(ad.get("category_id")),
+                 category_slugs_by_title(ad.get("category") or "")):
+        if path:
+            out.append(f"{MARKET_URL}/categories/" + "/".join(path[-2:]))
+            if len(path) > 1:
+                out.append(f"{MARKET_URL}/categories/{path[-1]}")
+            break
+    if out:
+        return list(dict.fromkeys(out))
+    return listing_urls_for(ad["id"], None, ad["title"], shop)
+
+
 async def _find_listing_page(uid: int, ad: dict) -> tuple[str, int, int, list]:
     """Найти страницу витрины, где стоит это объявление.
 
@@ -861,9 +907,7 @@ async def _find_listing_page(uid: int, ad: dict) -> tuple[str, int, int, list]:
     shop = get_shop_name(uid) or ""
     try:
         urls = await asyncio.wait_for(
-            loop.run_in_executor(None, listing_urls_for, ad["id"], None,
-                                 ad["title"], shop),
-            timeout=90)
+            loop.run_in_executor(None, _urls_for_ad, ad, shop), timeout=120)
     except Exception as e:
         logger.warning("listing urls for %s: %s", ad["id"], e)
         return "", 0, 0, []
