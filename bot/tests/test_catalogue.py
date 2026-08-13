@@ -180,6 +180,106 @@ class TheProbeSaysWhatCameBack(Answering):
         self.assertEqual(names.count("cat_debug"), 1, names)
 
 
+class TheTopLevelArrivesFlat(Answering):
+    """`/cat_debug` на живой витрине: 60 игр, ни у одной вложенных разделов.
+
+        tanks-blitz — Tanks Blitz
+        tiktok — TikTok
+        …
+
+    Считать их листьями нельзя: внутри «Telegram» живут «Звёзды»,
+    «Премиум» и прочее, и следить надо за разделом, а не за игрой целиком —
+    иначе позиция считается среди тысяч чужих товаров. Подразделы витрина
+    отдаёт отдельным запросом.
+    """
+
+    FLAT = [{"id": 1, "slug": "tanks-blitz", "title": "Tanks Blitz"},
+            {"id": 2, "slug": "telegram", "title": "Telegram"}]
+    KIDS = [{"id": 512, "slug": "zvezdy", "title": "Звёзды"},
+            {"id": 513, "slug": "premium", "title": "Премиум"}]
+
+    def by_params(self):
+        """Верхний уровень плоский; подразделы — только с параметром."""
+        import requests
+        outer = self
+
+        class R:
+            def __init__(self_inner, rows):
+                self_inner.status_code = 200
+                self_inner.content = b"x"
+                self_inner.text = ""
+                self_inner._rows = rows
+
+            def json(self_inner):
+                return {"data": self_inner._rows}
+
+        def fake(url, params=None, **kw):
+            outer.asked.append(url + str(params or ""))
+            if params and params.get("parent") == "telegram":
+                return R(outer.KIDS)
+            if params:
+                return R([])
+            return R(outer.FLAT)
+
+        requests.get = fake
+
+    def test_the_children_are_fetched_separately(self):
+        self.by_params()
+        kids = M.fetch_category_children("telegram")
+        self.assertEqual([k["slug"] for k in kids], ["zvezdy", "premium"])
+
+    def test_the_screen_gets_them_through_category_children(self):
+        self.by_params()
+        rows = M.category_children("telegram")
+        self.assertEqual([r["slug"] for r in rows], ["zvezdy", "premium"])
+
+    def test_the_parent_itself_is_not_its_own_child(self):
+        self.by_params()
+        self.assertNotIn("telegram",
+                         [k["slug"] for k in M.fetch_category_children("telegram")])
+
+    def test_a_game_with_no_sections_says_so_rather_than_looping(self):
+        """`/api/categories/<slug>` у части витрин отдаёт весь каталог
+        заново. Принять его за подразделы значит показать список игр под
+        видом разделов «Telegram»."""
+        self.by_params()
+        self.assertEqual(M.fetch_category_children("tanks-blitz"), [])
+
+    def test_and_says_so_in_the_trace(self):
+        self.by_params()
+        trace: list = []
+        M.fetch_category_children("tanks-blitz", None, trace)
+        self.assertTrue(any("весь каталог" in t for t in trace), trace)
+
+    def test_the_trace_records_which_address_answered(self):
+        self.by_params()
+        trace: list = []
+        M.fetch_category_children("telegram", None, trace)
+        self.assertTrue(any("2 подраздел" in t for t in trace), trace)
+
+    def test_inline_children_are_still_preferred(self):
+        """Лишний запрос там, где ответ уже на руках, — просто трата."""
+        self.body = {"data": [{"id": 2, "slug": "telegram", "title": "Telegram",
+                               "children": self.KIDS}]}
+        rows = M.category_children("telegram")
+        self.assertEqual([r["slug"] for r in rows], ["zvezdy", "premium"])
+        self.assertEqual(len(self.asked), 1)
+
+
+class TheNodeItself(Answering):
+    def test_a_game_is_found_by_slug(self):
+        self.body = {"data": SECTIONS}
+        self.assertEqual(M.category_node("telegram")["id"], 7)
+
+    def test_so_is_a_section_inside_it(self):
+        self.body = {"data": SECTIONS}
+        self.assertEqual(M.category_node("zvezdy")["title"], "Звёзды")
+
+    def test_an_unknown_slug_is_empty(self):
+        self.body = {"data": SECTIONS}
+        self.assertEqual(M.category_node("нет-такого"), {})
+
+
 class TheSectionToAddressStepNeedsIt(Answering):
     """Найти раздел и не суметь превратить его в адрес — то же самое, что
     не найти. Все три дороги упираются в каталог."""

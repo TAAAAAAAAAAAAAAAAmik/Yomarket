@@ -411,6 +411,19 @@ class NamingTheSectionByHand(FlowCase):
 
         self.patch(M, "category_children", children)
 
+        def node(slug):
+            for game in self.TREE:
+                if game["slug"] == slug:
+                    return {"id": game["id"], "slug": slug,
+                            "title": game["title"]}
+                for c in game.get("children", []):
+                    if c["slug"] == slug:
+                        return {"id": c["id"], "slug": slug,
+                                "title": c["title"]}
+            return {}
+
+        self.patch(M, "category_node", node)
+
         def slugs_for(cat_id):
             for game in self.TREE:
                 for c in game.get("children", []):
@@ -430,13 +443,21 @@ class NamingTheSectionByHand(FlowCase):
         super().tearDown()
 
     def test_the_top_level_offers_games_that_go_deeper(self):
+        """Шаг вглубь на каждой игре, а не только на признавшейся.
+
+        Живая витрина отдаёт верхний уровень плоским: шестьдесят игр, ни у
+        одной вложенных разделов. По прежнему правилу — «нет детей, значит
+        это и есть ответ» — выбор всегда останавливался на игре, и следить
+        пришлось бы за позицией среди тысяч чужих товаров.
+        """
         cb = FakeCallback("pos:cat:")
         self.run_(S.pos_pick_category(cb))
         data = [b.callback_data for row in cb.message.markups[-1].inline_keyboard
                 for b in row]
-        self.assertIn("pos:cat:black-russia", data, "a game must open its sections")
-        self.assertIn("pos:catpick:90", data,
-                      "one without sections is already the answer, by its id")
+        self.assertIn("pos:cat:black-russia", data)
+        self.assertIn("pos:cat:telegram", data)
+        self.assertFalse([d for d in data if d.startswith("pos:catpick:")],
+                         "наверху брать целиком нечего")
 
     def test_a_section_is_offered_with_how_much_it_holds(self):
         cb = FakeCallback("pos:cat:black-russia")
@@ -446,9 +467,20 @@ class NamingTheSectionByHand(FlowCase):
         self.assertTrue(any("Аккаунты с виртами" in l and "161" in l
                             for l in labels), labels)
         data = [b.callback_data for row in kb.inline_keyboard for b in row]
-        # By id, not by slugs: this API answers /categories/<game>/<section>
-        # with the game, so an address alone can widen to the whole game.
-        self.assertIn("pos:catpick:512", data)
+        self.assertIn("pos:cat:akkaunty-s-virtami", data)
+        # И саму игру можно взять целиком — по её номеру, а не по адресу:
+        # этот API отвечает на /categories/<игра>/<раздел> игрой, так что
+        # адрес умеет незаметно расшириться до всей игры.
+        self.assertIn("pos:catpick:77", data)
+
+    def test_a_section_without_children_offers_itself(self):
+        """Тупик «дальше некуда, а взять нечего» — худшее, чем может
+        кончиться экран выбора."""
+        cb = FakeCallback("pos:cat:virty")
+        self.run_(S.pos_pick_category(cb))
+        data = [b.callback_data for row in cb.message.markups[-1].inline_keyboard
+                for b in row]
+        self.assertIn("pos:catpick:513", data)
 
     def test_choosing_a_section_sets_the_watch_up_completely(self):
         cb = FakeCallback("pos:catpick:512")

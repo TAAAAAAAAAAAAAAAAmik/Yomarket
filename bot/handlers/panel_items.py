@@ -1572,6 +1572,24 @@ async def cat_debug(message: Message) -> None:
     for r in top[:8]:
         lines.append(f"  {r['slug']} — {r['title'][:28]}"
                      + (" ▸" if r["has_children"] else ""))
+    # Подразделы верхний уровень не отдаёт — их надо спрашивать отдельно, и
+    # именно на этом шаге выбор раздела упирался в игру целиком.
+    if top:
+        from automation.market import fetch_category_children
+        probe_slug = next((r["slug"] for r in top
+                           if r["slug"] in ("telegram", "tg")), top[0]["slug"])
+        trace: list = []
+        try:
+            kids = await asyncio.wait_for(
+                loop.run_in_executor(None, fetch_category_children,
+                                     probe_slug, None, trace), timeout=90)
+        except Exception as e:
+            kids, trace = [], [str(e)[:80]]
+        lines += ["", f"подразделы «{probe_slug}»: {len(kids)}"]
+        lines += [f"  {t}" for t in trace[:6]]
+        for k in kids[:8]:
+            lines.append(f"  · {k.get('slug')} — "
+                         f"{str(k.get('title') or k.get('name'))[:28]}")
     await status.edit_text(f"<code>{_html.escape(chr(10).join(lines))[:3800]}</code>")
 
 

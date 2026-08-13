@@ -944,6 +944,92 @@ def _find_by_id(nodes, want, trail=()) -> list:
     return []
 
 
+def category_node(slug: str) -> dict:
+    """Раздел каталога по slug'у: {"id", "slug", "title"} или пусто."""
+    want = str(slug or "")
+    if not want:
+        return {}
+
+    def walk(items):
+        for n in items if isinstance(items, list) else []:
+            if not isinstance(n, dict):
+                continue
+            if str(n.get("slug") or "") == want:
+                return {"id": n.get("id"), "slug": want,
+                        "title": str(n.get("title") or n.get("name") or want)}
+            for key in ("children", "subcategories", "items", "categories"):
+                if n.get(key):
+                    got = walk(n[key])
+                    if got:
+                        return got
+        return {}
+
+    return walk(category_tree())
+
+
+def _child_tries(slug: str, cid) -> tuple:
+    """Чем можно спросить подразделы. Порядок — от вероятного к запасному."""
+    tries = [("/api/categories", {"parent": slug}),
+             ("/api/categories", {"parent_slug": slug}),
+             (f"/api/categories/{slug}", None),
+             (f"/api/categories/{slug}/children", None)]
+    if cid not in (None, ""):
+        tries.insert(2, ("/api/categories", {"parent_id": str(cid)}))
+    return tuple(tries)
+
+
+def fetch_category_children(parent_slug: str, cid=None,
+                            trace: list | None = None) -> list:
+    """Подразделы одной игры, спрошенные у витрины отдельным запросом.
+
+    Верхний уровень каталога приезжает плоским: шестьдесят игр, ни у одной
+    вложенных разделов. Считать их листьями нельзя — внутри «Telegram»
+    живут «Звёзды», «Премиум» и прочее, и следить надо за разделом, а не за
+    игрой целиком.
+
+    Адрес не документирован, поэтому пробуется несколько; годным считается
+    ответ, где нашлись разделы с чужими slug'ами — сама игра в своих детях
+    не считается.
+    """
+    import requests
+    # Адрес вида /api/categories/<slug> у части витрин отдаёт весь каталог
+    # заново. Принять его за подразделы значит предложить продавцу список
+    # игр под видом разделов «Telegram» — поэтому ответ, целиком лежащий на
+    # верхнем уровне, отвергается.
+    top = {str(n.get("slug") or "") for n in category_tree()
+           if isinstance(n, dict)}
+    for path, params in _child_tries(parent_slug, cid):
+        label = path + (f"?{list(params)[0]}" if params else "")
+        try:
+            r = requests.get(f"{API_URL}{path}", params=params,
+                             headers=_API_HEADERS, timeout=(6, 20),
+                             verify=False)
+            if r.status_code != 200:
+                if trace is not None:
+                    trace.append(f"{label} → {r.status_code}")
+                continue
+            body = r.json()
+        except Exception as e:
+            if trace is not None:
+                trace.append(f"{label} → {str(e)[:50]}")
+            continue
+        for rows in _category_lists(body):
+            kids = [x for x in rows
+                    if str(x.get("slug") or "") not in ("", parent_slug)]
+            slugs = {str(x.get("slug") or "") for x in kids}
+            if kids and top and slugs <= top:
+                if trace is not None:
+                    trace.append(f"{label} → это снова весь каталог")
+                continue
+            if kids:
+                if trace is not None:
+                    trace.append(f"{label} → {len(kids)} подразделов")
+                return kids
+        if trace is not None:
+            trace.append(f"{label} → разделов нет")
+    return []
+
+
 def category_children(parent_slug: str = "") -> list:
     """Top-level sections, or the sections inside one game.
 
@@ -974,6 +1060,13 @@ def category_children(parent_slug: str = "") -> list:
             return []
         nodes = next((found[k] for k in ("children", "subcategories", "items",
                                          "categories") if found.get(k)), [])
+        if not nodes:
+            # Верхний уровень витрина отдаёт без вложений: у всех шестидесяти
+            # игр детей внутри нет. Значит подразделы — «Звёзды», «Премиум» —
+            # надо спрашивать отдельно, а не считать игру листом. Иначе
+            # продавец выбирает игру целиком и следит за позицией среди
+            # тысяч чужих товаров, которые к его лоту отношения не имеют.
+            nodes = fetch_category_children(parent_slug, found.get("id"))
     out = []
     for n in nodes if isinstance(nodes, list) else []:
         if not isinstance(n, dict) or not n.get("slug"):

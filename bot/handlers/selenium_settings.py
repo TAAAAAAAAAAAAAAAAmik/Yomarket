@@ -1107,7 +1107,19 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
     except Exception as e:
         rows = []
         logger.warning("catalogue %s: %s", parent, e)
-    if not rows:
+    # Раздел, в котором мы сейчас стоим. Нужен, чтобы его можно было взять
+    # целиком: тупик «дальше некуда, а выбрать нечего» — худшее, чем может
+    # кончиться экран выбора.
+    from automation.market import category_node
+    here = {}
+    if parent:
+        try:
+            here = await asyncio.wait_for(
+                loop.run_in_executor(None, category_node, parent), timeout=45)
+        except Exception:
+            here = {}
+
+    if not rows and not here:
         b = InlineKeyboardBuilder()
         b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
         b.button(text="⬅️ Назад", callback_data="pos:add")
@@ -1118,20 +1130,31 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
         return
 
     b = InlineKeyboardBuilder()
-    for r in rows[:60]:
-        # A section with children is a step deeper; one without is the answer.
-        target = (f"pos:cat:{r['slug']}" if r["has_children"]
-                  else f"pos:catpick:{r['id']}")
+    if here and here.get("id") is not None:
+        b.button(text=f"✅ Взять «{str(here['title'])[:24]}» целиком",
+                 callback_data=f"pos:catpick:{here['id']}"[:64])
+    for r in rows[:58]:
+        # Шаг вглубь на каждом разделе, а не только там, где витрина
+        # призналась во вложениях. Верхний уровень она отдаёт плоским — у
+        # всех шестидесяти игр детей внутри нет, — и по прежнему правилу
+        # «нет детей, значит это и есть ответ» выбор всегда останавливался
+        # на игре. Следить пришлось бы за позицией среди тысяч чужих
+        # товаров вместо своего раздела.
         count = f" · {r['ads_count']}" if r.get("ads_count") else ""
-        b.button(text=f"{r['title'][:30]}{count}", callback_data=target[:64])
+        b.button(text=f"{r['title'][:30]}{count}",
+                 callback_data=f"pos:cat:{r['slug']}"[:64])
     b.button(text="⬅️ Назад", callback_data="pos:add")
     b.adjust(1)
+    if parent:
+        name = _esc(str(here.get("title") or parent))
+        head = (f"Внутри «{name}»: {len(rows)} раздел(ов)." if rows
+                else f"Внутри «{name}» разделов нет — можно взять его целиком.")
+    else:
+        head = "Выберите игру или категорию."
     await _pos_edit(
         callback.message,
         f"📂 <b>{'Раздел' if parent else 'Игра или категория'}</b>\n\n"
-        f"Товар: {_esc(ad['title'][:40])}\n\n"
-        + ("Выберите раздел, в котором он продаётся."
-           if parent else "Выберите игру или категорию."),
+        f"Товар: {_esc(ad['title'][:40])}\n\n{head}",
         b.as_markup())
 
 
