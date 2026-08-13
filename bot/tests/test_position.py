@@ -347,6 +347,31 @@ class TheBudget(unittest.TestCase):
         self.assertEqual(P.budget_left(self.pp, self.now), 51)
         self.assertEqual(P.budget_left({}, self.now), -1, "no cap set")
 
+    def test_an_unenforceable_budget_stops_instead_of_being_ignored(self):
+        """Цена поднятия берётся из выбранного тарифа. Без неё проверка
+        бюджета молча пропускалась: на экране «Бюджет: 50 ₽/сут», бот
+        поднимает сколько влезет по счётчику, а «потрачено» вечно ноль.
+
+        Предел, который нельзя применить, обязан останавливать. Иначе на
+        экране стоит цифра, за которой ничего нет, — а это чужие деньги.
+        """
+        v = P.evaluate(self.w(), PAGE, shop="Спайк", pp=self.pp, now=self.now,
+                       price=0)
+        self.assertFalse(v.promote)
+
+    def test_and_says_what_to_do_about_it(self):
+        v = P.evaluate(self.w(), PAGE, shop="Спайк", pp=self.pp, now=self.now,
+                       price=0)
+        self.assertIn("тариф", v.reason)
+        self.assertTrue(any("Не поднимаю" in line for line in v.lines))
+
+    def test_without_a_budget_an_unknown_price_still_promotes(self):
+        """Не задавал бюджета — не надо ему и мешать: раньше это работало,
+        и ломать это не за чем."""
+        pp = {"auto_promote": True, "cooldown_hours": 0, "daily_limit": 0}
+        self.assertTrue(P.evaluate(self.w(), PAGE, shop="Спайк", pp=pp,
+                                   now=self.now, price=0).promote)
+
     def test_a_promotion_that_would_overshoot_is_refused_whole(self):
         """No partial spending: 60 ₽ left, a 99 ₽ promotion does not happen."""
         pp = dict(self.pp, daily_budget=60)
