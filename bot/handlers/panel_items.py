@@ -1528,6 +1528,53 @@ async def pos_api(message: Message) -> None:
     await status.delete()
 
 
+@router.message(Command("cat_debug"))
+async def cat_debug(message: Message) -> None:
+    """/cat_debug — что витрина отвечает на запрос каталога разделов.
+
+    Продавец: «разделы не выходят». Экран говорил «каталог витрины сейчас
+    не читается» и ничего больше. Каталог нужен обеим дорогам к разделу —
+    и кнопкам, и автоматике, — так что одна нечитаемая строчка ломала всё
+    слежение за позицией разом.
+
+    Только чтение: публичный каталог, ничего не меняется.
+    """
+    import html as _html
+
+    from automation.market import category_children, category_tree_probe
+
+    status = await message.answer("⏳ Спрашиваю каталог витрины…")
+    loop = asyncio.get_event_loop()
+    try:
+        tries = await asyncio.wait_for(
+            loop.run_in_executor(None, category_tree_probe), timeout=120)
+    except Exception as e:
+        await status.edit_text(f"❌ {_html.escape(str(e)[:200])}")
+        return
+
+    lines = ["🗂 <b>Каталог витрины</b>", ""]
+    for t in tries:
+        lines.append(f"{t['path']} → {t.get('status')} "
+                     f"({t.get('bytes', 0)} байт)")
+        lines.append(f"   форма: {t.get('shape')}")
+        if t.get("found"):
+            lines.append(f"   похоже на разделы: {t['found']}")
+            lines.append(f"   первый: {t.get('first')}")
+        if t.get("sample"):
+            lines.append(f"   начало: {t['sample']}")
+    try:
+        top = await asyncio.wait_for(
+            loop.run_in_executor(None, category_children, ""), timeout=60)
+    except Exception as e:
+        top = []
+        lines.append(f"верхний уровень: ошибка {str(e)[:60]}")
+    lines += ["", f"кнопок на первом экране получилось: {len(top)}"]
+    for r in top[:8]:
+        lines.append(f"  {r['slug']} — {r['title'][:28]}"
+                     + (" ▸" if r["has_children"] else ""))
+    await status.edit_text(f"<code>{_html.escape(chr(10).join(lines))[:3800]}</code>")
+
+
 @router.message(Command("pos_find"))
 async def pos_find(message: Message) -> None:
     """/pos_find <часть названия> — как витрина отвечает на поиск нашего товара.

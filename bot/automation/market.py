@@ -777,18 +777,122 @@ def _slug_chain(node, depth: int = 0) -> list:
     return out
 
 
-def category_tree() -> list:
-    """The catalogue as the storefront's own menu gets it."""
+def _looks_like_category(node) -> bool:
+    """Узел похож на раздел каталога: есть slug либо пара «номер + название»."""
+    if not isinstance(node, dict):
+        return False
+    if isinstance(node.get("slug"), str) and node["slug"].strip():
+        return True
+    has_name = any(isinstance(node.get(k), str) and node[k].strip()
+                   for k in ("title", "name"))
+    return has_name and node.get("id") is not None
+
+
+def _category_lists(node, depth: int = 0) -> list:
+    """Все массивы в ответе, похожие на список разделов, крупнейший первым.
+
+    Ответ разбирался одной строчкой — `body["data"]`. Если каталог лежит
+    под другим ключом или на уровень глубже, получался пустой список, и
+    экран говорил «каталог витрины сейчас не читается». Так же ищутся
+    предложения на странице (`_offer_lists`) — там это давно себя оправдало.
+    """
+    out: list = []
+    if depth > 6:
+        return out
+    if isinstance(node, list):
+        rows = [x for x in node if _looks_like_category(x)]
+        if len(rows) >= 2:
+            out.append(rows)
+        for x in node:
+            out.extend(_category_lists(x, depth + 1))
+    elif isinstance(node, dict):
+        for v in node.values():
+            out.extend(_category_lists(v, depth + 1))
+    return out
+
+
+# Куда ходить за каталогом. Первый адрес — тот, что был; остальные пробуются,
+# только если он не ответил ничем годным, и стоят по одному запросу.
+_CATALOGUE_TRIES = (
+    ("/api/categories", None),
+    ("/api/categories", {"per_page": "200"}),
+    ("/api/categories/tree", None),
+    ("/api/catalog", None),
+)
+
+
+def category_tree_probe() -> list[dict]:
+    """Что каждый адрес каталога ответил на самом деле. Только чтение.
+
+    Продавец: «разделы не выходят». Экран говорил «каталог не читается» и
+    ничего больше — а без ответа сервера чинить это можно только гаданием,
+    чего в этом проекте делать нельзя.
+    """
     import requests
-    try:
-        r = requests.get(f"{API_URL}/api/categories", headers=_API_HEADERS,
-                         timeout=(6, 20), verify=False)
-        body = r.json() if r.status_code == 200 else {}
-    except Exception as e:
-        logger.info("category tree: %s", e)
-        return []
-    rows = body.get("data") if isinstance(body, dict) else body
-    return rows if isinstance(rows, list) else []
+    out = []
+    for path, params in _CATALOGUE_TRIES:
+        row = {"path": path + ("?" + "&".join(f"{k}={v}" for k, v in
+                                              (params or {}).items())
+                               if params else "")}
+        try:
+            r = requests.get(f"{API_URL}{path}", params=params,
+                             headers=_API_HEADERS, timeout=(6, 20),
+                             verify=False)
+            row["status"] = r.status_code
+            row["bytes"] = len(r.content or b"")
+            try:
+                body = r.json()
+            except Exception:
+                row["shape"] = "не JSON"
+                row["sample"] = (r.text or "")[:120]
+                out.append(row)
+                continue
+            row["shape"] = (f"dict{sorted(body)[:8]}" if isinstance(body, dict)
+                            else f"{type(body).__name__}[{len(body)}]"
+                            if isinstance(body, list) else type(body).__name__)
+            # Разделы засчитываются только у нормального ответа: тело
+            # ошибки тоже бывает похоже на список, и «нашлось 2» на пятисотке
+            # увело бы в сторону.
+            lists = _category_lists(body) if r.status_code == 200 else []
+            row["found"] = len(lists[0]) if lists else 0
+            if lists:
+                row["first"] = _json.dumps(lists[0][0], ensure_ascii=False)[:200]
+        except Exception as e:
+            row["status"] = "—"
+            row["shape"] = f"ошибка: {str(e)[:70]}"
+        out.append(row)
+        if row.get("found"):
+            break
+    return out
+
+
+def category_tree() -> list:
+    """The catalogue as the storefront's own menu gets it.
+
+    Разбор терпимый нарочно: раньше бралось ровно `body["data"]`, и стоило
+    каталогу приехать под другим ключом — экран выбора раздела показывал
+    «каталог витрины сейчас не читается», а автоматика теряла оба пути к
+    разделу. Одна строчка разбора ломала обе дороги сразу.
+    """
+    import requests
+    for path, params in _CATALOGUE_TRIES:
+        try:
+            r = requests.get(f"{API_URL}{path}", params=params,
+                             headers=_API_HEADERS, timeout=(6, 20),
+                             verify=False)
+            if r.status_code != 200:
+                continue
+            body = r.json()
+        except Exception as e:
+            logger.info("category tree %s: %s", path, e)
+            continue
+        rows = body.get("data") if isinstance(body, dict) else body
+        if isinstance(rows, list) and any(_looks_like_category(x) for x in rows):
+            return rows
+        lists = _category_lists(body)
+        if lists:
+            return max(lists, key=len)
+    return []
 
 
 def _find_by_slug(nodes, want, trail=()) -> list:
