@@ -1144,9 +1144,15 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
     # Раздел, в котором мы сейчас стоим. Нужен, чтобы его можно было взять
     # целиком: тупик «дальше некуда, а выбрать нечего» — худшее, чем может
     # кончиться экран выбора.
+    #
+    # Сначала — то, что бот сам показал шагом раньше. Каталог верхнего
+    # уровня знает только игры; подразделы приезжают отдельным запросом и в
+    # нём отсутствуют. Продавец зашёл в «Аккаунты с виртами» — детей там
+    # нет и быть не должно, — а бот своего же подраздела не узнал и ответил
+    # «каталог не читается» вместо «возьмём его целиком».
     from automation.market import category_node
-    here = {}
-    if parent:
+    here = dict((_CAT_SEEN.get(callback.from_user.id) or {}).get(parent) or {})
+    if parent and not here.get("slug"):
         try:
             here = await asyncio.wait_for(
                 loop.run_in_executor(None, category_node, parent), timeout=45)

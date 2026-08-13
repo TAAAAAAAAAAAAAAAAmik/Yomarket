@@ -509,6 +509,42 @@ class NamingTheSectionByHand(FlowCase):
         self.assertNotIn("tanks-blitz", ws[0]["url"])
         self.assertIn("black-russia/akkaunty-s-virtami", ws[0]["url"])
 
+    def test_a_subsection_with_no_children_is_offered_whole(self):
+        """Продавец зашёл в «Аккаунты с виртами» и получил «каталог не
+        читается».
+
+        Детей у подраздела нет и быть не должно — это и есть тот самый
+        раздел. А узнать его бот не смог: каталог верхнего уровня знает
+        только игры, подразделы приезжают отдельным запросом и в нём
+        отсутствуют. При том, что показал этот подраздел он сам, шагом
+        раньше.
+        """
+        # Витрина знает только верхний уровень — как на живом магазине.
+        self.patch(M, "category_node",
+                   lambda slug: {"id": 77, "slug": "black-russia",
+                                 "title": "Black Russia"}
+                   if slug == "black-russia" else {})
+        self.run_(S.pos_pick_category(FakeCallback("pos:cat:black-russia")))
+        cb = FakeCallback("pos:cat:akkaunty-s-virtami")
+        self.run_(S.pos_pick_category(cb))
+        said = "\n".join(cb.message.sent)
+        self.assertNotIn("не читается", said)
+        data = [b.callback_data for row in cb.message.markups[-1].inline_keyboard
+                for b in row]
+        self.assertIn("pos:catpick:akkaunty-s-virtami", data)
+
+    def test_and_the_address_is_still_the_full_path(self):
+        self.patch(M, "category_node", lambda slug: {})
+        self.run_(S.pos_pick_category(FakeCallback("pos:cat:black-russia")))
+        self.run_(S.pos_pick_category(FakeCallback("pos:cat:akkaunty-s-virtami")))
+        self.run_(S.pos_category_chosen(
+            FakeCallback("pos:catpick:akkaunty-s-virtami")))
+        ws = self.watches()
+        self.assertEqual(len(ws), 1)
+        self.assertEqual(
+            ws[0]["url"],
+            "https://yoomarket.net/categories/black-russia/akkaunty-s-virtami")
+
     def test_an_unreadable_catalogue_says_why_and_which_step(self):
         """«Каталог не читается» без причины и без версии стоило круга:
         по такому экрану не понять даже, доехал ли до бота код, в котором
