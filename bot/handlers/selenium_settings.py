@@ -1128,11 +1128,18 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
     path = _walk_to(callback.from_user.id, parent)
     await callback.answer("⏳ Читаю каталог...")
     loop = asyncio.get_event_loop()
+    trouble = ""
     try:
         rows = await asyncio.wait_for(
-            loop.run_in_executor(None, category_children, parent), timeout=45)
+            loop.run_in_executor(None, category_children, parent), timeout=90)
+    except asyncio.TimeoutError:
+        # Подразделы спрашиваются несколькими запросами подряд; в прежние
+        # сорок пять секунд они не всегда укладывались, и экран говорил
+        # «каталог не читается» там, где витрина просто отвечала медленно.
+        rows, trouble = [], "витрина не ответила за 90 секунд"
+        logger.warning("catalogue %s: timeout", parent)
     except Exception as e:
-        rows = []
+        rows, trouble = [], str(e)[:80]
         logger.warning("catalogue %s: %s", parent, e)
     # Раздел, в котором мы сейчас стоим. Нужен, чтобы его можно было взять
     # целиком: тупик «дальше некуда, а выбрать нечего» — худшее, чем может
@@ -1148,12 +1155,25 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
 
     if not rows and not (here and here.get("slug")):
         b = InlineKeyboardBuilder()
+        b.button(text="🔄 Попробовать снова",
+                 callback_data=f"pos:cat:{parent}"[:64])
         b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
         b.button(text="⬅️ Назад", callback_data="pos:add")
         b.adjust(1)
-        await _pos_edit(callback.message,
-                        "❌ Каталог витрины сейчас не читается. "
-                        "Пришлите адрес страницы вручную.", b.as_markup())
+        # Отказ обязан объяснять себя. «Каталог не читается» без причины и
+        # без версии стоило круга: непонятно даже, доехал ли до бота код,
+        # в котором подразделы вообще умеют спрашиваться.
+        from handlers.start import BOT_VERSION
+        await _pos_edit(
+            callback.message,
+            "❌ Каталог витрины сейчас не читается.\n\n"
+            + (f"Шаг: <b>{_esc(parent)}</b>\n" if parent
+               else "Шаг: верхний уровень каталога\n")
+            + (f"Причина: {_esc(trouble)}\n" if trouble
+               else "Витрина ответила, но разделов в ответе нет.\n")
+            + f"<code>{BOT_VERSION}</code>\n\n"
+            "Проверить, что отвечает витрина: /cat_debug",
+            b.as_markup())
         return
 
     # Что видели по дороге — чтобы на выборе знать и номер раздела, и его

@@ -509,6 +509,33 @@ class NamingTheSectionByHand(FlowCase):
         self.assertNotIn("tanks-blitz", ws[0]["url"])
         self.assertIn("black-russia/akkaunty-s-virtami", ws[0]["url"])
 
+    def test_an_unreadable_catalogue_says_why_and_which_step(self):
+        """«Каталог не читается» без причины и без версии стоило круга:
+        по такому экрану не понять даже, доехал ли до бота код, в котором
+        подразделы вообще умеют спрашиваться."""
+        def slow(parent=""):
+            raise TimeoutError("медленно")
+
+        self.patch(M, "category_children", slow)
+        self.patch(M, "category_node", lambda slug: {})
+        cb = FakeCallback("pos:cat:telegram")
+        self.run_(S.pos_pick_category(cb))
+        said = "\n".join(cb.message.sent)
+        self.assertIn("не читается", said)
+        self.assertIn("telegram", said, "не сказано, на каком шаге")
+        self.assertIn("/cat_debug", said, "не сказано, чем проверить")
+        from handlers.start import BOT_VERSION
+        self.assertIn(BOT_VERSION, said, "по экрану не понять, что доехало")
+
+    def test_and_offers_to_try_again(self):
+        self.patch(M, "category_children", lambda parent="": [])
+        self.patch(M, "category_node", lambda slug: {})
+        cb = FakeCallback("pos:cat:telegram")
+        self.run_(S.pos_pick_category(cb))
+        data = [b.callback_data for row in cb.message.markups[-1].inline_keyboard
+                for b in row]
+        self.assertIn("pos:cat:telegram", data)
+
     def test_an_unknown_pick_asks_to_start_over_instead_of_guessing(self):
         """Прежде здесь молча получался адрес всего каталога, и дальше бот
         искал товар в чужой категории."""
