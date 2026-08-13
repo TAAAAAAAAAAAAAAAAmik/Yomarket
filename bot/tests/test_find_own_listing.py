@@ -475,6 +475,24 @@ class TheSectionInTheRowIsNotANumber(unittest.TestCase):
     def test_a_string_category_is_read(self):
         self.assertEqual(M.section_ref_of({"category": "zvezdy"}), "zvezdy")
 
+    def test_an_object_without_a_number_is_read_too(self):
+        """`{"slug": …, "title": …}` без `id` — тот же раздел на виду, и
+        требование номера снова оставляло «голосов: 0»."""
+        self.assertEqual(
+            M.section_ref_of({"category": {"slug": "zvezdy",
+                                           "title": "Звёзды"}}),
+            "zvezdy")
+
+    def test_an_object_with_only_a_title(self):
+        self.assertEqual(M.section_ref_of({"category": {"title": "Звёзды"}}),
+                         "Звёзды")
+
+    def test_neighbours_with_an_object_section_do_vote(self):
+        rows = [{"id": i, "title": "50 звёзд",
+                 "category": {"slug": "zvezdy", "title": "Звёзды"},
+                 "shop": {"name": "Сосед"}} for i in range(3)]
+        self.assertEqual(M.section_of_neighbours(rows, "50 звезд")[0], "zvezdy")
+
     def test_a_numeric_category_still_wins(self):
         self.assertEqual(
             M.section_ref_of({"category": "zvezdy", "category_id": 512}), 512)

@@ -732,13 +732,13 @@ async def pos_add_all(callback: CallbackQuery) -> None:
             f"✅ Добавлено: {len(added)}   ❔ Не нашёл: {len(missed)}\n\n"
             f"<i>Каждый товар — отдельный обход витрины, это не быстро.</i>",
             _cancel_kb("pos:menu"))
-        chosen, pos, _seen, urls = await _find_listing_page(uid, ad)
+        chosen, pos, _seen, urls, why = await _find_listing_page(uid, ad)
         if not chosen:
             # Две причины — два разных действия продавца, и в общем списке
             # они выглядели одинаково. «Раздел не определился» лечится
             # выбором раздела руками; «раздел есть, а нас в нём нет» —
             # значит товар снят с публикации или стоит в другом разделе.
-            missed.append((ad["title"], bool(urls)))
+            missed.append((ad["title"], why))
             continue
         s = get_settings(uid)
         pp = s.setdefault("promo_position", {})
@@ -756,28 +756,33 @@ async def pos_add_all(callback: CallbackQuery) -> None:
     lines = [f"📍 <b>Готово</b>\n",
              f"✅ Под наблюдением новых: <b>{len(added)}</b>"]
     if missed:
-        no_section = [t for t, had_urls in missed if not had_urls]
-        not_there = [t for t, had_urls in missed if had_urls]
         lines.append(f"❔ Не нашёл на витрине: <b>{len(missed)}</b>")
-        if no_section:
+        # Четыре разных исхода — четыре разных действия продавца. В одном
+        # списке они выглядели одинаково, и делать с ним было нечего.
+        groups = [
+            ("no-section", "Не понял раздел витрины",
+             "Добавьте по одному: бот покажет каталог, и раздел выбирается "
+             "кнопками."),
+            ("partial", "Раздел большой, до вас не дочитал",
+             "Список слишком длинный, чтобы просмотреть его целиком. "
+             "Укажите раздел поуже — каталогом или ссылкой."),
+            ("not-here", "Раздел прочитан весь, товара в нём нет",
+             "Значит это не тот раздел, либо товар снят с публикации. "
+             "Каталогом решается."),
+            ("unread", "Не удалось прочитать страницу раздела",
+             "Витрина не ответила. Попробуйте позже."),
+        ]
+        for code, head, advice in groups:
+            got = [t for t, why in missed if why == code]
+            if not got:
+                continue
             lines.append("")
-            lines.append(f"<b>Не понял раздел витрины — {len(no_section)}:</b>")
-            for title in no_section[:4]:
+            lines.append(f"<b>{head} — {len(got)}:</b>")
+            for title in got[:4]:
                 lines.append(f"• {_esc(title[:40])}")
-            if len(no_section) > 4:
-                lines.append(f"…и ещё {len(no_section) - 4}")
-            lines.append("<i>Добавьте по одному: бот покажет каталог, "
-                         "и раздел выбирается кнопками.</i>")
-        if not_there:
-            lines.append("")
-            lines.append(f"<b>Раздел нашёл, а товара в нём нет — "
-                         f"{len(not_there)}:</b>")
-            for title in not_there[:4]:
-                lines.append(f"• {_esc(title[:40])}")
-            if len(not_there) > 4:
-                lines.append(f"…и ещё {len(not_there) - 4}")
-            lines.append("<i>Обычно это снятый с публикации товар или "
-                         "другой раздел. Каталогом тоже решается.</i>")
+            if len(got) > 4:
+                lines.append(f"…и ещё {len(got) - 4}")
+            lines.append(f"<i>{advice}</i>")
     await _pos_edit(callback.message, "\n".join(lines), _pos_kb(s))
 
 
@@ -922,7 +927,8 @@ def _urls_for_ad(ad: dict, shop: str = "") -> list:
     return listing_urls_for(ad["id"], None, ad["title"], shop)
 
 
-async def _find_listing_page(uid: int, ad: dict) -> tuple[str, int, int, list]:
+async def _find_listing_page(uid: int, ad: dict
+                             ) -> tuple[str, int, int, list, str]:
     """Найти страницу витрины, где стоит это объявление.
 
     Возвращает (адрес, место, предложений на странице, кандидаты). Пустой
@@ -945,7 +951,7 @@ async def _find_listing_page(uid: int, ad: dict) -> tuple[str, int, int, list]:
             loop.run_in_executor(None, _urls_for_ad, ad, shop), timeout=120)
     except Exception as e:
         logger.warning("listing urls for %s: %s", ad["id"], e)
-        return "", 0, 0, []
+        return "", 0, 0, [], "no-section"
 
     # Какой из slug — игра, а какой — раздел, нигде не сказано, поэтому
     # кандидаты сверяются с каталогом: адрес, чей последний slug маркетплейс
@@ -964,7 +970,7 @@ async def _find_listing_page(uid: int, ad: dict) -> tuple[str, int, int, list]:
             chosen = url
             break
     if not chosen:
-        return "", 0, 0, urls
+        return "", 0, 0, urls, "no-section"
 
     # Раздел существует — ещё не доказательство, что мы в нём стоим.
     try:
@@ -972,12 +978,17 @@ async def _find_listing_page(uid: int, ad: dict) -> tuple[str, int, int, list]:
             loop.run_in_executor(None, fetch_listing, chosen, shop),
             timeout=180)
     except Exception:
-        return "", 0, 0, urls
+        return "", 0, 0, urls, "unread"
     mine = find_position(res["offers"], ad_id=ad["id"], title=ad["title"],
                          seller=shop) if ok else None
     if not mine:
-        return "", 0, 0, urls
-    return chosen, int(mine["pos"]), len(res["offers"]), urls
+        # «Нас тут нет» и «список не дочитан до конца» — разные вещи. Первое
+        # значит не тот раздел, второе — что товар просто глубже, чем бот
+        # успел просмотреть. Продавцу это говорит разное, а выглядело
+        # одинаково.
+        why = "partial" if ok and not res.get("complete") else "not-here"
+        return "", 0, (len(res["offers"]) if ok else 0), urls, why
+    return chosen, int(mine["pos"]), len(res["offers"]), urls, ""
 
 
 @router.callback_query(F.data.startswith("pos:addpick:"))
@@ -1018,7 +1029,8 @@ async def pos_add_pick(callback: CallbackQuery) -> None:
                     f"⏳ Ищу, на какой странице витрины стоит "
                     f"«{_esc(ad['title'][:40])}»...", _cancel_kb("pos:menu"))
 
-    chosen, pos, seen, urls = await _find_listing_page(callback.from_user.id, ad)
+    chosen, pos, seen, urls, _why = await _find_listing_page(
+        callback.from_user.id, ad)
 
     if not chosen:
         # Say which of the two steps failed. "Не смог" alone left nothing to

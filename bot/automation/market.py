@@ -615,6 +615,12 @@ def search_own_listing(market_id: str | int, title: str = "",
     facts["with_section"] = sum(section_votes(same).values())
     facts["row_keys"] = sorted(seen[0].keys())[:14] if seen else []
     facts["row_section"] = section_ref_of(seen[0]) if seen else None
+    # Сырое значение поля — последняя инстанция, когда «раздела нет», а поле
+    # есть. Шесть кругов ушло на то, чего не печатали.
+    facts["row_category_raw"] = repr((seen[0].get("category")
+                                      if seen else None))[:120]
+    if same:
+        facts["neighbour_section_raw"] = repr(same[0].get("category"))[:120]
     facts["section"], facts["section_votes"] = section_of_neighbours(by_word,
                                                                      title)
     return got, facts
@@ -705,8 +711,11 @@ def section_of_neighbours(rows: list, title: str) -> tuple[object, int]:
 def section_ref_of(row: dict):
     """Раздел строки витрины — номером, slug'ом или названием, как отдан.
 
-    Числовой ключ проверяется первым, но `category` у этой витрины строка,
-    и раньше она молча пропадала.
+    Числовой ключ проверяется первым. Дальше годится что угодно, чем витрина
+    назвала раздел: строка-slug, или объект без номера — `{"slug": …,
+    "title": …}`. Раньше требовался номер, и раздел, лежавший на виду,
+    молча пропадал; из-за этого «раздел по соседям» держался на нуле, сколько
+    бы соседей ни находилось.
     """
     cid = _category_id_of(row)
     if cid not in (None, ""):
@@ -714,6 +723,11 @@ def section_ref_of(row: dict):
     node = row.get("category") or row.get("subcategory")
     if isinstance(node, str) and node.strip():
         return node.strip()
+    if isinstance(node, dict):
+        for key in ("slug", "title", "name"):
+            got = node.get(key)
+            if isinstance(got, str) and got.strip():
+                return got.strip()
     return None
 
 
