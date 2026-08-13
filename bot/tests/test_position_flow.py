@@ -440,6 +440,11 @@ class NamingTheSectionByHand(FlowCase):
 
     def tearDown(self):
         S._PENDING_AD.pop(7, None)
+        # Путь по каталогу живёт в модуле. Не сбросить его — и следующий
+        # тест начнёт со середины чужого пути: ровно та беда, из-за которой
+        # тринадцать тестов когда-то падали «сами по себе».
+        S._CAT_PATH.clear()
+        S._CAT_SEEN.clear()
         super().tearDown()
 
     def test_the_top_level_offers_games_that_go_deeper(self):
@@ -471,7 +476,7 @@ class NamingTheSectionByHand(FlowCase):
         # И саму игру можно взять целиком — по её номеру, а не по адресу:
         # этот API отвечает на /categories/<игра>/<раздел> игрой, так что
         # адрес умеет незаметно расшириться до всей игры.
-        self.assertIn("pos:catpick:77", data)
+        self.assertIn("pos:catpick:black-russia", data)
 
     def test_a_section_without_children_offers_itself(self):
         """Тупик «дальше некуда, а взять нечего» — худшее, чем может
@@ -480,10 +485,43 @@ class NamingTheSectionByHand(FlowCase):
         self.run_(S.pos_pick_category(cb))
         data = [b.callback_data for row in cb.message.markups[-1].inline_keyboard
                 for b in row]
-        self.assertIn("pos:catpick:513", data)
+        self.assertIn("pos:catpick:virty", data)
+
+    def test_a_subsection_does_not_become_some_other_game(self):
+        """Продавец выбрал Black Russia, а бот ушёл в Tanks Blitz.
+
+        Подразделы витрина отдаёт **отдельным запросом**, и в каталоге
+        верхнего уровня их номеров нет. Адрес искался по номеру, не
+        находился, схлопывался до «/categories» — а на него витрина
+        отвечает первой попавшейся категорией. Дальше бот честно
+        докладывал, что просмотрел 675 предложений и товара там нет: беда
+        была не в поиске, а в адресе.
+
+        Путь по каталогу известен точно — продавец только что прошёл по
+        нему сам, и адрес собирается из него.
+        """
+        self.patch(M, "category_slugs_for", lambda cid: ["tanks-blitz"])
+        self.run_(S.pos_pick_category(FakeCallback("pos:cat:black-russia")))
+        cb = FakeCallback("pos:catpick:akkaunty-s-virtami")
+        self.run_(S.pos_category_chosen(cb))
+        ws = self.watches()
+        self.assertEqual(len(ws), 1)
+        self.assertNotIn("tanks-blitz", ws[0]["url"])
+        self.assertIn("black-russia/akkaunty-s-virtami", ws[0]["url"])
+
+    def test_an_unknown_pick_asks_to_start_over_instead_of_guessing(self):
+        """Прежде здесь молча получался адрес всего каталога, и дальше бот
+        искал товар в чужой категории."""
+        cb = FakeCallback("pos:catpick:чего-нет")
+        self.run_(S.pos_category_chosen(cb))
+        self.assertEqual(self.watches(), [])
+        self.assertIn("Не понял, какой раздел выбран",
+                      "\n".join(cb.message.sent))
 
     def test_choosing_a_section_sets_the_watch_up_completely(self):
-        cb = FakeCallback("pos:catpick:512")
+        # Продавец сначала проходит каталогом — путь и есть адрес.
+        self.run_(S.pos_pick_category(FakeCallback("pos:cat:black-russia")))
+        cb = FakeCallback("pos:catpick:akkaunty-s-virtami")
         self.run_(S.pos_category_chosen(cb))
         ws = self.watches()
         self.assertEqual(len(ws), 1)
@@ -503,11 +541,14 @@ class NamingTheSectionByHand(FlowCase):
                        "offers": M._normalize(
                            [{"title": "Чужое", "price": 5,
                              "shop": {"name": "Кто-то"}}]), "note": ""}))
-        cb = FakeCallback("pos:catpick:513")
+        self.run_(S.pos_pick_category(FakeCallback("pos:cat:black-russia")))
+        cb = FakeCallback("pos:catpick:virty")
         self.run_(S.pos_category_chosen(cb))
         self.assertEqual(self.watches(), [])
         said = "\n".join(cb.message.sent)
-        self.assertIn("В этом разделе товара нет", said)
+        # Раздел назван словом: продавец выбрал одно, увидел обрезанный
+        # адрес другого и первым делом спросил, почему так.
+        self.assertIn("В разделе «Вирты» товара нет", said)
         self.assertIn("Просмотрено предложений: 1", said)
 
     def test_the_choice_is_refused_when_no_listing_is_pending(self):

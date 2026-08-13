@@ -1080,6 +1080,32 @@ async def pos_add_pick(callback: CallbackQuery) -> None:
 # while they name its section by hand.
 _PENDING_AD: dict[int, dict] = {}
 
+# Путь, которым продавец идёт по каталогу, и что он по дороге видел.
+#
+# Без этого адрес раздела собирался поиском номера в каталоге верхнего
+# уровня — а подразделы витрина отдаёт **отдельным запросом**, и в верхнем
+# уровне их номеров нет. Поиск не находил ничего, адрес схлопывался до
+# «/categories», и витрина отвечала на него первой попавшейся категорией:
+# продавец выбирал Black Russia, а бот уходил искать товар в Tanks Blitz и
+# честно докладывал, что 675 предложений просмотрел и товара там нет.
+#
+# Путь известен точно — по нему продавец только что прошёл сам.
+_CAT_PATH: dict[int, list[str]] = {}
+_CAT_SEEN: dict[int, dict] = {}
+
+
+def _walk_to(uid: int, slug: str) -> list[str]:
+    """Обновить путь по каталогу и вернуть его. Пустой slug — в начало."""
+    path = _CAT_PATH.get(uid) or []
+    if not slug:
+        path = []
+    elif slug in path:
+        path = path[:path.index(slug) + 1]
+    else:
+        path = path + [slug]
+    _CAT_PATH[uid] = path
+    return path
+
 
 @router.callback_query(F.data.startswith("pos:cat:"))
 async def pos_pick_category(callback: CallbackQuery) -> None:
@@ -1099,6 +1125,7 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
         await callback.answer("Начните заново — выберите товар", show_alert=True)
         await _pos_screen(callback)
         return
+    path = _walk_to(callback.from_user.id, parent)
     await callback.answer("⏳ Читаю каталог...")
     loop = asyncio.get_event_loop()
     try:
@@ -1119,7 +1146,7 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
         except Exception:
             here = {}
 
-    if not rows and not here:
+    if not rows and not (here and here.get("slug")):
         b = InlineKeyboardBuilder()
         b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
         b.button(text="⬅️ Назад", callback_data="pos:add")
@@ -1129,10 +1156,19 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
                         "Пришлите адрес страницы вручную.", b.as_markup())
         return
 
+    # Что видели по дороге — чтобы на выборе знать и номер раздела, и его
+    # название, не спрашивая каталог заново.
+    seen_map = _CAT_SEEN.setdefault(callback.from_user.id, {})
+    if here and here.get("slug"):
+        seen_map[str(here["slug"])] = here
+    for r in rows:
+        seen_map[str(r["slug"])] = {"id": r.get("id"), "slug": str(r["slug"]),
+                                    "title": r.get("title") or r["slug"]}
+
     b = InlineKeyboardBuilder()
-    if here and here.get("id") is not None:
+    if here and here.get("slug"):
         b.button(text=f"✅ Взять «{str(here['title'])[:24]}» целиком",
-                 callback_data=f"pos:catpick:{here['id']}"[:64])
+                 callback_data=f"pos:catpick:{here['slug']}"[:64])
     for r in rows[:58]:
         # Шаг вглубь на каждом разделе, а не только там, где витрина
         # призналась во вложениях. Верхний уровень она отдаёт плоским — у
@@ -1172,23 +1208,48 @@ async def pos_category_chosen(callback: CallbackQuery) -> None:
         await callback.answer("Начните заново — выберите товар", show_alert=True)
         await _pos_screen(callback)
         return
-    cat_id = callback.data[len("pos:catpick:"):]
-    # The section's own id, straight from the catalogue. The address is built
-    # from it for display and for later checks, but the id is what the listing
-    # is actually asked for: this API answers /categories/<game>/<section> with
-    # the game, so an address alone can quietly widen to the whole game.
-    loop0 = asyncio.get_event_loop()
-    try:
-        slugs = await asyncio.wait_for(
-            loop0.run_in_executor(None, category_slugs_for, cat_id), timeout=45)
-    except Exception:
-        slugs = []
-    url = (f"{MARKET_URL}/categories/" + "/".join(slugs[-2:])) if slugs else \
-        f"{MARKET_URL}/categories"
+    picked = callback.data[len("pos:catpick:"):]
+    # Адрес собирается из пути, которым продавец только что прошёл сам.
+    #
+    # Раньше он искался по номеру в каталоге верхнего уровня — а подразделы
+    # витрина отдаёт отдельным запросом, и их номеров там нет. Поиск не
+    # находил ничего, адрес схлопывался до «/categories», и витрина
+    # отвечала первой попавшейся категорией: выбрана Black Russia, а бот
+    # уходил в Tanks Blitz и честно докладывал, что товара там нет.
+    uid = callback.from_user.id
+    node = (_CAT_SEEN.get(uid) or {}).get(picked) or {}
+    cat_id = None if node.get("id") in (None, "") else str(node["id"])
+    # Только то, что бот сам показал на экране. Кнопка из старого
+    # сообщения или чужой slug иначе дописались бы в путь, и адрес
+    # получился бы собранным из двух разных разделов.
+    slugs = _walk_to(uid, picked) if node.get("slug") else []
+    if not slugs and cat_id not in (None, ""):
+        loop0 = asyncio.get_event_loop()
+        try:                            # старая кнопка из прежнего сообщения
+            slugs = await asyncio.wait_for(
+                loop0.run_in_executor(None, category_slugs_for, cat_id),
+                timeout=45)
+        except Exception:
+            slugs = []
+    if not slugs:
+        b = InlineKeyboardBuilder()
+        b.button(text="📂 Выбрать раздел заново", callback_data="pos:cat:")
+        b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
+        b.adjust(1)
+        # Раньше здесь молча получался адрес всего каталога, и дальше бот
+        # искал товар в чужой категории.
+        await _pos_edit(callback.message,
+                        "❔ Не понял, какой раздел выбран — начните с каталога "
+                        "заново.", b.as_markup())
+        await callback.answer()
+        return
+    url = f"{MARKET_URL}/categories/" + "/".join(slugs[-2:])
+    title = str(node.get("title") or slugs[-1])
 
     await callback.answer("⏳ Проверяю раздел...")
     await _pos_edit(callback.message,
-                    f"⏳ Ищу «{_esc(ad['title'][:36])}» в этом разделе...",
+                    f"⏳ Ищу «{_esc(ad['title'][:36])}» в разделе "
+                    f"«{_esc(title)}»...",
                     _cancel_kb("pos:menu"))
     shop = get_shop_name(callback.from_user.id) or ""
     loop = asyncio.get_event_loop()
@@ -1206,9 +1267,12 @@ async def pos_category_chosen(callback: CallbackQuery) -> None:
         b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
         b.adjust(1)
         seen = len(res["offers"]) if ok else 0
+        # Раздел назван словом, а не только обрезанным адресом: продавец
+        # выбрал Black Russia, увидел «…/tanks-bli…» и первым делом спросил,
+        # почему одно читается как другое. Название снимает этот вопрос.
         await _pos_edit(
             callback.message,
-            f"❔ В этом разделе товара нет.\n\n"
+            f"❔ В разделе «{_esc(title)}» товара нет.\n\n"
             f"<code>{_esc(_short_url(url))}</code>\n"
             + (f"Просмотрено предложений: {seen}" if ok
                else f"❌ {_esc(str(res)[:150])}"),
