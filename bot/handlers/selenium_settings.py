@@ -79,9 +79,47 @@ def promo_price(s: dict) -> int:
     return int((s.get("auto_bump", {}).get("promo") or {}).get("price") or 0)
 
 
+def promo_pack(s: dict) -> str:
+    """Пак, который поднимает расписание. Пусто — расписание не на паке."""
+    return str((s.get("auto_bump", {}) or {}).get("only_pack") or "")
+
+
 def promo_only_ids(s: dict) -> list:
-    """Listings the seller picked for promotion. Empty = every listing."""
-    return list((s.get("auto_bump", {}) or {}).get("only_items") or [])
+    """Listings the seller picked for promotion. Empty = every listing.
+
+    Когда расписание привязано к паку, список берётся **из пака**, а не из
+    сохранённой копии: пак живёт своей жизнью, в него добавляют и убирают
+    товары, и вторая копия его состава разъехалась бы молча — поднимали бы
+    вчерашний набор.
+
+    Пустой ответ здесь означает «все объявления», поэтому исчезнувший пак
+    нельзя отдавать как пустоту: это оплата поднятия всего магазина вместо
+    трёх товаров. Разбирается это в `promo_pack_problem`.
+    """
+    ab = (s.get("auto_bump", {}) or {})
+    pack = promo_pack(s)
+    if pack:
+        return list((s.get("ad_packs", {}) or {}).get(pack) or [])
+    return list(ab.get("only_items") or [])
+
+
+def promo_pack_problem(s: dict) -> str:
+    """Почему расписание на паке запускать нельзя. Пусто — можно.
+
+    Пустой список товаров и «поднимать всё» — в этом коде одно и то же
+    значение, поэтому удалённый или опустевший пак обязан останавливать
+    прогон, а не превращаться в поднятие всего магазина.
+    """
+    pack = promo_pack(s)
+    if not pack:
+        return ""
+    packs = s.get("ad_packs", {}) or {}
+    if pack not in packs:
+        return (f"расписание привязано к паку «{pack}», а такого пака больше "
+                f"нет — продвижение остановлено, чтобы не поднять весь магазин")
+    if not packs[pack]:
+        return f"пак «{pack}» пуст — поднимать нечего"
+    return ""
 
 
 def promo_limit(s: dict) -> int:
@@ -213,7 +251,14 @@ def _sched_text(s: dict) -> str:
         f"Время запуска: <b>{', '.join(times) if times else 'не задано'}</b>",
     ]
     picked = promo_only_ids(s)
-    lines.append(f"Товары: <b>{f'выбрано {len(picked)}' if picked else 'все'}</b>")
+    pack = promo_pack(s)
+    lines.append(
+        f"Товары: <b>пак «{pack}» ({len(picked)})</b>" if pack
+        else f"Товары: <b>{f'выбрано {len(picked)}' if picked else 'все'}</b>")
+    trouble = promo_pack_problem(s)
+    if trouble:
+        # Молчать нельзя: расписание включено, а поднимать оно не будет.
+        lines.append(f"⛔ <b>{trouble}</b>")
     if price and times:
         per_run = (len(picked) or 0) * price
         lines.append(f"Цена поднятия: <b>{price:g} ₽</b>"

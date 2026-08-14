@@ -114,19 +114,103 @@ async def pack_view(callback: CallbackQuery) -> None:
     if name is None:
         await callback.answer("Пак не найден", show_alert=True)
         return
+    from handlers.selenium_settings import promo_pack
     ids = _packs(uid).get(name, [])
+    s = get_settings(uid)
+    scheduled = promo_pack(s) == name
+    bs = s.get("bump_schedule", {})
+    times = bs.get("times") or []
+
     lines = [f"📦 <b>{name}</b>\n", f"Объявлений: <b>{len(ids)}</b>"]
+    if scheduled:
+        # Состояние расписания видно на самом паке: иначе «поднимается ли он
+        # сам» приходится выяснять на другом экране, а это про деньги.
+        lines.append(
+            "⏰ Поднимается по расписанию: "
+            + (f"<b>{', '.join(times)}</b>" if bs.get("enabled") and times
+               else "<b>расписание выключено</b>"))
     if ids:
         lines.append("\n" + "\n".join(f"• <code>{i}</code>" for i in ids[:30]))
     b = InlineKeyboardBuilder()
     b.button(text="⬆️ Поднять весь пак", callback_data=f"pack:bump:{idx}")
     b.button(text="➕ Добавить объявления", callback_data=f"pack:add:{idx}")
+    b.button(text=("⏰ Расписание пака" if scheduled
+                   else "⏰ Поднимать по времени"),
+             callback_data=f"pack:sched:{idx}")
     if ids:
         b.button(text="🗑 Очистить", callback_data=f"pack:clear:{idx}")
     b.button(text="❌ Удалить пак", callback_data=f"pack:del:{idx}")
     b.button(text="⬅️ Паки", callback_data="packs:menu")
-    b.adjust(2, 1, 1)
+    b.adjust(2, 1, 1, 1)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pack:sched:"))
+async def pack_schedule(callback: CallbackQuery) -> None:
+    """Привязать расписание продвижения к этому паку.
+
+    Расписание в боте **одно на магазин**, а не по одному на пак. Строить
+    второе означало бы завести вторую дорогу к тратам: свой потолок, свой
+    счётчик, своя история — и два места, где можно ошибиться деньгами.
+    Поэтому пак не заводит собственный будильник, а становится тем набором,
+    который поднимает общее расписание.
+
+    Отсюда обязанность сказать вслух, что предыдущая привязка заменяется:
+    молча переключить расписание с одного пака на другой — значит начать
+    платить не за те товары.
+    """
+    from handlers.selenium_settings import promo_pack
+
+    uid = callback.from_user.id
+    try:
+        idx = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    name = _pack_by_index(uid, idx)
+    if name is None:
+        await callback.answer("Пак не найден", show_alert=True)
+        return
+    ids = _packs(uid).get(name, [])
+    if not ids:
+        await callback.answer("Пак пуст — сначала добавьте объявления",
+                              show_alert=True)
+        return
+
+    s = get_settings(uid)
+    was = promo_pack(s)
+    ab = s.setdefault("auto_bump", {})
+    ab["only_pack"] = name
+    # Прежний ручной выбор товаров больше не действует — он бы противоречил
+    # паку, и было бы непонятно, что из двух победит.
+    ab.pop("only_items", None)
+    save_settings(uid, s)
+
+    bs = s.get("bump_schedule", {})
+    times = bs.get("times") or []
+    head = [f"⏰ <b>Расписание для пака «{_esc(name)}»</b>", ""]
+    if was and was != name:
+        head.append(f"⚠️ Раньше по расписанию поднимался пак «{_esc(was)}» — "
+                    f"теперь поднимается этот.")
+        head.append("")
+    head.append(f"Товаров в паке: <b>{len(ids)}</b>")
+    head.append("Состав берётся из пака на каждом запуске — добавите товар, "
+                "и он начнёт подниматься сам.")
+    head.append("")
+    head.append(
+        f"Часы запуска: <b>{', '.join(times) if times else 'не заданы'}</b>"
+        if bs.get("enabled") or times else
+        "Часы запуска пока не заданы, и расписание выключено.")
+    head.append("")
+    head.append("Расписание в боте одно. Задать часы, потолок трат в день и "
+                "включить его — на следующем экране.")
+
+    b = InlineKeyboardBuilder()
+    b.button(text="🕐 Часы и потолок трат", callback_data="sched:menu")
+    b.button(text="📦 К паку", callback_data=f"pack:view:{idx}")
+    b.adjust(1)
+    await callback.message.edit_text("\n".join(head), reply_markup=b.as_markup())
     await callback.answer()
 
 

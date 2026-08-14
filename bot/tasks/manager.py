@@ -2475,6 +2475,15 @@ class TaskManager:
             return 0, ("не выбран тариф «Премиум» — откройте "
                        "«Объявления» → «Премиум продвижение» → «Тариф»")
 
+        # Пак, к которому привязано расписание, мог исчезнуть или опустеть.
+        # Пустой список товаров означает здесь «поднимать все», так что
+        # молчаливый пропуск этой проверки — оплата поднятия всего магазина
+        # вместо трёх товаров.
+        from handlers.selenium_settings import promo_pack_problem
+        problem = promo_pack_problem(settings)
+        if problem:
+            return 0, problem
+
         # Not gated on the shop balance: «Премиум» is paid by СБП/card/crypto,
         # not from it, so the balance says nothing about whether this can run.
         caps = [c for c in (promo_limit(settings),) if c]
