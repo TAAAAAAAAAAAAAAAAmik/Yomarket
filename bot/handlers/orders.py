@@ -11,7 +11,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from api.yoomarket import YooMarketAPI
 from keyboards.main import OrderCallback, PaginationCallback, back_keyboard, order_actions_keyboard
-from orderfields import describe, money, status_icon, status_ru
+from orderfields import (BACK, DONE, describe, money, status_icon,
+                         status_ru)
 from storage import get_settings
 
 router = Router()
@@ -478,7 +479,10 @@ async def orders_search_exec(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "orders:filter:done")
 async def filter_orders_done(callback: CallbackQuery) -> None:
     await callback.answer()
-    done_statuses = ("confirmed", "completed", "done")
+    # Общий список, а не свой: «success» — статус выполненного заказа у
+    # этого маркетплейса, и без него фильтр показывал пусто при полном
+    # магазине выполненных заказов.
+    done_statuses = DONE
     s = get_settings(callback.from_user.id)
     known_orders: dict = s.get("known_orders", {})
     order_details: dict = s.get("known_order_details", {})
@@ -571,7 +575,7 @@ async def filter_orders_active(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "orders:filter:refunds")
 async def filter_orders_refunds(callback: CallbackQuery) -> None:
     await callback.answer()
-    refund_statuses = ("refunded", "cancelled", "returned")
+    refund_statuses = BACK
     s = get_settings(callback.from_user.id)
     known_orders: dict = s.get("known_orders", {})
     order_details: dict = s.get("known_order_details", {})

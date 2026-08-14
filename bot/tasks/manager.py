@@ -1258,7 +1258,7 @@ class TaskManager:
                     await self._maybe_ask_stars_username(
                         api, settings, oid, title, chat_id, status)
 
-                elif prev_status != status and status in ("confirmed", "completed", "done"):
+                elif prev_status != status and status in _DONE_STATUSES:
                     ev = ae.get("on_confirmed", {})
                     if ev.get("enabled"):
                         msg = self._pick_message(
@@ -1282,7 +1282,7 @@ class TaskManager:
                         reply_markup=_order_notify_kb(oid, chat_id),
                     )
 
-                elif prev_status != status and status in ("refunded", "cancelled", "returned"):
+                elif prev_status != status and status in _BACK_STATUSES:
                     ev = ae.get("on_refunded", {})
                     if ev.get("enabled"):
                         msg = self._pick_message(
@@ -1735,7 +1735,13 @@ class TaskManager:
 
         changed = False
         for oid, status in known_orders.items():
-            if status in ("confirmed", "completed", "done", "refunded", "cancelled", "returned"):
+            # Списки статусов — общие, из `orderfields`. Свой, написанный
+            # здесь, не знал «success» — статуса, которым этот маркетплейс
+            # помечает выполненный заказ. Продавцу приходило «Ждёт
+            # подтверждения уже 48 ч» про заказ, у которого в том же
+            # сообщении стояло «Статус: ✅ Выполнен», и рядом кнопки
+            # «Подтвердить» и «Возврат».
+            if status in _DONE_STATUSES or status in _BACK_STATUSES:
                 continue
             if oid in reminded_set:
                 continue
