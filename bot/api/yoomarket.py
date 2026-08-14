@@ -144,10 +144,6 @@ class YooMarketAPI:
         """Put an ad back on sale — POST /ads/{ad_id}/publish (per the spec)."""
         return await self._post(f"/ads/{ad_id}/publish")
 
-    async def unpublish_ad(self, ad_id: int | str) -> dict:
-        """Take an ad off sale — POST /ads/{ad_id}/unpublish."""
-        return await self._post(f"/ads/{ad_id}/unpublish")
-
     # Statuses this marketplace will bring back on sale. Expiry is the case it
     # supports: a listing that ran out of time can be published again.
     # Deliberately excludes moderate/draft (on their way up already) and

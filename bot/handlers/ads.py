@@ -22,16 +22,6 @@ STATUS_EMOJI = {
     "sold": "✅ Продан",
 }
 
-# Which statuses each action is offered for. Hardcoding "active"/"inactive"
-# meant a listing in «unpublish» — this marketplace's word for taken down —
-# got no publish button at all: the bot showed it and offered nothing to do
-# with it. The classification the restore logic already uses is reused instead
-# of a second, differently-wrong list.
-def _can_publish(raw: str) -> bool:
-    from api.yoomarket import YooMarketAPI
-    return str(raw).lower() in YooMarketAPI._DOWN
-
-
 def _manual_only(raw: str) -> bool:
     """Taken down by hand — this marketplace only republishes expired listings.
 
@@ -40,10 +30,6 @@ def _manual_only(raw: str) -> bool:
     """
     from api.yoomarket import YooMarketAPI
     return str(raw).lower() in YooMarketAPI._MANUAL_ONLY
-
-
-def _can_unpublish(raw: str) -> bool:
-    return str(raw).lower() in ("publish", "published", "active")
 
 
 def _status(raw: str) -> str:
@@ -228,11 +214,11 @@ async def show_ad_detail(
                "\n\n" if _manual_only(status_raw) else "")
             + f"📝 <b>Описание:</b>\n{description}"
         )
+        # Ручные «снять с продажи» и «вернуть в продажу» убраны по решению
+        # продавца: то же самое делается на сайте в два нажатия, а в боте
+        # это была лишняя кнопка рядом с платными. Автовозврат истёкших
+        # объявлений — отдельная функция и остаётся (пункты C3 и C4).
         b = InlineKeyboardBuilder()
-        if _can_unpublish(status_raw):
-            b.button(text="⏸ Снять с продажи", callback_data=f"ad_pause:{callback_data.ad_id}")
-        elif _can_publish(status_raw):
-            b.button(text="▶️ Вернуть в продажу", callback_data=f"ad_activate:{callback_data.ad_id}")
         b.button(text="⬅️ К товарам", callback_data="ads_load")
         b.adjust(1, 1)
         keyboard = b.as_markup()
@@ -319,65 +305,5 @@ async def bump_ad_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
             await callback.message.edit_text(f"⛔ {msg[:400]}{hint}")
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {str(e)[:200]}")
-
-
-@router.callback_query(F.data.startswith("ad_pause:"))
-async def ad_pause(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    ad_id = callback.data.split(":", 1)[1]
-    try:
-        await api.unpublish_ad(ad_id)
-        await callback.answer("⏸ Товар приостановлен", show_alert=True)
-    except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
-    try:
-        ad = await api.get_ad(ad_id)
-        title = ad.get("title") or ad.get("name") or "—"
-        price = _price_text(ad)
-        status_raw = ad.get("status", "")
-        status = _status(status_raw)
-        text = (
-            f"📦 <b>{title}</b>\n\n"
-            f"💰 Цена: <b>{price} ₽</b>\n"
-            f"📊 Статус: {status}"
-        )
-        b = InlineKeyboardBuilder()
-        b.button(text="⬆️ Поднять товар", callback_data=f"ad_bump:{ad_id}")
-        if _can_publish(status_raw):
-            b.button(text="▶️ Вернуть в продажу", callback_data=f"ad_activate:{ad_id}")
-        b.button(text="⬅️ К товарам", callback_data="ads_load")
-        b.adjust(1, 1)
-        await callback.message.edit_text(text, reply_markup=b.as_markup())
-    except Exception:
-        await callback.message.edit_text("✅ Статус обновлён", reply_markup=back_keyboard())
-
-
-@router.callback_query(F.data.startswith("ad_activate:"))
-async def ad_activate(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    ad_id = callback.data.split(":", 1)[1]
-    try:
-        await api.restore_ad(ad_id)
-        await callback.answer("▶️ Товар активирован", show_alert=True)
-    except Exception as e:
-        await callback.answer(f"❌ {e}", show_alert=True)
-    try:
-        ad = await api.get_ad(ad_id)
-        title = ad.get("title") or ad.get("name") or "—"
-        price = _price_text(ad)
-        status_raw = ad.get("status", "")
-        status = _status(status_raw)
-        text = (
-            f"📦 <b>{title}</b>\n\n"
-            f"💰 Цена: <b>{price} ₽</b>\n"
-            f"📊 Статус: {status}"
-        )
-        b = InlineKeyboardBuilder()
-        b.button(text="⬆️ Поднять товар", callback_data=f"ad_bump:{ad_id}")
-        if _can_unpublish(status_raw):
-            b.button(text="⏸ Снять с продажи", callback_data=f"ad_pause:{ad_id}")
-        b.button(text="⬅️ К товарам", callback_data="ads_load")
-        b.adjust(1, 1)
-        await callback.message.edit_text(text, reply_markup=b.as_markup())
-    except Exception:
-        await callback.message.edit_text("✅ Статус обновлён", reply_markup=back_keyboard())
 
 

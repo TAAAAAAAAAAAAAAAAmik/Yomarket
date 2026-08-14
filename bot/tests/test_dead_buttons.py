@@ -114,6 +114,43 @@ class NothingUsesTheApiThatHasNoSuchMethod(unittest.TestCase):
             self.assertNotIn("get_reviews", text, path.name)
 
 
+class TakingAListingOffSaleByHandIsGone(unittest.TestCase):
+    """Ручные «⏸ Снять с продажи» и «▶️ Вернуть в продажу» сняты по решению
+    продавца: то же самое делается на сайте, а в боте это была лишняя кнопка
+    рядом с платными.
+
+    Автовозврат истёкших объявлений — отдельная функция и остаётся: он
+    ходит через `restore_ad`, и трогать его нельзя.
+    """
+
+    def _sources(self):
+        for path in (BOT / "handlers").glob("*.py"):
+            yield path, path.read_text()
+        for name in ("tasks/manager.py", "api/yoomarket.py"):
+            yield BOT / name, (BOT / name).read_text()
+
+    def test_the_buttons_are_not_offered_anywhere(self):
+        for path, text in self._sources():
+            self.assertNotIn("Снять с продажи", text, path.name)
+            self.assertNotIn("Вернуть в продажу", text, path.name)
+
+    def test_their_handlers_are_gone(self):
+        for path, text in self._sources():
+            self.assertNotIn("ad_pause", text, path.name)
+            self.assertNotIn("ad_activate", text, path.name)
+
+    def test_the_api_method_behind_them_is_gone_too(self):
+        """Мёртвый метод — приглашение вернуть кнопку не подумав."""
+        for path, text in self._sources():
+            self.assertNotIn("unpublish_ad", text, path.name)
+
+    def test_but_restoring_expired_listings_still_works(self):
+        """Автовозврат — это C3 и C4, их никто не отменял."""
+        from api.yoomarket import YooMarketAPI
+        self.assertTrue(hasattr(YooMarketAPI, "restore_ad"))
+        self.assertTrue(hasattr(YooMarketAPI, "restore_ads"))
+
+
 class BumpingAPack(Patched):
     def setUp(self):
         super().setUp()
