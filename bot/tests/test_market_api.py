@@ -81,10 +81,22 @@ class ApiCase(unittest.TestCase):
                          "children": [{"id": 512, "slug": "virty",
                                        "title": "Вирты", "ads_count": 638}]}
 
+        # Сколько витрина отдаёт БЕЗ раздела. Запрос без единого ключа
+        # раздела — это и есть общая лента; отличать её от раздела
+        # обязательно, иначе непринятый фильтр выглядит как настоящий.
+        self.all_total = 99999
+        self.all_calls: list[str] = []
+
         def fake(url, params=None, **kw):
             if "/api/categories" in url:
                 self.meta_calls.append(url)
                 return Reply(self.category or {})
+            # Проба общей ленты — ровно {"page": 1} и ничего больше.
+            # Считается отдельно: остальные проверки смотрят на `calls[0]`
+            # как на первый запрос ЗА РАЗДЕЛОМ.
+            if self.all_total is not None and dict(params or {}) == {"page": 1}:
+                self.all_calls.append(url)
+                return Reply({"data": [], "meta": {"total": self.all_total}})
             self.calls.append((url, dict(params or {})))
             n = int((params or {}).get("page", 0) or 0)
             if not n:
@@ -102,6 +114,7 @@ class ApiCase(unittest.TestCase):
     def tearDown(self):
         import requests
         requests.get = self._old
+        M._ALL_TOTAL.update(ts=0.0, value=None)
 
 
 class TheQuery(unittest.TestCase):
@@ -258,11 +271,21 @@ class TheRightCatalogue(unittest.TestCase):
         self.totals = {"category=virty": 4021,
                        "category=black-russia": 638,
                        "category_id=512": 638}
+        self.all_total = 50000
+        # Размер общей ленты кэшируется на десять минут. Не сбросить — и
+        # соседний тест получит чужое число: та самая беда, от которой
+        # тесты падают «сами по себе» в перемешанном порядке.
+        M._ALL_TOTAL.update(ts=0.0, value=None)
 
         def fake(url, params=None, **kw):
             if "/api/categories" in url:
                 return Reply(self.SECTION)
             p = dict(params or {})
+            # Общая лента — запрос вообще без раздела. Её размер должен
+            # отличаться от любого раздела, иначе «раздел не приняли» и
+            # «раздел не тот» неразличимы.
+            if p == {"page": 1}:
+                return Reply({"data": [], "meta": {"total": self.all_total}})
             self.asked.append(p)
             key = next((f"{k}={v}" for k, v in p.items()
                         if k in ("category", "category_id")), "")
@@ -274,6 +297,7 @@ class TheRightCatalogue(unittest.TestCase):
     def tearDown(self):
         import requests
         requests.get = self._old
+        M._ALL_TOTAL.update(ts=0.0, value=None)
 
     def test_the_section_id_is_taken_from_the_catalogue(self):
         """/api/categories answers about the game; the section is inside it."""
@@ -323,6 +347,29 @@ class TheRightCatalogue(unittest.TestCase):
         self.assertTrue(ok, "an answer is still returned")
         self.assertIn("⚠️", res["note"])
         self.assertIn("638", res["note"])
+
+    def test_a_filter_the_storefront_ignored_is_refused_outright(self):
+        """Раздел вернул столько же, сколько вся витрина без раздела.
+
+        Значит фильтр не применён, и читается общая лента. Продавец видел
+        это как «просмотрено 675 предложений» — свой же предел в сорок
+        пять страниц — и одно и то же число в двух разных разделах. Позиция
+        из такой ленты — число из чужого списка, а «товара в разделе нет» —
+        заявление о разделе, которого никто не читал. Отказ честнее.
+        """
+        self.all_total = 4021                  # ровно то, что отдают все формы
+        self.totals = {}
+        ok, res = M.fetch_offers_api(PAGE_URL)
+        self.assertFalse(ok)
+        self.assertIn("не приняла раздел", str(res))
+
+    def test_a_matching_count_is_trusted_even_if_the_feed_is_that_big(self):
+        """Счётчик раздела из каталога — доказательство сильнее совпадения
+        размеров, и проверяется первым."""
+        self.all_total = 638
+        ok, res = M.fetch_offers_api(PAGE_URL)
+        self.assertTrue(ok, res)
+        self.assertIn("запрос:", res["note"])
 
     def test_without_a_count_to_check_against_it_does_not_thrash(self):
         self.SECTION = {"slug": "virty"}       # no ads_count
@@ -531,13 +578,19 @@ class TheSectionIdWins(ApiCase):
         self.assertTrue(ok, res)
         self.assertEqual(self.calls[0][1].get("category_id"), 512)
 
-    def test_a_known_id_needs_no_catalogue_lookup_at_all(self):
+    def test_a_known_id_is_still_checked_against_the_catalogue(self):
+        """«Назван» не значит «принят».
+
+        Прежде на известный номер уходил ровно один запрос, и ответ
+        принимался как есть. Но как витрина ждёт номер раздела, нигде не
+        написано: неугаданный ключ она молча игнорирует и отдаёт общую
+        ленту. Продавец получал «просмотрено 675 предложений» — сорок пять
+        страниц по пятнадцать — и одно и то же число в двух разных
+        разделах.
+        """
         self.pages = {1: body([offer(1, "A")])}
         M.fetch_offers_api(PAGE_URL, max_pages=1, category_id=512)
-        self.assertEqual(self.meta_calls, [],
-                         "the section is already known — nothing to look up")
-        self.assertEqual(len(self.calls), 1,
-                         "and no query shapes to try — one request, one answer")
+        self.assertTrue(self.meta_calls, "счётчик раздела не спрошен")
 
     def test_the_pages_own_filters_still_travel_with_it(self):
         self.pages = {1: body([offer(1, "A")])}

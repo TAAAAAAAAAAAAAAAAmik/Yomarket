@@ -1267,6 +1267,44 @@ def _batch_of(body) -> list:
     return max(found, key=len) if found else []
 
 
+_ALL_TOTAL: dict = {"ts": 0.0, "value": None}
+
+
+def unfiltered_total(max_age: float = 600.0):
+    """Сколько предложений витрина отдаёт БЕЗ фильтра по разделу.
+
+    Проверка, которую нельзя обмануть и для которой ничего не нужно знать
+    о каталоге: если запрос с разделом возвращает столько же, сколько
+    запрос вообще без раздела, — раздел как фильтр не сработал.
+
+    Ровно это и происходило. «Звезды» и «Аккаунты с виртами» — разные
+    разделы, а бот в обоих прочитал по 675 предложений: сорок пять страниц
+    по пятнадцать, то есть свой же предел на общей ленте. Позиция,
+    посчитанная в такой ленте, — число из чужого списка, а «товара в
+    разделе нет» — заявление о разделе, которого никто не читал.
+    """
+    import time as _t
+    now = _t.time()
+    if _ALL_TOTAL["value"] is not None and now - _ALL_TOTAL["ts"] < max_age:
+        return _ALL_TOTAL["value"]
+    body, _e = _api_get(f"{API_URL}/api/products", {"page": 1})
+    total = (body.get("meta") or {}).get("total") if isinstance(body, dict) else None
+    try:
+        total = int(total) if total is not None else None
+    except (TypeError, ValueError):
+        total = None
+    _ALL_TOTAL.update(ts=now, value=total)
+    return total
+
+
+def _total_of(body) -> int | None:
+    got = (body.get("meta") or {}).get("total") if isinstance(body, dict) else None
+    try:
+        return int(got) if got is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _pick_query(candidates: list, expected) -> tuple[dict, dict | None, str, str]:
     """Choose the query that really stands for this section of the catalogue.
 
@@ -1278,22 +1316,35 @@ def _pick_query(candidates: list, expected) -> tuple[dict, dict | None, str, str
     many. The response is kept, not thrown away and re-fetched.
     """
     fallback_query, fallback_body, err = None, None, ""
+    all_total = unfiltered_total()
+    ignored = 0
     for cand in candidates:
         body, e = _api_get(f"{API_URL}/api/products", {**cand, "page": 1})
         if body is None:
             err = err or e
             continue
+        got = _total_of(body)
+        # Совпало со счётчиком раздела из каталога — это доказательство, и
+        # оно сильнее всего остального. Проверяется первым.
+        if expected and got is not None and got == int(expected):
+            return cand, body, f", запрос: {sorted(cand)}", ""
+        # Столько же, сколько без всякого раздела, — значит раздел витрина
+        # не приняла. Такой ответ не годится ни как выбор, ни как запасной:
+        # именно он и превращался в «просмотрено 675 предложений» из общей
+        # ленты и в «товара в разделе нет» про раздел, который не читали.
+        if all_total is not None and got is not None and got == all_total:
+            ignored += 1
+            continue
         if fallback_body is None:
             fallback_query, fallback_body = cand, body
         if not expected:
-            return cand, body, "", ""       # nothing to check against
-        got = (body.get("meta") or {}).get("total") if isinstance(body, dict) else None
-        try:
-            if got is not None and int(got) == int(expected):
-                return cand, body, f", запрос: {sorted(cand)}", ""
-        except (TypeError, ValueError):
-            pass
+            return cand, body, f", запрос: {sorted(cand)}", ""
     if fallback_body is None:
+        if ignored:
+            return {}, None, "", (
+                "витрина не приняла раздел как фильтр: на запрос с разделом "
+                f"отвечает тем же, что и без него ({all_total} предложений). "
+                "Позиция в такой ленте была бы числом из чужого списка.")
         return {}, None, "", err or "API витрины не ответил"
     return (fallback_query, fallback_body,
             f", ⚠️ ни один запрос не дал {expected} объявлений — "
@@ -1312,11 +1363,19 @@ def fetch_offers_api(url: str, shop: str = "",
     """
     slugs, filters = listing_path(url)
     if category_id not in (None, ""):
-        # The section was named outright — by the catalogue, not inferred from
-        # an address the API reads loosely. Nothing to search for.
-        meta_cat = {"id": category_id}
-        expected = None
-        candidates = [{**filters, "category_id": category_id}]
+        # Раздел назван прямо — каталогом, а не выведен из адреса, который
+        # этот API читает вольно. Но «назван» не значит «принят»: как
+        # именно витрина ждёт номер раздела, нигде не написано, и один
+        # угаданный ключ молча превращался в общую ленту. Поэтому имён
+        # несколько, а годность каждого проверяется.
+        meta_cat = category_meta(slugs) if slugs else {}
+        expected = meta_cat.get("ads_count")
+        candidates = [{**filters, "category_id": category_id},
+                      {**filters, "category": category_id},
+                      {**filters, "subcategory_id": category_id},
+                      {**filters, "categories[]": category_id}]
+        if slugs:
+            candidates.append({**filters, "category": slugs[-1]})
     else:
         meta_cat = category_meta(slugs) if slugs else {}
         expected = meta_cat.get("ads_count")
