@@ -1333,6 +1333,7 @@ class TaskManager:
             await self._check_messages(user_id, api, settings)
             await self._check_watched_chats(user_id, api, settings)
             await self._auto_confirm(user_id, api, settings)
+            await self._auto_refund(user_id, api, settings)
             if sold_ads or sold_now:
                 await self._restore_after_sale(user_id, api, settings,
                                                sold_ads, sold_now)
@@ -1835,6 +1836,121 @@ class TaskManager:
                        "Заказы, ждущие выдачи звёзд, автопринятие больше не "
                        "трогает. Остальные берёт как раньше."]))
         return True, real
+
+    async def _auto_refund(self, user_id: int, api: YooMarketAPI,
+                           settings: dict) -> None:
+        """Вернуть деньги за заказы, зависшие дольше заданного срока.
+
+        Единственная автоматика в боте, которая **отдаёт** деньги, поэтому
+        осторожностей здесь больше, чем в остальных.
+
+        Главная опасность — вернуть деньги за уже выданный товар: тогда
+        продавец теряет и товар, и деньги, а узнаёт об этом из отчёта.
+        Бот достоверно знает о выдаче только своей: заказ, который AutoStars
+        всё ещё ждёт (покупатель не прислал ник), товара точно не получил.
+        Отсюда два режима, и по умолчанию стоит осторожный:
+
+        * `scope="stars"` — только такие заказы;
+        * `scope="any"` — любой застрявший в работе, **включая выданные
+          вручную**. Включается осознанно, экран об этом предупреждает.
+
+        Остальные предохранители: суточный потолок возвратов, отметка уже
+        возвращённых, и перечитывание статуса после — код 200 доказательством
+        не считается, а «вернул» при невернувшемся заказе здесь стоит дороже
+        всего.
+        """
+        ar = settings.get("auto_refund", {})
+        if not ar.get("enabled"):
+            return
+
+        import localtime as _lt
+        today = _lt.today_str(settings)
+        if ar.get("day") != today:
+            ar["day"], ar["count"] = today, 0
+        cap = int(ar.get("max_per_day", 3) or 0)
+        if cap and int(ar.get("count", 0) or 0) >= cap:
+            return
+
+        threshold = float(ar.get("hours", 48) or 48) * 3600
+        scope = str(ar.get("scope") or "stars")
+        now = time.time()
+        known: dict = settings.get("known_orders", {})
+        details: dict = settings.get("known_order_details", {})
+        done: list = ar.setdefault("done", [])
+
+        for oid, status in list(known.items()):
+            if cap and int(ar.get("count", 0) or 0) >= cap:
+                break
+            if str(oid) in done:
+                continue
+            # Закрытый или уже возвращённый заказ трогать нечем и незачем.
+            if status in _DONE_STATUSES or status in _BACK_STATUSES:
+                continue
+            if status not in ("work", "working", "processing"):
+                continue
+            det = details.get(oid, {})
+            started = det.get("work_at") or det.get("seen_at")
+            if not started or (now - started) < threshold:
+                continue
+            waiting_stars = _stars_awaiting_delivery(settings, oid)
+            if scope != "any" and not waiting_stars:
+                # В осторожном режиме про этот заказ бот не знает, выдан ли
+                # товар, — а значит возвращать за него деньги не вправе.
+                continue
+
+            title = det.get("title", f"Заказ #{oid}")
+            hours = int((now - started) / 3600)
+            try:
+                await api.refund_order(oid)
+            except Exception as e:
+                await self._notify(
+                    user_id,
+                    _card("⚠️ <b>АВТОВОЗВРАТ НЕ ПРОШЁЛ</b>",
+                          [f"📦 {_esc(title)} <code>#{_esc(str(oid))}</code>",
+                           f"<i>{_esc(str(e)[:150])}</i>",
+                           "",
+                           "Заказ остался как был — верните вручную, если "
+                           "нужно."]))
+                done.append(str(oid))      # второй раз не долбимся
+                continue
+
+            # HTTP 200 — не доказательство. Перечитываем статус: «вернул» при
+            # невернувшемся заказе здесь дороже любой другой неправды.
+            confirmed = ""
+            try:
+                fresh = await api.get_order(oid)
+                from orderfields import order_status
+                got = order_status(fresh if isinstance(fresh, dict) else {})
+                if got:
+                    known[oid] = got
+                    confirmed = got
+            except Exception:
+                pass
+
+            done.append(str(oid))
+            ar["count"] = int(ar.get("count", 0) or 0) + 1
+            why = ("покупатель не прислал ник для выдачи звёзд"
+                   if waiting_stars else "заказ висит в работе")
+            if confirmed and confirmed in _BACK_STATUSES:
+                head, tail = "↩️ <b>АВТОВОЗВРАТ</b>", "Маркетплейс подтвердил возврат."
+            elif confirmed:
+                head = "⚠️ <b>АВТОВОЗВРАТ — СТАТУС НЕ ИЗМЕНИЛСЯ</b>"
+                tail = (f"Маркетплейс всё ещё показывает «{_status_ru(confirmed)}». "
+                        f"Проверьте заказ вручную.")
+            else:
+                head = "↩️ <b>АВТОВОЗВРАТ ОТПРАВЛЕН</b>"
+                tail = "Статус перечитать не удалось — проверьте заказ сами."
+            await self._notify(
+                user_id,
+                _card(head,
+                      [f"📦 {_esc(title)} <code>#{_esc(str(oid))}</code>",
+                       f"⏳ {why}, {hours} ч",
+                       "",
+                       tail]))
+
+        settings["auto_refund"] = ar
+        settings["known_orders"] = known
+        save_settings(user_id, settings)
 
     async def _auto_confirm(self, user_id: int, api: YooMarketAPI, settings: dict) -> None:
         ac = settings.get("auto_confirm", {})

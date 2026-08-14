@@ -18,6 +18,8 @@ class AutoState(StatesGroup):
     waiting_rule_keyword = State()
     waiting_rule_message = State()
     waiting_confirm_hours = State()
+    waiting_refund_hours = State()
+    waiting_refund_cap = State()
     waiting_bump_times = State()
     waiting_bump_price = State()
     waiting_bump_ceiling = State()
@@ -69,6 +71,16 @@ def _auto_text(s: dict) -> str:
     if ac_on:
         lines.append(f"   Через <b>{ac_h} ч</b> после взятия в работу")
 
+    rf = s.get("auto_refund", {})
+    rf_on = rf.get("enabled", False)
+    lines.append(f"\n↩️ <b>Автовозврат зависших</b> — {_st(rf_on)}")
+    if rf_on:
+        lines.append(f"   Через <b>{rf.get('hours', 48)} ч</b>, не больше "
+                     f"<b>{rf.get('max_per_day', 3)}</b> в сутки")
+        lines.append("   " + ("<b>любой</b> застрявший заказ"
+                              if rf.get("scope") == "any"
+                              else "только те, что ждут ник для звёзд"))
+
     bs = s.get("bump_schedule", {})
     bs_on = bs.get("enabled", False)
     bs_times = bs.get("times", [])
@@ -117,6 +129,23 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
     )
     if ac_on:
         builder.button(text="⏱ Время подтверждения", callback_data="auto:set:confirm_hours")
+
+    rf = s.get("auto_refund", {})
+    rf_on = rf.get("enabled", False)
+    builder.button(
+        text=f"{'🔴 Выкл' if rf_on else '🟢 Вкл'} автовозврат зависших "
+             f"({rf.get('hours', 48)} ч)",
+        callback_data="auto:toggle:refund",
+    )
+    if rf_on:
+        builder.button(text="⏱ Через сколько возвращать",
+                       callback_data="auto:set:refund_hours")
+        builder.button(
+            text=("🎯 Какие: любой застрявший" if rf.get("scope") == "any"
+                  else "🎯 Какие: только ждущие ник"),
+            callback_data="auto:set:refund_scope")
+        builder.button(text=f"⛔ Не больше {rf.get('max_per_day', 3)} в сутки",
+                       callback_data="auto:set:refund_cap")
 
     bs = s.get("bump_schedule", {})
     bs_on = bs.get("enabled", False)
@@ -359,6 +388,137 @@ async def save_confirm_hours(message: Message, state: FSMContext) -> None:
     s.setdefault("auto_confirm", {})["hours"] = hours
     save_settings(message.from_user.id, s)
     await message.answer(f"✅ Подтверждение через <b>{hours} ч</b>")
+    await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
+
+
+# ---------------------------------------------------------------------------
+# Автовозврат зависших заказов
+#
+# Единственная автоматика в боте, которая ОТДАЁТ деньги. Экран поэтому
+# устроен не как остальные: включение осторожного режима — обычная кнопка,
+# а переход на «любой заказ» проходит через отдельное предупреждение.
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "auto:toggle:refund")
+async def toggle_refund(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    rf = s.setdefault("auto_refund", {})
+    turning_on = not rf.get("enabled", False)
+    rf["enabled"] = turning_on
+    rf.setdefault("hours", 48)
+    rf.setdefault("scope", "stars")
+    rf.setdefault("max_per_day", 3)
+    save_settings(callback.from_user.id, s)
+    if turning_on:
+        # Один раз, при включении, — что именно теперь будет происходить с
+        # деньгами. Тумблер без этого выглядит как остальные, а он не такой.
+        await callback.answer(
+            f"Возврат через {rf['hours']} ч, не больше {rf['max_per_day']} "
+            f"в сутки. Пока — только заказы, ждущие ник для звёзд.",
+            show_alert=True)
+    await _refresh(callback)
+
+
+@router.callback_query(F.data == "auto:set:refund_scope")
+async def set_refund_scope(callback: CallbackQuery) -> None:
+    """Переключение охвата — через предупреждение, а не одним нажатием.
+
+    «Любой застрявший заказ» означает возврат и за товар, выданный вручную:
+    бот о такой выдаче не знает ничего. Продавец теряет и товар, и деньги, а
+    узнаёт из отчёта. Такое решение принимают осознанно.
+    """
+    s = get_settings(callback.from_user.id)
+    rf = s.setdefault("auto_refund", {})
+    if rf.get("scope") == "any":
+        rf["scope"] = "stars"
+        save_settings(callback.from_user.id, s)
+        await callback.answer("Теперь только заказы, ждущие ник для звёзд",
+                              show_alert=True)
+        await _refresh(callback)
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="⚠️ Да, возвращать любой", callback_data="auto:refund_any")
+    b.button(text="⬅️ Оставить как есть", callback_data="auto:menu")
+    b.adjust(1)
+    await callback.message.edit_text(
+        "⚠️ <b>Возвращать за любой застрявший заказ?</b>\n\n"
+        "Сейчас бот возвращает деньги только за заказы, которые сам не смог "
+        "выдать: покупатель не прислал ник для звёзд. Про такой заказ точно "
+        "известно, что товар не ушёл.\n\n"
+        "Про остальные бот <b>не знает, выдали вы товар или нет</b>. Если "
+        "выдали вручную и забыли подтвердить — возврат отдаст покупателю и "
+        "товар, и деньги.\n\n"
+        "Включайте, если выдаёте только через бота.",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "auto:refund_any")
+async def set_refund_any(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    s.setdefault("auto_refund", {})["scope"] = "any"
+    save_settings(callback.from_user.id, s)
+    await callback.answer("Возвращаю за любой застрявший заказ", show_alert=True)
+    await _refresh(callback)
+
+
+@router.callback_query(F.data == "auto:set:refund_hours")
+async def set_refund_hours(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AutoState.waiting_refund_hours)
+    cur = get_settings(callback.from_user.id).get("auto_refund", {}).get("hours", 48)
+    await callback.message.edit_text(
+        f"⏱ Через сколько часов возвращать деньги за зависший заказ?\n\n"
+        f"Текущее: <b>{cur} ч</b>\n\n"
+        f"Введите число (1–168). Меньше суток ставить не советую: покупатель "
+        f"может просто спать.",
+        reply_markup=_cancel_kb())
+    await callback.answer()
+
+
+@router.message(AutoState.waiting_refund_hours)
+async def save_refund_hours(message: Message, state: FSMContext) -> None:
+    try:
+        hours = int((message.text or "").strip())
+        if not 1 <= hours <= 168:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число от 1 до 168")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    s.setdefault("auto_refund", {})["hours"] = hours
+    save_settings(message.from_user.id, s)
+    await message.answer(f"✅ Возврат через <b>{hours} ч</b>")
+    await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
+
+
+@router.callback_query(F.data == "auto:set:refund_cap")
+async def set_refund_cap(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AutoState.waiting_refund_cap)
+    cur = get_settings(callback.from_user.id).get("auto_refund", {}).get("max_per_day", 3)
+    await callback.message.edit_text(
+        f"⛔ Сколько возвратов в сутки бот может сделать сам?\n\n"
+        f"Сейчас: <b>{cur}</b>\n\n"
+        f"Введите число (1–50). Потолок нужен на случай, если что-то пойдёт "
+        f"не так: без него одна ошибка вернёт деньги по всем заказам разом.",
+        reply_markup=_cancel_kb())
+    await callback.answer()
+
+
+@router.message(AutoState.waiting_refund_cap)
+async def save_refund_cap(message: Message, state: FSMContext) -> None:
+    try:
+        cap = int((message.text or "").strip())
+        if not 1 <= cap <= 50:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число от 1 до 50")
+        return
+    await state.clear()
+    s = get_settings(message.from_user.id)
+    s.setdefault("auto_refund", {})["max_per_day"] = cap
+    save_settings(message.from_user.id, s)
+    await message.answer(f"✅ Не больше <b>{cap}</b> возвратов в сутки")
     await message.answer(_auto_text(s), reply_markup=_auto_keyboard(s))
 
 

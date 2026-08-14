@@ -146,6 +146,13 @@ _DEFAULT_SETTINGS = {
     "reminded_orders": [],  # order IDs already reminded (reset on status change)
     "auto_accept": {"enabled": False},  # авто «начать заказ» при поступлении
     "auto_confirm": {"enabled": False, "hours": 24},
+    # Автовозврат «зависших» заказов. Единственная автоматика в боте, которая
+    # ОТДАЁТ деньги, поэтому по умолчанию выключена и работает только там, где
+    # бот сам знает, что товар не выдан.
+    #   scope="stars" — только заказы, которых AutoStars ждёт (ник не прислан);
+    #   scope="any"   — любой застрявший в работе, включая выданные вручную.
+    "auto_refund": {"enabled": False, "hours": 48, "scope": "stars",
+                    "max_per_day": 3, "day": "", "count": 0, "done": []},
     "withdrawal_history": [],  # [{amount, ts, type: manual/auto, status}]
     "balance_notify": {"enabled": False, "threshold": 1000, "last_notified_balance": 0.0},
     # Уведомления о новых заказах и о сообщениях в чатах. По умолчанию включены:
