@@ -774,6 +774,33 @@ async def order_debug(message: Message, api: YooMarketAPI) -> None:
         rows_out += [f"  <code>{_esc(k)}</code>" for k in _money_keys(card)] \
             or ["  денежных полей в ответе нет"]
 
+    # Цену из ответов маркетплейса видно выше, а бот показывает на экранах
+    # свою запись — и когда цена восстановлена из объявления, эти две вещи
+    # расходятся. Отчёт, который показывает только первую, читается как
+    # «всё ещё сломано».
+    stored = det.get("price")
+    rows_out.append(
+        f"у бота записано: <b>{money(stored)} ₽</b>"
+        + (" <i>по объявлению</i>" if det.get("price_src") == "ad" else "")
+        if isinstance(stored, (int, float))
+        else "у бота записано: <b>цены нет</b>"
+        + (" · объявление уже спрашивали" if det.get("price_tried")
+           else " · объявление ещё не спрашивали"))
+
+    from orderfields import ad_price, order_ad_id
+    ad_id = order_ad_id(card) or order_ad_id(listed)
+    if ad_id:
+        try:
+            got = ad_price(await api.get_ad(ad_id))
+            rows_out.append(f"в объявлении {_esc(ad_id)}: "
+                            + (f"<b>{money(got)} ₽</b>" if got is not None
+                               else "<b>цены нет</b>"))
+        except Exception as e:
+            rows_out.append(f"объявление {_esc(ad_id)} не прочиталось: "
+                            f"<code>{_esc(str(e)[:100])}</code>")
+    else:
+        rows_out.append("номера объявления в заказе нет — цену взять неоткуда")
+
     raw_list = str(listed.get("status") or "—")
     raw_card = str(card.get("status") or "—")
     rows_out += ["", "<b>📊 СТАТУС</b>",

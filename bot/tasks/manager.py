@@ -1139,10 +1139,19 @@ class TaskManager:
                 from orderfields import describe as _describe
                 d = _describe(order)
                 prev_det = order_details.get(oid, {})
+                # Заказы, дочитанные до того, как цена стала браться из
+                # объявления, помечены «дочитан» — и остались бы без цены
+                # навсегда, а вместе с ними и выручка за день. Одна
+                # повторная попытка на заказ: `price_tried` ставится и при
+                # неудаче, иначе заказ с удалённым объявлением дёргал бы
+                # витрину каждый проход.
+                needs_price = (d["price"] is None
+                               and not prev_det.get("price_tried")
+                               and prev_det.get("price") in (None, "", "—"))
                 # Список отдаёт заказ без товара и покупателя — дочитываем
                 # карточку. Один раз на заказ: дальше берём из сохранённого.
-                if (not d["title"] or not d["buyer"]):
-                    if prev_det.get("enriched"):
+                if (not d["title"] or not d["buyer"] or needs_price):
+                    if prev_det.get("enriched") and not needs_price:
                         d["title"] = d["title"] or prev_det.get("title") or ""
                         d["buyer"] = d["buyer"] or prev_det.get("buyer") or ""
                         d["username"] = d["username"] or prev_det.get("username") or ""
@@ -1185,6 +1194,9 @@ class TaskManager:
                     # объявления, потому что в заказе её не было вовсе.
                     "price_src": d.get("price_src")
                     or prev_det.get("price_src", ""),
+                    # Объявление за ценой спрашивали — второй раз не пойдём.
+                    "price_tried": bool(d.get("price_tried")
+                                        or prev_det.get("price_tried")),
                     "chat_id": chat_id,
                     "username": username,
                     "quantity": quantity,
@@ -2659,6 +2671,7 @@ class TaskManager:
             # прочиталась, дочитывать всё равно есть по чему.
             ad_id = order_ad_id(node) or order_ad_id(row or {}) or ""
             if ad_id:
+                d["price_tried"] = True
                 try:
                     ad = await api.get_ad(ad_id)
                     d["title"] = d.get("title") or ad_title(ad)

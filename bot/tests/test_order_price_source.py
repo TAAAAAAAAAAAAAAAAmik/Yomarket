@@ -177,6 +177,103 @@ class WhenTheListingCannotBeRead(unittest.TestCase):
         self.assertEqual(s["known_order_details"]["1218314"]["price"], "—")
 
 
+class OrdersSeenBeforeTheFixAreNotLeftWithoutAPrice(unittest.TestCase):
+    """Заказ, дочитанный до правки, помечен «дочитан» — и остался бы без
+    цены навсегда, а вместе с ним и выручка за день. Продавец увидел бы
+    «Сегодня: 6 · 0 ₽» ещё сутки после выката и решил, что не починилось."""
+
+    OLD = {"1218314": {"title": "50 зч", "buyer": "Telman Гадыев",
+                       "price": "—", "enriched": True,
+                       "seen_at": time.time() - 3600, "chat_id": "1158764"}}
+
+    def test_the_price_is_fetched_on_the_next_pass(self):
+        s, _api, _n = run(settings={
+            "known_orders": {"1218314": "paid"},
+            "known_order_details": {k: dict(v) for k, v in self.OLD.items()}})
+        self.assertEqual(s["known_order_details"]["1218314"]["price"], 60.0)
+
+    def test_the_listing_is_asked_once_even_if_it_has_no_price(self):
+        """Объявление удалено — цены не будет никогда. Спрашивать о ней
+        каждую минуту значит долбить витрину впустую."""
+        api = Api(ad={"id": 234852, "title": "50 зч"})
+        s, api, _n = run(api, settings={
+            "known_orders": {"1218314": "paid"},
+            "known_order_details": {k: dict(v) for k, v in self.OLD.items()}},
+            passes=4)
+        self.assertEqual(len(api.ads_read), 1, api.ads_read)
+        self.assertTrue(s["known_order_details"]["1218314"]["price_tried"])
+
+    def test_an_order_that_already_has_a_price_is_not_re_read(self):
+        api = Api()
+        _s, api, _n = run(api, settings={
+            "known_orders": {"1218314": "paid"},
+            "known_order_details": {"1218314": dict(self.OLD["1218314"],
+                                                    price=60.0)}})
+        self.assertEqual(api.ads_read, [])
+
+
+class TheDiagnosticShowsWhatTheBotStored(unittest.TestCase):
+    """Отчёт печатал цену из ответа маркетплейса — а её там нет и не будет.
+    Восстановленная из объявления лежит в записи бота, и без неё отчёт
+    читается как «всё ещё сломано»."""
+
+    def setUp(self):
+        import handlers.orders as O
+        self.O = O
+        self._get = O.get_settings
+        self.settings = {"auto_accept": {"enabled": True},
+                         "known_order_details": {
+                             "1218314": {"price": 60.0, "price_src": "ad",
+                                         "seen_at": time.time()}},
+                         "plugins": {"auto_stars": {"enabled": False}}}
+        O.get_settings = lambda uid: self.settings
+
+    def tearDown(self):
+        self.O.get_settings = self._get
+
+    def report(self, api=None):
+        api = api or Api()
+        said: list[str] = []
+
+        class Status:
+            async def edit_text(self, t, **kw):
+                said.append(t)
+
+        class Msg:
+            from_user = type("U", (), {"id": 1})()
+            text = "/order_debug 1218314"
+
+            async def answer(self, t, **kw):
+                said.append(t)
+                return Status()
+
+        asyncio.run(self.O.order_debug(Msg(), api))
+        return "\n\n".join(said)
+
+    def test_the_stored_price_is_in_the_report(self):
+        line = next((l for l in self.report().splitlines()
+                     if "у бота записано" in l), "")
+        self.assertIn("60 ₽", line)
+
+    def test_it_says_the_number_came_from_the_listing(self):
+        self.assertIn("по объявлению", self.report())
+
+    def test_the_listing_price_is_shown_too(self):
+        """Чтобы было видно: цену взять есть откуда, вопрос только в том,
+        дошла ли она до записи."""
+        self.assertIn("в объявлении 234852", self.report())
+
+    def test_a_missing_stored_price_says_whether_the_listing_was_asked(self):
+        self.settings["known_order_details"]["1218314"] = {"price": "—"}
+        got = self.report()
+        self.assertIn("ещё не спрашивали", got)
+
+    def test_and_says_when_it_already_was(self):
+        self.settings["known_order_details"]["1218314"] = {"price": "—",
+                                                           "price_tried": True}
+        self.assertIn("уже спрашивали", self.report())
+
+
 class TheDailyTallyCountsQuantity(unittest.TestCase):
     """Цена в записи — за штуку: карточка так её и показывает, «60 ₽ ×2».
     Выручка без множителя занижала день на каждой покупке больше одной."""
