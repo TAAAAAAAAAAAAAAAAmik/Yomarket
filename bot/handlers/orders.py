@@ -655,6 +655,135 @@ async def filter_orders_refunds(callback: CallbackQuery) -> None:
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
 
 
+def _money_keys(node: dict) -> list[str]:
+    """Поля верхнего уровня, в которых может лежать сумма, и что в них есть."""
+    from orderfields import _to_number
+    out: list[str] = []
+    for key in ("price", "total", "sum", "amount", "cost", "total_price",
+                "price_total", "paid", "paid_amount", "summ"):
+        if key not in node:
+            continue
+        value = node.get(key)
+        got = value.get("amount", value.get("value", value.get("sum"))) \
+            if isinstance(value, dict) else value
+        out.append(f"{key} = {str(value)[:60]}"
+                   + ("" if _to_number(got) is not None else "  ← не число"))
+    return out
+
+
+def _price_line(where: str, node: dict) -> str:
+    """«None» на экране продавца — такая же отписка, как английский код."""
+    from orderfields import order_price
+    got = order_price(node)
+    return (f"{where}: <b>{money(got)} ₽</b>" if got is not None
+            else f"{where}: <b>цены в ответе нет</b>")
+
+
+@router.message(Command("order_debug"))
+async def order_debug(message: Message, api: YooMarketAPI) -> None:
+    """Один заказ: откуда взялась цена и почему он не взят в работу.
+
+    Два вопроса, которые до сих пор выяснялись перепиской. Уведомление о
+    покупке собирается из **списка** заказов, а карточка — из ответа по
+    одному заказу, и это разные ответы маркетплейса. Пока их не сравнить,
+    «💰 — ₽» в уведомлении при живой цене в карточке объяснить нечем.
+
+    Только чтение: ничего не нажимает и ничего не меняет.
+    """
+    if not api:
+        await message.answer("⚠️ Нет токена — отправьте /start")
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Укажите номер: <code>/order_debug 1218314</code>")
+        return
+    oid = parts[1].lstrip("#")
+    status = await message.answer("⏳ Читаю заказ…")
+
+    from orderfields import (is_paid, needs_work, order_price, shape,
+                             status_ru)
+    from handlers.start import BOT_VERSION
+
+    listed: dict = {}
+    list_err = ""
+    try:
+        data = await api.get_orders()
+        rows = data.get("data") or data.get("items") or []
+        listed = next((r for r in rows if str(r.get("id")) == oid), {})
+    except Exception as e:
+        list_err = str(e)[:150]
+
+    card: dict = {}
+    card_err = ""
+    try:
+        got = await api.get_order(oid)
+        card = got.get("data") if isinstance(got.get("data"), dict) else got
+    except Exception as e:
+        card_err = str(e)[:150]
+
+    s = get_settings(message.from_user.id)
+    det = ((s.get("known_order_details") or {}).get(oid) or {})
+    aa = s.get("auto_accept", {}) or {}
+
+    rows_out = [f"🔍 <b>Заказ #{_esc(oid)}</b>  <code>{_esc(BOT_VERSION)}</code>",
+                "", "<b>💰 ЦЕНА</b>"]
+    if list_err:
+        rows_out.append(f"список заказов не прочитался: <code>{_esc(list_err)}</code>")
+    elif not listed:
+        rows_out.append("в списке заказов его нет — уведомление о покупке "
+                        "собиралось не из этого ответа")
+    else:
+        rows_out.append(_price_line("в списке", listed))
+        rows_out += [f"  <code>{_esc(k)}</code>" for k in _money_keys(listed)] \
+            or ["  денежных полей в ответе нет"]
+    if card_err:
+        rows_out.append(f"карточка не прочиталась: <code>{_esc(card_err)}</code>")
+    else:
+        rows_out.append(_price_line("в карточке", card))
+        rows_out += [f"  <code>{_esc(k)}</code>" for k in _money_keys(card)] \
+            or ["  денежных полей в ответе нет"]
+
+    raw_list = str(listed.get("status") or "—")
+    raw_card = str(card.get("status") or "—")
+    rows_out += ["", "<b>📊 СТАТУС</b>",
+                 f"в списке: <code>{_esc(raw_list)}</code>   "
+                 f"в карточке: <code>{_esc(raw_card)}</code>",
+                 f"{status_ru(raw_card)} · оплачен: "
+                 f"{'да' if is_paid(raw_card) else 'НЕТ'} · ждёт «в работу»: "
+                 f"{'да' if needs_work(raw_card) else 'нет'}"]
+
+    from tasks.manager import (_CATCHUP_HOURS, _CATCHUP_TRIES, _order_age,
+                               _stars_awaiting_delivery)
+    age = _order_age(det) if det else None
+    hours = float(aa.get("catchup_hours") or _CATCHUP_HOURS)
+    rows_out += ["", "<b>⚙️ ВЗЯТИЕ В РАБОТУ</b>",
+                 f"тумблер: {'включён' if aa.get('enabled') else 'ВЫКЛЮЧЕН'}",
+                 f"«в работу» = отчёт о выдаче: "
+                 f"{'да' if aa.get('means_fulfilled') else 'нет'}",
+                 f"ждёт ник для звёзд: "
+                 f"{'да' if _stars_awaiting_delivery(s, oid) else 'нет'}",
+                 f"бот знает этот заказ: {'да' if det else 'НЕТ'}",
+                 f"возраст: {int(age // 3600) if age else 0} ч "
+                 f"(берёт до {int(hours)} ч)" if age is not None
+                 else "возраст: неизвестен",
+                 f"жали «в работу»: {'да' if det.get('work_at') else 'нет'} · "
+                 f"попыток: {det.get('work_tries', 0)} из {_CATCHUP_TRIES}"]
+    if det.get("work_result"):
+        rows_out.append(f"стало после нажатия: "
+                        f"<code>{_esc(str(det['work_result']))}</code>")
+    for label, key in (("отказ", "work_error"), ("причина пропуска", "work_skip")):
+        if det.get(key):
+            rows_out.append(f"{label}: <code>{_esc(str(det[key])[:150])}</code>")
+
+    await status.edit_text("\n".join(rows_out))
+    body = shape(listed)[:1500] if listed else "заказа в списке нет"
+    await message.answer(
+        f"<b>Ответ маркетплейса — список</b>\n<code>{_esc(body)}</code>")
+    if card:
+        await message.answer(f"<b>Ответ маркетплейса — карточка</b>\n"
+                             f"<code>{_esc(shape(card)[:1500])}</code>")
+
+
 @router.message(Command("orders_debug"))
 async def orders_debug(message: Message, api: YooMarketAPI) -> None:
     """Что на самом деле лежит в заказе — только чтение, ничего не меняет.

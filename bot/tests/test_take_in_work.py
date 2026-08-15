@@ -369,5 +369,105 @@ class TheStatusListIsSharedNotWrittenOutAgain(unittest.TestCase):
         self.assertIn("needs_work", inspect.getsource(O._why_not_in_work))
 
 
+class TheDiagnosticShowsFactsNotGuesses(unittest.TestCase):
+    """Уведомление о покупке собирается из СПИСКА заказов, а карточка — из
+    ответа по одному заказу. Это разные ответы маркетплейса, и пока их не
+    сравнить, «💰 — ₽» в уведомлении при живой цене в карточке объяснить
+    нечем. До этого вопрос выяснялся перепиской."""
+
+    def setUp(self):
+        import handlers.orders as O
+        self.O = O
+        self._get = O.get_settings
+        self.settings = {"auto_accept": {"enabled": True},
+                         "known_order_details": {
+                             "1218314": {"seen_at": time.time() - 3600}},
+                         "plugins": {"auto_stars": {"enabled": False}}}
+        O.get_settings = lambda uid: self.settings
+
+    def tearDown(self):
+        self.O.get_settings = self._get
+
+    class Api:
+        def __init__(self, in_list=None, in_card=None):
+            self.in_list = in_list
+            self.in_card = in_card
+            self.pressed: list = []
+
+        async def get_orders(self, cursor=None):
+            return {"data": [self.in_list] if self.in_list else []}
+
+        async def get_order(self, oid):
+            return {"data": self.in_card or {}}
+
+        async def work_order(self, oid):        # только чтение
+            self.pressed.append(oid)
+
+        async def confirm_order(self, oid):
+            self.pressed.append(oid)
+
+    def report(self, api, text="/order_debug 1218314"):
+        said: list[str] = []
+
+        class Status:
+            async def edit_text(self, t, **kw):
+                said.append(t)
+
+        class Msg:
+            from_user = type("U", (), {"id": 1})()
+
+            def __init__(self, body):
+                self.text = body
+
+            async def answer(self, t, **kw):
+                said.append(t)
+                return Status()
+
+        asyncio.run(self.O.order_debug(Msg(text), api))
+        return "\n\n".join(said)
+
+    def test_it_names_the_price_the_list_did_not_send(self):
+        api = self.Api(in_list={"id": "1218314", "status": "paid"},
+                       in_card={"id": "1218314", "status": "paid",
+                                "price": {"amount": 60, "currency": "RUB"}})
+        got = self.report(api)
+        self.assertIn("цены в ответе нет", got)
+        self.assertIn("60 ₽", got)
+        self.assertNotIn("None", got)
+
+    def test_it_shows_the_raw_status_from_both_answers(self):
+        api = self.Api(in_list={"id": "1218314", "status": "paid"},
+                       in_card={"id": "1218314", "status": "work"})
+        got = self.report(api)
+        self.assertIn("paid", got)
+        self.assertIn("work", got)
+
+    def test_it_says_when_the_switch_is_off(self):
+        self.settings["auto_accept"] = {"enabled": False}
+        got = self.report(self.Api(in_card={"id": "1218314", "status": "paid"}))
+        self.assertIn("ВЫКЛЮЧЕН", got)
+
+    def test_a_missing_order_is_said_out_loud_not_shown_as_a_dash(self):
+        got = self.report(self.Api())
+        self.assertIn("в списке заказов его нет", got)
+
+    def test_it_presses_nothing(self):
+        """Диагностика, которая меняет состояние, — не диагностика."""
+        api = self.Api(in_list={"id": "1218314", "status": "paid"},
+                       in_card={"id": "1218314", "status": "paid"})
+        self.report(api)
+        self.assertEqual(api.pressed, [])
+
+    def test_without_a_number_it_asks_for_one(self):
+        got = self.report(self.Api(), text="/order_debug")
+        self.assertIn("Укажите номер", got)
+
+    def test_the_recorded_refusal_is_in_the_report(self):
+        self.settings["known_order_details"]["1218314"]["work_error"] = \
+            "incorrect_status"
+        got = self.report(self.Api(in_card={"id": "1218314", "status": "paid"}))
+        self.assertIn("incorrect_status", got)
+
+
 if __name__ == "__main__":
     unittest.main()
