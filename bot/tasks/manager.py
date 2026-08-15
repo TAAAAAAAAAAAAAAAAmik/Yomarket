@@ -40,6 +40,16 @@ _RESTORE_MAX_PER_PASS = 40
 # marketplace changed its mind.
 _RESTORE_BARRED_TTL = 7 * 86400
 
+# Догоняющее автопринятие: заказ уже лежит оплаченным, а в работу не взят.
+# Сколько таких брать за проход — чтобы после чистки хранилища магазин не
+# получил залп из десятков действий разом; насколько старые догонять — старый
+# оплаченный заказ мог быть выдан вручную, и на маркетплейсе, где «в работу»
+# означает «выдал», нажатие по нему было бы ложным отчётом; сколько раз
+# пробовать — отказ маркетплейса не лечится повтором каждую минуту.
+_CATCHUP_PER_PASS = 3
+_CATCHUP_HOURS = 48
+_CATCHUP_TRIES = 3
+
 
 async def shop_balance(user_id: int, api,
                        why: list | None = None) -> tuple[float, str]:
@@ -468,6 +478,7 @@ def _order_username(order: dict) -> str:
 # этот маркетплейс помечает выполненный заказ: выручка по таким заказам никуда
 # не попадала.
 from orderfields import (BACK as _BACK_STATUSES, DONE as _DONE_STATUSES,
+                         WORK as _WORK_STATUSES, needs_work as _needs_work,
                          status_ru as _status_ru)
 
 
@@ -499,6 +510,25 @@ def _stars_drop_if_closed(settings: dict, order_id: str) -> str:
         return ""
     pending.pop(str(order_id), None)
     return of.status_ru(status)
+
+
+def _order_age(det: dict) -> float | None:
+    """Сколько секунд заказу. None — время неизвестно.
+
+    Время создания на маркетплейсе достовернее, чем «когда бот его увидел»:
+    после чистки хранилища (а без DATABASE_URL она случается при каждом
+    редеплое) бот видит все старые заказы заново, и по `seen_at` им всем
+    выходит сегодняшний возраст.
+    """
+    ts = _ts_of({"created_at": det.get("created")})
+    if not ts:
+        try:
+            ts = float(det.get("seen_at") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+    if not ts:
+        return None
+    return max(0.0, time.time() - ts)
 
 
 def _stars_awaiting_delivery(settings: dict, order_id: str) -> bool:
@@ -1082,6 +1112,9 @@ class TaskManager:
             sold_now = False
             sold_ads: set[str] = set()
 
+            # Заказы, взятые в работу «догоняющим» проходом (см. ниже).
+            caught_up: list[str] = []
+
             # Сколько заказов дочитать за проход. Каждый — отдельный запрос,
             # поэтому на первом проходе полная витрина разбирается за
             # несколько кругов, а дальше дочитываются только новые.
@@ -1128,7 +1161,8 @@ class TaskManager:
                 category = _order_field(order, "category", "category_name", "ad_category")
 
                 work_at = prev_det.get("work_at")
-                if status in ("work", "working", "processing") and prev_status not in ("work", "working", "processing"):
+                if (status in _WORK_STATUSES
+                        and prev_status not in _WORK_STATUSES):
                     work_at = time.time()
                 # Спорный статус — это проблема сам по себе, ещё до того, как
                 # покупатель что-то написал.
@@ -1159,6 +1193,14 @@ class TaskManager:
                     "waiting": prev_det.get("waiting", 0),
                     "problem": (time.time() if disputed
                                 else prev_det.get("problem", 0)),
+                    # Почему заказ не взят в работу — тоже переживает
+                    # пересборку. Иначе счётчик попыток обнулялся каждый
+                    # проход, и «не долбиться в отказ» превращалось в
+                    # долбёжку раз в минуту.
+                    "work_tries": prev_det.get("work_tries", 0),
+                    "work_error": prev_det.get("work_error", ""),
+                    "work_skip": prev_det.get("work_skip", ""),
+                    "work_result": prev_det.get("work_result", ""),
                 }
 
                 # If order moved to a terminal/changed status, clear its reminder record
@@ -1305,9 +1347,11 @@ class TaskManager:
 
                 # Оплата могла прийти позже создания заказа: заказ увидели
                 # неоплаченным, выдачу не начинали, а теперь деньги дошли.
+                tried_now = False
                 if prev_status is not None and prev_status != status:
                     from orderfields import is_paid as _is_paid
                     if _is_paid(status) and not _is_paid(prev_status):
+                        tried_now = True
                         # Взять в работу — тоже здесь. Автопринятие жило в
                         # ветке «заказ увиден впервые», а увиден он бывает
                         # неоплаченным: деньги приходили следующим проходом, и
@@ -1320,6 +1364,24 @@ class TaskManager:
                             status = real or "work"
                         await self._maybe_ask_stars_username(
                             api, settings, oid, title, chat_id, status)
+
+                # Заказ лежит оплаченным, а в работу не взят. Автопринятие
+                # знало ровно два момента: заказ увиден впервые и пришла
+                # оплата. Оба можно пропустить — и пропускались:
+                #
+                # * первый проход после чистого хранилища записывает все
+                #   заказы молча, а без DATABASE_URL хранилище на Railway
+                #   стирается при каждом редеплое;
+                # * тумблер могли включить уже после покупки.
+                #
+                # Дальше заказ не трогал никто: статус не менялся, значит не
+                # было и повода. Продавец видел в панели оплаченный заказ с
+                # ненажатой кнопкой — при включённом автопринятии.
+                if (not tried_now and prev_status is not None
+                        and _needs_work(status)):
+                    status = await self._catch_up_work(
+                        user_id, api, settings, oid, status, order_details,
+                        title, caught_up)
 
                 known[oid] = status
 
@@ -1802,11 +1864,19 @@ class TaskManager:
             return False, ""
         if aa.get("means_fulfilled") and _stars_awaiting_delivery(settings, oid):
             logger.info("auto-accept skipped for %s: awaiting delivery", oid)
+            order_details.setdefault(str(oid), {})["work_skip"] = (
+                "ждёт ник для выдачи звёзд, а «в работу» здесь означает «выдал»")
             return False, ""
         try:
             await api.work_order(oid)
         except Exception as e:
+            # Отказ записывается туда, где его увидит продавец: в карточке
+            # заказа на вопрос «почему не взят» до этого отвечал лог на
+            # сервере, то есть никто.
             logger.warning("Auto-accept order %s: %s", oid, e)
+            det = order_details.setdefault(str(oid), {})
+            det["work_error"] = str(e)[:200]
+            det["work_tries"] = int(det.get("work_tries", 0) or 0) + 1
             return False, ""
 
         real = ""
@@ -1821,6 +1891,8 @@ class TaskManager:
         det = order_details.setdefault(str(oid), {})
         det["work_at"] = time.time()
         det["work_result"] = real
+        det.pop("work_error", None)
+        det.pop("work_skip", None)
         if real and real in _DONE_STATUSES and not aa.get("means_fulfilled"):
             aa["means_fulfilled"] = True
             settings["auto_accept"] = aa
@@ -1836,6 +1908,81 @@ class TaskManager:
                        "Заказы, ждущие выдачи звёзд, автопринятие больше не "
                        "трогает. Остальные берёт как раньше."]))
         return True, real
+
+    async def _catch_up_work(self, user_id: int, api: YooMarketAPI,
+                             settings: dict, oid: str, status: str,
+                             order_details: dict, title: str,
+                             caught: list) -> str:
+        """Взять в работу заказ, который уже лежит оплаченным.
+
+        Продавец прислал снимок панели: заказ «Оплачен», кнопка «В работу»
+        не нажата, автопринятие включено. Автоответ покупателю по этому же
+        заказу ушёл — значит бот его видел. Причина в том, что автопринятие
+        знало только два момента: заказ увиден впервые и пришла оплата. Оба
+        можно пропустить, и тогда заказ не трогал уже никто.
+
+        Предохранители здесь не украшение. «Взять в работу» на этом
+        маркетплейсе может означать «товар выдан» (см. `means_fulfilled`), а
+        догонять приходится пачку сразу — например всё, что открыто на
+        момент чистки хранилища. Поэтому: не больше нескольких за проход, не
+        старше суток-двух, и отказ маркетплейса не повторяется бесконечно.
+
+        Возвращает статус заказа — новый, если взяли, прежний, если нет.
+        Каждое «не взяли» объясняется в `work_skip`: карточка заказа читает
+        оттуда, чтобы вопрос «почему не взят» не выяснялся перепиской.
+        """
+        aa = settings.get("auto_accept", {}) or {}
+        if not aa.get("enabled"):
+            return status
+        det = order_details.setdefault(str(oid), {})
+        if int(det.get("work_tries", 0) or 0) >= _CATCHUP_TRIES:
+            return status                     # причина уже лежит в work_error
+        if det.get("work_at"):
+            # Нажимали и не помогло. Второй раз здесь — это круг: заказ
+            # остаётся оплаченным, догонялка видит его снова, и так каждую
+            # минуту до бесконечности. Код 200 доказательством не считается,
+            # но и поводом жать повторно — тоже.
+            det["work_skip"] = ("бот уже нажимал «в работу», а заказ так и "
+                                "остался оплаченным — повторно не жму, "
+                                "нажмите в панели")
+            return status
+        if len(caught) >= _CATCHUP_PER_PASS:
+            det["work_skip"] = (f"за проход бот берёт не больше "
+                                f"{_CATCHUP_PER_PASS} зависших заказов — "
+                                f"дойдёт очередь на следующем")
+            return status
+        age = _order_age(det)
+        if age is None:
+            det["work_skip"] = ("время заказа неизвестно — такие бот сам в "
+                                "работу не берёт, нажмите вручную")
+            return status
+        hours = float(aa.get("catchup_hours") or _CATCHUP_HOURS)
+        if age > hours * 3600:
+            det["work_skip"] = (f"заказ старше {int(hours)} ч — бот не берёт "
+                                f"в работу задним числом, нажмите вручную")
+            return status
+
+        got, real = await self._maybe_accept_order(
+            user_id, api, settings, oid, status, order_details)
+        if not got:
+            return status
+        caught.append(str(oid))
+
+        lay = f"{int(age // 3600)} ч" if age >= 3600 else "меньше часа"
+        await self._notify(
+            user_id,
+            _card("✅ <b>ВЗЯЛ В РАБОТУ</b>",
+                  [f"📦 <b>{_esc(title)}</b>" if title
+                   else "📦 <i>товар без названия</i>",
+                   f"🧾 <code>#{_esc(str(oid))}</code>",
+                   "",
+                   f"Заказ лежал оплаченным {lay} и в работу взят не был — "
+                   f"ни при появлении, ни при оплате. Взял сейчас.",
+                   "",
+                   f"📊 Стал: {_status_ru(real)}" if real else
+                   "📊 Маркетплейс ответил, но перечитать статус не удалось — "
+                   "проверьте в панели."]))
+        return real or "work"
 
     async def _auto_refund(self, user_id: int, api: YooMarketAPI,
                            settings: dict) -> None:
@@ -1886,7 +2033,7 @@ class TaskManager:
             # Закрытый или уже возвращённый заказ трогать нечем и незачем.
             if status in _DONE_STATUSES or status in _BACK_STATUSES:
                 continue
-            if status not in ("work", "working", "processing"):
+            if status not in _WORK_STATUSES:
                 continue
             det = details.get(oid, {})
             started = det.get("work_at") or det.get("seen_at")
@@ -1968,7 +2115,7 @@ class TaskManager:
             if not _stars_awaiting_delivery(settings, oid):
                 ac["held"].pop(oid, None)
         for oid, status in list(known_orders.items()):
-            if status not in ("work", "working", "processing"):
+            if status not in _WORK_STATUSES:
                 continue
             det = order_details.get(oid, {})
             work_at = det.get("work_at")

@@ -169,6 +169,35 @@ async def paginate_orders(
     await callback.answer()
 
 
+def _why_not_in_work(s: dict, status: str, oid: str) -> str:
+    """Почему заказ не взят в работу автоматически. Пусто — вопрос не стоит.
+
+    Продавец прислал снимок панели: заказ «Оплачен», кнопка «В работу» не
+    нажата. Бот заказ видел — автоответ покупателю ушёл, — а в работу не
+    взял, и понять причину со стороны было нельзя ничем: ни экраном, ни
+    логом. Причин же ровно четыре, и делать по ним надо разное.
+    """
+    from orderfields import WORK, needs_work
+    key = str(status or "").strip().lower()
+    if not needs_work(status):
+        # Взят в работу, выполнен, возвращён — вопрос не стоит. Неоплаченный
+        # заказ бот в работу не берёт намеренно: панель на такой прямо
+        # предупреждает «не выдавайте товар».
+        if not key or key in WORK or key in DONE or key in BACK:
+            return ""
+        return ("этот статус бот оплаченным не считает, а неоплаченный заказ "
+                "в работу не берёт")
+    aa = s.get("auto_accept", {}) or {}
+    if not aa.get("enabled"):
+        return "автопринятие выключено — Автопилот → Заказы"
+    det = ((s.get("known_order_details") or {}).get(str(oid)) or {})
+    if det.get("work_error"):
+        return f"маркетплейс отказал: {_esc(str(det['work_error']))}"
+    if det.get("work_skip"):
+        return _esc(str(det["work_skip"]))
+    return "должен взять в работу на ближайшем проходе — иначе /version"
+
+
 @router.callback_query(OrderCallback.filter(F.action == "view"))
 async def show_order_detail(
     callback: CallbackQuery,
@@ -203,7 +232,16 @@ async def show_order_detail(
             rows.append(f"💰 <b>{money(d['price'])} ₽</b>"
                         + (f"   ×{_esc(d['quantity'])}" if d["quantity"]
                            and str(d["quantity"]) != "1" else ""))
-        rows.append(f"📊 {status_ru(d['status'])}")
+        # Сырой статус рядом с переведённым. Стоило круга: «Оплачен» на
+        # экране и `paid` в ответе API — разные вещи, и когда автоматика на
+        # такой заказ не срабатывает, по одному переводу это не различить.
+        rows.append(f"📊 {status_ru(d['status'])}"
+                    + (f"  <code>{_esc(d['status'])}</code>" if d["status"]
+                       else ""))
+        why = _why_not_in_work(get_settings(callback.from_user.id), d["status"],
+                               str(oid))
+        if why:
+            rows.append(f"⚙️ {why}")
         if d["buyer"] or d["username"]:
             rows.append(f"👤 {_esc(d['buyer'] or '')}"
                         + (f"  {_esc(d['username'])}" if d["username"] else ""))

@@ -287,8 +287,28 @@ def is_paid(status) -> bool:
     if key in UNPAID:
         return False
     return key in PAID
+
+
 BACK = ("refunded", "returned", "refund", "cancelled", "canceled", "rejected",
         "failed", "expired")
+
+# Заказ уже взят в работу. Список отдельный, потому что «оплачен» сам по себе
+# включает и выполненные, и взятые в работу — по нему нельзя понять, ждёт ли
+# заказ кнопки «В работу».
+WORK = ("work", "working", "processing", "in_work", "inwork", "in_progress")
+
+
+def needs_work(status) -> bool:
+    """Оплачен, но в работу не взят — тот самый заказ, который ждёт кнопки.
+
+    Продавец прислал снимок панели: заказ «Оплачен», кнопка «В работу» не
+    нажата, автопринятие включено. Проверка составная, а писалась она по
+    месту: в одном файле «оплачен», в другом «не выполнен» — и заказ
+    проваливался между ними.
+    """
+    key = str(status or "").strip().lower()
+    return (bool(key) and is_paid(key) and key not in WORK
+            and key not in DONE and key not in BACK)
 
 
 def parse_amount(value):
