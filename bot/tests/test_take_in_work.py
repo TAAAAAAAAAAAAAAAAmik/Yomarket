@@ -212,6 +212,19 @@ class ARefusalIsRecordedAndNotRepeatedForever(unittest.TestCase):
         det = s["known_order_details"]["1217623"]
         self.assertIn("incorrect_status", det.get("work_error", ""))
 
+    def test_the_status_at_the_moment_of_refusal_is_recorded(self):
+        """«incorrect_status» приходит в двух совсем разных случаях: заказ
+        успел уйти из оплаченных между чтением списка и нажатием, или
+        маркетплейс не пускает в работу и оплаченный. Совет продавцу разный,
+        а различить их можно только статусом — на отказе он не приходит."""
+        s, _api, _n = run([order()], fail="incorrect_status")
+        det = s["known_order_details"]["1217623"]
+        self.assertEqual(det.get("work_error_status"), "paid")
+
+    def test_and_that_turns_into_a_usable_answer(self):
+        s, _api, _n = run([order()], fail="incorrect_status")
+        self.assertIn("в панели", _why_not_in_work(s, "paid", "1217623"))
+
     def test_and_the_bot_stops_after_a_few_tries(self):
         """Долбиться в отказ каждую минуту — не настойчивость, а шум."""
         _s, api, _n = run([order()], fail="incorrect_status", passes=6)
@@ -246,22 +259,33 @@ class TheOrderCardAnswersWhyItIsNotInWork(unittest.TestCase):
         self.assertIn("оплач", got)
         self.assertNotIn("Автопилот", got)
 
-    def test_a_marketplace_refusal_is_quoted(self):
+    def test_a_marketplace_refusal_is_said_in_russian(self):
         got = self.card(known_order_details={
             "1217623": {"work_error": "incorrect_status"}})
-        self.assertIn("incorrect_status", got)
+        self.assertIn("отказал", got)
+        self.assertNotIn("incorrect", got.lower())
 
     def test_a_skip_reason_is_shown_as_written(self):
         got = self.card(known_order_details={
             "1217623": {"work_skip": "заказ старше 48 ч"}})
         self.assertIn("старше 48 ч", got)
 
-    def test_an_english_code_is_not_the_whole_answer(self):
-        """Английский код ошибки на экране продавца — это отписка."""
+    def test_a_race_is_not_reported_as_a_breakage(self):
+        """Заказ успел уйти из оплаченных между чтением списка и нажатием —
+        это обычная гонка, а не поломка, и совет тут другой."""
         got = self.card(known_order_details={
-            "1217623": {"work_error": "incorrect_status"}})
-        self.assertTrue(got.split(":")[0].strip("⚙️ "))
-        self.assertIn("отказал", got)
+            "1217623": {"work_error": "incorrect_status",
+                        "work_error_status": "refunded"}})
+        self.assertIn("уже был", got)
+        self.assertNotIn("нажмите в панели", got)
+
+    def test_but_a_refusal_on_a_paid_order_is(self):
+        """Тот же код, а вывод обратный: если заказ в момент отказа был
+        оплачен, значит через API его в работу не взять."""
+        got = self.card(known_order_details={
+            "1217623": {"work_error": "incorrect_status",
+                        "work_error_status": "paid"}})
+        self.assertIn("в панели", got)
 
 
 class TheCardActuallyPrintsIt(unittest.TestCase):
@@ -347,7 +371,9 @@ class TheSkipReasonsReachTheCard(unittest.TestCase):
 
     def test_a_refusal_explains_itself_too(self):
         s, _api, _n = run([order()], fail="incorrect_status")
-        self.assertIn("incorrect_status", _why_not_in_work(s, "paid", "1217623"))
+        got = _why_not_in_work(s, "paid", "1217623")
+        self.assertIn("отказал", got)
+        self.assertNotIn("incorrect", got.lower())
 
 
 class TheStatusListIsSharedNotWrittenOutAgain(unittest.TestCase):

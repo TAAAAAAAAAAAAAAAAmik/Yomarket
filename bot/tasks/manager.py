@@ -602,9 +602,17 @@ def _today_stats(order_details: dict, known_orders: dict,
         if seen and seen >= day_start:
             cnt += 1
             try:
-                rev += int(float(str(det.get("price", 0))))
+                amount = float(str(det.get("price", 0)))
             except (ValueError, TypeError):
-                pass
+                continue          # цены нет — это не ноль рублей
+            # Цена в записи — за штуку: карточка так её и показывает, «60 ₽
+            # ×2». Выручка без множителя занижала день на каждой покупке
+            # больше одной штуки.
+            try:
+                qty = int(float(str(det.get("quantity") or 1)))
+            except (ValueError, TypeError):
+                qty = 1
+            rev += int(amount * max(qty, 1))
     return cnt, rev
 
 
@@ -1140,9 +1148,10 @@ class TaskManager:
                         d["username"] = d["username"] or prev_det.get("username") or ""
                         if d["price"] is None:
                             d["price"] = prev_det.get("price")
+                            d["price_src"] = prev_det.get("price_src", "")
                     elif detail_budget > 0:
                         detail_budget -= 1
-                        d = await self._enrich_order(api, oid, d)
+                        d = await self._enrich_order(api, oid, d, order)
                 status = d["status"]
                 prev_status = known.get(oid)
                 title = d["title"] or "—"
@@ -1172,6 +1181,10 @@ class TaskManager:
                     "title": title,
                     "buyer": buyer,
                     "price": price,
+                    # Откуда взята цена: пусто — из заказа, «ad» — из
+                    # объявления, потому что в заказе её не было вовсе.
+                    "price_src": d.get("price_src")
+                    or prev_det.get("price_src", ""),
                     "chat_id": chat_id,
                     "username": username,
                     "quantity": quantity,
@@ -1199,6 +1212,7 @@ class TaskManager:
                     # долбёжку раз в минуту.
                     "work_tries": prev_det.get("work_tries", 0),
                     "work_error": prev_det.get("work_error", ""),
+                    "work_error_status": prev_det.get("work_error_status", ""),
                     "work_skip": prev_det.get("work_skip", ""),
                     "work_result": prev_det.get("work_result", ""),
                 }
@@ -1265,6 +1279,8 @@ class TaskManager:
                         body = [
                             f"📦 <b>{_esc(title)}</b>{qty_part}",
                             f"💰 <b>{_money(price)} ₽</b>"
+                            + (" <i>по объявлению</i>"
+                               if d.get("price_src") == "ad" else "")
                             + (f"   🏷 {_esc(category)}" if category else ""),
                             "",
                             who_line,
@@ -1877,6 +1893,20 @@ class TaskManager:
             det = order_details.setdefault(str(oid), {})
             det["work_error"] = str(e)[:200]
             det["work_tries"] = int(det.get("work_tries", 0) or 0) + 1
+            # Каким заказ был в этот момент на самом деле. «incorrect_status»
+            # один и тот же в двух совершенно разных случаях: маркетплейс не
+            # пускает в работу оплаченный заказ — тогда функция здесь
+            # невозможна, — или заказ успел уйти из оплаченных между чтением
+            # списка и нажатием, и всё в порядке. Различить их можно только
+            # статусом, а он на отказе не приходит.
+            try:
+                fresh = await api.get_order(oid)
+                node = (fresh.get("data") if isinstance(fresh, dict)
+                        and isinstance(fresh.get("data"), dict) else fresh)
+                det["work_error_status"] = _describe(
+                    node if isinstance(node, dict) else {})["status"]
+            except Exception as err:
+                logger.info("Auto-accept re-read after refusal %s: %s", oid, err)
             return False, ""
 
         real = ""
@@ -2576,7 +2606,8 @@ class TaskManager:
                 best = (len(kw), str(rule.get("message", default)))
         return render(best[1] if best else default, ctx)
 
-    async def _enrich_order(self, api: YooMarketAPI, oid: str, d: dict) -> dict:
+    async def _enrich_order(self, api: YooMarketAPI, oid: str, d: dict,
+                            row: dict | None = None) -> dict:
         """Дочитать заказ, если список отдал одни номера.
 
         GET /orders отдаёт скупую строку — номер, статус, ссылку на
@@ -2584,6 +2615,12 @@ class TaskManager:
         покупателя. Карточка заказа знает больше, а название товара при
         необходимости берётся из самого объявления. Дочитывается один раз на
         заказ: результат оседает в известных деталях.
+
+        Ответ приходит завёрнутым в `{"data": …}`, и номер объявления искали
+        в самой обёртке — то есть не находили никогда. Дочитывание
+        объявления не срабатывало ни разу, а выглядело это как «маркетплейс
+        не прислал название»: в уведомлении стоял прочерк. Разворачиваем
+        один раз в начале и дальше работаем с содержимым.
         """
         from orderfields import ad_title, describe, order_ad_id
 
@@ -2592,25 +2629,44 @@ class TaskManager:
             full = await api.get_order(oid)
         except Exception as e:
             logger.info("order %s detail: %s", oid, e)
-        if isinstance(full, dict) and full:
-            deeper = describe(full.get("data") if isinstance(full.get("data"), dict)
-                              else full)
+        node = (full.get("data") if isinstance(full, dict)
+                and isinstance(full.get("data"), dict) else full)
+        node = node if isinstance(node, dict) else {}
+        if node:
+            deeper = describe(node)
             for key in ("title", "buyer", "username", "quantity"):
                 if not d.get(key):
                     d[key] = deeper.get(key)
             # Номер чата есть в карточке заказа, но не в строке списка — ради
             # него дочитывание и нужно в первую очередь.
             from orderfields import order_chat_id
-            node = full.get("data") if isinstance(full.get("data"), dict) else full
             d["chat_id"] = order_chat_id(node) or d.get("chat_id") or ""
             if d.get("price") in (None, "") and deeper.get("price") is not None:
                 d["price"] = deeper["price"]
 
-        if not d.get("title"):
-            ad_id = order_ad_id(full if isinstance(full, dict) else {}) or ""
+        # Цена — оттуда же, откуда название. На этом магазине заказ приходит
+        # вообще без денежных полей: ни в списке, ни в карточке. Продавец
+        # видел «💰 — ₽» в каждом уведомлении и «Сегодня: 6 · 0 ₽» при шести
+        # покупках — проверено `/order_debug 1218314`, в ответе только id,
+        # ad_id, chat_id, покупатель, статус и время.
+        #
+        # Цена объявления — не то же самое, что уплаченная: продавец мог
+        # поменять её после продажи, да и скидку маркетплейс сюда не
+        # передаёт. Поэтому источник запоминается и подписывается на экране,
+        # а не выдаётся за сумму заказа.
+        if not d.get("title") or d.get("price") is None:
+            # Номер объявления есть и в строке списка — если карточка не
+            # прочиталась, дочитывать всё равно есть по чему.
+            ad_id = order_ad_id(node) or order_ad_id(row or {}) or ""
             if ad_id:
                 try:
-                    d["title"] = ad_title(await api.get_ad(ad_id))
+                    ad = await api.get_ad(ad_id)
+                    d["title"] = d.get("title") or ad_title(ad)
+                    if d.get("price") is None:
+                        from orderfields import ad_price
+                        got = ad_price(ad)
+                        if got is not None:
+                            d["price"], d["price_src"] = got, "ad"
                 except Exception as e:
                     logger.info("ad %s for order %s: %s", ad_id, oid, e)
         d["enriched"] = True

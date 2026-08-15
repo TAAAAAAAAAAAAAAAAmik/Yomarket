@@ -58,6 +58,10 @@ def _merge(order: dict, details: dict | None) -> dict:
     if d.get("price") is None:
         raw = det.get("price")
         d["price"] = raw if isinstance(raw, (int, float)) else None
+        # Заказ на этом магазине приходит вообще без денежных полей, и цену
+        # фоновый опрос берёт из объявления. Это не то же самое, что
+        # уплаченная сумма, поэтому источник едет вместе с числом.
+        d["price_src"] = str(det.get("price_src") or "")
     return d
 
 
@@ -169,6 +173,31 @@ async def paginate_orders(
     await callback.answer()
 
 
+def _refusal_ru(det: dict) -> str:
+    """Отказ маркетплейса по-русски, с тем статусом, который был на деле.
+
+    `incorrect_status` приходит в двух совсем разных случаях: маркетплейс не
+    пускает в работу оплаченный заказ — тогда автопринятие здесь невозможно
+    в принципе, — или заказ успел уйти из оплаченных между чтением списка и
+    нажатием, и это обычная гонка. Совет продавцу в этих случаях разный,
+    поэтому один и тот же английский код показывать нельзя.
+    """
+    from autoreply import explain_error
+    from orderfields import BACK, DONE, needs_work, status_ru
+    why, _fixable = explain_error(str(det.get("work_error") or ""))
+    real = str(det.get("work_error_status") or "").lower()
+    if real in BACK or real in DONE:
+        return (f"бот нажал «в работу», но заказ к тому моменту уже был "
+                f"{status_ru(real).lower().lstrip('✅↩️❌ ')} — "
+                f"маркетплейс отказал, и правильно сделал")
+    if needs_work(real):
+        return ("маркетплейс отказал, хотя заказ был оплачен — похоже, "
+                "через бота этот заказ в работу не взять, нажмите в панели")
+    if real:
+        return f"маркетплейс отказал ({status_ru(real)}): {_esc(why)}"
+    return f"маркетплейс отказал: {_esc(why)}"
+
+
 def _why_not_in_work(s: dict, status: str, oid: str) -> str:
     """Почему заказ не взят в работу автоматически. Пусто — вопрос не стоит.
 
@@ -192,7 +221,7 @@ def _why_not_in_work(s: dict, status: str, oid: str) -> str:
         return "автопринятие выключено — Автопилот → Заказы"
     det = ((s.get("known_order_details") or {}).get(str(oid)) or {})
     if det.get("work_error"):
-        return f"маркетплейс отказал: {_esc(str(det['work_error']))}"
+        return _refusal_ru(det)
     if det.get("work_skip"):
         return _esc(str(det["work_skip"]))
     return "должен взять в работу на ближайшем проходе — иначе /version"
@@ -230,6 +259,8 @@ async def show_order_detail(
                 else "📦 <i>товар без названия</i>"]
         if d["price"] is not None:
             rows.append(f"💰 <b>{money(d['price'])} ₽</b>"
+                        + (" <i>по объявлению</i>"
+                           if d.get("price_src") == "ad" else "")
                         + (f"   ×{_esc(d['quantity'])}" if d["quantity"]
                            and str(d["quantity"]) != "1" else ""))
         # Сырой статус рядом с переведённым. Стоило круга: «Оплачен» на
@@ -771,9 +802,14 @@ async def order_debug(message: Message, api: YooMarketAPI) -> None:
     if det.get("work_result"):
         rows_out.append(f"стало после нажатия: "
                         f"<code>{_esc(str(det['work_result']))}</code>")
-    for label, key in (("отказ", "work_error"), ("причина пропуска", "work_skip")):
-        if det.get(key):
-            rows_out.append(f"{label}: <code>{_esc(str(det[key])[:150])}</code>")
+    if det.get("work_error"):
+        rows_out += [f"отказ: <code>{_esc(str(det['work_error'])[:150])}</code>",
+                     f"  статус в момент отказа: "
+                     f"<code>{_esc(str(det.get('work_error_status') or '—'))}</code>",
+                     f"  {_refusal_ru(det)}"]
+    if det.get("work_skip"):
+        rows_out.append(f"причина пропуска: "
+                        f"<code>{_esc(str(det['work_skip'])[:150])}</code>")
 
     await status.edit_text("\n".join(rows_out))
     body = shape(listed)[:1500] if listed else "заказа в списке нет"
