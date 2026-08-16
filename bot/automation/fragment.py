@@ -970,6 +970,50 @@ def page_signals(html: str) -> list[str]:
     return out
 
 
+def page_rewrites_cookies_sync(cookies: dict, proxy: str = "") -> list[str]:
+    """Переписывает ли страница покупки наши куки. Только чтение.
+
+    Это проба под конкретную версию, а не украшение отчёта. Рабочий клиент
+    продавца страницу не читает вовсе — хеш у него в настройках, — а мы
+    читаем, и ответ страницы приносит свои `Set-Cookie` в ту же банку. Если
+    они ложатся поверх кук продавца, то дальше поиск получателя проходит (он
+    работает и без входа), а заявка отвечает «Access denied» одинаково на
+    живых и на протухших куках. Ровно это и наблюдалось.
+
+    Проверить версию можно бесплатно: открыть страницу и сравнить банку до и
+    после. Значения кук наружу не выходят — только имена.
+    """
+    out: list[str] = []
+    if not cookies:
+        return ["куки Fragment не заданы"]
+    session = _make_session(cookies, proxy)
+    before = dict(cookies)
+    try:
+        r = session.get("https://fragment.com/stars/buy", timeout=20)
+    except Exception as e:
+        return [f"страница не открылась: {str(e)[:80]}"]
+    after = {}
+    try:
+        after = dict(session.cookies)
+    except Exception:
+        pass
+    out.append(f"страница: {len(r.text or '')} символов")
+    out += [f"  {line}" for line in page_signals(r.text or "")[:5]]
+    overwritten = sorted(k for k, v in before.items()
+                         if k in after and after[k] != v)
+    added = sorted(set(after) - set(before))
+    out.append(f"переписаны наши куки: {', '.join(overwritten) or 'нет'}")
+    out.append(f"добавлены страницей: {', '.join(added) or 'нет'}")
+    if overwritten:
+        out.append("⚠️ Это и есть подозреваемый: заявку на покупку Fragment "
+                   "принимает только от вошедшего, а поиск получателя "
+                   "проходит и без входа. Бот теперь возвращает ваши куки "
+                   "на место сразу после чтения страницы.")
+    else:
+        out.append("Версия про подмену кук этой пробой не подтвердилась.")
+    return out
+
+
 def _looks_logged_out(html: str) -> bool:
     """Похоже ли, что страница отдана гостю.
 

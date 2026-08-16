@@ -1482,6 +1482,55 @@ class ThePageMustNotOverwriteTheSellersCookies(Case):
         self.assertEqual(gets, [])
 
 
+class TheCookieSwapCanBeCheckedWithoutSpendingAnything(Case):
+    """Версию про подмену кук незачем проверять покупкой: страницу можно
+    открыть и сравнить банку до и после. Это бесплатно и занимает секунду."""
+
+    def probe(self, page_sets: dict, page=PAGE):
+        sess = self.fake.session()
+        jar = dict(COOKIES)
+        sess.cookies = jar
+
+        def get(url, **kw):
+            jar.update(page_sets)
+            return Reply(None, 200, page)
+
+        sess.get = get
+        F._make_session = lambda cookies, proxy='': sess
+        return "\n".join(F.page_rewrites_cookies_sync(COOKIES))
+
+    def test_a_swap_is_named_by_cookie(self):
+        got = self.probe({"stel_token": "ГОСТЬ"})
+        self.assertIn("переписаны наши куки: stel_token", got)
+
+    def test_and_called_the_suspect_in_plain_words(self):
+        self.assertIn("подозреваемый", self.probe({"stel_token": "ГОСТЬ"}))
+
+    def test_no_swap_is_said_just_as_plainly(self):
+        got = self.probe({})
+        self.assertIn("переписаны наши куки: нет", got)
+        self.assertIn("не подтвердилась", got)
+
+    def test_a_cookie_the_page_adds_is_listed_separately(self):
+        """Добавленная кука — не подмена, и путать их нельзя."""
+        got = self.probe({"stel_dt": "1"})
+        self.assertIn("добавлены страницей: stel_dt", got)
+        self.assertIn("переписаны наши куки: нет", got)
+
+    def test_cookie_values_never_reach_the_report(self):
+        secret = "s3cr3t_знач3ние"
+        sess = self.fake.session()
+        sess.cookies = {"stel_token": secret}
+        sess.get = lambda url, **kw: Reply(None, 200, PAGE)
+        F._make_session = lambda cookies, proxy='': sess
+        got = "\n".join(F.page_rewrites_cookies_sync({"stel_token": secret}))
+        self.assertNotIn(secret, got)
+
+    def test_no_cookies_at_all_is_said_rather_than_probed(self):
+        self.assertIn("не заданы",
+                      "\n".join(F.page_rewrites_cookies_sync({})))
+
+
 class MoneyIsNeverSentWithoutFragmentsComment(unittest.TestCase):
     """Комментарий — это то, чем Fragment узнаёт платёж.
 

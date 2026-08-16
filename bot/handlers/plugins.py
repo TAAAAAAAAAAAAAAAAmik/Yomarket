@@ -642,6 +642,39 @@ async def fragment_debug(message: Message) -> None:
     await status.edit_text(f"🔍 <b>Сессия Fragment</b>\n<code>{body}</code>")
 
 
+@router.message(Command("fragment_cookies"))
+async def fragment_cookies(message: Message) -> None:
+    """/fragment_cookies — переписывает ли страница покупки наши куки.
+
+    Проба под конкретную версию, а не украшение отчёта: рабочий клиент
+    продавца страницу не читает вовсе, а мы читаем — и если её `Set-Cookie`
+    ложатся поверх кук продавца, то «Access denied» на заявке при
+    проходящем поиске получателя объясняется этим целиком. Только чтение,
+    денег не тратит; значения кук наружу не выходят, только имена.
+    """
+    from automation.fragment import page_rewrites_cookies_sync
+
+    creds = get_fragment_creds(message.from_user.id) or {}
+    if not creds.get("cookies"):
+        await message.answer("⚠️ Куки Fragment не заданы: Плагины → AutoStars "
+                             "→ 🔑 Данные Fragment")
+        return
+    status = await message.answer("⏳ Открываю страницу покупки и сравниваю "
+                                  "куки до и после…")
+    loop = asyncio.get_event_loop()
+    try:
+        lines = await asyncio.wait_for(
+            loop.run_in_executor(None, page_rewrites_cookies_sync,
+                                 creds["cookies"], creds.get("proxy", "")),
+            timeout=60)
+    except Exception as e:
+        await status.edit_text(f"❌ {html.escape(str(e)[:200])}")
+        return
+    body = "\n".join(html.escape(str(x)) for x in lines)[:3500]
+    await status.edit_text(
+        f"🍪 <b>Страница покупки и наши куки</b>\n<code>{body}</code>")
+
+
 @router.message(Command("fragment_js"))
 async def fragment_js(message: Message) -> None:
     """/fragment_js — как сайт зовёт свой API, по его же коду. Только чтение.
