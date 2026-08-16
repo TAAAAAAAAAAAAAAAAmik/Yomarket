@@ -1494,20 +1494,47 @@ def _probe_methods(cookies: dict, api_hash: str, username: str,
             return str(data.get("error") or data.get("error_message"))[:50]
         return "принято: " + ", ".join(sorted(data))[:50]
 
+    # Написания перебираются все, как в самой покупке. Проба брала только
+    # первое — «@ник» — и на его отказе писала «получателя не нашли», хотя
+    # покупка попробовала бы и «ник» без собаки. Диагностика, которая
+    # мрачнее проверяемого кода, отправляет искать несуществующую поломку:
+    # ровно это и случилось с @durov.
+    forms = _query_forms(username)
     recipient = ""
-    first = _query_forms(username)[:1]
-    if first:
+    used = ""
+    tried: list[str] = []
+    for form in forms:
         try:
             got = session.post(
                 FRAGMENT_API_URL,
                 params={"method": "searchStarsRecipient", "hash": api_hash,
-                        "query": first[0]}, timeout=20).json()
-            recipient = _extract_recipient(got)
-        except Exception:
-            recipient = ""
+                        "query": form}, timeout=20).json()
+        except Exception as e:
+            tried.append(f"  «{form}» → ошибка сети {str(e)[:30]}")
+            continue
+        found = _extract_recipient(got) if isinstance(got, dict) else ""
+        if found:
+            recipient, used = found, form
+            tried.append(f"  «{form}» → найден")
+            break
+        err = ""
+        if isinstance(got, dict):
+            err = str(got.get("error") or got.get("error_message") or "")[:60]
+        tried.append(f"  «{form}» → {err or 'не найден'}")
 
+    out = ["Написания ника (как в покупке):"] + tried
+    if recipient:
+        out.append(f"  подошло: «{used}»")
+    else:
+        out.append("  ни одно написание не подошло — дальше проверять нечего, "
+                   "и это НЕ про права: заявку Fragment смотрит после "
+                   "получателя")
+    out.append("")
+    out.append("Что отвечают методы:")
+
+    first = forms[:1]
     checks = [
-        ("searchStarsRecipient", {"query": first[0] if first else "x"}),
+        ("searchStarsRecipient", {"query": used or (first[0] if first else "x")}),
         ("initBuyStarsRequest", {"recipient": recipient or "x",
                                  "quantity": quantity}),
         ("getBuyStarsLink", {"id": "0", "transaction": 1}),
@@ -1517,7 +1544,6 @@ def _probe_methods(cookies: dict, api_hash: str, username: str,
         ("thisMethodDoesNotExist", {}),
         ("searchStarsRecipientX", {"query": first[0] if first else "x"}),
     ]
-    out = []
     for method, args in checks:
         out.append(f"  {method}: {ask(method, args)}")
     return out

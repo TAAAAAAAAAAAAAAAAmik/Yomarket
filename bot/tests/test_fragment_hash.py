@@ -1163,6 +1163,53 @@ class AskingWhatOtherMethodsAnswer(Case):
         F._make_session = lambda cookies, proxy='': sess
         return F._probe_methods(COOKIES, REAL_HASH, "durov", 50), seen
 
+    def _ask_forms(self, works: str):
+        """Поиск находит получателя только по написанию `works`."""
+        sess = self.fake.session()
+        asked: list[str] = []
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if q.get("method") == "searchStarsRecipient":
+                asked.append(q.get("query", ""))
+                if q.get("query") == works:
+                    return Reply({"ok": True, "found": {"recipient": "R"}})
+                return Reply({"error":
+                              "Please enter a username assigned to a user."})
+            return Reply({"ok": True})
+
+        sess.post = post
+        F._make_session = lambda cookies, proxy='': sess
+        return "\n".join(F._probe_methods(COOKIES, REAL_HASH, "durov", 50)), asked
+
+    def test_every_spelling_is_tried_the_way_the_purchase_tries_them(self):
+        """Проба брала только «@ник» и на его отказе писала «получателя не
+        нашли» — а покупка попробовала бы и «ник» без собаки. Диагностика
+        мрачнее проверяемого кода отправляет искать несуществующую поломку:
+        ровно это и вышло с @durov."""
+        _text, asked = self._ask_forms("durov")
+        # Третий запрос — из блока «что отвечают методы», он переспрашивает
+        # уже подошедшим написанием.
+        self.assertEqual(asked[:2], ["@durov", "durov"])
+
+    def test_the_spelling_that_worked_is_named(self):
+        text, _asked = self._ask_forms("durov")
+        self.assertIn("подошло: «durov»", text)
+
+    def test_a_refusal_is_shown_per_spelling(self):
+        text, _asked = self._ask_forms("durov")
+        self.assertIn("«@durov» → Please enter a username", text)
+
+    def test_the_search_stops_at_the_first_that_works(self):
+        _text, asked = self._ask_forms("@durov")
+        self.assertNotIn("durov", asked, "перебор не остановился на первом")
+
+    def test_when_none_works_it_says_that_is_not_about_rights(self):
+        """Иначе «не нашли» читается как продолжение истории про Access
+        denied, а это разные ворота: получателя Fragment смотрит раньше."""
+        text, _asked = self._ask_forms("никогда-не-совпадёт")
+        self.assertIn("НЕ про права", text)
+
     def test_a_made_up_method_is_asked_about_too(self):
         _lines, seen = self._ask({})
         self.assertIn("thisMethodDoesNotExist", seen)
