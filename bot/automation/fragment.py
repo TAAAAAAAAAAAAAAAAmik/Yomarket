@@ -37,6 +37,8 @@ MAINNET_CHAIN = "-239"
 DEFAULT_HASH = ""
 SEQNO_POLL_SECS = 3
 SEQNO_MAX_WAIT_SECS = 120
+# Сколько раз перечитать счётчик кошелька, прежде чем поверить нулю.
+_SEQNO_READ_TRIES = 3
 
 # Сколько ждать покупку целиком — одно число на всех, кто её зовёт. Считается
 # по самой цепочке: страница с хешем 30 + до трёх написаний ника по 30 +
@@ -218,23 +220,41 @@ def _build_signed_boc(wallet, to_addr: str, amount_nano, payload_b64: str, seqno
     Fragment сверяет платёж по самому BOC: `confirmReq` шлёт ему BOC
     целиком. Проверить это можно будет только на удавшейся покупке.
     """
+    # Комментарий — это то, чем Fragment узнаёт платёж. Без него перевод
+    # уходит обычными деньгами на обычный адрес, и связать его с заявкой
+    # нечем: звёзды не начислятся, а TON уже не вернуть.
+    #
+    # Раньше здесь стояло «не разобрали — отправим без комментария», с
+    # записью в лог контейнера. То есть на любой неожиданности в ответе
+    # Fragment бот отправлял деньги в никуда и докладывал об успехе.
+    #
+    # Проверка стоит до кошелька и до tonsdk намеренно: отказывать надо
+    # раньше, чем что-то подписано.
+    if not payload_b64:
+        raise ValueError(
+            "Fragment не прислал комментарий к переводу — платёж без него "
+            "не с чем связать, деньги ушли бы впустую")
+
     from tonsdk.utils import Address, to_nano
     from tonsdk.boc import Cell
 
     amount_ton = Decimal(int(amount_nano)) / Decimal(1_000_000_000)
 
-    payload_cell = None
-    if payload_b64:
-        try:
-            src = Cell.one_from_boc(base64.b64decode(_fix_base64(payload_b64)))
-            text = src.bits.get_top_upped_array().decode("utf-8",
-                                                         errors="ignore").strip()
-            payload_cell = Cell()
-            payload_cell.bits.write_uint(0, 32)
-            payload_cell.bits.write_bytes(text.encode("utf-8"))
-        except Exception as e:
-            logger.warning("payload decode failed, sending without payload: %s", e)
-            payload_cell = None
+    try:
+        src = Cell.one_from_boc(base64.b64decode(_fix_base64(payload_b64)))
+        text = src.bits.get_top_upped_array().decode("utf-8",
+                                                     errors="ignore").strip()
+    except Exception as e:
+        raise ValueError(
+            f"Комментарий Fragment не разобрать ({str(e)[:60]}) — без него "
+            f"платёж не с чем связать") from e
+    if not text:
+        raise ValueError(
+            "Комментарий Fragment оказался пустым — платёж без него не с чем "
+            "связать")
+    payload_cell = Cell()
+    payload_cell.bits.write_uint(0, 32)
+    payload_cell.bits.write_bytes(text.encode("utf-8"))
 
     transfer = wallet.create_transfer_message(
         to_addr=Address(to_addr),
@@ -247,19 +267,56 @@ def _build_signed_boc(wallet, to_addr: str, amount_nano, payload_b64: str, seqno
     return base64.b64encode(boc_bytes).decode()
 
 
-def _get_seqno(address_str: str) -> int:
+def _read_seqno(address_str: str) -> tuple[int, bool]:
+    """Счётчик отправок кошелька → (seqno, прочитан ли достоверно).
+
+    Второе значение важнее первого. У неразвёрнутого кошелька seqno и правда
+    ноль — первый же перевод его и разворачивает, — но точно такой же ноль
+    получался, когда TonCenter просто не ответил как надо. С чужим нулём
+    вместо настоящего счётчика перевод подписывается недействительным: сеть
+    его не проведёт, а бот, увидев принятый узлом BOC, доложит об отправке.
+    Деньги при этом остаются на месте — но продавец считает, что выдал.
+    """
     r = requests.post(TONCENTER_RUN,
                       json={"address": address_str, "method": "seqno", "stack": []},
                       timeout=15)
     r.raise_for_status()
     data = r.json()
     if not data.get("ok"):
-        # Fresh (undeployed) wallet → seqno 0
-        return 0
+        # Неразвёрнутый кошелёк — законный ноль. Отличить его от сбоя по
+        # этому ответу нельзя, поэтому «достоверно» здесь не ставится, и
+        # решает вызывающий: повторить или сказать честно.
+        return 0, False
     try:
-        return int(data["result"]["stack"][0][1], 16)
+        return int(data["result"]["stack"][0][1], 16), True
     except (KeyError, IndexError, ValueError):
-        return 0
+        return 0, False
+
+
+def _get_seqno(address_str: str) -> int:
+    """Счётчик отправок кошелька. Повтор — против одиночного сбоя TonCenter.
+
+    Ноль здесь бывает настоящим: у кошелька, с которого ещё ни разу не
+    отправляли, seqno и правда ноль, а первый перевод его разворачивает.
+    Отличить такой ноль от «сервер не ответил» по одному ответу нельзя, а
+    цена ошибки разная: с чужим нулём перевод подписывается недействительным,
+    сеть его не проводит, и деньги остаются на месте — но бот, увидев
+    принятый узлом BOC, доложил бы об отправке.
+
+    Гадать не будем, а повторить чтение дёшево: запрос только на чтение, и
+    он закрывает самую вероятную причину — секундную неудачу TonCenter.
+    Если ноль всё-таки чужой, это увидит ожидание seqno после отправки, и в
+    ответе будет сказано, что подтверждения в сети не было.
+    """
+    last = 0
+    for attempt in range(_SEQNO_READ_TRIES):
+        value, sure = _read_seqno(address_str)
+        if sure:
+            return value
+        last = value
+        if attempt + 1 < _SEQNO_READ_TRIES:
+            time.sleep(1)
+    return last
 
 
 def _send_boc(boc_b64: str) -> bool:
@@ -375,13 +432,39 @@ def buy_stars_sync(
     # снятый в браузере, где покупка проходит, просто не доходил до запроса.
     # Не задан — читаем со страницы покупки, той же сессией, как в
     # документации.
+    #
+    # Документ страницу не читает вовсе: хеш у него в настройках. Это
+    # последнее, чем наша покупка от него отличается, — и отличие не
+    # безобидное. Ответ страницы приносит свои `Set-Cookie`, и они ложатся
+    # поверх кук продавца в той же банке. Дальше поиск получателя проходит
+    # (он работает и без входа — это проверено), а заявка, единственная,
+    # которой вход нужен, отвечает «Access denied». И отвечает одинаково на
+    # живых куках и на протухших — ровно то, что мы наблюдали и не могли
+    # объяснить.
+    #
+    # Поэтому куки продавца возвращаются на место сразу после чтения
+    # страницы. Сессия остаётся одна (хеш Fragment выдаёт сессии), но
+    # покупка идёт с теми куками, которые продавец дал, а не с теми, что
+    # страница успела подсунуть.
     h = (api_hash or "").strip()
     if not h:
+        try:
+            before = dict(session.cookies)
+        except Exception:       # банка кук бывает не только словарём
+            before = {}
         try:
             page = session.get("https://fragment.com/stars/buy", timeout=30)
             body = page.text or ""
         except Exception as e:
             return False, f"Страница fragment.com/stars/buy: {str(e)[:80]}"
+        changed = [k for k, v in before.items()
+                   if session.cookies.get(k) != v]
+        if changed:
+            logger.warning("страница покупки переписала куки: %s",
+                           ", ".join(sorted(changed)))
+            if report is not None:
+                report["cookies_rewritten"] = sorted(changed)
+            session.cookies.update(before)
         for pattern in _HASH_PATTERNS:
             m = re.search(pattern, body)
             if m:

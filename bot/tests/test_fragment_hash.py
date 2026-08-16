@@ -18,6 +18,14 @@ from automation import fragment as F          # noqa: E402
 logging.getLogger("automation.fragment").setLevel(logging.CRITICAL)
 
 COOKIES = {"stel_token": "a", "stel_ssid": "b", "stel_ton_token": "c"}
+
+# Подпись TON здесь не проверяется, и tonsdk в окружении тестов может не
+# быть. Проверки, которым он нужен по существу, помечены отдельно.
+try:
+    import tonsdk  # noqa: F401
+    _HAS_TONSDK = True
+except Exception:
+    _HAS_TONSDK = False
 REAL_HASH = "0123456789abcdef"
 SIGNED_IN = '<a href="/logout">Log out</a>'          # признак вошедшего
 PAGE = ('<html>' + SIGNED_IN + '<script>var x = "/api?hash=' + REAL_HASH
@@ -1388,6 +1396,236 @@ class OnlyTheFirstMessageIsPaid(Case):
         """Иначе «Прибыль» посчитает деньги, которые не уходили."""
         _ok, _msg, report, _sent = self._buy(self.TWO)
         self.assertEqual(report["nano"], 1500000000)
+
+
+class ThePageMustNotOverwriteTheSellersCookies(Case):
+    """Последнее расхождение с рабочим клиентом продавца.
+
+    Документ страницу покупки не читает вовсе: хеш у него в настройках. Мы
+    читаем — и ответ страницы приносит свои `Set-Cookie`, которые ложатся
+    поверх кук продавца в той же банке. Дальше поиск получателя проходит (он
+    работает и без входа), а заявка, единственная, которой вход нужен,
+    отвечает «Access denied» — одинаково на живых куках и на протухших.
+    Это ровно то, что наблюдалось и не объяснялось.
+    """
+
+    def _buy(self, page_sets: dict):
+        outer = self.fake
+        sess = outer.session()
+        jar: dict = {}
+        seen: list[dict] = []
+
+        class Jar(dict):
+            def get(self, k, default=None):
+                return dict.get(self, k, default)
+
+        sess.cookies = Jar(COOKIES)
+
+        def get(url, **kw):
+            sess.cookies.update(page_sets)      # как Set-Cookie от страницы
+            return Reply(None, 200, PAGE)
+
+        def post(url, params=None, data=None, **kw):
+            seen.append(dict(sess.cookies))
+            q = dict(params or {})
+            if q.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            return Reply({"ok": False, "error": "Access denied"})
+
+        sess.get, sess.post = get, post
+        saved = {n: getattr(F, n) for n in ("_make_session", "_page_session")}
+        F._make_session = lambda cookies, proxy='': sess
+        F._page_session = lambda cookies, proxy='': sess
+        report: dict = {}
+        try:
+            F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
+                             report=report)
+        finally:
+            for name, value in saved.items():
+                setattr(F, name, value)
+        return seen, report
+
+    def test_the_purchase_goes_with_the_cookies_the_seller_gave(self):
+        seen, _r = self._buy({"stel_token": "ГОСТЬ"})
+        self.assertTrue(seen, "запросов к API не было вовсе")
+        self.assertEqual(seen[0]["stel_token"], "a")
+
+    def test_and_the_swap_is_written_down_rather_than_swallowed(self):
+        _seen, report = self._buy({"stel_token": "ГОСТЬ"})
+        self.assertEqual(report.get("cookies_rewritten"), ["stel_token"])
+
+    def test_a_page_that_touches_nothing_changes_nothing(self):
+        _seen, report = self._buy({})
+        self.assertNotIn("cookies_rewritten", report)
+
+    def test_a_cookie_the_page_adds_is_kept(self):
+        """Возвращаем свои поверх чужих, а не стираем банку целиком: новая
+        кука может быть и нужной."""
+        seen, _r = self._buy({"stel_dt": "новая"})
+        self.assertEqual(seen[0].get("stel_dt"), "новая")
+
+    def test_with_a_hash_set_by_hand_the_page_is_not_read_at_all(self):
+        """Ровно как в документе: хеш из настроек, страницы нет."""
+        outer = self.fake
+        sess = outer.session()
+        gets: list = []
+        sess.get = lambda url, **kw: gets.append(url) or Reply(None, 200, PAGE)
+        sess.post = lambda url, params=None, **kw: Reply(
+            {"ok": False, "error": "Access denied"})
+        saved = F._make_session
+        F._make_session = lambda cookies, proxy='': sess
+        try:
+            F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov", 100,
+                             api_hash=REAL_HASH)
+        finally:
+            F._make_session = saved
+        self.assertEqual(gets, [])
+
+
+class MoneyIsNeverSentWithoutFragmentsComment(unittest.TestCase):
+    """Комментарий — это то, чем Fragment узнаёт платёж.
+
+    Раньше здесь стояло «не разобрали — отправим без комментария», с записью
+    в лог контейнера. То есть на любой неожиданности в ответе Fragment бот
+    отправлял TON обычным переводом на обычный адрес: связать его с заявкой
+    нечем, звёзды не начислятся, деньги не вернуть. И докладывал об успехе.
+
+    Сверено с рабочим клиентом продавца (`fragment_utils`): там комментарий
+    собирается всегда, варианта «без него» просто нет.
+    """
+
+    def build(self, payload):
+        addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
+        wallet = type("W", (), {
+            "address": addr,
+            "create_transfer_message": staticmethod(
+                lambda **kw: {"message": type("M", (), {
+                    "to_boc": staticmethod(lambda x: b"BOC")})()}),
+        })()
+        return F._build_signed_boc(wallet, "EQ" + "A" * 46, 1500000000,
+                                   payload, 5)
+
+    def test_an_empty_payload_stops_the_payment(self):
+        with self.assertRaises(ValueError) as e:
+            self.build("")
+        self.assertIn("не с чем связать", str(e.exception))
+
+    @unittest.skipUnless(_HAS_TONSDK, "tonsdk в окружении тестов нет")
+    def test_an_unreadable_payload_stops_it_too(self):
+        with self.assertRaises(ValueError) as e:
+            self.build("не base64 и не BOC")
+        self.assertIn("не с чем связать", str(e.exception))
+
+    def test_and_the_reason_says_why_it_matters(self):
+        """«Ошибка сборки транзакции» продавцу ничего не объясняет."""
+        with self.assertRaises(ValueError) as e:
+            self.build("")
+        self.assertIn("Fragment", str(e.exception))
+
+    @unittest.skipUnless(_HAS_TONSDK, "tonsdk в окружении тестов нет")
+    def test_a_good_payload_still_goes_through(self):
+        import base64 as b64
+
+        from tonsdk.boc import Cell
+        cell = Cell()
+        cell.bits.write_uint(0, 32)
+        cell.bits.write_bytes(b"ref#12345")
+        payload = b64.b64encode(cell.to_boc(False)).decode()
+        self.assertEqual(self.build(payload), b64.b64encode(b"BOC").decode())
+
+    def test_the_purchase_reports_it_instead_of_paying(self):
+        """И, главное, до отправки денег: `_send_boc` не должен вызваться."""
+        sent: list = []
+        saved = {n: getattr(F, n) for n in
+                 ("_build_signed_boc", "_send_boc", "_get_seqno",
+                  "_wallet_from_mnemonic", "_make_session")}
+        fake = FakeFragment()
+        sess = fake.session()
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if q.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            if q.get("method") == "initBuyStarsRequest":
+                return Reply({"ok": True, "req_id": "REQ-1"})
+            if q.get("method") == "getBuyStarsLink":
+                return Reply({"transaction": {"messages": [
+                    {"address": "EQ" + "A" * 46, "amount": "1500000000",
+                     "payload": ""}]}})
+            return Reply({"ok": True})
+
+        sess.post = post
+        addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
+        F._wallet_from_mnemonic = lambda m, v: type("W", (), {"address": addr})()
+        F._make_session = lambda cookies, proxy='': sess
+        F._get_seqno = lambda a: 5
+        F._send_boc = lambda boc: sent.append(boc) or True
+        report: dict = {}
+        try:
+            ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
+                                       100, api_hash=REAL_HASH, report=report)
+        finally:
+            for name, value in saved.items():
+                setattr(F, name, value)
+        self.assertFalse(ok)
+        self.assertEqual(sent, [], "деньги ушли без комментария")
+        self.assertFalse(report.get("sent_onchain"))
+
+
+class TheWalletCounterIsNotBelievedOnTheFirstStumble(unittest.TestCase):
+    """Ноль вместо настоящего seqno подписывает недействительный перевод.
+
+    У кошелька, с которого ещё не отправляли, ноль настоящий. Но точно такой
+    же ноль получался, когда TonCenter секунду не отвечал — и тогда сеть
+    перевод не проводит, деньги остаются на месте, а бот, увидев принятый
+    узлом BOC, докладывает об отправке.
+    """
+
+    def setUp(self):
+        self.calls: list = []
+        self._post = F.requests.post
+        self._sleep = F.time.sleep
+        F.time.sleep = lambda s: None
+
+    def tearDown(self):
+        F.requests.post = self._post
+        F.time.sleep = self._sleep
+
+    def answer(self, *payloads):
+        queue = list(payloads)
+
+        def post(url, **kw):
+            self.calls.append(url)
+            return Reply(queue.pop(0) if queue else {"ok": False})
+
+        F.requests.post = post
+
+    def test_a_stumble_is_retried_rather_than_read_as_zero(self):
+        self.answer({"ok": False},
+                    {"ok": True, "result": {"stack": [["num", "0x2a"]]}})
+        self.assertEqual(F._get_seqno("EQ..."), 42)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_first_good_answer_costs_one_request(self):
+        self.answer({"ok": True, "result": {"stack": [["num", "0x7"]]}})
+        self.assertEqual(F._get_seqno("EQ..."), 7)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_a_wallet_that_never_sent_still_reads_as_zero(self):
+        """Первый перевод такой кошелёк и разворачивает — ноль тут
+        настоящий, и запрещать покупку из-за него нельзя."""
+        self.answer({"ok": False}, {"ok": False}, {"ok": False})
+        self.assertEqual(F._get_seqno("EQ..."), 0)
+
+    def test_it_does_not_hammer_toncenter_forever(self):
+        self.answer({"ok": False}, {"ok": False}, {"ok": False})
+        F._get_seqno("EQ...")
+        self.assertEqual(len(self.calls), F._SEQNO_READ_TRIES)
+
+    def test_a_broken_answer_shape_is_a_stumble_too(self):
+        self.answer({"ok": True, "result": {}},
+                    {"ok": True, "result": {"stack": [["num", "0x5"]]}})
+        self.assertEqual(F._get_seqno("EQ..."), 5)
 
 
 class ConfirmedInTheNetworkOnlyWhenItIs(Case):
