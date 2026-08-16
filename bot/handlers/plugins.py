@@ -24,14 +24,48 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_cookies(text: str) -> dict:
-    """Parse a 'k=v; k2=v2' cookie string into a dict."""
+    """Куки из того, что человек скопировал, — в каком угодно виде.
+
+    Раньше разбиралась только строка `k=v; k2=v2` из `document.cookie`, и
+    экран её же и советовал. Беда в том, что `document.cookie` **не
+    показывает** `stel_token` и `stel_ssid` — они HttpOnly, — то есть
+    массовая вставка приносила ровно ту куку, без которой можно обойтись, а
+    две главные продавец каждый раз вбивал руками. Куки Fragment живут
+    часами, так что «каждый раз» — это по нескольку раз в день.
+
+    Полный набор есть в заголовке `Cookie:` любого запроса к fragment.com и
+    в том, что даёт «Copy as cURL». Разбираем и то и другое: обёртки
+    (`-b '…'`, `-H 'cookie: …'`, `Cookie: …`) снимаются, дальше всё те же
+    пары. Чужие куки в наборе не мешают — сохраняются только знакомые имена,
+    и это делает вызывающий.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    # Из cURL берём только то, что относится к кукам: в нём есть и другие
+    # заголовки со знаком «равно», и они бы разобрались как куки.
+    chunks: list[str] = []
+    for m in re.finditer(r"(?:-b|--cookie)\s+(['\"])(.*?)\1", raw, re.S):
+        chunks.append(m.group(2))
+    for m in re.finditer(r"(?:-H|--header)\s+(['\"])\s*cookie\s*:\s*(.*?)\1",
+                         raw, re.S | re.I):
+        chunks.append(m.group(2))
+    if not chunks:
+        # Не cURL — значит либо голая строка кук, либо заголовок с именем.
+        chunks.append(re.sub(r"^\s*cookie\s*:\s*", "", raw, flags=re.I))
+
     out: dict = {}
-    for part in (text or "").split(";"):
-        part = part.strip()
-        if "=" in part:
+    for chunk in chunks:
+        for part in chunk.split(";"):
+            part = part.strip()
+            if "=" not in part:
+                continue
             k, _, v = part.partition("=")
-            if k.strip():
-                out[k.strip()] = v.strip()
+            k, v = k.strip(), v.strip()
+            # Имя куки — не предложение с пробелами: так отсеиваются куски
+            # команды, случайно попавшие в вставку.
+            if k and v and re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", k):
+                out[k] = v
     return out
 
 
@@ -451,14 +485,18 @@ async def stars_set_one_cookie_input(message: Message,
 async def stars_set_cookies_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PluginState.stars_set_cookies)
     await callback.message.edit_text(
-        "🍪 <b>Cookies Fragment</b>\n\n"
+        "🍪 <b>Cookies Fragment — все три одной вставкой</b>\n\n"
         "1. Войдите на <b>fragment.com</b> через TON-кошелёк\n"
-        "2. F12 → Console → введите <code>document.cookie</code> → Enter\n"
-        "3. Скопируйте результат и пришлите сюда\n\n"
-        "<i>Формат: stel_token=...; stel_ssid=...; ...</i>\n\n"
-        "⚠️ <code>document.cookie</code> не покажет <b>stel_token</b> и "
-        "<b>stel_ssid</b> — они HttpOnly. Их берут по одной кнопкой выше "
-        "(Application → Cookies → fragment.com).\n\n" + _PHONE_HELP,
+        "2. F12 → вкладка <b>Network</b> → обновите страницу → щёлкните "
+        "любой запрос к <code>fragment.com</code>\n"
+        "3. <b>Request Headers</b> → строка <code>Cookie:</code> → "
+        "скопируйте <b>всё значение</b> и пришлите сюда\n\n"
+        "Годится и «Copy as cURL» целиком — разберу сам.\n\n"
+        "<i>Так приходят и <b>stel_token</b> с <b>stel_ssid</b>: в "
+        "<code>document.cookie</code> их нет, они HttpOnly, и именно из-за "
+        "этого их раньше приходилось вбивать по одной. Кнопки выше никуда "
+        "не делись — если удобнее по одной, они работают.</i>\n\n"
+        "⚠️ Сообщение с куками удалю сразу после разбора.\n\n" + _PHONE_HELP,
         reply_markup=_cancel_kb("plugins:stars:creds"),
     )
     await callback.answer()
