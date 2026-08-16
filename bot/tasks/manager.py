@@ -46,6 +46,13 @@ _RESTORE_BARRED_TTL = 7 * 86400
 # оплаченный заказ мог быть выдан вручную, и на маркетплейсе, где «в работу»
 # означает «выдал», нажатие по нему было бы ложным отчётом; сколько раз
 # пробовать — отказ маркетплейса не лечится повтором каждую минуту.
+from automation.fragment import BUY_TIMEOUT_SECS as _BUY_TIMEOUT_SECS
+
+# Как часто проверять, жива ли сессия Fragment. Один лёгкий запрос страницы:
+# чаще — бессмысленно (куки живут часами), реже — продавец узнаёт об
+# истечении от покупателя.
+_STARS_SESSION_EVERY = 3 * 3600
+
 _CATCHUP_PER_PASS = 3
 _CATCHUP_HOURS = 48
 _CATCHUP_TRIES = 3
@@ -2364,6 +2371,7 @@ class TaskManager:
         # Сколько TON реально ушло — считает сам кошелёк. Иначе «прибыль»
         # пришлось бы прикидывать по курсу из головы.
         spend: dict = {}
+        timed_out = False
         try:
             ok, result = await asyncio.wait_for(
                 loop.run_in_executor(
@@ -2377,10 +2385,17 @@ class TaskManager:
                         report=spend,
                         proxy=creds.get("proxy", "")),
                 ),
-                timeout=180,
+                timeout=self._STARS_BUY_TIMEOUT,
             )
+        except asyncio.TimeoutError:
+            timed_out = True
+            ok, result = False, (
+                f"покупка не завершилась за "
+                f"{int(self._STARS_BUY_TIMEOUT / 60)} мин")
         except Exception as e:
-            ok, result = False, f"ошибка: {str(e)[:100]}"
+            # У TimeoutError пустой str(), и продавцу приходило «ошибка: » без
+            # ошибки. Имя класса некрасиво, но это хотя бы факт.
+            ok, result = False, f"ошибка: {str(e)[:100] or type(e).__name__}"
 
         # Update plugin state
         pending.pop(order_id, None)
@@ -2429,6 +2444,31 @@ class TaskManager:
                     "Плагины → AutoStars → 🚀 Ручная выдача",
                 )
                 return True
+            if timed_out:
+                # Таймаут — это неизвестность, а не отказ, и обходиться с ним
+                # как с отказом нельзя. Ожидание оборвалось на нашей стороне,
+                # а поток покупки продолжает работать: он может отправить
+                # деньги через секунду после того, как мы решили «не вышло».
+                # Отчёт о тратах мы к этому моменту уже прочитали, и повтор
+                # через двадцать минут купил бы звёзды второй раз — за те же
+                # деньги продавца. Поэтому заказ уходит продавцу, а не в
+                # очередь на повтор.
+                p.setdefault("stuck", {})[order_id] = {
+                    "username": username, "quantity": qty,
+                    "reason": str(result)[:200], "unknown": True,
+                    "ts": time.time()}
+                await self._notify(
+                    user_id,
+                    f"⚠️ <b>AutoStars</b>: заказ #{order_id}, @{username}, "
+                    f"{qty}⭐ — <b>чем кончилась покупка, неизвестно</b>.\n"
+                    f"{result}.\n\n"
+                    "Деньги могли уйти уже после того, как ожидание "
+                    "оборвалось, поэтому повтор не делаю: он купил бы звёзды "
+                    "второй раз. Проверьте на fragment.com, начислены ли "
+                    "звёзды, и выдайте вручную только если их нет: "
+                    "Плагины → AutoStars → 🚀 Ручная выдача",
+                )
+                return True
             if tries < self._STARS_MAX_TRIES:
                 # Ник сохраняем: покупатель прислал его один раз и второй раз
                 # не пришлёт. Без этого заказ возвращался в ожидание пустым и
@@ -2464,6 +2504,12 @@ class TaskManager:
     # Через сколько повторить покупку, которая не удалась. Не сразу: отказ
     # чаще всего временный, но повтор через секунду упрётся в ту же причину.
     _STARS_RETRY_AFTER = 20 * 60
+
+    # Сколько ждать покупку целиком. Число одно на всех, кто её зовёт, и
+    # живёт рядом с самой цепочкой — см. `fragment.BUY_TIMEOUT_SECS`.
+    # Прежние 180 с обрывали покупку в середине, ровно там, где деньги уже
+    # могли уйти.
+    _STARS_BUY_TIMEOUT = _BUY_TIMEOUT_SECS
 
     # Сколько раз пытаться выдать звёзды по одному заказу, прежде чем оставить
     # его продавцу. Без счёта каждая неудача возвращала заказ в очередь, и
@@ -2539,6 +2585,59 @@ class TaskManager:
         return _card("⭐ <b>ЗВЁЗДЫ: ЖДУТ USERNAME</b>", lines,
                      "Покупатели не прислали @username. Напишите им или "
                      "выдайте вручную: Плагины → AutoStars")
+
+    async def _stars_session_watch(self, user_id: int, settings: dict,
+                                   now: float) -> str:
+        """Сказать про истёкшую сессию Fragment до заказа, а не во время.
+
+        Куки Fragment живут недолго — это записано в журнале приёмки как
+        отдельная находка: в один и тот же день проба видела личный раздел, а
+        через полчаса гостевую страницу с теми же куками. Без этой проверки
+        продавец узнавал об истечении в единственный момент, когда поздно:
+        покупатель прислал ник, заказ оплачен, звёзды не уходят.
+
+        Молчание — тоже ответ, но только одно: пока сессия жива, сообщений
+        нет. Предупреждение приходит один раз на истечение, и один раз —
+        когда куки переснимут.
+        """
+        p = settings.get("plugins", {}).get("auto_stars", {})
+        if not p.get("enabled"):
+            return ""
+        if (now - float(p.get("session_checked_at") or 0)) < _STARS_SESSION_EVERY:
+            return ""
+        from storage import get_fragment_creds
+        creds = get_fragment_creds(user_id)
+        if not creds or not creds.get("cookies"):
+            return ""
+        p["session_checked_at"] = now
+        loop = asyncio.get_event_loop()
+        try:
+            from automation.fragment import session_alive_sync
+            alive, why = await asyncio.wait_for(
+                loop.run_in_executor(None, session_alive_sync,
+                                     creds["cookies"], creds.get("proxy", "")),
+                timeout=40)
+        except Exception as e:
+            logger.info("AutoStars session for %s: %s", user_id, e)
+            return ""
+        was_dead = bool(p.get("session_dead"))
+        p["session_dead"] = not alive
+        if alive:
+            if was_dead:
+                return _card("⭐ <b>СЕССИЯ FRAGMENT СНОВА ЖИВА</b>",
+                             [f"Проверил: {_esc(why)}.",
+                              "Автовыдача звёзд работает."])
+            return ""
+        if was_dead:
+            return ""                  # уже сказали; повторять каждый час — шум
+        return _card("⭐ <b>СЕССИЯ FRAGMENT ИСТЕКЛА</b>",
+                     [f"Проверил: {_esc(why)}.",
+                      "",
+                      "Автовыдача звёзд сейчас не сработает: покупатель "
+                      "пришлёт ник, а купить будет нечем.",
+                      "",
+                      "Переснимите куки: Плагины → AutoStars → ⚙️ Настройки "
+                      "→ 🔑 Данные Fragment."])
 
     async def _stars_balance_watch(self, user_id: int, settings: dict,
                                    now: float) -> str:
@@ -3515,6 +3614,8 @@ class TaskManager:
                 for note in (await self._stars_pending_sweep(
                                  user_id, api, settings, now),
                              await self._stars_balance_watch(
+                                 user_id, settings, now),
+                             await self._stars_session_watch(
                                  user_id, settings, now)):
                     if note:
                         messages.append(note)

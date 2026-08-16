@@ -1390,6 +1390,169 @@ class OnlyTheFirstMessageIsPaid(Case):
         self.assertEqual(report["nano"], 1500000000)
 
 
+class ConfirmedInTheNetworkOnlyWhenItIs(Case):
+    """«Подтверждено в TON» держалось на намерении, а не на факте.
+
+    Ответ ожидания seqno выбрасывался: бот две минуты смотрел, сдвинулся ли
+    счётчик кошелька, и печатал «(подтверждено в TON)» независимо от того,
+    что увидел. Приписка означала «мы собирались подождать», а читалась как
+    «сеть провела перевод» — на ней продавец и решает, идти ли проверять
+    начисление руками.
+
+    Провал это не отменяет: перевод подписан, отправлен и принят узлом, а
+    сеть могла просто не успеть за отведённое время. Поэтому выдача
+    считается состоявшейся, но подтверждение не выдумывается.
+    """
+
+    def _buy(self, advanced: bool):
+        outer = self.fake
+        sess = outer.session()
+
+        def post(url, params=None, data=None, **kw):
+            q = dict(params or {})
+            if q.get("method") == "searchStarsRecipient":
+                return Reply({"ok": True, "found": {"recipient": "R1"}})
+            if q.get("method") == "initBuyStarsRequest":
+                return Reply({"ok": True, "req_id": "REQ-1"})
+            if q.get("method") == "getBuyStarsLink":
+                return Reply({"transaction": {"messages": [
+                    {"address": "EQ" + "A" * 46, "amount": "1500000000",
+                     "payload": ""}]}})
+            return Reply({"ok": True})
+
+        sess.post = post
+        saved = {n: getattr(F, n) for n in
+                 ("_build_signed_boc", "_send_boc", "_get_seqno",
+                  "_wait_seqno_advance", "_wallet_from_mnemonic",
+                  "_make_session")}
+        addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
+        F._wallet_from_mnemonic = lambda m, v: type("W", (), {"address": addr})()
+        F._make_session = lambda cookies, proxy='': sess
+        F._build_signed_boc = lambda *a, **k: "BOC"
+        F._send_boc = lambda boc: True
+        F._get_seqno = lambda a: 5
+        F._wait_seqno_advance = lambda a, n: advanced
+        report: dict = {}
+        try:
+            ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
+                                       100, api_hash=REAL_HASH, report=report)
+        finally:
+            for name, value in saved.items():
+                setattr(F, name, value)
+        return ok, msg, report
+
+    def test_a_confirmed_transfer_says_so(self):
+        ok, msg, _r = self._buy(True)
+        self.assertTrue(ok)
+        self.assertIn("подтверждено в TON", msg)
+
+    def test_an_unconfirmed_one_does_not(self):
+        _ok, msg, _r = self._buy(False)
+        self.assertNotIn("подтверждено в TON", msg)
+
+    def test_and_says_what_was_actually_seen(self):
+        _ok, msg, _r = self._buy(False)
+        self.assertIn("не увидел", msg)
+        self.assertIn("fragment.com", msg)
+
+    def test_it_is_still_counted_as_delivered(self):
+        """Перевод ушёл и Fragment его засчитал — объявлять провал значило бы
+        отправить продавца выдавать звёзды второй раз."""
+        ok, _msg, _r = self._buy(False)
+        self.assertTrue(ok)
+
+    def test_the_fact_is_written_down_for_the_caller(self):
+        _ok, _msg, report = self._buy(False)
+        self.assertIs(report["seqno_advanced"], False)
+        _ok, _msg, report = self._buy(True)
+        self.assertIs(report["seqno_advanced"], True)
+
+
+class TheSessionIsCheckedBeforeItIsNeeded(Case):
+    """Куки Fragment живут часами, а узнавалось об этом на кассе.
+
+    В журнале приёмки это записано отдельной находкой: в один и тот же день
+    проба видела личный раздел, через полчаса — гостевую страницу с теми же
+    куками. Пока проверки не было, продавец узнавал об истечении в худший
+    момент: заказ оплачен, покупатель прислал ник, звёзды не уходят.
+    """
+
+    def test_a_live_session_is_recognised(self):
+        alive, why = F.session_alive_sync(COOKIES)
+        self.assertTrue(alive)
+        self.assertIn("выход", why)
+
+    def test_a_guest_page_is_not(self):
+        self.fake.page = "<html>Please <a href='/login'>Log in</a></html>"
+        alive, why = F.session_alive_sync(COOKIES)
+        self.assertFalse(alive)
+        self.assertIn("гостю", why)
+
+    def test_connect_ton_is_not_taken_for_a_login(self):
+        """Кнопка «Connect TON» — признак ОБРАТНОГО. На этом слове детектор
+        входа однажды уже ошибался и докладывал «вход есть» гостю."""
+        self.fake.page = "<html><div class='ton-auth'>Connect TON</div></html>"
+        alive, _why = F.session_alive_sync(COOKIES)
+        self.assertFalse(alive)
+
+    def test_a_session_that_only_answers_a_phone_is_not_buried(self):
+        """Куки, снятые с телефона, десктопному User-Agent могут не подойти.
+        Один заголовок объявил бы рабочую сессию мёртвой, и продавец пошёл
+        бы переснимать куки без причины."""
+        sess = self.fake.session()
+
+        def get(url, **kw):
+            mobile = "Mobile" in (sess.headers.get("User-Agent") or "")
+            return Reply(None, 200,
+                         PAGE if mobile else "<html>Log in</html>")
+
+        sess.get = get
+        F._page_session = lambda cookies, proxy='': sess
+        alive, why = F.session_alive_sync(COOKIES)
+        self.assertTrue(alive)
+        self.assertIn("телефон", why)
+
+    def test_a_live_session_costs_exactly_one_request(self):
+        """Лишние запросы к Fragment — способ потерять сессию, а не
+        проверить её."""
+        calls: list = []
+        sess = self.fake.session()
+        real = sess.get
+
+        def get(url, **kw):
+            calls.append(url)
+            return real(url, **kw)
+
+        sess.get = get
+        F._page_session = lambda cookies, proxy='': sess
+        F.session_alive_sync(COOKIES)
+        self.assertEqual(len(calls), 1, calls)
+
+    def test_a_network_failure_is_not_an_expired_session(self):
+        """Переснимать куки при упавшей сети незачем, а будить продавца —
+        тем более."""
+        sess = self.fake.session()
+
+        def boom(url, **kw):
+            raise RuntimeError("сеть недоступна")
+
+        sess.get = boom
+        F._page_session = lambda cookies, proxy='': sess
+        alive, why = F.session_alive_sync(COOKIES)
+        self.assertTrue(alive)
+        self.assertIn("проверить не вышло", why)
+
+    def test_no_cookies_at_all_is_said_plainly(self):
+        alive, why = F.session_alive_sync({})
+        self.assertFalse(alive)
+        self.assertIn("не заданы", why)
+
+    def test_the_report_carries_no_secrets(self):
+        secret = "s3cr3ttoken"
+        _alive, why = F.session_alive_sync({"stel_token": secret})
+        self.assertNotIn(secret, why)
+
+
 class OneSessionForEverything(Case):
     """Последнее расхождение с документацией — и самое незаметное.
 

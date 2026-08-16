@@ -12,7 +12,7 @@ from storage import delete_token, get_token, save_token, get_settings, save_sett
 router = Router()
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-08-15-price-backfill"
+BOT_VERSION = "2026-08-15-stars-money-safety"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -123,6 +123,18 @@ async def cmd_version(message: Message) -> None:
     panel = storage.get_panel_creds(uid)
     panel_line = f"🌐 Куки панели: {'✅ есть' if panel and panel.get('cookies') else '❌ нет'}"
 
+    # Seed-фраза TON — это доступ к чужому кошельку, и лежит она в том же
+    # хранилище, что и всё остальное. Видеть, зашифрована ли она на самом
+    # деле, важнее, чем верить, что «наверное, да».
+    has_seed = bool((storage.get_fragment_creds(uid) or {}).get("mnemonic"))
+    if not has_seed:
+        seed_line = "🔐 Seed-фраза TON: не сохранена"
+    elif storage.encryption_on():
+        seed_line = "🔐 Seed-фраза TON: ✅ зашифрована"
+    else:
+        seed_line = ("🔐 Seed-фраза TON: ⚠️ <b>в открытом виде</b> — "
+                     "задайте SECRET_KEY в переменных окружения")
+
     # Время видно только внутри «Настроек», а зависит от него многое: час
     # итогов дня, окно ночного режима, граница суток в статистике. Вопрос
     # «какое время в боте» не должен требовать хождения по экранам.
@@ -141,7 +153,7 @@ async def cmd_version(message: Message) -> None:
         f"приходят по столько же раз.</i>\n\n"
         + "\n".join(storage_lines)
         + f"\n{redis_line}\n\n"
-        + f"{token_line}\n{panel_line}\n{time_line}"
+        + f"{token_line}\n{panel_line}\n{seed_line}\n{time_line}"
     )
 
 

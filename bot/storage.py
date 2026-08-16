@@ -1,6 +1,9 @@
 import json
+import logging
 import os
 import shutil
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_data_dir() -> str:
@@ -626,6 +629,76 @@ def delete_panel_creds(user_id: int) -> None:
 # Stored per active account. Never log the mnemonic or cookie values.
 # ---------------------------------------------------------------------------
 
+# Ключ шифрования seed-фразы. Берётся из окружения и в репозиторий не
+# попадает; на Railway задаётся переменной SECRET_KEY (или FRAGMENT_KEY).
+#
+# Подстраховки «нет ключа — придумаем свой» здесь нет намеренно. Ключ,
+# выведенный из чего-то, что лежит рядом с данными, шифрованием не является:
+# он создаёт ощущение защиты, а seed-фраза — это чужой кошелёк. Нет ключа —
+# храним как раньше и говорим об этом вслух в /version.
+_SECRET_KEY = (os.environ.get("FRAGMENT_KEY")
+               or os.environ.get("SECRET_KEY") or "").strip()
+_ENC_PREFIX = "enc:v1:"
+
+
+def _fernet():
+    """Шифровальщик или None, если ключа нет либо библиотека недоступна."""
+    if not _SECRET_KEY:
+        return None
+    try:
+        import base64
+        import hashlib
+
+        from cryptography.fernet import Fernet
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        # Не `Exception`: битая сборка cryptography роняет импорт
+        # `pyo3_runtime.PanicException`, а он наследуется от BaseException и
+        # мимо обычного перехвата проходит насквозь. Поймано на этой самой
+        # машине: падал не только вход в настройки, но и /version, то есть
+        # ровно та команда, которой выясняют, что происходит.
+        logger.exception("Шифрование недоступно — cryptography не загрузилась")
+        return None
+    # Ключ Fernet — ровно 32 байта в base64. Продавец задаёт произвольную
+    # строку, поэтому она приводится к нужной длине хешем, а не обрезанием:
+    # обрезание молча ослабило бы длинный ключ до первых символов.
+    digest = hashlib.sha256(_SECRET_KEY.encode("utf-8")).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def encryption_on() -> bool:
+    """Шифруется ли seed-фраза на самом деле. Показывается в /version."""
+    return _fernet() is not None
+
+
+def _seal(value: str) -> str:
+    f = _fernet()
+    if not f or not value or str(value).startswith(_ENC_PREFIX):
+        return value
+    try:
+        return _ENC_PREFIX + f.encrypt(str(value).encode("utf-8")).decode()
+    except Exception:                              # pragma: no cover
+        return value
+
+
+def _unseal(value: str) -> str:
+    """Расшифровать. Записи, сделанные до шифрования, читаются как есть."""
+    text = str(value or "")
+    if not text.startswith(_ENC_PREFIX):
+        return text
+    f = _fernet()
+    if not f:
+        # Ключ потеряли или сменили. Отдать зашифрованную строку как
+        # seed-фразу нельзя: кошелёк из неё не соберётся, а сообщение об
+        # ошибке будет про «неверную seed-фразу» вместо «нет ключа».
+        return ""
+    try:
+        return f.decrypt(text[len(_ENC_PREFIX):].encode()).decode("utf-8")
+    except Exception:
+        return ""
+
+
 def _load_fragment_creds() -> dict:
     return _read_blob("fragment_creds")
 
@@ -640,13 +713,22 @@ def get_fragment_creds(user_id: int) -> dict | None:
     # TON: отдать её другому магазину значит отдать доступ к кошельку.
     if _take_legacy(data, user_id):
         _save_fragment_data(data)
-    return data.get(_account_key(user_id))
+    creds = data.get(_account_key(user_id))
+    if not creds:
+        return creds
+    if creds.get("mnemonic"):
+        creds = {**creds, "mnemonic": _unseal(creds["mnemonic"])}
+    return creds
 
 
 def save_fragment_creds(user_id: int, creds: dict) -> None:
     data = _load_fragment_creds()
     existing = data.get(_account_key(user_id)) or {}
     existing.update(creds)
+    # Шифруется в единственном месте — на записи. Старые записи в открытом
+    # виде переезжают сюда же при первом же сохранении.
+    if existing.get("mnemonic"):
+        existing["mnemonic"] = _seal(_unseal(existing["mnemonic"]))
     data[_account_key(user_id)] = existing
     _save_fragment_data(data)
     if not _USE_DB:

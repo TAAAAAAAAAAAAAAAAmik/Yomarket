@@ -35,30 +35,58 @@ def _parse_cookies(text: str) -> dict:
     return out
 
 
-async def deliver_stars(uid: int, username: str, quantity: int) -> tuple[bool, str]:
-    """Run the blocking Fragment purchase in a thread. Returns (ok, message)."""
-    from automation.fragment import buy_stars_sync
+# Повторять покупку нельзя — деньги могли уйти. Один текст на оба ручных
+# пути, чтобы совет не разошёлся с тем, что бот делает сам.
+_DO_NOT_REPEAT = (
+    "Повторять не следует: деньги могли уйти. Проверьте на fragment.com, "
+    "начислены ли звёзды, и выдавайте заново, только если их нет."
+)
+
+
+async def deliver_stars(uid: int, username: str,
+                        quantity: int) -> tuple[bool, str, bool]:
+    """Покупка звёзд в отдельном потоке → (успех, текст, повторять нельзя).
+
+    Третье значение появилось не для красоты. Раньше исходов было два, и
+    оборванное ожидание попадало в «не вышло» вместе с обычным отказом — а
+    под «не вышло» стоит кнопка «🔁 Повторить». Поток покупки при этом
+    продолжает работать и может отправить деньги уже после обрыва: нажатие
+    покупало звёзды второй раз, за деньги продавца.
+    """
+    from automation.fragment import BUY_TIMEOUT_SECS, buy_stars_sync
     creds = get_fragment_creds(uid)
     if not creds or not creds.get("cookies") or not creds.get("mnemonic"):
         return False, ("Не настроены данные Fragment.\n"
-                       "Плагины → AutoStars → ⚙️ Настройки → 🔑 Данные Fragment")
+                       "Плагины → AutoStars → ⚙️ Настройки → 🔑 Данные Fragment"), False
     loop = asyncio.get_event_loop()
+    spend: dict = {}
     try:
-        return await asyncio.wait_for(
+        ok, msg = await asyncio.wait_for(
             loop.run_in_executor(
-                None, buy_stars_sync,
-                creds["cookies"], creds["mnemonic"], username, quantity,
-                creds.get("wallet_version", "v4r2"),
-                # Пусто — бот подберёт хеш сам; чужой даёт «Bad request».
-                creds.get("api_hash", ""),
-                proxy=creds.get("proxy", ""),
+                None, functools.partial(
+                    buy_stars_sync,
+                    creds["cookies"], creds["mnemonic"], username, quantity,
+                    creds.get("wallet_version", "v4r2"),
+                    # Пусто — бот подберёт хеш сам; чужой даёт «Bad request».
+                    creds.get("api_hash", ""),
+                    report=spend,
+                    proxy=creds.get("proxy", "")),
             ),
-            timeout=180,
+            timeout=BUY_TIMEOUT_SECS,
         )
     except asyncio.TimeoutError:
-        return False, "⏱ Fragment/TON не ответили за 180 секунд"
+        return False, (f"⏱ Покупка не завершилась за "
+                       f"{BUY_TIMEOUT_SECS // 60} мин, и чем она кончилась — "
+                       f"неизвестно.\n\n{_DO_NOT_REPEAT}"), True
     except Exception as e:
-        return False, f"Ошибка выдачи: {str(e)[:150]}"
+        # У TimeoutError пустой str(); имя класса некрасиво, но это факт, а
+        # пустая причина на экране — то же, что её отсутствие.
+        return False, f"Ошибка выдачи: {str(e)[:150] or type(e).__name__}", False
+    if not ok and spend.get("sent_onchain"):
+        ton = float(spend.get("ton") or 0)
+        return False, (f"{msg}\n\n⚠️ Списано {ton:.4f} TON — перевод ушёл, "
+                       f"а выдача не подтверждена.\n{_DO_NOT_REPEAT}"), True
+    return ok, msg, False
 
 
 class PluginState(StatesGroup):
@@ -1015,12 +1043,21 @@ async def stars_manual_amount_input(message: Message, state: FSMContext) -> None
         f"⭐ Кол-во: <b>{amount}</b>\n\n"
         f"<i>Покупка через Fragment и подтверждение в TON — до 3 минут…</i>"
     )
-    ok, msg = await deliver_stars(message.from_user.id, buyer, amount)
+    ok, msg, no_repeat = await deliver_stars(message.from_user.id, buyer, amount)
     b = InlineKeyboardBuilder()
     b.button(text="⭐ AutoStars", callback_data="plugins:auto_stars")
     if ok:
         await status.edit_text(
             f"✅ <b>Звёзды выданы!</b>\n\n{msg}", reply_markup=b.as_markup())
+    elif no_repeat:
+        # Кнопки «Повторить» здесь нет намеренно: чем кончилась покупка,
+        # неизвестно, и нажатие купило бы звёзды второй раз. Предлагать
+        # действие, которое может стоить денег на пустом месте, — это то же
+        # обещание невозможного, что и совет ответить в закрытый чат.
+        b.adjust(1)
+        await status.edit_text(
+            f"⚠️ <b>Чем кончилась выдача — неизвестно</b>\n\n{msg}",
+            reply_markup=b.as_markup())
     else:
         b.button(text="🔁 Повторить", callback_data="plugins:stars:manual")
         b.adjust(1)
@@ -1131,16 +1168,31 @@ async def stars_retry(callback: CallbackQuery) -> None:
     status = await callback.message.answer(
         f"⏳ Выдаю {qty}⭐ на @{username} по заказу #{order_id}…")
     spend: dict = {}
+    no_repeat = False
     loop = asyncio.get_event_loop()
     try:
+        from automation.fragment import BUY_TIMEOUT_SECS
         ok, msg = await asyncio.wait_for(
             loop.run_in_executor(None, functools.partial(
                 buy_stars_sync, creds["cookies"], creds["mnemonic"],
                 username, qty, creds.get("wallet_version", "v4r2"),
-                creds.get("api_hash", ""), report=spend)),
-            timeout=200)
+                creds.get("api_hash", ""), report=spend,
+                proxy=creds.get("proxy", ""))),
+            timeout=BUY_TIMEOUT_SECS)
+    except asyncio.TimeoutError:
+        # Ровно то же, что и в автоматической выдаче: оборванное ожидание —
+        # это неизвестность, а не отказ. Поток продолжает работать и может
+        # отправить деньги уже после обрыва.
+        ok, msg, no_repeat = False, (
+            f"⏱ Покупка не завершилась за {BUY_TIMEOUT_SECS // 60} мин, и чем "
+            f"она кончилась — неизвестно.\n\n{_DO_NOT_REPEAT}"), True
     except Exception as e:
-        ok, msg = False, str(e)[:150]
+        ok, msg = False, str(e)[:150] or type(e).__name__
+    if not ok and spend.get("sent_onchain"):
+        ton = float(spend.get("ton") or 0)
+        msg = (f"{msg}\n\n⚠️ Списано {ton:.4f} TON — перевод ушёл, а выдача "
+               f"не подтверждена.\n{_DO_NOT_REPEAT}")
+        no_repeat = True
 
     s = get_settings(uid)          # перечитываем: фон мог тронуть настройки
     p = s["plugins"]["auto_stars"]
@@ -1152,6 +1204,20 @@ async def stars_retry(callback: CallbackQuery) -> None:
         save_settings(uid, s)
         await status.edit_text(f"✅ <b>Выдано</b>\n\n{html.escape(str(msg)[:600])}",
                                reply_markup=_pending_kb(p))
+    elif no_repeat:
+        # Заказ остаётся в списке — кнопка выдачи нужна: продавец проверит
+        # начисление на fragment.com и решит сам. Но пометка о том, что
+        # деньги могли уйти, остаётся в записи, а не только на этом экране:
+        # через час он его уже не увидит.
+        entry = (p.get("stuck") or {}).get(order_id)
+        if isinstance(entry, dict):
+            entry["unknown"] = True
+            entry["reason"] = str(msg)[:200]
+            save_settings(uid, s)
+        await status.edit_text(
+            f"⚠️ <b>Чем кончилась выдача — неизвестно</b>\n\n"
+            f"{html.escape(str(msg)[:500])}",
+            reply_markup=_pending_kb(p))
     else:
         # Заказ остаётся в списке: неудачная попытка — не повод его потерять.
         await status.edit_text(

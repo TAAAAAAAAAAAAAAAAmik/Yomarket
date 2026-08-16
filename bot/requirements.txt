@@ -7,3 +7,6 @@ requests[socks]
 tonsdk
 psycopg2-binary
 redis
+# Шифрование seed-фразы TON в хранилище. Приходил транзитивно, но
+# держать защиту чужого кошелька на чужой зависимости нельзя.
+cryptography

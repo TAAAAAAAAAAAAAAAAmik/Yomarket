@@ -38,6 +38,14 @@ DEFAULT_HASH = ""
 SEQNO_POLL_SECS = 3
 SEQNO_MAX_WAIT_SECS = 120
 
+# Сколько ждать покупку целиком — одно число на всех, кто её зовёт. Считается
+# по самой цепочке: страница с хешем 30 + до трёх написаний ника по 30 +
+# заявка 30 + ссылка 30 + seqno 15 + отправка 20 + подтверждение 30, и сверху
+# ожидание сети. Раньше у трёх мест было три разных числа (180, 180, 200),
+# все меньше цепочки, — то есть обрыв приходился ровно туда, где деньги уже
+# могли уйти, а повтор покупал звёзды второй раз.
+BUY_TIMEOUT_SECS = 245 + SEQNO_MAX_WAIT_SECS
+
 
 def _fix_base64(s: str) -> str:
     s = s.replace("-", "+").replace("_", "/")
@@ -477,9 +485,16 @@ def buy_stars_sync(
         if len(messages) > 1:
             report["extra_messages"] = len(messages) - 1
 
-    # Документ ждёт seqno до confirmReq — так и делаем.
+    # Документ ждёт seqno до confirmReq — так и делаем. Ответ этого ожидания
+    # раньше выбрасывался, а в итоговом сообщении всё равно стояло
+    # «подтверждено в TON»: приписка держалась на том, что ждать мы вообще
+    # собирались, а не на том, что дождались. Сеть могла не показать движения
+    # за две минуты — и продавцу всё равно сообщали о подтверждении.
+    landed = True
     if wait_confirm:
-        _wait_seqno_advance(bounce_addr, seqno)
+        landed = _wait_seqno_advance(bounce_addr, seqno)
+        if report is not None:
+            report["seqno_advanced"] = landed
 
     # 8. Подтверждение. Его ответ и решает, засчитана ли оплата.
     confirm = post("confirmReq", {"id": req_id, "boc": boc,
@@ -499,6 +514,15 @@ def buy_stars_sync(
         tail = (f"\n⚠️ Fragment попросил ещё {len(messages) - 1} перевод(а) — "
                 "оплачен только первый, как в документации. Проверьте, "
                 "начислились ли звёзды.")
+    if wait_confirm and not landed:
+        # Fragment оплату засчитал, а кошелёк движения за отведённое время не
+        # показал. Это не провал: перевод подписан, отправлен и принят узлом,
+        # сеть просто могла не успеть. Но и «подтверждено» здесь — неправда.
+        return True, (
+            f"✅ {quantity}⭐ отправлены на @{username}{tail}\n"
+            f"⚠️ Подтверждения в сети за {SEQNO_MAX_WAIT_SECS} с не увидел — "
+            f"перевод отправлен и Fragment его засчитал, но проверьте "
+            f"начисление на fragment.com.")
     if wait_confirm:
         return True, (f"✅ {quantity}⭐ отправлены на @{username} "
                       f"(подтверждено в TON){tail}")
@@ -534,6 +558,53 @@ def _page_session(cookies: dict, proxy: str = "") -> requests.Session:
         "Accept-Language": "ru,en;q=0.9",
     })
     return _apply_proxy(s, proxy)
+
+
+def session_alive_sync(cookies: dict, proxy: str = "") -> tuple[bool, str]:
+    """Жива ли сессия Fragment. Один запрос, только чтение.
+
+    Куки Fragment живут недолго: в один и тот же день проба видела личный
+    раздел, через полчаса — гостевую страницу с теми же куками. Выяснялось
+    это в худший момент — когда покупатель уже прислал ник и ждёт звёзд за
+    оплаченный заказ. Отдельная лёгкая проверка нужна, чтобы сказать об этом
+    заранее, а не на кассе.
+
+    Признак входа — только `/logout` или личный раздел. Кнопка «Connect TON»
+    — признак ОБРАТНОГО, на этом детектор однажды уже ошибался.
+
+    Возвращает (жива, чем подтверждено). Секреты наружу не выходят: в
+    описании нет ни кук, ни адресов кошелька.
+    """
+    if not cookies:
+        return False, "куки Fragment не заданы"
+
+    # Сессия Fragment бывает привязана не только к куке: снятая с телефона, к
+    # десктопному User-Agent она может не подойти. Один заголовок объявил бы
+    # мёртвой рабочую сессию — и продавец пошёл бы переснимать куки без
+    # причины. Пробуем те же три строки, что и большая проба, но по очереди:
+    # первый же вход прекращает перебор, и в обычном случае запрос ровно один.
+    seen_page = False
+    last_err = ""
+    for label, agent in _USER_AGENTS:
+        session = _page_session(cookies, proxy)
+        session.headers["User-Agent"] = agent
+        try:
+            r = session.get("https://fragment.com/stars/buy", timeout=20)
+        except Exception as e:
+            last_err = str(e)[:80]
+            continue
+        seen_page = True
+        html = r.text or ""
+        if not _looks_logged_out(html):
+            what = ("вижу личный раздел" if "my assets" in html.lower()
+                    else "вижу ссылку выхода")
+            return True, f"{what} ({label})"
+    if not seen_page:
+        # Сеть не ответила — это не «сессия умерла». Разница важная: на
+        # мёртвой сессии куки надо переснимать, а на упавшей сети ничего
+        # делать не надо, и будить продавца незачем.
+        return True, f"проверить не вышло: {last_err}"
+    return False, "страница отдана гостю: ни ссылки выхода, ни «My assets»"
 
 
 _HASH_PATTERNS = (

@@ -168,8 +168,12 @@ class RetryingAFailedOrder(Base):
         self.fr.buy_stars_sync = self._buy
 
     def _buy_returns(self, ok, msg, ton=0.08):
+        # **kwargs, а не перечень: вызов покупки пополнялся и будет
+        # пополняться (прокси доехал сюда позже прочих путей), а подделка,
+        # падающая на новом аргументе, превращается в «покупка не удалась» —
+        # то есть проверяет не то, что написано в имени теста.
         def fake(cookies, mnemonic, username, qty, wallet_version="v4r2",
-                 api_hash="", wait_confirm=True, report=None):
+                 api_hash="", wait_confirm=True, report=None, **kw):
             if report is not None and ok:
                 report["ton"] = ton
             return ok, msg
@@ -328,6 +332,167 @@ class Replies(Base):
     def test_the_standard_ask_still_carries_no_at_sign(self):
         """Иначе бот вычитает «@username» из своего же вопроса как ответ."""
         self.assertNotIn("@", M.stars_text({}, "ask"))
+
+
+class ARepeatIsNotOfferedWhenItCouldCostMoney(Base):
+    """«🔁 Повторить» под оборванной покупкой — кнопка, покупающая звёзды
+    второй раз за деньги продавца.
+
+    Исходов у выдачи было два — вышло и не вышло, — и оборванное ожидание
+    попадало во второй вместе с обычным отказом Fragment. Между тем поток
+    покупки после обрыва продолжает работать: он может отправить деньги уже
+    после того, как экран сказал «не удалось». Третий исход — «неизвестно» —
+    заведён ровно для этого.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.store = base_settings(stuck={
+            "88": {"username": "vasya", "quantity": 50,
+                   "reason": "Bad request", "ts": time.time()}})
+        P.get_fragment_creds = lambda uid: {"cookies": {"a": "b"},
+                                            "mnemonic": "w " * 24}
+        P.save_settings = lambda uid, s: self.store.update(s)
+        import automation.fragment as FR
+        self.fr = FR
+        self._buy = FR.buy_stars_sync
+
+    def tearDown(self):
+        self.fr.buy_stars_sync = self._buy
+
+    def _hangs(self):
+        def fake(*a, **kw):
+            raise asyncio.TimeoutError()
+        self.fr.buy_stars_sync = fake
+
+    def _paid_but_unconfirmed(self):
+        def fake(*a, **kw):
+            if isinstance(kw.get("report"), dict):
+                kw["report"].update({"sent_onchain": True, "ton": 0.081})
+            return False, "Fragment не засчитал оплату"
+        self.fr.buy_stars_sync = fake
+
+    def _retry(self):
+        cb = CB("plugins:stars:retry:88")
+        self.run_(P.stars_retry(cb))
+        return cb
+
+    def test_an_interrupted_retry_is_not_called_a_failure(self):
+        self._hangs()
+        cb = self._retry()
+        self.assertIn("неизвестно", cb.message.last)
+        self.assertNotIn("Не вышло", cb.message.last)
+
+    def test_and_says_not_to_press_again_before_checking(self):
+        self._hangs()
+        self.assertIn("fragment.com", self._retry().message.last)
+
+    def test_the_order_keeps_the_mark_after_the_screen_is_gone(self):
+        """Через час продавец увидит только список, а не этот экран."""
+        self._hangs()
+        self._retry()
+        self.assertTrue(
+            self.store["plugins"]["auto_stars"]["stuck"]["88"].get("unknown"))
+
+    def test_money_that_already_left_is_named_with_the_amount(self):
+        self._paid_but_unconfirmed()
+        cb = self._retry()
+        self.assertIn("0.0810", cb.message.last)
+        self.assertIn("неизвестно", cb.message.last)
+
+    def test_an_ordinary_refusal_is_still_an_ordinary_refusal(self):
+        """Осторожность не должна съесть обычный путь: отказ Fragment,
+        случившийся вовремя, деньгами не пахнет и повтора не запрещает."""
+        def fake(*a, **kw):
+            return False, "снова Bad request"
+        self.fr.buy_stars_sync = fake
+        cb = self._retry()
+        self.assertIn("Не вышло", cb.message.last)
+        self.assertFalse(
+            self.store["plugins"]["auto_stars"]["stuck"]["88"].get("unknown"))
+
+
+class TheManualHandOutScreenTooo(Base):
+    """Второй ручной путь — «🚀 Ручная выдача». Там кнопка «Повторить»
+    стояла прямо под сообщением о неудаче."""
+
+    def setUp(self):
+        super().setUp()
+        import automation.fragment as FR
+        self.fr = FR
+        self._buy = FR.buy_stars_sync
+        P.get_fragment_creds = lambda uid: {"cookies": {"a": "b"},
+                                            "mnemonic": "w " * 24}
+
+    def tearDown(self):
+        self.fr.buy_stars_sync = self._buy
+
+    def deliver(self, fake):
+        self.fr.buy_stars_sync = fake
+        return self.run_(P.deliver_stars(1, "vasya", 50))
+
+    def test_an_interrupted_purchase_forbids_a_repeat(self):
+        def hangs(*a, **kw):
+            raise asyncio.TimeoutError()
+        ok, msg, no_repeat = self.deliver(hangs)
+        self.assertFalse(ok)
+        self.assertTrue(no_repeat)
+        self.assertIn("неизвестно", msg)
+
+    def test_a_purchase_that_already_paid_forbids_it_too(self):
+        def paid(*a, **kw):
+            if isinstance(kw.get("report"), dict):
+                kw["report"].update({"sent_onchain": True, "ton": 0.081})
+            return False, "не засчитал"
+        _ok, msg, no_repeat = self.deliver(paid)
+        self.assertTrue(no_repeat)
+        self.assertIn("0.0810", msg)
+
+    def test_an_ordinary_refusal_still_allows_one(self):
+        _ok, _msg, no_repeat = self.deliver(lambda *a, **kw: (False, "отказ"))
+        self.assertFalse(no_repeat)
+
+    def test_a_wordless_error_still_names_itself(self):
+        def boom(*a, **kw):
+            raise RuntimeError("")
+        _ok, msg, _n = self.deliver(boom)
+        self.assertIn("RuntimeError", msg)
+
+    def test_success_is_success(self):
+        ok, _msg, no_repeat = self.deliver(lambda *a, **kw: (True, "готово"))
+        self.assertTrue(ok)
+        self.assertFalse(no_repeat)
+
+    def screen_after(self, fake) -> Screen:
+        """Настоящий экран ручной выдачи, а не разбор её исходников."""
+        self.fr.buy_stars_sync = fake
+        out = Screen()
+
+        class Msg:
+            text = "50"
+            from_user = type("U", (), {"id": 1})()
+
+            async def answer(self, text, reply_markup=None, **kw):
+                return await out.answer(text, reply_markup, **kw)
+
+        fsm = FSM()
+        fsm.data["buyer"] = "vasya"
+        self.run_(P.stars_manual_amount_input(Msg(), fsm))
+        return out
+
+    def test_the_screen_hides_the_repeat_button_after_an_interrupted_buy(self):
+        """Проверка проводки: значение может считаться верно, а экран всё
+        равно нарисует кнопку."""
+        def hangs(*a, **kw):
+            raise asyncio.TimeoutError()
+
+        out = self.screen_after(hangs)
+        self.assertIn("неизвестно", out.last)
+        self.assertNotIn("🔁 Повторить", buttons(out.kbs[-1]))
+
+    def test_but_keeps_it_after_an_ordinary_refusal(self):
+        out = self.screen_after(lambda *a, **kw: (False, "отказ"))
+        self.assertIn("🔁 Повторить", buttons(out.kbs[-1]))
 
 
 if __name__ == "__main__":
