@@ -1499,12 +1499,40 @@ class TheCookieSwapCanBeCheckedWithoutSpendingAnything(Case):
         F._make_session = lambda cookies, proxy='': sess
         return "\n".join(F.page_rewrites_cookies_sync(COOKIES))
 
+    GUEST = ('<html><title>Fragment</title>'
+             '<div class="ton-auth">Connect TON</div></html>')
+
+    def test_a_guest_page_is_the_headline_not_a_footnote(self):
+        """Проба писалась под вопрос о куках и отвечала только на него: внизу
+        стояло «версия не подтвердилась», и продавец шёл дальше — мимо того,
+        что страница вообще отдана гостю. А это ответ на весь вопрос."""
+        got = self.probe({}, page=self.GUEST)
+        head = got.splitlines()[0]
+        self.assertIn("ГОСТЮ", head)
+
+    def test_and_says_why_that_settles_it(self):
+        got = self.probe({}, page=self.GUEST)
+        self.assertIn("только от вошедшего", got)
+        self.assertIn("ожидаем", got)
+
+    def test_and_what_to_do_next(self):
+        got = self.probe({}, page=self.GUEST)
+        self.assertIn("переснять куки", got)
+        self.assertIn("/fragment_debug", got)
+
+    def test_a_logged_in_page_says_so_first_too(self):
+        got = self.probe({})
+        self.assertIn("Вход есть", got.splitlines()[0])
+
+    def test_a_logged_in_page_is_not_told_to_re_take_cookies(self):
+        self.assertNotIn("переснять куки", self.probe({}))
+
     def test_a_swap_is_named_by_cookie(self):
         got = self.probe({"stel_token": "ГОСТЬ"})
         self.assertIn("переписаны наши куки: stel_token", got)
 
     def test_and_called_the_suspect_in_plain_words(self):
-        self.assertIn("подозреваемый", self.probe({"stel_token": "ГОСТЬ"}))
+        self.assertIn("Подмена кук", self.probe({"stel_token": "ГОСТЬ"}))
 
     def test_no_swap_is_said_just_as_plainly(self):
         got = self.probe({})

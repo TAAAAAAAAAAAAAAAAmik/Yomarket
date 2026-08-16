@@ -997,20 +997,39 @@ def page_rewrites_cookies_sync(cookies: dict, proxy: str = "") -> list[str]:
         after = dict(session.cookies)
     except Exception:
         pass
-    out.append(f"страница: {len(r.text or '')} символов")
-    out += [f"  {line}" for line in page_signals(r.text or "")[:5]]
+    html = r.text or ""
+    # Вошли или нет — первым. Проба писалась под вопрос о куках, и первая
+    # её версия отвечала только на него: строчки про вход печатались среди
+    # прочих, а вывод внизу говорил «версия не подтвердилась». Продавец
+    # читал «не подтвердилась» и шёл дальше — мимо того, что страница вообще
+    # отдана гостю, а это и есть ответ на весь вопрос.
+    if _looks_logged_out(html):
+        out.append("❌ СТРАНИЦА ОТДАНА ГОСТЮ — Fragment не узнаёт сессию.")
+        out.append("Заявку на покупку он принимает только от вошедшего, "
+                   "поэтому «Access denied» здесь ожидаем, а проверять что-то "
+                   "ещё бессмысленно, пока это так.")
+    else:
+        out.append("✅ Вход есть — Fragment узнаёт сессию.")
+    out.append(f"страница: {len(html)} символов")
+    out += [f"  {line}" for line in page_signals(html)[:5]]
     overwritten = sorted(k for k, v in before.items()
                          if k in after and after[k] != v)
     added = sorted(set(after) - set(before))
     out.append(f"переписаны наши куки: {', '.join(overwritten) or 'нет'}")
     out.append(f"добавлены страницей: {', '.join(added) or 'нет'}")
     if overwritten:
-        out.append("⚠️ Это и есть подозреваемый: заявку на покупку Fragment "
-                   "принимает только от вошедшего, а поиск получателя "
-                   "проходит и без входа. Бот теперь возвращает ваши куки "
-                   "на место сразу после чтения страницы.")
+        out.append("⚠️ Подмена кук: заявку на покупку Fragment принимает "
+                   "только от вошедшего, а поиск получателя проходит и без "
+                   "входа. Бот возвращает ваши куки на место сразу после "
+                   "чтения страницы.")
     else:
         out.append("Версия про подмену кук этой пробой не подтвердилась.")
+    if _looks_logged_out(html):
+        out.append("")
+        out.append("Что делать: переснять куки Fragment и повторить эту "
+                   "пробу. Если и с новыми страница гостевая — дело не в "
+                   "свежести, и следующий шаг /fragment_debug: он пробует "
+                   "три разных User-Agent, а сессия бывает привязана и к нему.")
     return out
 
 
