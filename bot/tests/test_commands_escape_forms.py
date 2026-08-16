@@ -53,14 +53,18 @@ class FakeMessage:
 class Bench(unittest.TestCase):
     def run_it(self, text, state):
         passed: list = []
+        self.data = {"state": state,
+                     # Ровно то, что кладёт FSM-middleware самого aiogram:
+                     # состояние он читает один раз, до нас, и фильтры
+                     # сверяются с этим значением, а не с хранилищем.
+                     "raw_state": getattr(state, "current", None)}
 
         async def handler(event, data):
             passed.append(event)
             return "выполнено"
 
         msg = FakeMessage(text)
-        got = asyncio.run(M.CommandsEscapeForms()(handler, msg,
-                                                  {"state": state}))
+        got = asyncio.run(M.CommandsEscapeForms()(handler, msg, self.data))
         return msg, got, bool(passed)
 
 
@@ -82,6 +86,31 @@ class ACommandGetsThrough(Bench):
         state = FakeState("CreateAdState:waiting_photo")
         msg, _got, _r = self.run_it("/order_debug 1218314", state)
         self.assertTrue(any("форма закрыта" in t for t in msg.said), msg.said)
+
+    def test_the_state_filter_sees_the_form_as_closed(self):
+        """Одного `clear()` мало — и это стоило отдельного круга.
+
+        Фильтр состояния сверяется не с хранилищем, а с `raw_state`, которое
+        aiogram прочитал один раз ещё до нас. Форма закрывалась, бот писал
+        «выполняю команду», а фильтр видел старое состояние и отдавал
+        сообщение той же форме: продавец получал обе строки подряд —
+        «форма закрыта» и снова «отправьте фото».
+        """
+        self.run_it("/fragment_cookies", FakeState("CreateAdState:photo"))
+        self.assertIsNone(self.data["raw_state"])
+
+    def test_the_real_aiogram_filter_agrees(self):
+        """Проверка не нашим представлением о фильтре, а самим фильтром."""
+        from aiogram.filters import StateFilter
+        self.run_it("/fragment_cookies", FakeState("CreateAdState:photo"))
+        passes = asyncio.run(StateFilter("CreateAdState:photo")(
+            FakeMessage("/fragment_cookies"),
+            raw_state=self.data["raw_state"]))
+        self.assertFalse(passes, "форма всё ещё перехватывает команду")
+
+    def test_an_untouched_form_still_holds_its_state(self):
+        self.run_it("обычный текст", FakeState("CreateAdState:photo"))
+        self.assertEqual(self.data["raw_state"], "CreateAdState:photo")
 
     def test_a_command_with_arguments_counts_as_a_command(self):
         state = FakeState("ChatState:waiting_text")
