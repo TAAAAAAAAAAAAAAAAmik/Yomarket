@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import ssl
 from typing import Any, Awaitable, Callable
 
@@ -64,6 +65,51 @@ class AccessMiddleware:
                     except Exception:
                         pass
                     return
+        return await handler(event, data)
+
+
+_COMMAND_RE = re.compile(r"^/[a-zA-Z0-9_]{1,32}(@[A-Za-z0-9_]+)?(\s|$)")
+
+
+class CommandsEscapeForms:
+    """Команда работает всегда, даже если на экране висит незаконченная форма.
+
+    Продавец вызвал `/fragment_cookies` и получил в ответ «📷 Отправьте фото
+    или нажмите „Без фото“»: за час до этого он начал создавать объявление и
+    не довёл до конца. Экран, ждущий ввода, ловит **любое** сообщение —
+    команду в том числе, — и команда не выполняется вовсе.
+
+    Экранов таких девяносто три. То есть одна брошенная форма выключала в
+    боте все команды разом, а выглядело это как поломка той команды, которую
+    в этот момент набрали. Ровно та же тишина, что была у команд-двойников,
+    только причина другая.
+
+    Middleware внешний: он должен отработать раньше фильтров, иначе состояние
+    уже перехватит сообщение. Брошенная форма при этом не исчезает молча —
+    об этом говорится одной строкой: пропажа наполовину заполненной формы
+    без объяснения удивляла бы не меньше.
+    """
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        state = data.get("state")
+        text = getattr(event, "text", "") or ""
+        if state is not None and _COMMAND_RE.match(text):
+            try:
+                current = await state.get_state()
+            except Exception:                      # хранилище FSM недоступно
+                current = None
+            if current:
+                await state.clear()
+                try:
+                    await event.answer(
+                        "↩️ Незаконченная форма закрыта — выполняю команду.")
+                except Exception:
+                    pass
         return await handler(event, data)
 
 
@@ -182,6 +228,9 @@ async def main() -> None:
     task_manager = TaskManager(bot)
     dp["task_manager"] = task_manager
 
+    # Внешний и первый: он должен отработать до фильтров состояний, иначе
+    # брошенная форма перехватит команду раньше, чем мы успеем вмешаться.
+    dp.message.outer_middleware(CommandsEscapeForms())
     dp.message.middleware(AccessMiddleware())
     dp.callback_query.middleware(AccessMiddleware())
     dp.message.middleware(YooMarketMiddleware())
