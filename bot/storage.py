@@ -59,6 +59,7 @@ _SETTINGS_FILE = os.path.join(_DATA_DIR, "settings.json")
 _PANEL_FILE = os.path.join(_DATA_DIR, "panel_creds.json")
 # Sensitive: Fragment cookies + TON wallet seed phrase. Never logged/committed.
 _FRAGMENT_FILE = os.path.join(_DATA_DIR, "fragment_creds.json")
+_NS_FILE = os.path.join(_DATA_DIR, "ns_creds.json")
 _ADMIN_FILE = os.path.join(_DATA_DIR, "admin.json")
 
 _DEFAULT_SETTINGS = {
@@ -257,6 +258,7 @@ _BLOBS = {
     "settings": _SETTINGS_FILE,
     "panel_creds": _PANEL_FILE,
     "fragment_creds": _FRAGMENT_FILE,
+    "ns_creds": _NS_FILE,
     "admin": _ADMIN_FILE,
 }
 
@@ -736,6 +738,56 @@ def save_fragment_creds(user_id: int, creds: dict) -> None:
             os.chmod(_FRAGMENT_FILE, 0o600)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Доступ к поставщику ns.gifts: {user_id, login, password, api_secret, proxy}.
+# Шифруются пароль и секрет — вместе они дают право тратить баланс кабинета.
+# ---------------------------------------------------------------------------
+
+# Что именно прячем. Логин и user_id не секреты сами по себе, но без пароля и
+# ключа они бесполезны, поэтому шифруем ровно те два поля, ради которых стоит
+# заводить шифрование.
+_NS_SECRET_FIELDS = ("api_secret", "password")
+
+
+def ns_fields() -> tuple[str, ...]:
+    """Какие поля нужны для входа к поставщику — один список на бота."""
+    return ("user_id", "login", "password", "api_secret")
+
+
+def get_ns_creds(user_id: int) -> dict:
+    data = _read_blob("ns_creds")
+    creds = dict(data.get(_account_key(user_id)) or {})
+    for field in _NS_SECRET_FIELDS:
+        if creds.get(field):
+            creds[field] = _unseal(creds[field])
+    return creds
+
+
+def save_ns_creds(user_id: int, creds: dict) -> None:
+    data = _read_blob("ns_creds")
+    existing = dict(data.get(_account_key(user_id)) or {})
+    existing.update(creds)
+    for field in _NS_SECRET_FIELDS:
+        if existing.get(field):
+            # Как и у seed-фразы: шифруем на записи и только один раз —
+            # `_unseal` перед `_seal` не даёт нарастить второй слой.
+            existing[field] = _seal(_unseal(existing[field]))
+    data[_account_key(user_id)] = existing
+    _write_blob("ns_creds", data)
+    if not _USE_DB:
+        try:
+            os.chmod(_NS_FILE, 0o600)
+        except OSError:
+            pass
+
+
+def delete_ns_creds(user_id: int) -> None:
+    data = _read_blob("ns_creds")
+    data.pop(_account_key(user_id), None)
+    data.pop(str(user_id), None)
+    _write_blob("ns_creds", data)
 
 
 def delete_fragment_creds(user_id: int) -> None:
