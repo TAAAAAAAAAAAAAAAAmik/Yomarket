@@ -76,6 +76,44 @@ class Fake:
         return self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
 
 
+class FakeSession:
+    """Сессия-подставка.
+
+    И рабочие вызовы, и проба ходят через `_session` — одну точку на весь
+    модуль. Пока проба ходила мимо неё, напрямую через `requests.get`, тесты
+    подменяли не то, что работает, а прогон уходил в настоящую сеть и
+    растягивался на полминуты.
+    """
+
+    def __init__(self, answer, proxy=""):
+        self.answer = answer
+        self.proxy = proxy
+        self.proxies: dict = {}
+        self.calls: list[dict] = []
+        if proxy:
+            self.proxies.update({"http": proxy, "https": proxy})
+
+    def get(self, url, headers=None, timeout=None):
+        self.calls.append({"url": url, "headers": dict(headers or {}),
+                           "proxies": dict(self.proxies)})
+        return self.answer(url)
+
+
+def patch_session(case, answer):
+    """Подменить сессию на время теста и вернуть список созданных."""
+    made: list[FakeSession] = []
+    real = A._session
+
+    def factory(proxy=""):
+        s = FakeSession(answer, proxy)
+        made.append(s)
+        return s
+
+    A._session = factory
+    case.addCleanup(lambda: setattr(A, "_session", real))
+    return made
+
+
 def client(fake, **over):
     c = A.ARClient(**{**{"api_key": KEY}, **over})
     c.session = fake
@@ -314,15 +352,11 @@ class TheProbePrintsValuesNotJustFieldNames(unittest.TestCase):
     диагностика, которая говорит «форма не та» и молчит о причине."""
 
     def setUp(self):
-        self._get = A.requests.get
-        A.requests.get = lambda url, headers=None, timeout=None: Reply({
+        patch_session(self, lambda url: Reply({
             "data": None, "errorCode": "UNAUTHORIZED", "errors": None,
             "status": False, "statusCode": 401,
             "statusMessage": "API key is not allowed from IP 1.2.3.4",
-            "traceId": "4af69e7d"})
-
-    def tearDown(self):
-        A.requests.get = self._get
+            "traceId": "4af69e7d"}))
 
     def test_the_message_value_is_in_the_report(self):
         rows = A.probe_sync(CREDS)
@@ -341,18 +375,80 @@ class TheProbePrintsValuesNotJustFieldNames(unittest.TestCase):
         self.assertIn("null", A.probe_sync(CREDS)[0]["data"])
 
     def test_data_contents_are_described_not_dumped(self):
-        A.requests.get = lambda url, headers=None, timeout=None: Reply({
+        patch_session(self, lambda url: Reply({
             "data": {"ip": "1.2.3.4", "account": "x"}, "traceId": "t",
-            "statusCode": 200})
+            "statusCode": 200}))
         self.assertIn("ip", A.probe_sync(CREDS)[0]["data"])
 
     def test_the_key_is_cut_out_of_values_too(self):
         """Поставщик вполне может вернуть ключ в тексте своей же ошибки."""
-        A.requests.get = lambda url, headers=None, timeout=None: Reply({
+        patch_session(self, lambda url: Reply({
             "statusMessage": f"key {KEY} rejected", "errorCode": "UNAUTHORIZED",
-            "traceId": "t"})
+            "traceId": "t"}))
         blob = json.dumps(A.probe_sync(CREDS), ensure_ascii=False)
         self.assertNotIn(KEY, blob)
+
+
+class EveryRequestGoesTheSameWayIncludingTheDiagnostics(unittest.TestCase):
+    """Белый список у поставщика привязан к адресу, с которого мы приходим.
+    Значит проба обязана идти тем же маршрутом, что и рабочие вызовы: первая
+    версия ходила напрямую, а каталог и баланс — через прокси продавца, и
+    отчёт показывал бы адрес, с которого поставщик нас вообще не видит.
+    Диагностика, врущая про собственный маршрут, хуже её отсутствия."""
+
+    PROXY = "http://user:pass@1.2.3.4:8080"
+
+    def test_the_probe_uses_the_sellers_proxy(self):
+        made = patch_session(self, lambda url: Reply(envelope("OK", data={})))
+        A.probe_sync({**CREDS, "proxy": self.PROXY})
+        self.assertTrue(made, "сессия не создавалась вовсе")
+        self.assertTrue(all(s.proxy == self.PROXY for s in made))
+
+    def test_the_working_calls_use_it_too(self):
+        made = patch_session(self, lambda url: Reply(envelope("OK", data={})))
+        A._client({**CREDS, "proxy": self.PROXY})
+        self.assertEqual(made[-1].proxy, self.PROXY)
+
+    def test_without_a_proxy_nothing_is_routed_anywhere(self):
+        made = patch_session(self, lambda url: Reply(envelope("OK", data={})))
+        A._client(dict(CREDS))
+        self.assertEqual(made[-1].proxies, {})
+
+    def test_the_session_carries_the_proxy_to_requests(self):
+        """Проверка самой сборки сессии, без подмены."""
+        s = A._session(self.PROXY)
+        self.assertEqual(s.proxies.get("https"), self.PROXY)
+
+
+class TheProxyPasswordIsNeverShown(unittest.TestCase):
+    """В строке прокси логин и пароль от платного адреса — чужой доступ
+    ровно так же, как ключ."""
+
+    PROXY = "socks5://vasya:secret-pass@5.6.7.8:1080"
+
+    def test_the_label_keeps_only_host_and_port(self):
+        label = A.proxy_label({"proxy": self.PROXY})
+        self.assertIn("5.6.7.8", label)
+        self.assertNotIn("secret-pass", label)
+        self.assertNotIn("vasya", label)
+
+    def test_no_proxy_says_so_plainly(self):
+        self.assertEqual(A.proxy_label({}), "не задан")
+
+    def test_a_socks_proxy_without_the_package_is_flagged_before_the_request(self):
+        """Иначе продавец получит английское «Missing dependencies for SOCKS
+        support» вместо ответа — то есть отписку."""
+        import automation.fragment as F
+        real = F.proxy_problem
+        F.proxy_problem = lambda url: ("для socks5 нужен пакет PySocks"
+                                       if str(url).startswith("socks") else "")
+        self.addCleanup(lambda: setattr(F, "proxy_problem", real))
+        self.assertIn("PySocks", A.proxy_problem({"proxy": self.PROXY}))
+        self.assertEqual(A.proxy_problem({"proxy": "http://1.2.3.4:8080"}), "")
+
+    def test_the_stored_proxy_is_encrypted_like_the_key(self):
+        import storage
+        self.assertIn("proxy", storage._AR_SECRET_FIELDS)
 
 
 class TheAllowlistIsTheFirstThingToCheck(unittest.TestCase):
@@ -406,17 +502,12 @@ class TheRawProbeAsksBothDashboards(unittest.TestCase):
     approute.io, и какой из них наш — вопрос к серверу, а не к нам."""
 
     def setUp(self):
-        self.calls: list = []
-        self._get = A.requests.get
+        self.made = patch_session(
+            self, lambda url: Reply(envelope("OK", data={"ip": "1.2.3.4"})))
 
-        def fake_get(url, headers=None, timeout=None):
-            self.calls.append({"url": url, "headers": dict(headers or {})})
-            return Reply(envelope("OK", data={"ip": "1.2.3.4"}))
-
-        A.requests.get = fake_get
-
-    def tearDown(self):
-        A.requests.get = self._get
+    @property
+    def calls(self):
+        return [c for s in self.made for c in s.calls]
 
     def test_both_dashboards_are_asked(self):
         A.probe_sync(CREDS)
@@ -437,33 +528,30 @@ class TheRawProbeAsksBothDashboards(unittest.TestCase):
             self.assertEqual(row["code"], "OK")
 
     def test_a_body_that_is_not_json_is_quoted_as_it_came(self):
-        A.requests.get = lambda url, headers=None, timeout=None: Reply(
-            None, code=502)
+        patch_session(self, lambda url: Reply(None, code=502))
         rows = A.probe_sync(CREDS)
         self.assertTrue(all(not r["json"] for r in rows))
 
     def test_a_dead_host_does_not_stop_the_other_one(self):
         """Половина фактов лучше, чем трассировка вместо отчёта."""
-        def half(url, headers=None, timeout=None):
+        def half(url):
             if "approute.ru" in url:
                 raise A.requests.ConnectionError("no route to host")
             return Reply(envelope("OK", data={}))
 
-        A.requests.get = half
+        patch_session(self, half)
         rows = A.probe_sync(CREDS)
         self.assertTrue(any(r["error"] for r in rows))
         self.assertTrue(any(r["http"] == 200 for r in rows))
 
     def test_the_key_never_appears_in_the_probe_output(self):
-        A.requests.get = lambda url, headers=None, timeout=None: Reply(
-            None, code=418)
+        patch_session(self, lambda url: Reply(None, code=418))
         blob = json.dumps(A.probe_sync(CREDS), ensure_ascii=False)
         self.assertNotIn(KEY, blob)
 
     def test_the_key_is_cut_out_even_if_the_server_echoes_it(self):
         """Поставщик вполне может вернуть его в тексте ошибки."""
-        A.requests.get = lambda url, headers=None, timeout=None: Reply(
-            None, code=400)
+        patch_session(self, lambda url: Reply(None, code=400))
         real_redact = A._redact
         self.assertIn("вырезан", real_redact(f"bad key {KEY}", KEY))
         self.assertNotIn(KEY, real_redact(f"bad key {KEY}", KEY))

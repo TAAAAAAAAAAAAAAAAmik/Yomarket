@@ -143,6 +143,21 @@ def base_url_of(creds: dict) -> str:
     return BASE_URLS.get(region, BASE_URL)
 
 
+def _session(proxy: str = "") -> requests.Session:
+    """Сессия для запросов к поставщику — одна точка на весь модуль.
+
+    Через неё ходят и рабочие вызовы, и диагностика: иначе проба показывала
+    бы адрес, с которого поставщик нас вообще не видит. Заодно это
+    единственное место подмены для тестов — с прямым `requests.get` прогон
+    уходил в настоящую сеть.
+    """
+    s = requests.Session()
+    url = (proxy or "").strip()
+    if url:
+        s.proxies.update({"http": url, "https": url})
+    return s
+
+
 class ARClient:
     """Клиент на одну сессию. Авторизация — один заголовок."""
 
@@ -151,9 +166,7 @@ class ARClient:
         self.api_key = str(api_key or "").strip()
         self.base = (base_url or BASE_URL).rstrip("/")
         self.max_retries = max(0, int(max_retries or 0))
-        self.session = requests.Session()
-        if proxy:
-            self.session.proxies.update({"http": proxy, "https": proxy})
+        self.session = _session(proxy)
 
     def call(self, method: str, path: str, *, params: dict | None = None,
              json_body: dict | None = None):
@@ -292,6 +305,34 @@ def _retry_after(r) -> float:
 # Готовые вызовы. Блокирующие — звать через executor.
 # ---------------------------------------------------------------------------
 
+def proxy_problem(creds: dict) -> str:
+    """Что мешает пользоваться заданным прокси. Пусто — ничего.
+
+    Разбор общий с Fragment: там socks5 без PySocks уже показывал продавцу
+    «Missing dependencies for SOCKS support» вместо ответа, и второй раз
+    писать то же самое незачем.
+    """
+    from automation.fragment import proxy_problem as check
+    return check(str((creds or {}).get("proxy") or ""))
+
+
+def proxy_label(creds: dict) -> str:
+    """Прокси для показа: только хост и порт, без логина и пароля."""
+    from automation.fragment import proxy_label as label
+    return label(str((creds or {}).get("proxy") or ""))
+
+
+def outbound_ip(creds: dict) -> str:
+    """С какого адреса нас видит интернет — с прокси или без него.
+
+    Это тот адрес, который надо вписать в белый список кабинета. Спрашивается
+    у стороннего сервиса, а не у AppRoute: `/whoami` доступен только когда
+    ключ уже принят, а узнать адрес нужно как раз до этого.
+    """
+    from automation.fragment import outbound_ip as ip
+    return ip(str((creds or {}).get("proxy") or ""))
+
+
 def _client(creds: dict) -> ARClient:
     return ARClient(str((creds or {}).get("api_key") or ""),
                     base_url_of(creds), str((creds or {}).get("proxy") or ""))
@@ -356,6 +397,12 @@ def probe_sync(creds: dict) -> list[dict]:
     он вырезается.
     """
     key = str((creds or {}).get("api_key") or "")
+    # Проба обязана идти тем же путём, что и рабочие вызовы. Первая версия
+    # ходила напрямую через `requests.get`, а покупки и каталог — через
+    # прокси продавца: тогда отчёт показывал бы адрес, с которого поставщик
+    # нас вообще не видит. Диагностика, врущая про свой же маршрут, хуже её
+    # отсутствия.
+    session = _session(str((creds or {}).get("proxy") or ""))
     out: list[dict] = []
     for region, base in BASE_URLS.items():
         for path in ("/whoami", "/accounts"):
@@ -363,7 +410,7 @@ def probe_sync(creds: dict) -> list[dict]:
                    "keys": [], "code": "", "trace": "", "said": "",
                    "excerpt": "", "error": "", "fields": {}, "data": ""}
             try:
-                r = requests.get(
+                r = session.get(
                     base + path,
                     headers={"X-API-Key": key, "Accept": "application/json"},
                     timeout=TIMEOUT)

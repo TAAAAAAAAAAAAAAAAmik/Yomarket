@@ -49,12 +49,14 @@ _ALIASES = {
     "api_key": ("api_key", "apikey", "key", "x-api-key", "ключ", "апиключ",
                 "api-key", "token", "токен"),
     "region": ("region", "регион", "кабинет", "домен"),
+    "proxy": ("proxy", "прокси", "proxy_url"),
 }
 
 
 class ARState(StatesGroup):
     key = State()
     search = State()
+    proxy = State()
 
 
 def parse_creds(text: str) -> dict:
@@ -208,19 +210,30 @@ async def _whoami_text(creds: dict) -> str:
     меняется при каждом деплое. Когда ключ «не сработал», это первое, что
     надо посмотреть, — и узнать это можно только отсюда, с самого сервера.
     """
-    from automation.approute import whoami_sync
+    from automation.approute import outbound_ip, proxy_label, whoami_sync
 
     loop = asyncio.get_event_loop()
     try:
         ok, data = await asyncio.wait_for(
             loop.run_in_executor(None, whoami_sync, creds), timeout=60)
     except Exception as e:
-        return f"❌ {html.escape(str(e)[:300])}"
+        ok, data = False, str(e)[:300]
     if not ok:
+        # Адрес нужен именно тогда, когда ключ ещё не приняли: его и
+        # вписывают в белый список. Спрашивать его у AppRoute бесполезно —
+        # он отвечает только принятому ключу, — поэтому берём у стороннего
+        # сервиса, тем же маршрутом (через прокси, если он задан).
+        mine = await asyncio.wait_for(
+            loop.run_in_executor(None, outbound_ip, creds), timeout=40)
+        route = ("через прокси " + proxy_label(creds) if creds.get("proxy")
+                 else "напрямую с сервера")
         return (f"❌ {html.escape(str(data)[:600])}\n\n"
-                f"<i>Если здесь сказано про адрес или права — сверьте белый "
-                f"список IP в кабинете: командой из кабинета он проверяется "
-                f"так же, как этой кнопкой.</i>")
+                f"📍 <b>Наш адрес наружу: <code>{html.escape(mine)}</code></b>\n"
+                f"   маршрут: {html.escape(route)}\n\n"
+                f"<i>Это тот адрес, который нужно вписать в белый список "
+                f"кабинета. Если бот живёт на Railway, он меняется при каждом "
+                f"выкате — тогда нужен прокси с постоянным адресом, кнопка "
+                f"«🌐 Прокси».</i>")
     lines = ["🪪 <b>Поставщик отвечает:</b>"]
     if isinstance(data, dict):
         for k, v in list(data.items())[:15]:
@@ -431,10 +444,11 @@ def _creds_kb(creds: dict) -> InlineKeyboardMarkup:
         b.button(text="🧪 Проверить ключ", callback_data="apr:check")
         b.button(text="📦 Каталог", callback_data="apr:stock")
         b.button(text="🪪 Наш IP у поставщика", callback_data="apr:whoami")
+        b.button(text="🌐 Прокси", callback_data="apr:proxy")
         b.button(text="🔎 Что отвечает сервер", callback_data="apr:debug")
         b.button(text="🗑 Удалить ключ", callback_data="apr:del")
     b.button(text="⬅️ Назад", callback_data="plugins:auto_roblox")
-    b.adjust(1, 1, 2, 2, 1, 1)
+    b.adjust(1, 1, 2, 2, 1, 1, 1)
     return b.as_markup()
 
 
@@ -451,6 +465,14 @@ def _creds_text(creds: dict) -> str:
         lines.append("▫️ Ключ: <i>не задан</i>")
     label, about = _REGIONS.get(region, _REGIONS["io"])
     lines.append(f"🌍 Кабинет: <b>{label}</b> — {about}")
+    from automation.approute import proxy_label, proxy_problem
+    mark = "🟢" if creds.get("proxy") else "⚪"
+    lines.append(f"{mark} 🌐 Прокси: <code>{html.escape(proxy_label(creds))}</code>")
+    trouble = proxy_problem(creds)
+    if trouble:
+        # Иначе socks5 падает уже внутри запроса, и продавец видит английскую
+        # строку про зависимости вместо ответа.
+        lines.append(f"   ⚠️ {html.escape(trouble)}")
     lines.append("")
     if key:
         lines.append("«🧪 Проверить ключ» спросит баланс — это только чтение, "
@@ -553,6 +575,74 @@ async def apr_key_input(message: Message, state: FSMContext) -> None:
         return
     save_ar_creds(message.from_user.id, {"api_key": got["api_key"]})
     await _show_creds(message, message.from_user.id, "✅ Ключ сохранён.")
+
+
+@router.callback_query(F.data == "apr:proxy")
+async def apr_proxy_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    """Ввод прокси. Он же — единственный способ дать боту постоянный адрес.
+
+    У AppRoute белый список IP, а на Railway адрес меняется при каждом
+    выкате. Прокси со своим постоянным адресом решает это: в список
+    вписывается он, а не сервер.
+    """
+    await state.set_state(ARState.proxy)
+    b = InlineKeyboardBuilder()
+    if get_ar_creds(callback.from_user.id).get("proxy"):
+        b.button(text="🗑 Убрать прокси", callback_data="apr:proxy_off")
+    b.button(text="⬅️ Отмена", callback_data="apr:creds")
+    b.adjust(1)
+    await callback.message.edit_text(
+        "🌐 <b>Прокси для запросов к AppRoute</b>\n\n"
+        "Нужен, если у поставщика включён белый список адресов: туда "
+        "вписывается адрес <b>прокси</b>, а не сервера.\n\n"
+        "Пришлите одной строкой:\n"
+        "<code>http://логин:пароль@адрес:порт</code>\n"
+        "<code>socks5://логин:пароль@адрес:порт</code>\n\n"
+        "⚠️ Адрес у прокси должен быть <b>постоянным</b>. Дешёвые прокси "
+        "часто меняют его на каждый запрос — такой в белый список не "
+        "впишешь.\n\n"
+        "<i>Ключ прокси-провайдеру не достаётся: соединение с AppRoute "
+        "шифруется, и через прокси видно только имя сайта.</i>",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.message(ARState.proxy)
+async def apr_proxy_input(message: Message, state: FSMContext) -> None:
+    from automation.approute import proxy_problem
+
+    value = (message.text or "").strip()
+    await state.clear()
+    # В строке прокси обычно логин и пароль — удаляем, как и ключ.
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if not value:
+        await _show_creds(message, message.from_user.id,
+                          "⚠️ Пустое значение — ничего не изменил.")
+        return
+    trouble = proxy_problem({"proxy": value})
+    if trouble:
+        # Сохранить всё равно сохраним: адрес может быть верным, а мешает
+        # сборка. Но сказать надо сразу, а не при первом же запросе.
+        await _show_creds(message, message.from_user.id,
+                          f"⚠️ Сохранил, но: {html.escape(trouble)}")
+        save_ar_creds(message.from_user.id, {"proxy": value})
+        return
+    save_ar_creds(message.from_user.id, {"proxy": value})
+    await _show_creds(message, message.from_user.id,
+                      "✅ Прокси сохранён. Проверьте «🪪 Наш IP у поставщика»: "
+                      "там должен появиться адрес прокси — его и вписывайте "
+                      "в белый список.")
+
+
+@router.callback_query(F.data == "apr:proxy_off")
+async def apr_proxy_off(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    save_ar_creds(callback.from_user.id, {"proxy": ""})
+    await _show_creds(callback, callback.from_user.id, "🗑 Прокси убран.")
+    await callback.answer()
 
 
 @router.callback_query(F.data == "apr:check")
