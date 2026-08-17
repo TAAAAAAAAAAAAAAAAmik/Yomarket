@@ -389,6 +389,19 @@ class TheAccessIsEnteredByButtons(unittest.TestCase):
         self.assertNotIn(PASSWORD, cb.message.last)
         self.assertIn("символов", cb.message.last)
 
+    def test_encryption_is_promised_only_when_it_is_real(self):
+        """Без `SECRET_KEY` пароль ложится в базу открытым — и экран обязан
+        это сказать, а не обещать шифрование."""
+        self.saved.update({"login": "candbug", "api_secret": SECRET})
+        real = H.encryption_on
+        try:
+            H.encryption_on = lambda: False
+            said = self.screen().message.last
+            self.assertIn("в открытом виде", said)
+            self.assertNotIn("хранятся зашифрованными", said)
+        finally:
+            H.encryption_on = real
+
     def test_the_login_is_shown_as_is(self):
         """Он не секрет, и видеть его полезно: опечатку иначе не заметить."""
         self.saved["login"] = "candbug"

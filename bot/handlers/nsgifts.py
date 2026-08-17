@@ -23,7 +23,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from storage import delete_ns_creds, get_ns_creds, ns_fields, save_ns_creds
+from storage import (delete_ns_creds, encryption_on, get_ns_creds, ns_fields,
+                     save_ns_creds)
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -286,8 +287,15 @@ def _creds_text(creds: dict) -> str:
         lines.append("Всё на месте. «🧪 Проверить вход» спросит баланс — "
                      "это только чтение, денег не тратит.")
     lines.append("")
-    lines.append("<i>Пароль и ключ хранятся зашифрованными. Сообщения с ними "
-                 "удаляю сразу после разбора.</i>")
+    # Та же оговорка, что и на экране AppRoute: без `SECRET_KEY` шифрования
+    # нет, и обещать его нельзя.
+    if encryption_on():
+        lines.append("<i>Пароль и ключ хранятся зашифрованными. Сообщения с "
+                     "ними удаляю сразу после разбора.</i>")
+    else:
+        lines.append("⚠️ <i>Пароль и ключ лягут в базу <b>в открытом виде</b>: "
+                     "на сервере не задана переменная <code>SECRET_KEY</code>. "
+                     "Сообщения с ними удаляю в любом случае.</i>")
     return "\n".join(lines)
 
 

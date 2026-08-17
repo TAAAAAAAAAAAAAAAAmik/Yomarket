@@ -1587,12 +1587,15 @@ def _roblox_keyboard(settings: dict) -> InlineKeyboardMarkup:
     builder.button(text="🔔 Уведомления", callback_data="plugins:roblox:notifs")
     builder.button(text="💬 Ответы", callback_data="plugins:roblox:replies")
     # Доступ к поставщику — отсюда же: искать его отдельной командой продавцу
-    # неоткуда, а без него в этом разделе не работает ничего.
-    builder.button(text="🔑 Поставщик ns.gifts", callback_data="ns:creds")
+    # неоткуда, а без него в этом разделе не работает ничего. Поставщик
+    # выбран — AppRoute; ns.gifts остаётся второй кнопкой, потому что
+    # сравнивать закупочную цену не с чем, если кабинет виден только один.
+    builder.button(text="🔑 Поставщик AppRoute", callback_data="apr:creds")
+    builder.button(text="🔑 ns.gifts (сравнить цену)", callback_data="ns:creds")
     builder.button(text="▶️ Включить" if not enabled else "⏸ Выключить", callback_data="plugins:roblox:toggle")
     builder.button(text="⚙️ Настройки", callback_data="plugins:roblox:settings")
     builder.button(text="⬅️ Назад", callback_data="plugins:menu")
-    builder.adjust(2, 2, 2, 1, 1, 2)
+    builder.adjust(2, 2, 2, 1, 1, 1, 2)
     return builder.as_markup()
 
 

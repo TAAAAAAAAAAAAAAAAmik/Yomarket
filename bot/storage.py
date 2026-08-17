@@ -60,6 +60,7 @@ _PANEL_FILE = os.path.join(_DATA_DIR, "panel_creds.json")
 # Sensitive: Fragment cookies + TON wallet seed phrase. Never logged/committed.
 _FRAGMENT_FILE = os.path.join(_DATA_DIR, "fragment_creds.json")
 _NS_FILE = os.path.join(_DATA_DIR, "ns_creds.json")
+_AR_FILE = os.path.join(_DATA_DIR, "approute_creds.json")
 _ADMIN_FILE = os.path.join(_DATA_DIR, "admin.json")
 
 _DEFAULT_SETTINGS = {
@@ -259,6 +260,7 @@ _BLOBS = {
     "panel_creds": _PANEL_FILE,
     "fragment_creds": _FRAGMENT_FILE,
     "ns_creds": _NS_FILE,
+    "approute_creds": _AR_FILE,
     "admin": _ADMIN_FILE,
 }
 
@@ -788,6 +790,58 @@ def delete_ns_creds(user_id: int) -> None:
     data.pop(_account_key(user_id), None)
     data.pop(str(user_id), None)
     _write_blob("ns_creds", data)
+
+
+# ---------------------------------------------------------------------------
+# Доступ к поставщику AppRoute: {api_key, region}. Шифруется ключ — он один
+# и даёт право тратить баланс кабинета целиком.
+# ---------------------------------------------------------------------------
+
+_AR_SECRET_FIELDS = ("api_key",)
+
+
+def ar_fields() -> tuple[str, ...]:
+    """Что нужно для входа к AppRoute — один список на бота.
+
+    Регион сюда не входит: у него есть значение по умолчанию, и требовать
+    его выбора значит держать продавца перед экраном, который и так знает
+    ответ.
+    """
+    return ("api_key",)
+
+
+def get_ar_creds(user_id: int) -> dict:
+    data = _read_blob("approute_creds")
+    creds = dict(data.get(_account_key(user_id)) or {})
+    for field in _AR_SECRET_FIELDS:
+        if creds.get(field):
+            creds[field] = _unseal(creds[field])
+    return creds
+
+
+def save_ar_creds(user_id: int, creds: dict) -> None:
+    data = _read_blob("approute_creds")
+    existing = dict(data.get(_account_key(user_id)) or {})
+    existing.update(creds)
+    for field in _AR_SECRET_FIELDS:
+        if existing.get(field):
+            # Как у seed-фразы: шифруем на записи и только один раз —
+            # `_unseal` перед `_seal` не даёт нарастить второй слой.
+            existing[field] = _seal(_unseal(existing[field]))
+    data[_account_key(user_id)] = existing
+    _write_blob("approute_creds", data)
+    if not _USE_DB:
+        try:
+            os.chmod(_AR_FILE, 0o600)
+        except OSError:
+            pass
+
+
+def delete_ar_creds(user_id: int) -> None:
+    data = _read_blob("approute_creds")
+    data.pop(_account_key(user_id), None)
+    data.pop(str(user_id), None)
+    _write_blob("approute_creds", data)
 
 
 def delete_fragment_creds(user_id: int) -> None:

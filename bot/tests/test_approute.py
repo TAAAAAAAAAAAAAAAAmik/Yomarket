@@ -1,0 +1,745 @@
+"""Поставщик AppRoute: конверт ответа, отказы, каталог и ключ.
+
+Поставщик выбран, и с него начинается автовыдача Robux. Проверяется в первую
+очередь то, на чём этот проект уже обжигался.
+
+**Главное здесь — конверт.** У AppRoute «получилось ли» отвечает поле `code`
+внутри тела, а не статус HTTP: «нет в наличии» и «не хватает денег» приезжают
+с HTTP 200. Клиент, который смотрит на статус, будет бодро докладывать об
+успехе там, где ничего не произошло, — это самая дорогая поломка в этом
+проекте, и её ловят первые же тесты.
+
+**Второе — camelCase на проводе.** В SDK поля пишутся `item_id`, но его
+транспорт переводит их в `itemId` перед отправкой. Мы идём без SDK, значит
+имена наши собственные, и разойтись с сервером здесь так же легко, как
+разошлись с Fragment.
+
+**Третье — ключ наружу не выходит.** Он один даёт право тратить баланс
+кабинета целиком.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("BOT_TOKEN", "x")
+
+from automation import approute as A          # noqa: E402
+from handlers import approute as H            # noqa: E402
+
+# Заведомо не ключ: сканер секретов у GitHub видит в `sk_live_` + сплошной
+# алфавит ключ Stripe и отклоняет пуш целиком. Дефисы ломают этот шаблон, а
+# для теста важна только длина и узнаваемость.
+KEY = "sk_live_test-not-a-real-key-0000-0000-0000"
+CREDS = {"api_key": KEY, "region": "io"}
+
+
+def envelope(code="OK", data=None, message="", trace="tr-1", errors=None):
+    """Ответ в том виде, в каком его отдаёт поставщик."""
+    body = {"status": "completed", "code": code, "message": message,
+            "traceId": trace, "data": data}
+    if errors:
+        body["errors"] = errors
+    return body
+
+
+class Reply:
+    def __init__(self, payload, code=200, headers=None):
+        self.status_code = code
+        self._payload = payload
+        self.headers = headers or {}
+        self.text = "" if payload is None else json.dumps(payload)
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("not json")
+        return self._payload
+
+
+class Fake:
+    """Сервер поставщика: отдаёт заготовленные ответы и помнит запросы."""
+
+    def __init__(self, *replies):
+        self.replies = list(replies) or [Reply(envelope(data={}))]
+        self.seen: list[dict] = []
+        self.proxies: dict = {}
+
+    def request(self, method, url, headers=None, params=None, json=None,
+                timeout=None):
+        self.seen.append({"method": method, "url": url,
+                          "headers": dict(headers or {}), "params": params,
+                          "body": json})
+        return self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+
+
+def client(fake, **over):
+    c = A.ARClient(**{**{"api_key": KEY}, **over})
+    c.session = fake
+    return c
+
+
+class TheEnvelopeDecidesNotTheHttpStatus(unittest.TestCase):
+    """HTTP 200 — не доказательство. У этого поставщика отказ «нет в наличии»
+    приезжает именно двухсотым, и клиент, читающий статус, отчитается об
+    успехе там, где ничего не произошло."""
+
+    def test_a_two_hundred_with_a_refusal_code_is_a_refusal(self):
+        fake = Fake(Reply(envelope("OUT_OF_STOCK", message="no stock")))
+        with self.assertRaises(A.ARError) as e:
+            client(fake).call("GET", "/services")
+        self.assertEqual(e.exception.code, "OUT_OF_STOCK")
+
+    def test_the_payload_is_the_data_field_not_the_whole_body(self):
+        fake = Fake(Reply(envelope(data={"items": [1, 2]})))
+        self.assertEqual(client(fake).call("GET", "/services"),
+                         {"items": [1, 2]})
+
+    def test_accepted_counts_as_success(self):
+        fake = Fake(Reply(envelope("ACCEPTED", data={"x": 1})))
+        self.assertEqual(client(fake).call("GET", "/services"), {"x": 1})
+
+    def test_a_repeat_of_the_same_order_counts_as_success(self):
+        """`IDEMPOTENCY_REPLAY` — это «такой заказ уже был, отдаю прежний
+        результат». Принять его за отказ значит потерять уже оплаченный
+        заказ: ровно та беда, которую мы разбирали на звёздах."""
+        fake = Fake(Reply(envelope("IDEMPOTENCY_REPLAY", data={"x": 1})))
+        self.assertEqual(client(fake).call("GET", "/orders"), {"x": 1})
+
+    def test_an_unknown_code_is_a_refusal_not_a_success(self):
+        fake = Fake(Reply(envelope("SOMETHING_NEW", data={"x": 1})))
+        with self.assertRaises(A.ARError):
+            client(fake).call("GET", "/services")
+
+    def test_a_body_without_an_envelope_is_reported_by_its_http_code(self):
+        """Отвечал не поставщик, а что-то перед ним."""
+        fake = Fake(Reply({"nginx": "502"}, code=502))
+        with self.assertRaises(A.ARError) as e:
+            client(fake, max_retries=0).call("GET", "/services")
+        self.assertIn("вышестоящ", e.exception.why)
+
+    def test_html_instead_of_json_does_not_crash_with_a_parser_error(self):
+        fake = Fake(Reply(None, code=404))
+        with self.assertRaises(A.ARError) as e:
+            client(fake).call("GET", "/services")
+        self.assertIn("base_url", e.exception.why)
+
+
+class ARefusalIsExplainedInRussianAndCanBeTraced(unittest.TestCase):
+    """Английский код на экране продавца — отписка. А `traceId` — то, по чему
+    поставщик найдёт запрос у себя; без него разговор с поддержкой начинается
+    с «пришлите время и что вы делали»."""
+
+    def refusal(self, code, message="", errors=None):
+        fake = Fake(Reply(envelope(code, message=message, errors=errors),
+                          code=422))
+        try:
+            client(fake).call("GET", "/services")
+        except A.ARError as e:
+            return e
+        self.fail("отказ не поднялся")
+
+    def test_every_documented_code_has_a_russian_reason(self):
+        for code in ("VALIDATION_ERROR", "UNAUTHORIZED", "FORBIDDEN",
+                     "NOT_FOUND", "CONFLICT", "LIMIT_REACHED", "OUT_OF_STOCK",
+                     "INSUFFICIENT_FUNDS", "UPSTREAM_ERROR", "INTERNAL_ERROR"):
+            why = self.refusal(code).why
+            self.assertTrue(any("а" <= ch.lower() <= "я" for ch in why),
+                            f"{code} остался без перевода: {why}")
+
+    def test_not_enough_money_says_so_in_plain_words(self):
+        self.assertIn("не хватает средств", self.refusal("INSUFFICIENT_FUNDS").why)
+
+    def test_a_rejected_key_hints_at_the_two_dashboards(self):
+        """Кабинета два, и ключ от одного в другом не работает. Без этой
+        подсказки «ключ не принят» означает и «ключ не тот», и «кабинет не
+        тот» — а различить их продавцу нечем."""
+        self.assertIn("approute.ru", self.refusal("UNAUTHORIZED").why)
+
+    def test_the_trace_id_reaches_the_seller(self):
+        self.assertIn("tr-1", self.refusal("INTERNAL_ERROR").explain())
+
+    def test_the_field_errors_are_named(self):
+        e = self.refusal("VALIDATION_ERROR", errors=[
+            {"field": "quantity", "code": "OUT_OF_RANGE", "message": "too big"}])
+        self.assertIn("quantity", e.explain())
+
+    def test_the_suppliers_own_words_are_kept(self):
+        """Их текст часто конкретнее кода."""
+        self.assertIn("limit 3/day",
+                      self.refusal("LIMIT_REACHED", message="limit 3/day").why)
+
+
+class TheKeyTravelsAsAHeaderAndNowhereElse(unittest.TestCase):
+    def test_the_header_is_the_one_the_api_expects(self):
+        fake = Fake()
+        client(fake).call("GET", "/accounts")
+        self.assertEqual(fake.seen[-1]["headers"]["X-API-Key"], KEY)
+
+    def test_the_key_is_not_in_the_url_or_the_query(self):
+        """В адрес он попадал бы в чужие логи по дороге."""
+        fake = Fake()
+        client(fake).call("GET", "/accounts")
+        sent = fake.seen[-1]
+        self.assertNotIn(KEY, sent["url"])
+        self.assertNotIn(KEY, json.dumps(sent["params"]))
+
+    def test_a_refusal_never_repeats_the_key(self):
+        fake = Fake(Reply(envelope("UNAUTHORIZED", message="bad key"),
+                          code=401))
+        ok, why = A.balance_sync({"api_key": KEY, "region": "io"})
+        self.assertIn(str(why), str(why))          # причина есть
+        self.assertNotIn(KEY, str(why))
+
+    def test_the_dashboard_choice_picks_the_base_url(self):
+        self.assertIn("approute.io", A.base_url_of({"region": "io"}))
+        self.assertIn("approute.ru", A.base_url_of({"region": "ru"}))
+
+    def test_an_unknown_region_falls_back_to_the_default_one(self):
+        self.assertEqual(A.base_url_of({"region": "zz"}), A.BASE_URL)
+
+    def test_an_explicit_base_url_wins(self):
+        self.assertEqual(A.base_url_of({"base_url": "https://x/api/v1/"}),
+                         "https://x/api/v1")
+
+
+class TooManyRequestsIsWaitedOutNotReportedAsFailure(unittest.TestCase):
+    def setUp(self):
+        self.slept: list[float] = []
+        self._sleep = A.time.sleep
+        A.time.sleep = self.slept.append
+
+    def tearDown(self):
+        A.time.sleep = self._sleep
+
+    def test_the_second_try_succeeds(self):
+        fake = Fake(Reply(envelope(), code=429),
+                    Reply(envelope(data={"items": []})))
+        self.assertEqual(client(fake).call("GET", "/services"), {"items": []})
+        self.assertEqual(len(fake.seen), 2)
+
+    def test_the_wait_is_the_one_the_supplier_asked_for(self):
+        """Своя оценка была бы догадкой поверх его же ответа."""
+        fake = Fake(Reply(envelope(), code=429, headers={"Retry-After": "7"}),
+                    Reply(envelope(data={})))
+        client(fake).call("GET", "/services")
+        self.assertEqual(self.slept, [7.0])
+
+    def test_a_permanent_refusal_is_not_retried(self):
+        fake = Fake(Reply(envelope("UNAUTHORIZED"), code=401))
+        with self.assertRaises(A.ARError):
+            client(fake).call("GET", "/services")
+        self.assertEqual(len(fake.seen), 1)
+
+
+class TheCatalogueIsReadAsItCame(unittest.TestCase):
+    """Имена полей — из `openapi.yaml`, а не из наших привычек: на проводе
+    camelCase (`categoryName`, `itemId`), потому что snake_case в SDK — это
+    его собственный перевод перед отправкой."""
+
+    CATALOG = {"items": [
+        {"id": "svc-1", "name": "Roblox Gift Card", "type": "voucher",
+         "categoryName": "Games", "subcategoryName": "Roblox",
+         "countryCode": "US",
+         "items": [
+             {"id": "it-1", "name": "800 Robux", "nominal": 10, "price": 8.4,
+              "currency": "USDT", "available": True, "stock": 25},
+             {"id": "it-2", "name": "1700 Robux", "nominal": 20, "price": 16.9,
+              "currency": "USDT", "available": False, "stock": 0},
+         ],
+         "fields": [{"key": "nickname", "type": "text", "required": True},
+                    {"key": "region", "type": "select"}]},
+        {"id": "svc-2", "name": "Steam Wallet", "type": "direct_topup",
+         "categoryName": "Wallets", "items": [], "fields": []},
+    ], "hasNext": False}
+
+    def test_searching_by_name_finds_the_product(self):
+        got = A.find_products(self.CATALOG, "roblox")
+        self.assertEqual([p["id"] for p in got], ["svc-1"])
+
+    def test_searching_by_category_finds_it_too(self):
+        self.assertEqual(len(A.find_products(self.CATALOG, "wallets")), 1)
+
+    def test_an_empty_word_returns_everything(self):
+        self.assertEqual(len(A.find_products(self.CATALOG, "")), 2)
+
+    def test_the_search_is_case_insensitive(self):
+        self.assertEqual(len(A.find_products(self.CATALOG, "ROBLOX")), 1)
+
+    def test_a_truncated_catalogue_is_recognised(self):
+        """«Роблокса нет» и «нам прислали не весь список» — разные ответы."""
+        self.assertFalse(A.truncated(self.CATALOG))
+        self.assertTrue(A.truncated({"items": [], "hasNext": True}))
+
+    def test_balances_are_read_from_their_field_names(self):
+        lines = A.balance_lines({"items": [
+            {"currency": "USDT", "balance": 120.5, "available": 100.0,
+             "overdraftLimit": 0}]})
+        self.assertEqual(len(lines), 1)
+        self.assertIn("USDT", lines[0])
+        self.assertIn("120.5", lines[0])
+        self.assertIn("100.0", lines[0])
+
+    def test_no_accounts_means_no_lines(self):
+        self.assertEqual(A.balance_lines({"items": []}), [])
+        self.assertEqual(A.balance_lines(None), [])
+
+
+class NothingHereBuysAnything(unittest.TestCase):
+    """Диагностика, которая тратит деньги, — не диагностика. Пока не видно,
+    под каким `itemId` лежит Roblox и каких полей требует заказ, выдача была
+    бы гаданием на чужих деньгах."""
+
+    def test_the_client_has_no_order_call(self):
+        import inspect
+        src = inspect.getsource(A)
+        self.assertNotIn('"POST"', src.replace('json_body: dict | None = None', ''))
+
+    def test_the_screens_never_post(self):
+        import inspect
+        src = inspect.getsource(H)
+        for forbidden in ("create_order", "orders_type", "checkOnly",
+                          '"/orders"'):
+            self.assertNotIn(forbidden, src)
+
+    def test_the_ready_made_calls_are_reads_only(self):
+        for name in ("balance_sync", "services_sync"):
+            fake = Fake()
+            fn = getattr(A, name)
+            real = A._client
+            A._client = lambda creds, f=fake: client(f)
+            try:
+                fn(CREDS)
+            finally:
+                A._client = real
+            self.assertEqual(fake.seen[-1]["method"], "GET",
+                             f"{name} сходил не за чтением")
+
+
+class Msg:
+    def __init__(self, text):
+        self.text = text
+        self.said: list[str] = []
+        self.deleted = False
+        self.from_user = type("U", (), {"id": 1})()
+
+    async def answer(self, text, reply_markup=None, **kw):
+        self.said.append(text)
+        return Status(self.said)
+
+    async def delete(self):
+        self.deleted = True
+
+
+class Status:
+    def __init__(self, sink):
+        self.sink = sink
+
+    async def edit_text(self, text, **kw):
+        self.sink.append(text)
+
+
+class Screen:
+    def __init__(self):
+        self.texts: list[str] = []
+        self.kbs: list = []
+
+    async def edit_text(self, text, reply_markup=None, **kw):
+        self.texts.append(text)
+        self.kbs.append(reply_markup)
+        return self
+
+    async def answer(self, text, reply_markup=None, **kw):
+        self.texts.append(text)
+        self.kbs.append(reply_markup)
+        return self
+
+    @property
+    def last(self) -> str:
+        return self.texts[-1] if self.texts else ""
+
+
+class CB:
+    def __init__(self, data):
+        self.data = data
+        self.message = Screen()
+        self.from_user = type("U", (), {"id": 1})()
+        self.alerts: list[str] = []
+
+    async def answer(self, text="", **kw):
+        self.alerts.append(text)
+
+
+class FSM:
+    def __init__(self):
+        self.data: dict = {}
+        self.state = None
+
+    async def set_state(self, s):
+        self.state = s
+
+    async def clear(self):
+        self.state = None
+
+    async def update_data(self, **kw):
+        self.data.update(kw)
+
+    async def get_data(self):
+        return dict(self.data)
+
+
+def buttons(kb) -> list[str]:
+    return [] if kb is None else [b.text for row in kb.inline_keyboard
+                                  for b in row]
+
+
+def callbacks(kb) -> list[str]:
+    return [] if kb is None else [b.callback_data for row in kb.inline_keyboard
+                                  for b in row]
+
+
+class TheKeyIsReadFromWhateverWasPasted(unittest.TestCase):
+    def test_a_bare_key_needs_no_label(self):
+        """Ключ один, угадывать нечего — требовать подписи значит требовать
+        аккуратности там, где она ничего не даёт."""
+        self.assertEqual(H.parse_creds(KEY)["api_key"], KEY)
+
+    def test_a_labelled_key_works_too(self):
+        self.assertEqual(H.parse_creds(f"api_key: {KEY}")["api_key"], KEY)
+
+    def test_the_russian_label_is_understood(self):
+        self.assertEqual(H.parse_creds(f"ключ = {KEY}")["api_key"], KEY)
+
+    def test_the_dashboard_can_be_named_in_russian(self):
+        self.assertEqual(H.parse_creds("регион: российский")["region"], "ru")
+
+    def test_the_international_dashboard_is_the_default_reading(self):
+        self.assertEqual(H.parse_creds("region: io")["region"], "io")
+
+    def test_a_sentence_is_not_mistaken_for_a_key(self):
+        self.assertEqual(H.parse_creds("я не понял что присылать"), {})
+
+
+class TheMessageWithTheKeyDoesNotLinger(unittest.TestCase):
+    def setUp(self):
+        self.saved: dict = {}
+        self._save, self._get = H.save_ar_creds, H.get_ar_creds
+        H.save_ar_creds = lambda uid, c: self.saved.update(c)
+        H.get_ar_creds = lambda uid: dict(self.saved)
+
+    def tearDown(self):
+        H.save_ar_creds, H.get_ar_creds = self._save, self._get
+
+    def login(self, text):
+        msg = Msg(text)
+        asyncio.run(H.apr_login(msg))
+        return msg
+
+    def test_it_is_deleted_after_being_read(self):
+        self.assertTrue(self.login(f"/apr_login {KEY}").deleted)
+
+    def test_it_is_deleted_even_when_nothing_parsed(self):
+        self.assertTrue(self.login("/apr_login что сюда писать").deleted)
+
+    def test_the_answer_never_repeats_the_key(self):
+        msg = self.login(f"/apr_login {KEY}")
+        self.assertNotIn(KEY, "\n".join(msg.said))
+
+    def test_an_empty_command_explains_where_the_key_lives(self):
+        said = "\n".join(self.login("/apr_login").said)
+        self.assertIn("approute.io/dashboard", said)
+        self.assertIn("approute.ru/dashboard", said)
+
+    def test_a_saved_key_points_at_the_next_step(self):
+        self.assertIn("/apr_stock", "\n".join(self.login(f"/apr_login {KEY}").said))
+
+
+class TheAccessIsEnteredByButtons(unittest.TestCase):
+    """Продавцу неоткуда узнать про команду: раздел он открывает кнопками,
+    значит и ключ вводится там же."""
+
+    def setUp(self):
+        self.saved: dict = {}
+        self._save, self._get = H.save_ar_creds, H.get_ar_creds
+        self._del = H.delete_ar_creds
+        H.save_ar_creds = lambda uid, c: self.saved.update(c)
+        H.get_ar_creds = lambda uid: dict(self.saved)
+        H.delete_ar_creds = lambda uid: self.saved.clear()
+
+    def tearDown(self):
+        H.save_ar_creds, H.get_ar_creds = self._save, self._get
+        H.delete_ar_creds = self._del
+
+    def screen(self):
+        cb = CB("apr:creds")
+        asyncio.run(H.apr_creds_screen(cb, FSM()))
+        return cb
+
+    def test_the_roblox_plugin_leads_here(self):
+        """Проверка проводки: экран может быть хорош, а попасть в него
+        неоткуда."""
+        from handlers import plugins as P
+        self.assertIn("apr:creds",
+                      callbacks(P._roblox_keyboard({"plugins": {"auto_roblox": {}}})))
+
+    def test_the_previous_supplier_is_still_reachable_for_price_comparison(self):
+        """Выбрали AppRoute — но сравнивать закупочную цену не с чем, если
+        второй кабинет виден только по памяти."""
+        from handlers import plugins as P
+        self.assertIn("ns:creds",
+                      callbacks(P._roblox_keyboard({"plugins": {"auto_roblox": {}}})))
+
+    def test_reading_the_catalogue_is_offered_only_once_the_key_is_there(self):
+        cb = self.screen()
+        self.assertNotIn("apr:stock", callbacks(cb.message.kbs[-1]))
+        self.saved["api_key"] = KEY
+        self.assertIn("apr:stock", callbacks(self.screen().message.kbs[-1]))
+
+    def test_the_key_is_shown_as_a_length_not_a_value(self):
+        self.saved["api_key"] = KEY
+        cb = self.screen()
+        self.assertNotIn(KEY, cb.message.last)
+        self.assertIn("символов", cb.message.last)
+
+    def test_encryption_is_promised_only_when_it_is_real(self):
+        """Обещать шифрование без `SECRET_KEY` — то же враньё, что «Пак
+        поднят · Поднято: 0». На Railway ключ до сих пор не задан, и узнавать
+        об этом продавец должен здесь, а не из /version."""
+        self.saved["api_key"] = KEY
+        real = H.encryption_on
+        try:
+            H.encryption_on = lambda: True
+            self.assertIn("зашифрован", self.screen().message.last)
+            H.encryption_on = lambda: False
+            said = self.screen().message.last
+            self.assertIn("в открытом виде", said)
+            self.assertIn("SECRET_KEY", said)
+            self.assertNotIn("хранится зашифрованным", said)
+        finally:
+            H.encryption_on = real
+
+    def test_the_dashboard_is_named_on_the_screen(self):
+        self.saved.update({"api_key": KEY, "region": "ru"})
+        self.assertIn("approute.ru", self.screen().message.last)
+
+    def test_switching_the_dashboard_is_saved(self):
+        self.saved["region"] = "io"
+        asyncio.run(H.apr_region(CB("apr:region:ru")))
+        self.assertEqual(self.saved["region"], "ru")
+
+    def test_a_typed_key_is_saved_and_the_message_deleted(self):
+        fsm = FSM()
+        asyncio.run(H.apr_set_key(CB("apr:set"), fsm))
+        msg = Msg(KEY)
+        asyncio.run(H.apr_key_input(msg, fsm))
+        self.assertEqual(self.saved["api_key"], KEY)
+        self.assertTrue(msg.deleted)
+
+    def test_and_the_answer_does_not_echo_it(self):
+        fsm = FSM()
+        asyncio.run(H.apr_set_key(CB("apr:set"), fsm))
+        msg = Msg(KEY)
+        asyncio.run(H.apr_key_input(msg, fsm))
+        self.assertNotIn(KEY, "\n".join(msg.said))
+
+    def test_an_empty_value_changes_nothing(self):
+        fsm = FSM()
+        asyncio.run(H.apr_set_key(CB("apr:set"), fsm))
+        asyncio.run(H.apr_key_input(Msg("   "), fsm))
+        self.assertNotIn("api_key", self.saved)
+
+    def test_deleting_clears_it(self):
+        self.saved["api_key"] = KEY
+        asyncio.run(H.apr_delete(CB("apr:del")))
+        self.assertEqual(self.saved, {})
+
+    def test_the_check_button_only_reads(self):
+        self.saved["api_key"] = KEY
+        real = A.balance_sync
+        A.balance_sync = lambda creds: (True, {"items": [
+            {"currency": "USDT", "balance": 42.0, "available": 42.0}]})
+        try:
+            cb = CB("apr:check")
+            asyncio.run(H.apr_check(cb))
+        finally:
+            A.balance_sync = real
+        self.assertIn("42.0", cb.message.last)
+
+    def test_a_refused_check_says_why_and_does_not_claim_success(self):
+        self.saved["api_key"] = KEY
+        real = A.balance_sync
+        A.balance_sync = lambda creds: (False, "ключ не принят — проверьте, "
+                                               "что он из того же кабинета")
+        try:
+            cb = CB("apr:check")
+            asyncio.run(H.apr_check(cb))
+        finally:
+            A.balance_sync = real
+        self.assertIn("не принят", cb.message.last)
+        self.assertNotIn("Ключ принят", cb.message.last)
+
+
+class TheCatalogueReportShowsWhatAnOrderWillNeed(unittest.TestCase):
+    """Это и есть тот живой ответ, ради которого всё написано: есть ли у
+    AppRoute Roblox, под каким `itemId` и почём. Печатается как пришло —
+    угадывание имён полей в этом проекте уже стоило дня."""
+
+    def setUp(self):
+        self._get = H.get_ar_creds
+        H.get_ar_creds = lambda uid: dict(CREDS)
+        self._services = A.services_sync
+
+    def tearDown(self):
+        H.get_ar_creds = self._get
+        A.services_sync = self._services
+
+    def report(self, text="/apr_stock roblox", answer=None):
+        A.services_sync = lambda creds: (answer or
+                                         (True, TheCatalogueIsReadAsItCame.CATALOG))
+        msg = Msg(text)
+        asyncio.run(H.apr_stock(msg))
+        return "\n".join(msg.said)
+
+    def test_the_service_id_is_shown(self):
+        self.assertIn("serviceId=svc-1", self.report())
+
+    def test_the_item_id_of_each_nominal_is_shown(self):
+        """Заказ делается по `itemId`, а не по названию номинала."""
+        got = self.report()
+        self.assertIn("itemId=it-1", got)
+        self.assertIn("itemId=it-2", got)
+
+    def test_the_price_is_shown_next_to_the_nominal(self):
+        """Ради этого каталог и читается: сравнить закупку с ns.gifts."""
+        got = self.report()
+        self.assertIn("800 Robux", got)
+        self.assertIn("8.4", got)
+
+    def test_a_sold_out_nominal_is_marked_as_such(self):
+        got = self.report()
+        self.assertIn("⛔", got)
+
+    def test_the_order_fields_are_printed_as_they_came(self):
+        got = self.report()
+        self.assertIn("nickname", got)
+        self.assertIn("region", got)
+
+    def test_a_required_field_is_marked(self):
+        self.assertIn("nickname (text)*", self.report())
+
+    def test_the_kind_of_product_is_said_in_russian(self):
+        self.assertIn("ваучер", self.report())
+
+    def test_nothing_found_says_so_and_suggests_another_word(self):
+        got = self.report("/apr_stock minecraft")
+        self.assertIn("ничего не нашлось", got)
+        self.assertIn("другое слово", got)
+
+    def test_a_partial_catalogue_is_admitted_not_passed_off_as_whole(self):
+        """«Роблокса нет» и «нам прислали не весь список» — разные ответы, и
+        второй нельзя выдать за первый."""
+        got = self.report(answer=(True, {"items": [], "hasNext": True}))
+        self.assertIn("не весь", got)
+
+    def test_a_refusal_is_shown_instead_of_a_catalogue(self):
+        got = self.report(answer=(False, "ключу не хватает прав — они "
+                                         "включаются в кабинете"))
+        self.assertIn("не хватает прав", got)
+
+    def test_a_missing_key_stops_it_before_the_network(self):
+        H.get_ar_creds = lambda uid: {}
+        called: list = []
+        A.services_sync = lambda creds: called.append(1) or (True, {})
+        msg = Msg("/apr_stock")
+        asyncio.run(H.apr_stock(msg))
+        self.assertEqual(called, [])
+        self.assertIn("не задан", "\n".join(msg.said))
+
+
+class TheKeyIsStoredEncrypted(unittest.TestCase):
+    """Ключ — право тратить баланс кабинета целиком, ровно как seed-фраза
+    TON. В базу он ложится зашифрованным, если задан SECRET_KEY."""
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self._env = {k: os.environ.get(k) for k in ("DATA_DIR", "SECRET_KEY",
+                                                    "DATABASE_URL", "FRAGMENT_KEY")}
+        os.environ["DATA_DIR"] = self.dir
+        os.environ["SECRET_KEY"] = "тестовый-ключ"
+        os.environ.pop("DATABASE_URL", None)
+        os.environ.pop("FRAGMENT_KEY", None)
+        self._rm = shutil.rmtree
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._rm(self.dir, ignore_errors=True)
+        import importlib
+
+        import storage
+        importlib.reload(storage)
+
+    def load(self):
+        import importlib
+
+        import storage
+        return importlib.reload(storage)
+
+    def test_the_key_comes_back_the_same(self):
+        s = self.load()
+        s.save_ar_creds(1, {"api_key": KEY, "region": "ru"})
+        got = s.get_ar_creds(1)
+        self.assertEqual(got["api_key"], KEY)
+        self.assertEqual(got["region"], "ru")
+
+    def test_it_is_not_readable_in_the_file(self):
+        s = self.load()
+        s.save_ar_creds(1, {"api_key": KEY})
+        with open(os.path.join(self.dir, "approute_creds.json"),
+                  encoding="utf-8") as f:
+            raw = f.read()
+        self.assertNotIn(KEY, raw)
+
+    def test_saving_twice_does_not_wrap_it_twice(self):
+        s = self.load()
+        s.save_ar_creds(1, {"api_key": KEY})
+        s.save_ar_creds(1, {"region": "io"})
+        self.assertEqual(s.get_ar_creds(1)["api_key"], KEY)
+
+    def test_deleting_leaves_nothing(self):
+        s = self.load()
+        s.save_ar_creds(1, {"api_key": KEY})
+        s.delete_ar_creds(1)
+        self.assertEqual(s.get_ar_creds(1), {})
+
+    def test_nothing_stored_means_nothing_returned(self):
+        self.assertEqual(self.load().get_ar_creds(999), {})
+
+
+class TheCommandsAreWiredIn(unittest.TestCase):
+    def test_the_router_is_included_in_main(self):
+        import inspect
+
+        import main as M
+        self.assertIn("dp.include_router(approute.router)",
+                      inspect.getsource(M.main))
+
+    def test_the_commands_do_not_collide_with_the_reply_rules(self):
+        """Префикс `ar:` уже занят автоответами. Две кнопки с одним
+        callback_data — не ошибка, а тишина: победит роутер, подключённый
+        раньше."""
+        import inspect
+        src = inspect.getsource(H)
+        self.assertNotIn('"ar:', src)
+
+
+if __name__ == "__main__":
+    unittest.main()
