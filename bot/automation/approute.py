@@ -36,8 +36,10 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Кабинеты разные, и ключ от одного в другом не работает. Продавец выбирает
-# регион кнопкой — иначе «ключ не принят» означает что угодно.
+# Кабинета два. Их README говорит брать ключ в «своём» кабинете, но экран
+# выдачи ключа в approute.ru предлагает проверять его запросом на
+# approute.io — то есть общий адрес не исключён. Мы не гадаем: регион
+# переключается кнопкой, а `/apr_debug` спрашивает оба и печатает ответы.
 BASE_URLS = {
     "io": "https://approute.io/api/v1",
     "ru": "https://approute.ru/api/v1",
@@ -55,9 +57,11 @@ SUCCESS_CODES = ("OK", "ACCEPTED", "IDEMPOTENCY_REPLAY")
 # отпиской.
 _CODES = {
     "VALIDATION_ERROR": "запрос не прошёл проверку",
-    "UNAUTHORIZED": "ключ не принят — проверьте, что он из того же кабинета "
-                    "(approute.io и approute.ru — разные)",
-    "FORBIDDEN": "ключу не хватает прав — они включаются в кабинете",
+    "UNAUTHORIZED": "ключ не принят. Проверьте две вещи: тот ли кабинет "
+                    "(io/ru) и стоит ли наш IP в белом списке — его "
+                    "показывает кнопка «🪪 Наш IP у поставщика»",
+    "FORBIDDEN": "ключу не хватает прав, либо наш IP не в белом списке "
+                 "кабинета — посмотрите «🪪 Наш IP у поставщика»",
     "NOT_FOUND": "товар или заказ не найден",
     "CONFLICT": "конфликт: такой заказ уже создан",
     "LIMIT_REACHED": "упёрлись в лимит кабинета",
@@ -69,8 +73,8 @@ _CODES = {
 
 # Если конверта нет вовсе (упал балансировщик, отдалась HTML-страница).
 _HTTP = {
-    401: "ключ не принят",
-    403: "ключу не хватает прав",
+    401: "ключ не принят — проверьте кабинет (io/ru) и белый список IP",
+    403: "ключу не хватает прав или наш IP не в белом списке кабинета",
     404: "адрес не найден — возможно, не тот base_url",
     429: "слишком часто: поставщик просит подождать",
     500: "внутренняя ошибка AppRoute",
@@ -178,11 +182,38 @@ class ARClient:
         if code in SUCCESS_CODES:
             return body.get("data")
         if not code:
-            # Конверта нет — значит отвечали не мы и не их приложение.
-            raise ARError("", _HTTP.get(r.status_code, f"HTTP {r.status_code}"),
+            # Конверта нет. Раньше здесь печаталось голое «HTTP 200» — это
+            # отписка: продавец видит цифру, из которой ничего не следует.
+            # Говорим, чем ответ отличается от ожидаемого, и отдаём то, что
+            # в нём всё-таки было. Живой отказ 17.08 выглядел именно так:
+            # HTTP 200, traceId есть, поля code нет вовсе.
+            raise ARError("", _no_envelope(body, r.status_code),
                           r.status_code, trace)
         raise ARError(code, explain_code(code, body.get("message")),
                       r.status_code, trace, body.get("errors") or [])
+
+
+def _no_envelope(body: dict, http: int) -> str:
+    """Ответ без поля `code` — что о нём можно сказать честно.
+
+    Догадка не подаётся как факт: мы не знаем, отказ это или успех в другой
+    форме, и так и пишем. Зато перечисляем, что в теле было, — по этому
+    поставщик и мы поймём, чем его ответ отличается от описанного в SDK.
+    """
+    known = _HTTP.get(http)
+    if known:
+        return known
+    said = str(body.get("message") or body.get("error") or
+               body.get("detail") or "").strip()
+    keys = ", ".join(sorted(str(k) for k in body)[:12]) or "пусто"
+    out = (f"поставщик ответил HTTP {http}, но поля <code>code</code> в теле "
+           f"нет — а по нему и определяется, получилось ли.")
+    if said:
+        out += f"\nОн написал: {said}"
+    out += (f"\nЧто было в ответе: {keys}"
+            f"\nЭто не тот конверт, что описан в их SDK. Покажите этот "
+            f"отчёт поставщику или посмотрите <code>/apr_debug</code>.")
+    return out
 
 
 def _retry_after(r) -> float:
@@ -234,6 +265,66 @@ def services_sync(creds: dict) -> tuple[bool, object]:
     живой ответ. В SDK и OpenAPI списка товаров нет.
     """
     return _guarded(lambda: (_client(creds).call("GET", "/services") or {}))
+
+
+def whoami_sync(creds: dict) -> tuple[bool, object]:
+    """`GET /whoami` → (успех, что ответил поставщик).
+
+    Этого вызова нет ни в SDK, ни в `openapi.yaml` — он найден на экране
+    выдачи ключа в кабинете, где им предлагают проверить, **какой IP видит
+    поставщик**. У AppRoute белый список адресов, а бот живёт на Railway, где
+    адрес меняется при каждом деплое: это первое, что надо проверять, когда
+    ключ «не сработал».
+    """
+    return _guarded(lambda: (_client(creds).call("GET", "/whoami") or {}))
+
+
+def probe_sync(creds: dict) -> list[dict]:
+    """Сырые ответы обоих кабинетов — факты, а не наша их трактовка.
+
+    17.08 «Проверить ключ» вернуло HTTP 200 с `traceId`, но **без поля
+    `code`**, то есть ответ не той формы, что описана в SDK. Гадать, что это
+    было, здесь не принято: проба ходит по обоим адресам, печатает статус,
+    ключи тела и его начало — и тогда видно, что происходит на самом деле.
+
+    Только чтение. Ключ в отчёт не попадает: если поставщик вернёт его сам,
+    он вырезается.
+    """
+    key = str((creds or {}).get("api_key") or "")
+    out: list[dict] = []
+    for region, base in BASE_URLS.items():
+        for path in ("/whoami", "/accounts"):
+            row = {"region": region, "path": path, "http": 0, "json": False,
+                   "keys": [], "code": "", "trace": "", "said": "",
+                   "excerpt": "", "error": ""}
+            try:
+                r = requests.get(
+                    base + path,
+                    headers={"X-API-Key": key, "Accept": "application/json"},
+                    timeout=TIMEOUT)
+                row["http"] = r.status_code
+                try:
+                    body = r.json()
+                    row["json"] = True
+                    if isinstance(body, dict):
+                        row["keys"] = sorted(str(k) for k in body)[:12]
+                        row["code"] = str(body.get("code") or "")
+                        row["trace"] = str(body.get("traceId") or "")
+                        row["said"] = str(body.get("message") or
+                                          body.get("error") or
+                                          body.get("detail") or "")[:200]
+                except ValueError:
+                    row["excerpt"] = _redact(r.text, key)[:200]
+            except requests.RequestException as e:
+                row["error"] = _redact(str(e), key)[:150]
+            out.append(row)
+    return out
+
+
+def _redact(text: str, key: str) -> str:
+    """Ключ не показывается даже в сыром отчёте — это право тратить баланс."""
+    text = str(text or "")
+    return text.replace(key, "…ключ вырезан…") if key else text
 
 
 def balance_lines(data) -> list[str]:

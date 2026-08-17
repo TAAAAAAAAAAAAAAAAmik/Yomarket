@@ -170,9 +170,113 @@ async def apr_stock(message: Message) -> None:
     await _catalog_report(message, message.from_user.id, needle)
 
 
+@router.message(Command("apr_debug"))
+async def apr_debug(message: Message) -> None:
+    """Сырой ответ поставщика по обоим кабинетам. Только чтение."""
+    creds, hint = _creds_or_hint(message.from_user.id)
+    if hint:
+        await message.answer(hint)
+        return
+    status = await message.answer("⏳ Спрашиваю оба кабинета…")
+    await _probe_report(status, creds)
+
+
+@router.message(Command("apr_whoami"))
+async def apr_whoami(message: Message) -> None:
+    """Кем нас видит поставщик и с какого IP. Только чтение."""
+    creds, hint = _creds_or_hint(message.from_user.id)
+    if hint:
+        await message.answer(hint)
+        return
+    status = await message.answer("⏳ Спрашиваю, кем нас видит поставщик…")
+    await status.edit_text(await _whoami_text(creds))
+
+
 # ---------------------------------------------------------------------------
 # Отчёты — общие для команд и кнопок
 # ---------------------------------------------------------------------------
+
+async def _whoami_text(creds: dict) -> str:
+    """`/whoami` словами: он же показывает IP, который видит поставщик.
+
+    У AppRoute белый список адресов, а бот живёт на Railway, где адрес
+    меняется при каждом деплое. Когда ключ «не сработал», это первое, что
+    надо посмотреть, — и узнать это можно только отсюда, с самого сервера.
+    """
+    from automation.approute import whoami_sync
+
+    loop = asyncio.get_event_loop()
+    try:
+        ok, data = await asyncio.wait_for(
+            loop.run_in_executor(None, whoami_sync, creds), timeout=60)
+    except Exception as e:
+        return f"❌ {html.escape(str(e)[:300])}"
+    if not ok:
+        return (f"❌ {html.escape(str(data)[:600])}\n\n"
+                f"<i>Если здесь сказано про адрес или права — сверьте белый "
+                f"список IP в кабинете: командой из кабинета он проверяется "
+                f"так же, как этой кнопкой.</i>")
+    lines = ["🪪 <b>Поставщик отвечает:</b>"]
+    if isinstance(data, dict):
+        for k, v in list(data.items())[:15]:
+            lines.append(f"• {html.escape(str(k))}: "
+                         f"<code>{html.escape(str(v)[:120])}</code>")
+        ip = str(data.get("ip") or data.get("clientIp") or
+                 data.get("remoteAddr") or "")
+        if ip:
+            lines.append("")
+            lines.append(f"📍 Наш адрес глазами поставщика: <code>{html.escape(ip)}</code>")
+            lines.append("Он должен стоять в белом списке кабинета. На Railway "
+                         "адрес меняется при деплое — если ключ перестал "
+                         "работать после выката, причина обычно здесь.")
+    else:
+        lines.append(f"<code>{html.escape(str(data)[:500])}</code>")
+    return "\n".join(lines)
+
+
+async def _probe_report(target, creds: dict) -> None:
+    """Что именно отвечают оба кабинета — фактами, без нашей трактовки.
+
+    Написана после живого отказа 17.08: «Ключ не сработал · HTTP 200». Тело
+    пришло, `traceId` в нём был, а поля `code` не было вовсе — то есть форма
+    ответа не та, что описана в SDK. Разбирать такое по догадкам в этом
+    проекте уже стоило дней.
+    """
+    from automation.approute import probe_sync
+
+    say = target.edit_text if hasattr(target, "edit_text") else target.answer
+    loop = asyncio.get_event_loop()
+    try:
+        rows = await asyncio.wait_for(
+            loop.run_in_executor(None, probe_sync, creds), timeout=120)
+    except Exception as e:
+        await say(f"❌ {html.escape(str(e)[:300])}")
+        return
+    lines = ["🔎 <b>Что отвечает AppRoute</b>",
+             "<i>Только чтение. Ключ в отчёт не попадает.</i>", ""]
+    for row in rows:
+        head = f"<b>approute.{row['region']}{html.escape(row['path'])}</b>"
+        if row["error"]:
+            lines.append(f"{head} — не достучались: {html.escape(row['error'])}")
+            lines.append("")
+            continue
+        lines.append(f"{head} — HTTP <b>{row['http']}</b>")
+        if not row["json"]:
+            lines.append(f"   ответ не JSON: <code>{html.escape(row['excerpt'])}</code>")
+        else:
+            lines.append(f"   поля тела: <code>{html.escape(', '.join(row['keys']) or 'пусто')}</code>")
+            lines.append(f"   code: <code>{html.escape(row['code'] or '— нет —')}</code>")
+            if row["said"]:
+                lines.append(f"   сказано: {html.escape(row['said'])}")
+            if row["trace"]:
+                lines.append(f"   traceId: <code>{html.escape(row['trace'])}</code>")
+        lines.append("")
+    lines.append("Если поля <code>code</code> нет ни в одном ответе — форма "
+                 "конверта у поставщика не та, что в его же SDK. Это к их "
+                 "поддержке, с номером обращения выше.")
+    await say("\n".join(lines)[:4000])
+
+
 
 async def _balance_text(creds: dict) -> tuple[bool, str]:
     """Баланс словами. Он же проверка ключа: чтение, денег не тратит."""
@@ -315,9 +419,11 @@ def _creds_kb(creds: dict) -> InlineKeyboardMarkup:
         # невозможного, что и совет ответить в закрытый чат.
         b.button(text="🧪 Проверить ключ", callback_data="apr:check")
         b.button(text="📦 Каталог", callback_data="apr:stock")
+        b.button(text="🪪 Наш IP у поставщика", callback_data="apr:whoami")
+        b.button(text="🔎 Что отвечает сервер", callback_data="apr:debug")
         b.button(text="🗑 Удалить ключ", callback_data="apr:del")
     b.button(text="⬅️ Назад", callback_data="plugins:auto_roblox")
-    b.adjust(1, 1, 2, 1, 1)
+    b.adjust(1, 1, 2, 2, 1, 1)
     return b.as_markup()
 
 
@@ -340,11 +446,14 @@ def _creds_text(creds: dict) -> str:
                      "денег не тратит.")
         lines.append("«📦 Каталог» покажет, есть ли Roblox, под каким itemId "
                      "и почём.")
+        lines.append("«🪪 Наш IP у поставщика» — на случай белого списка: "
+                     "адрес сервера меняется при каждом выкате.")
     else:
         lines.append("Ключ берётся в кабинете: <b>approute.io/dashboard</b> "
                      "(международный) или <b>approute.ru/dashboard</b> "
-                     "(российский). Ключ от одного кабинета в другом не "
-                     "работает — сначала выберите нужный.")
+                     "(российский). Если не знаете, какой выбрать, — вводите "
+                     "ключ и жмите «🔎 Что отвечает сервер»: он спросит оба "
+                     "и покажет, где ключ приняли.")
     lines.append("")
     # Обещать шифрование, когда ключа для него нет, — то же враньё, что
     # «✅ Пак поднят · Поднято: 0». На Railway `SECRET_KEY` до сих пор не
@@ -437,8 +546,33 @@ async def apr_check(callback: CallbackQuery) -> None:
     await callback.message.edit_text("⏳ Спрашиваю баланс у поставщика…")
     ok, text = await _balance_text(creds)
     note = (f"✅ <b>Ключ принят.</b>\n{text}" if ok
-            else f"❌ <b>Ключ не сработал.</b>\n{text}")
+            else (f"❌ <b>Ключ не сработал.</b>\n{text}\n\n"
+                  f"Дальше по порядку: «🪪 Наш IP у поставщика» — стоит ли "
+                  f"наш адрес в белом списке; «🔎 Что отвечает сервер» — что "
+                  f"именно приходит из обоих кабинетов."))
     await _show_creds(callback, callback.from_user.id, note)
+
+
+@router.callback_query(F.data == "apr:whoami")
+async def apr_whoami_button(callback: CallbackQuery) -> None:
+    creds, hint = _creds_or_hint(callback.from_user.id)
+    if hint:
+        await callback.answer("Ключ ещё не задан", show_alert=True)
+        return
+    await callback.answer("⏳ Спрашиваю…")
+    await callback.message.edit_text("⏳ Спрашиваю, кем нас видит поставщик…")
+    await _show_creds(callback, callback.from_user.id, await _whoami_text(creds))
+
+
+@router.callback_query(F.data == "apr:debug")
+async def apr_debug_button(callback: CallbackQuery) -> None:
+    creds, hint = _creds_or_hint(callback.from_user.id)
+    if hint:
+        await callback.answer("Ключ ещё не задан", show_alert=True)
+        return
+    await callback.answer("⏳ Спрашиваю оба кабинета…")
+    await callback.message.edit_text("⏳ Спрашиваю оба кабинета…")
+    await _probe_report(callback.message, creds)
 
 
 @router.callback_query(F.data == "apr:del")

@@ -153,11 +153,13 @@ class ARefusalIsExplainedInRussianAndCanBeTraced(unittest.TestCase):
     def test_not_enough_money_says_so_in_plain_words(self):
         self.assertIn("не хватает средств", self.refusal("INSUFFICIENT_FUNDS").why)
 
-    def test_a_rejected_key_hints_at_the_two_dashboards(self):
-        """Кабинета два, и ключ от одного в другом не работает. Без этой
-        подсказки «ключ не принят» означает и «ключ не тот», и «кабинет не
-        тот» — а различить их продавцу нечем."""
-        self.assertIn("approute.ru", self.refusal("UNAUTHORIZED").why)
+    def test_a_rejected_key_names_both_things_it_can_mean(self):
+        """«Ключ не принят» означает сразу три разные вещи: ключ не тот,
+        кабинет не тот, наш адрес не в белом списке. Продавцу нечем их
+        различить, если не назвать их вслух."""
+        why = self.refusal("UNAUTHORIZED").why
+        self.assertIn("кабинет", why)
+        self.assertIn("белом списке", why)
 
     def test_the_trace_id_reaches_the_seller(self):
         self.assertIn("tr-1", self.refusal("INTERNAL_ERROR").explain())
@@ -171,6 +173,152 @@ class ARefusalIsExplainedInRussianAndCanBeTraced(unittest.TestCase):
         """Их текст часто конкретнее кода."""
         self.assertIn("limit 3/day",
                       self.refusal("LIMIT_REACHED", message="limit 3/day").why)
+
+
+class AnAnswerWithoutTheEnvelopeIsExplainedNotJustNumbered(unittest.TestCase):
+    """Живой отказ 17.08: «❌ Ключ не сработал · ❌ HTTP 200», и всё. Тело
+    пришло, `traceId` в нём был, а поля `code` не было вовсе — то есть форма
+    ответа не та, что в их SDK. Голая цифра на экране продавца — отписка:
+    из неё не следует ни что случилось, ни что делать дальше."""
+
+    def refusal(self, body, http=200):
+        fake = Fake(Reply(body, code=http))
+        try:
+            client(fake, max_retries=0).call("GET", "/accounts")
+        except A.ARError as e:
+            return e
+        self.fail("отказ не поднялся")
+
+    def test_a_two_hundred_without_a_code_says_what_is_missing(self):
+        e = self.refusal({"traceId": "25d2b713", "status": "completed"})
+        self.assertIn("code", e.why)
+        self.assertNotEqual(e.why.strip(), "HTTP 200")
+
+    def test_it_lists_what_did_arrive(self):
+        """По этому и видно, чем ответ отличается от описанного."""
+        e = self.refusal({"traceId": "25d2b713", "result": {}})
+        self.assertIn("traceId", e.why)
+        self.assertIn("result", e.why)
+
+    def test_the_suppliers_own_message_is_shown_if_there_is_one(self):
+        e = self.refusal({"traceId": "t", "message": "ip not allowed"})
+        self.assertIn("ip not allowed", e.why)
+
+    def test_the_trace_id_still_reaches_the_seller(self):
+        e = self.refusal({"traceId": "25d2b713"})
+        self.assertIn("25d2b713", e.explain())
+
+    def test_it_points_at_the_diagnostic(self):
+        e = self.refusal({"traceId": "t"})
+        self.assertIn("apr_debug", e.why)
+
+    def test_a_known_http_code_keeps_its_own_wording(self):
+        """401 объясняется по-своему и без рассуждений про конверт."""
+        e = self.refusal({"traceId": "t"}, http=401)
+        self.assertIn("ключ не принят", e.why)
+        self.assertNotIn("apr_debug", e.why)
+
+
+class TheAllowlistIsTheFirstThingToCheck(unittest.TestCase):
+    """У AppRoute белый список IP — это написано на экране выдачи ключа, а не
+    в SDK. Бот живёт на Railway, где адрес меняется при каждом выкате, и
+    «ключ не сработал» после деплоя обычно означает именно это."""
+
+    def test_a_rejected_key_names_the_allowlist_not_just_the_dashboard(self):
+        fake = Fake(Reply(envelope("UNAUTHORIZED"), code=401))
+        try:
+            client(fake, max_retries=0).call("GET", "/accounts")
+        except A.ARError as e:
+            self.assertIn("белом списке", e.why)
+
+    def test_forbidden_says_the_same(self):
+        fake = Fake(Reply(envelope("FORBIDDEN"), code=403))
+        try:
+            client(fake, max_retries=0).call("GET", "/accounts")
+        except A.ARError as e:
+            self.assertIn("белом списке", e.why)
+
+    def test_whoami_only_reads(self):
+        fake = Fake(Reply(envelope(data={"ip": "1.2.3.4"})))
+        real = A._client
+        A._client = lambda creds: client(fake)
+        try:
+            ok, data = A.whoami_sync(CREDS)
+        finally:
+            A._client = real
+        self.assertTrue(ok)
+        self.assertEqual(fake.seen[-1]["method"], "GET")
+        self.assertTrue(fake.seen[-1]["url"].endswith("/whoami"))
+
+
+class TheRawProbeAsksBothDashboards(unittest.TestCase):
+    """Разбирать непонятное по догадкам в этом проекте уже стоило дней. Проба
+    печатает факты: статус, поля тела и его начало — по обоим адресам, потому
+    что кабинет approute.ru предлагает проверять ключ запросом на
+    approute.io, и какой из них наш — вопрос к серверу, а не к нам."""
+
+    def setUp(self):
+        self.calls: list = []
+        self._get = A.requests.get
+
+        def fake_get(url, headers=None, timeout=None):
+            self.calls.append({"url": url, "headers": dict(headers or {})})
+            return Reply(envelope("OK", data={"ip": "1.2.3.4"}))
+
+        A.requests.get = fake_get
+
+    def tearDown(self):
+        A.requests.get = self._get
+
+    def test_both_dashboards_are_asked(self):
+        A.probe_sync(CREDS)
+        hosts = {c["url"].split("/api/")[0] for c in self.calls}
+        self.assertEqual(hosts, {"https://approute.io", "https://approute.ru"})
+
+    def test_it_asks_who_we_are_and_what_the_balance_is(self):
+        A.probe_sync(CREDS)
+        paths = {c["url"].rsplit("/", 1)[-1] for c in self.calls}
+        self.assertEqual(paths, {"whoami", "accounts"})
+
+    def test_the_rows_carry_the_facts_not_a_verdict(self):
+        rows = A.probe_sync(CREDS)
+        self.assertEqual(len(rows), 4)
+        for row in rows:
+            self.assertEqual(row["http"], 200)
+            self.assertIn("traceId", row["keys"])
+            self.assertEqual(row["code"], "OK")
+
+    def test_a_body_that_is_not_json_is_quoted_as_it_came(self):
+        A.requests.get = lambda url, headers=None, timeout=None: Reply(
+            None, code=502)
+        rows = A.probe_sync(CREDS)
+        self.assertTrue(all(not r["json"] for r in rows))
+
+    def test_a_dead_host_does_not_stop_the_other_one(self):
+        """Половина фактов лучше, чем трассировка вместо отчёта."""
+        def half(url, headers=None, timeout=None):
+            if "approute.ru" in url:
+                raise A.requests.ConnectionError("no route to host")
+            return Reply(envelope("OK", data={}))
+
+        A.requests.get = half
+        rows = A.probe_sync(CREDS)
+        self.assertTrue(any(r["error"] for r in rows))
+        self.assertTrue(any(r["http"] == 200 for r in rows))
+
+    def test_the_key_never_appears_in_the_probe_output(self):
+        A.requests.get = lambda url, headers=None, timeout=None: Reply(
+            None, code=418)
+        blob = json.dumps(A.probe_sync(CREDS), ensure_ascii=False)
+        self.assertNotIn(KEY, blob)
+
+    def test_the_key_is_cut_out_even_if_the_server_echoes_it(self):
+        """Поставщик вполне может вернуть его в тексте ошибки."""
+        A.requests.get = lambda url, headers=None, timeout=None: Reply(
+            None, code=400)
+        real_redact = A._redact
+        self.assertIn("вырезан", real_redact(f"bad key {KEY}", KEY))
+        self.assertNotIn(KEY, real_redact(f"bad key {KEY}", KEY))
 
 
 class TheKeyTravelsAsAHeaderAndNowhereElse(unittest.TestCase):
