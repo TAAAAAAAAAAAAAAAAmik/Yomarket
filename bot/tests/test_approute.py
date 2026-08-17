@@ -367,6 +367,18 @@ class TheAllowlistIsTheFirstThingToCheck(unittest.TestCase):
         except A.ARError as e:
             self.assertIn("белом списке", e.why)
 
+    def test_a_rejected_key_names_the_expiry_too(self):
+        """Продавец сказал, что в кабинете выдают ещё и временный ключ на 48
+        часов, живущий по другим правилам. Назвать одну причину из трёх —
+        значит отправить человека проверять не то."""
+        fake = Fake(Reply(envelope("UNAUTHORIZED"), code=401))
+        try:
+            client(fake, max_retries=0).call("GET", "/accounts")
+        except A.ARError as e:
+            self.assertIn("48 часов", e.why)
+            self.assertIn("белом списке", e.why)
+            self.assertIn("кабинет", e.why)
+
     def test_forbidden_says_the_same(self):
         fake = Fake(Reply(envelope("FORBIDDEN"), code=403))
         try:
@@ -702,6 +714,13 @@ class TheKeyIsReadFromWhateverWasPasted(unittest.TestCase):
 
     def test_the_international_dashboard_is_the_default_reading(self):
         self.assertEqual(H.parse_creds("region: io")["region"], "io")
+
+    def test_a_key_of_an_unexpected_shape_is_still_accepted(self):
+        """В README у поставщика примеры вида `sk_live_…`, а настоящий ключ
+        из кабинета оказался другой формы (`wli-…`). Проверка «похоже ли на
+        ключ» отвергала бы ровно то, что поставщик и выдал."""
+        real = "wli-lq1Tm941fe613nnbhE6Re-примерно-такой-формы"
+        self.assertEqual(H.parse_creds(real)["api_key"], real)
 
     def test_a_sentence_is_not_mistaken_for_a_key(self):
         self.assertEqual(H.parse_creds("я не понял что присылать"), {})
