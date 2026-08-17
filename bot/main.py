@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -283,9 +284,29 @@ async def main() -> None:
         logger.info("Bot stopped.")
 
 
+def health_payload() -> dict:
+    """Что отдаёт `/health`. Вынесено отдельно, чтобы это можно было
+    проверить тестом: от этого ответа зависит, сможет ли выкат отличить
+    «код доехал» от «поднялась старая сборка»."""
+    return {
+        "status": "ok",
+        "version": start.BOT_VERSION,
+        "storage": "postgres" if os.environ.get("DATABASE_URL") else "files",
+    }
+
+
 async def _start_health_server() -> None:
-    """Tiny HTTP server on $PORT so platforms that require a listening port
-    (Koyeb, Render, Fly) keep the container alive. No-op if PORT is unset."""
+    """Крошечный HTTP-сервер на $PORT: платформам, требующим открытый порт
+    (Koyeb, Render, Fly), он говорит, что контейнер жив. Без `PORT` не
+    поднимается вовсе.
+
+    Отдаёт **версию бота**, и это не украшение. Правило проекта: после
+    выката проверить, доехал ли код, — иначе «функция не работает» и «код не
+    задеплоен» неразличимы. Пока версию показывал только `/version` в чате,
+    проверить это мог лишь человек руками; теперь то же самое может сделать
+    скрипт обновления (`scripts/deploy.sh`) и не отчитаться об успехе там,
+    где поднялась старая сборка.
+    """
     port = os.environ.get("PORT")
     if not port:
         return
@@ -293,7 +314,12 @@ async def _start_health_server() -> None:
         from aiohttp import web
         app = web.Application()
         async def _ok(_req):
-            return web.Response(text="OK — bot running")
+            # `ensure_ascii=False`: иначе версия с кириллицей уехала бы
+            # экранированной, и выкат не узнал бы её при сверке — то есть
+            # отчитался бы о неудаче там, где всё в порядке.
+            return web.json_response(
+                health_payload(),
+                dumps=lambda o: json.dumps(o, ensure_ascii=False))
         app.router.add_get("/", _ok)
         app.router.add_get("/health", _ok)
         runner = web.AppRunner(app)

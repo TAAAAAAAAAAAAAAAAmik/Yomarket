@@ -176,24 +176,34 @@ class TheOrderOfMessagesIsNotAssumed(unittest.TestCase):
     СТАРОЕ письмо, и экран уверенно докладывал про трёхдневную давность,
     пока сегодняшнее сообщение висело непрочитанным."""
 
-    REVERSED = [
-        {"id": "15488500", "sender_type": "buyer", "text": "долго",
-         "created_at": stamp(120)},
-        {"id": "15360529", "sender_type": "buyer", "text": "спасибо",
-         "created_at": stamp(69 * 3600)},
-    ]
+    def rows(self):
+        """Письма строятся в момент прогона, а не при импорте модуля.
+
+        Были списком в теле класса — то есть с отметками времени, снятыми
+        один раз при загрузке. Пока набор бежал полминуты, это сходило с рук;
+        стоило ему вырасти до полутора минут, и «свежее» письмо успевало
+        состариться до «0.1 ч назад» ещё до того, как до теста доходила
+        очередь. Тест падал через раз и выглядел как случайная поломка, хотя
+        ломались часы, а не код.
+        """
+        return [
+            {"id": "15488500", "sender_type": "buyer", "text": "долго",
+             "created_at": stamp(120)},
+            {"id": "15360529", "sender_type": "buyer", "text": "спасибо",
+             "created_at": stamp(69 * 3600)},
+        ]
 
     def test_the_newest_letter_wins_even_when_the_api_sorts_backwards(self):
-        text = report(settings(seen="1"), FakeAPI(self.REVERSED))
+        text = report(settings(seen="1"), FakeAPI(self.rows()))
         self.assertIn("долго", text)
         self.assertIn("0.0 ч назад", text)
 
     def test_the_newest_id_is_the_largest_not_the_last(self):
-        text = report(settings(seen="1"), FakeAPI(self.REVERSED))
+        text = report(settings(seen="1"), FakeAPI(self.rows()))
         self.assertIn("15488500", text)
 
     def test_an_unread_letter_is_announced(self):
-        text = report(settings(seen="15360529"), FakeAPI(self.REVERSED))
+        text = report(settings(seen="15360529"), FakeAPI(self.rows()))
         self.assertIn("Есть непрочитанное", text)
 
 
