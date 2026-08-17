@@ -254,7 +254,7 @@ class TheCatalogueIsPrintedAsItCame(unittest.TestCase):
     def test_nothing_found_says_so_and_suggests_another_word(self):
         got = self.report("/ns_stock minecraft")
         self.assertIn("ничего не нашлось", got)
-        self.assertIn("/ns_stock", got)
+        self.assertIn("другое слово", got)
 
     def test_a_refusal_is_shown_instead_of_a_catalogue(self):
         got = self.report(answer=(False, "доступ запрещён — возможно, наш IP "
@@ -269,6 +269,196 @@ class TheCatalogueIsPrintedAsItCame(unittest.TestCase):
         asyncio.run(H.ns_stock(msg))
         self.assertEqual(called, [])
         self.assertIn("Не задано", "\n".join(msg.said))
+
+
+class CB:
+    def __init__(self, data):
+        self.data = data
+        self.message = Screen()
+        self.from_user = type("U", (), {"id": 1})()
+        self.alerts: list[str] = []
+
+    async def answer(self, text="", **kw):
+        self.alerts.append(text)
+
+
+class Screen:
+    def __init__(self):
+        self.texts: list[str] = []
+        self.kbs: list = []
+
+    async def edit_text(self, text, reply_markup=None, **kw):
+        self.texts.append(text)
+        self.kbs.append(reply_markup)
+        return self
+
+    async def answer(self, text, reply_markup=None, **kw):
+        self.texts.append(text)
+        self.kbs.append(reply_markup)
+        return self
+
+    @property
+    def last(self) -> str:
+        return self.texts[-1] if self.texts else ""
+
+
+class FSM:
+    def __init__(self):
+        self.data: dict = {}
+        self.state = None
+
+    async def set_state(self, s):
+        self.state = s
+
+    async def clear(self):
+        self.state = None
+
+    async def update_data(self, **kw):
+        self.data.update(kw)
+
+    async def get_data(self):
+        return dict(self.data)
+
+
+def buttons(kb) -> list[str]:
+    return [] if kb is None else [b.text for row in kb.inline_keyboard
+                                  for b in row]
+
+
+def callbacks(kb) -> list[str]:
+    return [] if kb is None else [b.callback_data for row in kb.inline_keyboard
+                                  for b in row]
+
+
+class TheAccessIsEnteredByButtons(unittest.TestCase):
+    """Продавцу неоткуда узнать про команду `/ns_login`: раздел он открывает
+    кнопками, значит и доступ вводится там же."""
+
+    def setUp(self):
+        self.saved: dict = {}
+        self._save, self._get = H.save_ns_creds, H.get_ns_creds
+        self._del = H.delete_ns_creds
+        H.save_ns_creds = lambda uid, c: self.saved.update(c)
+        H.get_ns_creds = lambda uid: dict(self.saved)
+        H.delete_ns_creds = lambda uid: self.saved.clear()
+
+    def tearDown(self):
+        H.save_ns_creds, H.get_ns_creds = self._save, self._get
+        H.delete_ns_creds = self._del
+
+    def screen(self):
+        cb = CB("ns:creds")
+        asyncio.run(H.ns_creds_screen(cb, FSM()))
+        return cb
+
+    def test_the_roblox_plugin_leads_here(self):
+        """Проверка проводки: экран может быть хорош, а попасть в него
+        неоткуда."""
+        from handlers import plugins as P
+        kb = P._roblox_keyboard({"plugins": {"auto_roblox": {}}})
+        self.assertIn("ns:creds", callbacks(kb))
+
+    def test_every_field_has_its_own_button(self):
+        cb = self.screen()
+        marks = callbacks(cb.message.kbs[-1])
+        for i in range(4):
+            self.assertIn(f"ns:set:{i}", marks)
+
+    def test_an_empty_field_is_marked_as_empty(self):
+        cb = self.screen()
+        self.assertTrue(any("▫️" in t for t in buttons(cb.message.kbs[-1])))
+
+    def test_a_filled_one_is_marked_as_filled(self):
+        self.saved["login"] = "candbug"
+        cb = self.screen()
+        self.assertTrue(any("✅" in t for t in buttons(cb.message.kbs[-1])))
+
+    def test_checking_the_login_is_offered_only_when_all_is_there(self):
+        """Кнопка, которая заведомо не сработает, — обещание невозможного."""
+        cb = self.screen()
+        self.assertNotIn("ns:check", callbacks(cb.message.kbs[-1]))
+        self.saved.update({"user_id": "1", "login": "a", "password": "b",
+                           "api_secret": "c"})
+        cb = self.screen()
+        self.assertIn("ns:check", callbacks(cb.message.kbs[-1]))
+
+    def test_the_secret_is_shown_as_a_length_not_a_value(self):
+        self.saved.update({"api_secret": SECRET, "password": PASSWORD})
+        cb = self.screen()
+        self.assertNotIn(SECRET, cb.message.last)
+        self.assertNotIn(PASSWORD, cb.message.last)
+        self.assertIn("символов", cb.message.last)
+
+    def test_the_login_is_shown_as_is(self):
+        """Он не секрет, и видеть его полезно: опечатку иначе не заметить."""
+        self.saved["login"] = "candbug"
+        self.assertIn("candbug", self.screen().message.last)
+
+    def test_a_field_typed_in_is_saved_and_the_message_deleted(self):
+        cb = CB("ns:set:2")            # пароль
+        fsm = FSM()
+        asyncio.run(H.ns_set_field(cb, fsm))
+        msg = Msg(PASSWORD)
+        asyncio.run(H.ns_one_field_input(msg, fsm))
+        self.assertEqual(self.saved["password"], PASSWORD)
+        self.assertTrue(msg.deleted)
+
+    def test_and_the_answer_does_not_echo_it(self):
+        cb = CB("ns:set:3")            # ключ
+        fsm = FSM()
+        asyncio.run(H.ns_set_field(cb, fsm))
+        msg = Msg(SECRET)
+        asyncio.run(H.ns_one_field_input(msg, fsm))
+        self.assertNotIn(SECRET, "\n".join(msg.said))
+
+    def test_an_empty_value_changes_nothing(self):
+        cb = CB("ns:set:1")
+        fsm = FSM()
+        asyncio.run(H.ns_set_field(cb, fsm))
+        msg = Msg("   ")
+        asyncio.run(H.ns_one_field_input(msg, fsm))
+        self.assertNotIn("login", self.saved)
+
+    def test_the_bulk_paste_still_works_from_the_screen(self):
+        fsm = FSM()
+        asyncio.run(H.ns_bulk_prompt(CB("ns:bulk"), fsm))
+        msg = Msg(f"user_id: 1\nlogin: a\npassword: {PASSWORD}")
+        asyncio.run(H.ns_bulk_input(msg, fsm))
+        self.assertEqual(self.saved["user_id"], "1")
+        self.assertTrue(msg.deleted)
+
+    def test_deleting_clears_everything(self):
+        self.saved.update({"login": "a", "api_secret": SECRET})
+        asyncio.run(H.ns_delete(CB("ns:del")))
+        self.assertEqual(self.saved, {})
+
+    def test_the_check_button_only_reads(self):
+        """«Проверить вход» спрашивает баланс — покупок здесь быть не может."""
+        import automation.nsgifts as N
+        self.saved.update({"user_id": "1", "login": "a", "password": "b",
+                           "api_secret": "c"})
+        real = N.balance_sync
+        N.balance_sync = lambda creds: (True, "305.2403")
+        try:
+            cb = CB("ns:check")
+            asyncio.run(H.ns_check(cb))
+        finally:
+            N.balance_sync = real
+        self.assertIn("305.2403", cb.message.last)
+
+    def test_a_refused_check_says_why(self):
+        import automation.nsgifts as N
+        self.saved.update({"user_id": "1", "login": "a", "password": "b",
+                           "api_secret": "c"})
+        real = N.balance_sync
+        N.balance_sync = lambda creds: (False, "доступ запрещён — возможно, "
+                                               "наш IP не в белом списке")
+        try:
+            cb = CB("ns:check")
+            asyncio.run(H.ns_check(cb))
+        finally:
+            N.balance_sync = real
+        self.assertIn("белом списке", cb.message.last)
 
 
 class TheCommandsAreWiredIn(unittest.TestCase):
