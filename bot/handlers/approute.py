@@ -265,15 +265,21 @@ async def _probe_report(target, creds: dict) -> None:
             lines.append(f"   ответ не JSON: <code>{html.escape(row['excerpt'])}</code>")
         else:
             lines.append(f"   поля тела: <code>{html.escape(', '.join(row['keys']) or 'пусто')}</code>")
-            lines.append(f"   code: <code>{html.escape(row['code'] or '— нет —')}</code>")
-            if row["said"]:
-                lines.append(f"   сказано: {html.escape(row['said'])}")
+            # Значения важнее имён: в `statusMessage` поставщик словами
+            # пишет, что не так, и без этого отчёт отвечает «форма не та»,
+            # молча о причине.
+            for name, value in (row.get("fields") or {}).items():
+                lines.append(f"   {html.escape(name)}: "
+                             f"<code>{html.escape(str(value))}</code>")
+            if row.get("data"):
+                lines.append(f"   data: <code>{html.escape(str(row['data']))}</code>")
             if row["trace"]:
                 lines.append(f"   traceId: <code>{html.escape(row['trace'])}</code>")
         lines.append("")
-    lines.append("Если поля <code>code</code> нет ни в одном ответе — форма "
-                 "конверта у поставщика не та, что в его же SDK. Это к их "
-                 "поддержке, с номером обращения выше.")
+    lines.append("Строка <code>statusMessage</code> — это то, что поставщик "
+                 "говорит о запросе своими словами; <code>errorCode</code> — "
+                 "его же название отказа. С ними и <code>traceId</code> можно "
+                 "идти в их поддержку.")
     await say("\n".join(lines)[:4000])
 
 

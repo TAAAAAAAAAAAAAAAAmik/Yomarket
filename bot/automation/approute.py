@@ -7,12 +7,19 @@
 
 Три вещи, которые легко сделать «по-своему» и получить молчаливую поломку:
 
-* **HTTP 200 — не ответ на вопрос «получилось ли».** У AppRoute всё
-  завёрнуто в конверт `{status, code, message, traceId, data}`, и успехом
-  считаются только коды `OK`, `ACCEPTED`, `IDEMPOTENCY_REPLAY`. «Нет в
-  наличии» и «не хватает денег» приезжают с кодом внутри конверта. Клиент,
-  который смотрит на статус HTTP, будет бодро докладывать об успехе там,
-  где ничего не произошло, — это самая дорогая поломка в этом проекте.
+* **HTTP 200 — не ответ на вопрос «получилось ли».** Всё завёрнуто в
+  конверт, и снаружи ответ всегда двухсотый. Клиент, который смотрит на
+  статус HTTP, будет бодро докладывать об успехе там, где ничего не
+  произошло, — это самая дорогая поломка в этом проекте.
+* **Конвертов два, и настоящий — не тот, что в SDK.** SDK описывает
+  `{status, code, message, traceId, data}` с успехом по трём кодам (`OK`,
+  `ACCEPTED`, `IDEMPOTENCY_REPLAY`). Живой ответ, снятый пробой на настоящем
+  ключе 17.08, выглядит иначе:
+  `{data, errorCode, errors, status, statusCode, statusMessage, traceId}` —
+  ни `code`, ни `message` там нет вовсе, а значимый код лежит в `statusCode`
+  **внутри** тела. Одинаково на обоих доменах. Понимаем оба; признак успеха
+  во втором **выведен из имён полей**, а не прочитан в документации, поэтому
+  сомнение решается в сторону отказа.
 * **На проводе camelCase.** В SDK поля пишутся `item_id`, `reference_id`,
   `client_time` — но это удобство Python: его транспорт переводит ключи в
   `itemId`, `referenceId`, `clientTime` перед отправкой. Мы идём без SDK,
@@ -177,20 +184,74 @@ class ARClient:
         if not isinstance(body, dict):
             raise ARError("", f"неожиданный ответ (HTTP {r.status_code})",
                           r.status_code)
-        code = str(body.get("code") or "")
         trace = str(body.get("traceId") or "")
-        if code in SUCCESS_CODES:
-            return body.get("data")
-        if not code:
-            # Конверта нет. Раньше здесь печаталось голое «HTTP 200» — это
-            # отписка: продавец видит цифру, из которой ничего не следует.
-            # Говорим, чем ответ отличается от ожидаемого, и отдаём то, что
-            # в нём всё-таки было. Живой отказ 17.08 выглядел именно так:
-            # HTTP 200, traceId есть, поля code нет вовсе.
-            raise ARError("", _no_envelope(body, r.status_code),
-                          r.status_code, trace)
-        raise ARError(code, explain_code(code, body.get("message")),
-                      r.status_code, trace, body.get("errors") or [])
+        errors = body.get("errors") or []
+
+        # Конверт из SDK: успех решает `code`.
+        code = str(body.get("code") or "")
+        if code:
+            if code in SUCCESS_CODES:
+                return body.get("data")
+            raise ARError(code, explain_code(code, body.get("message")),
+                          r.status_code, trace, errors)
+
+        # Живой конверт, снятый 17.08 пробой `/apr_debug`: полей `code` и
+        # `message` в нём нет вовсе, зато есть `errorCode`, `statusCode` и
+        # `statusMessage`. Форма разошлась с их же SDK, и разбираем мы её
+        # по тому, что видели, а не по тому, что было написано.
+        if _looks_like_live_envelope(body):
+            problem = str(body.get("errorCode") or "").strip()
+            said = str(body.get("statusMessage") or "").strip()
+            status_code = body.get("statusCode")
+            if _live_envelope_is_ok(body):
+                return body.get("data")
+            why = explain_code(problem, said) if problem else (
+                said or "поставщик отказал, не назвав причины")
+            if status_code and str(status_code) not in ("200", "0"):
+                why += f" (код {status_code})"
+            raise ARError(problem, why, r.status_code, trace, errors)
+
+        # Ни того конверта, ни другого — значит отвечали не они.
+        raise ARError("", _no_envelope(body, r.status_code),
+                      r.status_code, trace)
+
+
+# Поля живого конверта AppRoute — снято пробой на настоящем ключе 17.08.
+# Их SDK описывает другой набор (`code`, `message`), и полагаться на него
+# одного значит не понимать половину ответов.
+LIVE_ENVELOPE_FIELDS = ("statusCode", "statusMessage", "errorCode")
+
+
+def _looks_like_live_envelope(body: dict) -> bool:
+    return any(k in body for k in LIVE_ENVELOPE_FIELDS)
+
+
+def _live_envelope_is_ok(body: dict) -> bool:
+    """Успех ли это — по тому конверту, который приходит на самом деле.
+
+    Признак успеха здесь **выведен из имён полей, а не прочитан в
+    документации**: `errorCode` пуст, `status`/`statusCode` не возражают, и
+    `data` действительно есть. Сомнение решается в сторону отказа — принять
+    отказ за успех значит отчитаться о выдаче, которой не было, а это самая
+    дорогая поломка в этом проекте. Обратная ошибка дешевле: продавец увидит
+    причину и `traceId`.
+    """
+    if str(body.get("errorCode") or "").strip():
+        return False
+    if body.get("errors"):
+        return False
+    status = body.get("status")
+    if isinstance(status, bool) and not status:
+        return False
+    if isinstance(status, str) and status.strip().lower() in (
+            "error", "fail", "failed", "false", "ошибка"):
+        return False
+    status_code = body.get("statusCode")
+    if status_code is not None and str(status_code).strip() not in ("200", "201", "0", ""):
+        return False
+    # Пустой `data` при отсутствии жалоб — не успех, а «непонятно»: у чтения
+    # каталога и баланса ответ всегда содержателен.
+    return body.get("data") is not None
 
 
 def _no_envelope(body: dict, http: int) -> str:
@@ -296,7 +357,7 @@ def probe_sync(creds: dict) -> list[dict]:
         for path in ("/whoami", "/accounts"):
             row = {"region": region, "path": path, "http": 0, "json": False,
                    "keys": [], "code": "", "trace": "", "said": "",
-                   "excerpt": "", "error": ""}
+                   "excerpt": "", "error": "", "fields": {}, "data": ""}
             try:
                 r = requests.get(
                     base + path,
@@ -313,12 +374,43 @@ def probe_sync(creds: dict) -> list[dict]:
                         row["said"] = str(body.get("message") or
                                           body.get("error") or
                                           body.get("detail") or "")[:200]
+                        # Значения, а не только имена полей. Первая проба
+                        # напечатала список ключей — и `statusMessage`, то
+                        # самое место, где сервер словами говорит, что не
+                        # так, осталась непрочитанной. Перечень имён без
+                        # значений отвечает «форма не та» и молчит о причине.
+                        for name in ("status", "statusCode", "statusMessage",
+                                     "errorCode", "message", "error"):
+                            if name in body and body.get(name) not in (None, ""):
+                                row["fields"][name] = _redact(
+                                    str(body.get(name)), key)[:200]
+                        if body.get("errors"):
+                            row["fields"]["errors"] = _redact(
+                                str(body.get("errors")), key)[:200]
+                        row["data"] = _describe_data(body.get("data"), key)
                 except ValueError:
                     row["excerpt"] = _redact(r.text, key)[:200]
             except requests.RequestException as e:
                 row["error"] = _redact(str(e), key)[:150]
             out.append(row)
     return out
+
+
+def _describe_data(data, key: str) -> str:
+    """Что лежит в `data` — коротко и без секретов.
+
+    «Есть ли данные» и «что именно» — разные ответы: пустой `data` при
+    отсутствии жалоб означает не успех, а «непонятно».
+    """
+    if data is None:
+        return "null (пусто)"
+    if isinstance(data, dict):
+        if not data:
+            return "{} (пустой объект)"
+        return "поля: " + _redact(", ".join(sorted(str(k) for k in data)), key)[:200]
+    if isinstance(data, list):
+        return f"список из {len(data)}"
+    return _redact(str(data), key)[:200]
 
 
 def _redact(text: str, key: str) -> str:

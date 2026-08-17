@@ -219,6 +219,142 @@ class AnAnswerWithoutTheEnvelopeIsExplainedNotJustNumbered(unittest.TestCase):
         self.assertNotIn("apr_debug", e.why)
 
 
+class TheLiveEnvelopeIsNotTheOneInTheirSdk(unittest.TestCase):
+    """Снято пробой на настоящем ключе 17.08. На проводе приходит
+
+        {data, errorCode, errors, status, statusCode, statusMessage, traceId}
+
+    — ни `code`, ни `message`, которые описаны в их SDK. Одинаково на обоих
+    доменах, то есть за ними один шлюз. Разбираем то, что видели: иначе бот
+    не понимает ни одного настоящего ответа этого поставщика.
+
+    Признак успеха здесь **выведен из имён полей, а не прочитан в
+    документации**, поэтому сомнение решается в сторону отказа: принять
+    отказ за успех значит отчитаться о выдаче, которой не было."""
+
+    def answer(self, body, http=200):
+        fake = Fake(Reply(body, code=http))
+        return client(fake, max_retries=0)
+
+    def live(self, **over):
+        body = {"data": None, "errorCode": None, "errors": None,
+                "status": True, "statusCode": 200, "statusMessage": "OK",
+                "traceId": "4af69e7d"}
+        body.update(over)
+        return body
+
+    def test_an_error_code_is_a_refusal_even_at_http_200(self):
+        c = self.answer(self.live(errorCode="UNAUTHORIZED",
+                                  statusCode=401, statusMessage="Invalid key"))
+        with self.assertRaises(A.ARError) as e:
+            c.call("GET", "/accounts")
+        self.assertEqual(e.exception.code, "UNAUTHORIZED")
+
+    def test_the_suppliers_own_sentence_reaches_the_seller(self):
+        """`statusMessage` — то место, где сервер говорит словами. Первая
+        проба напечатала только имена полей, и эта строка потерялась."""
+        c = self.answer(self.live(errorCode="FORBIDDEN",
+                                  statusMessage="IP 1.2.3.4 is not allowed"))
+        with self.assertRaises(A.ARError) as e:
+            c.call("GET", "/accounts")
+        self.assertIn("1.2.3.4", e.exception.why)
+
+    def test_an_unknown_error_code_still_says_something_useful(self):
+        c = self.answer(self.live(errorCode="WHAT_IS_THIS",
+                                  statusMessage="что-то пошло не так"))
+        with self.assertRaises(A.ARError) as e:
+            c.call("GET", "/accounts")
+        self.assertIn("что-то пошло не так", e.exception.why)
+
+    def test_the_data_comes_back_when_nothing_complains(self):
+        c = self.answer(self.live(data={"ip": "1.2.3.4"}))
+        self.assertEqual(c.call("GET", "/whoami"), {"ip": "1.2.3.4"})
+
+    def test_an_empty_data_without_complaints_is_not_called_success(self):
+        """`data: null` и никаких жалоб — это «непонятно», а не «получилось».
+        У чтения каталога и баланса ответ всегда содержателен."""
+        c = self.answer(self.live(data=None))
+        with self.assertRaises(A.ARError):
+            c.call("GET", "/accounts")
+
+    def test_a_failing_status_flag_is_a_refusal(self):
+        c = self.answer(self.live(status=False, data={"x": 1}))
+        with self.assertRaises(A.ARError):
+            c.call("GET", "/accounts")
+
+    def test_a_non_success_status_code_inside_the_body_is_a_refusal(self):
+        """Внутренний `statusCode` важнее внешнего HTTP: снаружи всегда 200."""
+        c = self.answer(self.live(statusCode=403, data={"x": 1}))
+        with self.assertRaises(A.ARError) as e:
+            c.call("GET", "/accounts")
+        self.assertIn("403", e.exception.why)
+
+    def test_field_errors_alone_are_enough_to_refuse(self):
+        c = self.answer(self.live(data={"x": 1},
+                                  errors=[{"field": "q", "message": "плохо"}]))
+        with self.assertRaises(A.ARError):
+            c.call("GET", "/accounts")
+
+    def test_the_trace_id_survives_the_other_envelope(self):
+        c = self.answer(self.live(errorCode="UNAUTHORIZED"))
+        with self.assertRaises(A.ARError) as e:
+            c.call("GET", "/accounts")
+        self.assertIn("4af69e7d", e.exception.explain())
+
+    def test_the_sdk_envelope_still_works(self):
+        """Их SDK не выдумка: где-то этот конверт может и прийти."""
+        fake = Fake(Reply(envelope("OK", data={"items": []})))
+        self.assertEqual(client(fake).call("GET", "/services"), {"items": []})
+
+
+class TheProbePrintsValuesNotJustFieldNames(unittest.TestCase):
+    """Первая проба напечатала «поля тела: data, errorCode, …» — и на этом
+    остановилась. Ответ на вопрос «что не так» лежал в значении
+    `statusMessage`, которое она не показала. Перечень имён без значений —
+    диагностика, которая говорит «форма не та» и молчит о причине."""
+
+    def setUp(self):
+        self._get = A.requests.get
+        A.requests.get = lambda url, headers=None, timeout=None: Reply({
+            "data": None, "errorCode": "UNAUTHORIZED", "errors": None,
+            "status": False, "statusCode": 401,
+            "statusMessage": "API key is not allowed from IP 1.2.3.4",
+            "traceId": "4af69e7d"})
+
+    def tearDown(self):
+        A.requests.get = self._get
+
+    def test_the_message_value_is_in_the_report(self):
+        rows = A.probe_sync(CREDS)
+        self.assertIn("statusMessage", rows[0]["fields"])
+        self.assertIn("1.2.3.4", rows[0]["fields"]["statusMessage"])
+
+    def test_the_error_code_value_is_in_the_report(self):
+        self.assertEqual(A.probe_sync(CREDS)[0]["fields"]["errorCode"],
+                         "UNAUTHORIZED")
+
+    def test_the_inner_status_code_is_shown_too(self):
+        """Снаружи всегда 200 — значимо именно внутреннее число."""
+        self.assertEqual(A.probe_sync(CREDS)[0]["fields"]["statusCode"], "401")
+
+    def test_it_says_whether_there_was_any_data_at_all(self):
+        self.assertIn("null", A.probe_sync(CREDS)[0]["data"])
+
+    def test_data_contents_are_described_not_dumped(self):
+        A.requests.get = lambda url, headers=None, timeout=None: Reply({
+            "data": {"ip": "1.2.3.4", "account": "x"}, "traceId": "t",
+            "statusCode": 200})
+        self.assertIn("ip", A.probe_sync(CREDS)[0]["data"])
+
+    def test_the_key_is_cut_out_of_values_too(self):
+        """Поставщик вполне может вернуть ключ в тексте своей же ошибки."""
+        A.requests.get = lambda url, headers=None, timeout=None: Reply({
+            "statusMessage": f"key {KEY} rejected", "errorCode": "UNAUTHORIZED",
+            "traceId": "t"})
+        blob = json.dumps(A.probe_sync(CREDS), ensure_ascii=False)
+        self.assertNotIn(KEY, blob)
+
+
 class TheAllowlistIsTheFirstThingToCheck(unittest.TestCase):
     """У AppRoute белый список IP — это написано на экране выдачи ключа, а не
     в SDK. Бот живёт на Railway, где адрес меняется при каждом выкате, и
