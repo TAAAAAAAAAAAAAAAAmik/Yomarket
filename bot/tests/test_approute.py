@@ -451,6 +451,77 @@ class TheProxyPasswordIsNeverShown(unittest.TestCase):
         self.assertIn("proxy", storage._AR_SECRET_FIELDS)
 
 
+class WhetherAProxyFitsTheAllowlistIsCheckedNotAdvised(unittest.TestCase):
+    """«Подойдёт ли мой прокси» — вопрос проверяемый, и отвечать на него
+    советом значит перекладывать проверку на продавца. Белому списку нужен
+    постоянный адрес; ротационный прокси меняет его от запроса к запросу, и
+    вписывать в кабинет нечего."""
+
+    def ips(self, *answers):
+        import automation.fragment as F
+        seq = list(answers)
+        real = F.outbound_ip
+        F.outbound_ip = lambda proxy="": (seq.pop(0) if seq else "5.5.5.5")
+        self.addCleanup(lambda: setattr(F, "outbound_ip", real))
+
+    def test_one_address_every_time_is_called_suitable(self):
+        self.ips("1.2.3.4", "1.2.3.4", "1.2.3.4", "9.9.9.9")
+        got = A.proxy_check_sync({"proxy": "http://p:1"})
+        self.assertTrue(got["stable"])
+        self.assertEqual(got["ip"], "1.2.3.4")
+
+    def test_a_changing_address_is_called_unsuitable(self):
+        """Ровно то, чем плох дешёвый ротационный прокси."""
+        self.ips("1.2.3.4", "1.2.3.5", "1.2.3.6", "9.9.9.9")
+        got = A.proxy_check_sync({"proxy": "http://p:1"})
+        self.assertFalse(got["stable"])
+        self.assertEqual(len(got["seen"]), 3)
+
+    def test_a_proxy_that_changes_nothing_is_caught(self):
+        """«Прокси задан» и «запросы идут через прокси» — разные
+        утверждения. Совпадение с прямым адресом означает второе неверным."""
+        self.ips("7.7.7.7", "7.7.7.7", "7.7.7.7", "7.7.7.7")
+        got = A.proxy_check_sync({"proxy": "http://p:1"})
+        self.assertTrue(got["same_as_direct"])
+
+    def test_a_dead_proxy_leaves_no_address(self):
+        self.ips("адрес не узнать", "адрес не узнать", "адрес не узнать",
+                 "9.9.9.9")
+        got = A.proxy_check_sync({"proxy": "http://p:1"})
+        self.assertEqual(got["ip"], "")
+        self.assertFalse(got["stable"])
+
+    def test_without_a_proxy_it_reports_the_direct_address(self):
+        self.ips("9.9.9.9")
+        got = A.proxy_check_sync({})
+        self.assertFalse(got["proxy"])
+        self.assertEqual(got["ip"], "9.9.9.9")
+
+    def test_the_verdict_names_the_address_to_whitelist(self):
+        self.ips("1.2.3.4", "1.2.3.4", "1.2.3.4", "9.9.9.9")
+        said = asyncio.run(H._proxy_verdict({"proxy": "http://p:1"}))
+        self.assertIn("1.2.3.4", said)
+        self.assertIn("белый список", said)
+
+    def test_the_verdict_refuses_a_rotating_proxy_plainly(self):
+        self.ips("1.2.3.4", "1.2.3.5", "1.2.3.6", "9.9.9.9")
+        said = asyncio.run(H._proxy_verdict({"proxy": "http://p:1"}))
+        self.assertIn("не годится", said)
+        self.assertNotIn("✅", said)
+
+    def test_the_verdict_does_not_pass_a_sample_off_as_proof(self):
+        """Прокси может менять адрес раз в час — три запроса этого не
+        покажут. Догадка, поданная как факт, — то же враньё."""
+        self.ips("1.2.3.4", "1.2.3.4", "1.2.3.4", "9.9.9.9")
+        said = asyncio.run(H._proxy_verdict({"proxy": "http://p:1"}))
+        self.assertIn("выборка", said)
+
+    def test_the_check_is_reachable_from_the_screen(self):
+        """Проверка, до которой не дойти кнопкой, продавцу не существует."""
+        import inspect
+        self.assertIn("apr:proxy_test", inspect.getsource(H))
+
+
 class TheAllowlistIsTheFirstThingToCheck(unittest.TestCase):
     """У AppRoute белый список IP — это написано на экране выдачи ключа, а не
     в SDK. Бот живёт на Railway, где адрес меняется при каждом выкате, и

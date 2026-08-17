@@ -588,6 +588,7 @@ async def apr_proxy_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ARState.proxy)
     b = InlineKeyboardBuilder()
     if get_ar_creds(callback.from_user.id).get("proxy"):
+        b.button(text="🧪 Годится ли он", callback_data="apr:proxy_test")
         b.button(text="🗑 Убрать прокси", callback_data="apr:proxy_off")
     b.button(text="⬅️ Отмена", callback_data="apr:creds")
     b.adjust(1)
@@ -635,6 +636,61 @@ async def apr_proxy_input(message: Message, state: FSMContext) -> None:
                       "✅ Прокси сохранён. Проверьте «🪪 Наш IP у поставщика»: "
                       "там должен появиться адрес прокси — его и вписывайте "
                       "в белый список.")
+
+
+@router.callback_query(F.data == "apr:proxy_test")
+async def apr_proxy_test(callback: CallbackQuery, state: FSMContext) -> None:
+    """Годится ли этот прокси для белого списка — фактом, а не советом."""
+    await state.clear()
+    creds = get_ar_creds(callback.from_user.id)
+    await callback.answer("⏳ Проверяю…")
+    await callback.message.edit_text(
+        "⏳ Спрашиваю свой адрес несколько раз подряд…")
+    await _show_creds(callback, callback.from_user.id,
+                      await _proxy_verdict(creds))
+
+
+async def _proxy_verdict(creds: dict) -> str:
+    """Отчёт о прокси. Собирается из фактов, а не из разбора своей же прозы."""
+    from automation.approute import proxy_check_sync
+
+    loop = asyncio.get_event_loop()
+    try:
+        got = await asyncio.wait_for(
+            loop.run_in_executor(None, proxy_check_sync, creds), timeout=120)
+    except Exception as e:
+        return f"❌ Проверить не вышло: {html.escape(str(e)[:200])}"
+
+    if not got["proxy"]:
+        return (f"🌐 Прокси не задан. Наружу выходим напрямую с адреса "
+                f"<code>{html.escape(got['ip'])}</code> — его и надо вписывать "
+                f"в белый список. На Railway он меняется при каждом выкате.")
+
+    seen = ", ".join(html.escape(a) for a in got["seen"])
+    if got["problem"]:
+        return f"⚠️ {html.escape(got['problem'])}"
+    if not got["ip"]:
+        return ("❌ Через этот прокси не удалось выйти наружу ни разу.\n"
+                "Проверьте строку: адрес, порт, логин и пароль.")
+    if got["same_as_direct"]:
+        # «Прокси задан» и «запросы идут через прокси» — разные утверждения.
+        return (f"❌ Прокси не применяется: адрес такой же, как без него "
+                f"(<code>{html.escape(got['ip'])}</code>).\n"
+                f"Обычно это неверный формат строки или отвергнутый пароль.")
+    if not got["stable"]:
+        return (f"❌ <b>Для белого списка не годится.</b>\n"
+                f"Адрес меняется от запроса к запросу: {seen}\n"
+                f"В кабинет вписывают один адрес, а этот прокси ротационный. "
+                f"Нужен статический (выделенный).")
+    return (f"✅ <b>Похоже, годится.</b>\n"
+            f"Три запроса подряд вышли с одного адреса: "
+            f"<code>{html.escape(got['ip'])}</code>\n"
+            f"Без прокси мы выходим с <code>{html.escape(got['direct'])}</code> "
+            f"— значит прокси действительно работает.\n\n"
+            f"Вписывайте в белый список <code>{html.escape(got['ip'])}</code>.\n"
+            f"<i>Три запроса — это выборка, а не доказательство: прокси может "
+            f"менять адрес раз в час или на новую сессию. Окончательно "
+            f"подтвердит только принятый ключ.</i>")
 
 
 @router.callback_query(F.data == "apr:proxy_off")

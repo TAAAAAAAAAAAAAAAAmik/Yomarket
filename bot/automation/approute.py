@@ -333,6 +333,45 @@ def outbound_ip(creds: dict) -> str:
     return ip(str((creds or {}).get("proxy") or ""))
 
 
+def proxy_check_sync(creds: dict, times: int = 3) -> dict:
+    """Годится ли этот прокси для белого списка. Только чтение.
+
+    Белому списку нужен **постоянный** адрес. Ротационные прокси меняют его
+    на каждый запрос, и вписывать в кабинет нечего. Проверяется это
+    единственным честным способом: спросить свой адрес несколько раз подряд
+    и посмотреть, один ли он.
+
+    Заодно сверяется адрес без прокси. Если они совпали — прокси не
+    применяется на самом деле (не тот формат строки, отвергнутая
+    авторизация, тихий обход), и тогда «прокси задан» ничего не значит.
+
+    Ответ — dict, а не готовый текст: разбирать собственную прозу вместо
+    структурных данных в этом проекте уже приводило к ошибкам.
+    """
+    from automation.fragment import outbound_ip as ip
+
+    proxy = str((creds or {}).get("proxy") or "").strip()
+    out = {"proxy": bool(proxy), "seen": [], "stable": False, "ip": "",
+           "direct": "", "same_as_direct": False, "problem": proxy_problem(creds)}
+    if not proxy:
+        out["direct"] = ip("")
+        out["ip"] = out["direct"]
+        out["seen"] = [out["direct"]]
+        out["stable"] = True
+        return out
+
+    seen = []
+    for _ in range(max(1, int(times or 1))):
+        seen.append(ip(proxy))
+    out["seen"] = seen
+    good = [a for a in seen if a and a != "адрес не узнать"]
+    out["ip"] = good[0] if good else ""
+    out["stable"] = bool(good) and len(set(good)) == 1 and len(good) == len(seen)
+    out["direct"] = ip("")
+    out["same_as_direct"] = bool(out["ip"]) and out["ip"] == out["direct"]
+    return out
+
+
 def _client(creds: dict) -> ARClient:
     return ARClient(str((creds or {}).get("api_key") or ""),
                     base_url_of(creds), str((creds or {}).get("proxy") or ""))
