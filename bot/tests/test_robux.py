@@ -201,13 +201,20 @@ class TheScreenDoesNotPromiseWhatItCannotDo(unittest.TestCase):
         self.assertIn("код", said.lower())
         self.assertIn("ник", said.lower())      # и что он не нужен
 
-    def test_the_toggle_still_does_not_claim_delivery_works(self):
-        """Покупка не написана. «🟢 Автовыдача включена» здесь было бы
-        обещанием, которого никто не выполнит."""
+    def test_the_toggle_now_means_what_it_says(self):
+        """Выдача написана, и тумблер её включает — обещание выполнимо."""
         from handlers import plugins as P
         said = P._roblox_text({"plugins": {"auto_roblox": {"enabled": True}}})
-        self.assertIn("ещё не работает", said.lower())
-        self.assertNotIn("автовыдача включена", said.lower())
+        self.assertIn("автовыдача включена", said.lower())
+        off = P._roblox_text({"plugins": {"auto_roblox": {"enabled": False}}})
+        self.assertIn("выключена", off.lower())
+
+    def test_but_it_admits_it_has_never_run_on_a_real_order(self):
+        """«Работает» и «проверено» — разные утверждения. Выдавать второе за
+        первое здесь уже стоило дней разбирательств."""
+        from handlers import plugins as P
+        said = P._roblox_text({"plugins": {"auto_roblox": {"enabled": True}}})
+        self.assertIn("не проверялась", said.lower())
 
 
 class TheSettingsAskForWhatRobuxActuallyNeed(unittest.TestCase):

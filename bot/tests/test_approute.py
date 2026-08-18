@@ -767,29 +767,41 @@ class NothingHereBuysAnything(unittest.TestCase):
     назвал свой.
     """
 
-    def test_the_client_has_no_order_call(self):
-        import inspect
-        src = inspect.getsource(A)
-        self.assertNotIn('"POST"', src.replace('json_body: dict | None = None', ''))
+    def test_buying_lives_in_exactly_one_function(self):
+        """Покупка написана — значит важно, чтобы она была в одном месте.
 
-    def test_the_only_order_call_is_the_dry_run_probe(self):
-        """Место с `/orders` ровно одно, и оно сухое.
-
-        Появится второе — значит кто-то начал писать выдачу, не сверив форму
-        тела живым вызовом. Ровно этого запрет и не пускает.
+        Разъехавшись по коду, `POST /orders` перестанет подчиняться правилам
+        про `reference` и сухой прогон, и повтор однажды купит второй раз.
         """
         import inspect
         src = inspect.getsource(A)
-        self.assertEqual(src.count('"/orders"'), 1,
-                         "вызовов /orders стало больше одного")
-        self.assertIn("checkOnly", src)
-        self.assertNotIn("create_order", src)
+        self.assertEqual(src.count('"POST", "/orders"'), 1,
+                         "покупка появилась не только в order_sync")
 
-    def test_the_screens_never_place_a_real_order(self):
-        """Экранам покупка недоступна: они зовут пробу, а не заказ."""
+    def test_the_body_is_the_shape_the_server_actually_takes(self):
+        """Сервер отверг и форму SDK, и форму openapi. Возврат к любой из
+        них — это 422 на оплаченном заказе."""
+        body = A.live_order_body("den-1", 2, "ref-1")
+        self.assertEqual(body["ordersType"], "shop")
+        self.assertEqual(body["orders"][0]["denominationId"], "den-1")
+        self.assertEqual(body["orders"][0]["quantity"], 2)
+        self.assertNotIn("itemId", body)
+        self.assertNotIn("clientTime", body)
+        self.assertNotIn("checkOnly", body)
+
+    def test_a_dry_run_says_so_in_the_same_body(self):
+        """Проверять форму телом, отличным от боевого, значит проверять не то."""
+        dry = A.live_order_body("den-1", 2, "ref-1", check_only=True)
+        real = A.live_order_body("den-1", 2, "ref-1")
+        self.assertIs(dry.pop("checkOnly"), True)
+        self.assertEqual(dry, real)
+
+    def test_the_screens_never_place_an_order_themselves(self):
+        """Выдача — дело фонового цикла: он умеет записать намерение до
+        вызова и код до отправки. Экран, покупающий сам, этого не делает."""
         import inspect
         src = inspect.getsource(H)
-        for forbidden in ("create_order", "orders_type", '"/orders"'):
+        for forbidden in ("order_sync", "create_order", '"POST", "/orders"'):
             self.assertNotIn(forbidden, src)
 
     def test_the_ready_made_calls_are_reads_only(self):

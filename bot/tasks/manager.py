@@ -1334,6 +1334,9 @@ class TaskManager:
                     # AutoStars: ask the buyer for their @username in chat
                     await self._maybe_ask_stars_username(
                         api, settings, oid, title, chat_id, status)
+                    # AutoRoblox: спрашивать нечего — выдаём код сразу
+                    await self._maybe_deliver_robux(
+                        user_id, api, settings, oid, title, chat_id, status)
 
                 elif prev_status != status and status in _DONE_STATUSES:
                     ev = ae.get("on_confirmed", {})
@@ -1399,6 +1402,8 @@ class TaskManager:
                             status = real or "work"
                         await self._maybe_ask_stars_username(
                             api, settings, oid, title, chat_id, status)
+                        await self._maybe_deliver_robux(
+                            user_id, api, settings, oid, title, chat_id, status)
 
                 # Заказ лежит оплаченным, а в работу не взят. Автопринятие
                 # знало ровно два момента: заказ увиден впервые и пришла
@@ -2208,6 +2213,195 @@ class TaskManager:
     # ------------------------------------------------------------------
     # AutoStars — Telegram Stars auto-delivery via Fragment
     # ------------------------------------------------------------------
+
+    async def _maybe_deliver_robux(
+        self, user_id: int, api: YooMarketAPI, settings: dict,
+        order_id: str, title: str, chat_id: str, status: str = "",
+    ) -> None:
+        """Выдать код Robux по оплаченному заказу.
+
+        Порядок шагов — из `docs/robux_delivery.md`, и он не переставляется:
+        намерение пишется до вызова поставщика, код — до отправки
+        покупателю, отметка «выдано» — только после подтверждённой отправки.
+        Каждое из трёх закрывает свой способ потерять деньги.
+
+        В отличие от звёзд, спрашивать покупателя не о чем: выдаётся код,
+        ник не нужен. Поэтому выдача идёт сразу по факту оплаты.
+        """
+        from automation.robux import (codes_from_result, is_robux_order,
+                                      match_denomination, order_reference,
+                                      robux_quantity)
+        from orderfields import is_paid
+        from storage import get_ar_creds
+
+        p = settings.get("plugins", {}).get("auto_roblox", {})
+        if not p.get("enabled"):
+            return
+        if not is_robux_order(title, p.get("keyword") or ""):
+            return
+        # «Создан» деньгами не является: панель на таком заказе прямо
+        # предупреждает «не выдавайте товар».
+        if not is_paid(status):
+            return
+        delivered: list = p.setdefault("delivered", [])
+        if order_id in delivered:
+            return
+        log: list = p.setdefault("log", [])
+        # Заказ уже в журнале со ссылкой — значит вызов поставщика мог уйти.
+        # Повторять его можно только той же ссылкой (см. ниже), а заводить
+        # вторую запись нельзя: по ней потом не понять, что покупали.
+        already = next((e for e in log if e.get("order") == order_id), None)
+
+        qty = robux_quantity(title)
+        region = str(p.get("region") or "GL").upper()
+
+        creds = get_ar_creds(user_id)
+        if not creds or not creds.get("api_key"):
+            await self._robux_stop(user_id, settings, order_id, qty,
+                                   "ключ AppRoute не задан — Плагины → "
+                                   "AutoRoblox → 🔑 Поставщик AppRoute")
+            return
+
+        loop = asyncio.get_event_loop()
+        from automation.approute import order_sync, services_sync
+        try:
+            ok, catalog = await asyncio.wait_for(
+                loop.run_in_executor(None, services_sync, creds), timeout=90)
+        except Exception as e:
+            ok, catalog = False, str(e)[:200]
+        if not ok:
+            await self._robux_stop(user_id, settings, order_id, qty,
+                                   f"каталог поставщика не прочитан: {catalog}")
+            return
+
+        row, why = match_denomination(catalog, qty, region)
+        if not row:
+            await self._robux_stop(user_id, settings, order_id, qty, why)
+            return
+
+        reference = order_reference(order_id, qty)
+        entry = already or {"order": order_id, "robux": qty,
+                            "denomination": row["denomination_id"],
+                            "reference": reference, "region": region,
+                            "price": row.get("price"), "at": time.time(),
+                            "codes": [], "state": "собираемся покупать"}
+        if entry not in log:
+            log.insert(0, entry)
+            del log[40:]
+        save_settings(user_id, settings)      # намерение — до вызова
+
+        # Сухой прогон тем же телом. Форма выяснена ответами сервера, но
+        # последнее звено живым вызовом не подтверждалось: если она всё же
+        # неверна, отказ придёт здесь и денег не потратит.
+        try:
+            dry_ok, dry = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: order_sync(creds, row["denomination_id"],
+                                             1, reference, True)),
+                timeout=90)
+        except Exception as e:
+            dry_ok, dry = False, str(e)[:200]
+        if not dry_ok:
+            entry["state"] = "сухой прогон отказал"
+            entry["why"] = str(dry)[:300]
+            save_settings(user_id, settings)
+            await self._robux_stop(user_id, settings, order_id, qty,
+                                   f"проверка заказа не прошла: {dry}",
+                                   record=False)
+            return
+
+        entry["state"] = "покупаем"
+        save_settings(user_id, settings)
+        try:
+            bought, data = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: order_sync(creds, row["denomination_id"],
+                                             1, reference, False)),
+                timeout=120)
+        except Exception as e:
+            bought, data = False, str(e)[:200]
+        if not bought:
+            entry["state"] = "поставщик отказал"
+            entry["why"] = str(data)[:300]
+            save_settings(user_id, settings)
+            await self._robux_stop(user_id, settings, order_id, qty,
+                                   f"поставщик отказал: {data}", record=False)
+            return
+
+        codes = codes_from_result(data)
+        if not codes:
+            # Двухсотый без кода — это не выдача. Деньги при этом могли уйти,
+            # поэтому молчать здесь нельзя: продавец должен посмотреть кабинет.
+            entry["state"] = "ответ без кода"
+            save_settings(user_id, settings)
+            await self._notify(user_id, _card(
+                "🎮 <b>ROBUX: ОТВЕТ БЕЗ КОДА</b>",
+                [f"Заказ #{_esc(order_id)}, {qty} Robux.",
+                 "Поставщик не отказал, но кода не прислал.",
+                 f"Ссылка покупки: <code>{_esc(reference)}</code>.",
+                 "",
+                 "Деньги могли списаться. Посмотрите кабинет по этой ссылке "
+                 "и выдайте код вручную, если он там есть."]))
+            return
+
+        # Код записывается ДО отправки: чат может быть закрыт, и тогда
+        # купленный код не должен остаться никому.
+        entry["codes"] = codes
+        entry["state"] = "куплен, отправляем"
+        save_settings(user_id, settings)
+
+        note = str(p.get("note") or "").strip()
+        text = "\n".join(
+            [f"Ваш код на {qty} Robux:"]
+            + [f"{c}" for c in codes]
+            + ["", "Активировать: roblox.com → Пополнить → Использовать код."]
+            + ([f"Регион кода: {region}."] if region else [])
+            + ([note] if note else []))
+        sent, err = await self._send_chat(api, chat_id, text, settings)
+        if not sent:
+            entry["state"] = "куплен, отправить не смогли"
+            entry["why"] = str(err)[:200]
+            save_settings(user_id, settings)
+            await self._notify(user_id, _card(
+                "🎮 <b>ROBUX КУПЛЕН, НО НЕ ОТПРАВЛЕН</b>",
+                [f"Заказ #{_esc(order_id)}, {qty} Robux.",
+                 f"Причина: {_esc(str(err))}.",
+                 "",
+                 "Код: " + ", ".join(_esc(c) for c in codes),
+                 "",
+                 "Передайте его покупателю сами — второй раз бот покупать "
+                 "не станет."]))
+            return
+
+        # Только теперь. Отметка по факту покупки однажды доложила бы о
+        # выдаче, которой покупатель не видел.
+        entry["state"] = "выдан"
+        delivered.append(order_id)
+        del delivered[200:]
+        save_settings(user_id, settings)
+        logger.info("AutoRoblox: order %s delivered (%s Robux)", order_id, qty)
+
+    async def _robux_stop(self, user_id: int, settings: dict, order_id: str,
+                          qty: int, why: str, record: bool = True) -> None:
+        """Сказать продавцу, почему выдачи не будет.
+
+        «Ничего не произошло» без причины — самая частая поломка этого
+        проекта. Здесь она стоила бы покупателю ожидания оплаченного заказа.
+        """
+        if record:
+            p = settings.setdefault("plugins", {}).setdefault("auto_roblox", {})
+            log: list = p.setdefault("log", [])
+            log.insert(0, {"order": order_id, "robux": qty, "codes": [],
+                           "state": "не выдан", "why": str(why)[:300],
+                           "at": time.time()})
+            del log[40:]
+            save_settings(user_id, settings)
+        await self._notify(user_id, _card(
+            "🎮 <b>ROBUX НЕ ВЫДАНЫ</b>",
+            [f"Заказ #{_esc(order_id)}" + (f", {qty} Robux" if qty else "") + ".",
+             f"Причина: {_esc(str(why))}.",
+             "",
+             "Покупатель ждёт оплаченный заказ — выдайте вручную."]))
 
     async def _maybe_ask_stars_username(
         self, api: YooMarketAPI, settings: dict,

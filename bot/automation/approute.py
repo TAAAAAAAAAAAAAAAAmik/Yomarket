@@ -424,6 +424,69 @@ def whoami_sync(creds: dict) -> tuple[bool, object]:
     return _guarded(lambda: (_client(creds).call("GET", "/whoami") or {}))
 
 
+def live_order_body(denomination_id: str, quantity: int = 1,
+                    reference: str = "", check_only: bool = False) -> dict:
+    """Тело заказа в той форме, которую поставщик принимает на самом деле.
+
+    Выяснена сухим прогоном 18.08: ни SDK (`itemId` наверху), ни
+    `openapi.yaml` (`clientTime` + `reference`) не угадали. Сервер требует
+    `ordersType` и позиции **списком**, а внутри позиции — `denominationId`,
+    то есть `id` номинала из `/services`, а не услуги:
+
+        {"ordersType": "shop",
+         "orders": [{"denominationId": "…", "quantity": 1}]}
+
+    `reference` кладётся, только если задан: лишние поля эта схема
+    запрещает, а был ли он принят — покажет первый живой ответ.
+    """
+    body: dict = {
+        "ordersType": "shop",
+        "orders": [{"denominationId": str(denomination_id or ""),
+                    "quantity": int(quantity or 1)}],
+    }
+    if reference:
+        body["orders"][0]["reference"] = str(reference)
+    if check_only:
+        body["checkOnly"] = True
+    return body
+
+
+def order_sync(creds: dict, denomination_id: str, quantity: int = 1,
+               reference: str = "", check_only: bool = False
+               ) -> tuple[bool, object]:
+    """Купить номинал → (успех, `data` поставщика или причина по-русски).
+
+    **Единственное место в проекте, которое тратит чужие деньги.** Отсюда
+    два правила, оба написаны прошлыми потерями:
+
+    * `reference` придумывается вызывающим ДО обращения сюда и при повторе
+      обязан быть тем же. Тогда обрыв связи лечится повтором: на ту же
+      ссылку поставщик отвечает `IDEMPOTENCY_REPLAY` — «такой заказ уже
+      был, отдаю прежний результат», то есть успехом. Принять этот ответ за
+      отказ значит купить второй раз.
+    * `check_only=True` — сухой прогон: тело то же, заказ не создаётся.
+      Им проверяется форма перед настоящей покупкой.
+
+    Успех здесь означает ровно «поставщик не отказал». Есть ли в ответе
+    код — решает вызывающий: пустой `vouchers` при HTTP 200 это отказ, а не
+    выдача.
+    """
+    body = live_order_body(denomination_id, quantity, reference, check_only)
+    return _guarded(lambda: _client(creds).call("POST", "/orders",
+                                                json_body=body))
+
+
+def order_by_reference_sync(creds: dict, reference: str) -> tuple[bool, object]:
+    """Чем кончился заказ с этой ссылкой — на случай обрыва связи.
+
+    Ссылку мы придумали до вызова, поэтому спросить о судьбе покупки можно
+    и тогда, когда ответа на неё не пришло вовсе. Без этого единственным
+    выходом был бы повтор вслепую.
+    """
+    return _guarded(lambda: _client(creds).call(
+        "GET", "/orders", params={"referenceId": str(reference or "")}))
+
+
 def probe_sync(creds: dict) -> list[dict]:
     """Сырые ответы обоих кабинетов — факты, а не наша их трактовка.
 
