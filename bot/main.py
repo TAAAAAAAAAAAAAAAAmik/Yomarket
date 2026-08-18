@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time as _t
 import os
 import re
 import ssl
@@ -126,6 +127,104 @@ class CommandsEscapeForms:
 _LAST_ERROR_AT: dict[int, float] = {}
 
 
+# Состояние получения обновлений. Собирается в dict, а не в текст: правило
+# «не управляйте логикой по тексту собственного отчёта» здесь тоже действует.
+POLLING: dict = {
+    "last_update": 0.0,     # когда пришло последнее обновление от Telegram
+    "error": "",            # чем именно кончилась последняя попытка
+    "error_at": 0.0,
+    "failing_since": 0.0,
+    "told_at": 0.0,         # когда об этом сказали продавцу
+}
+
+# Признаки того, что бота запустили дважды с одним токеном. Telegram отдаёт
+# обновления только одному потребителю, второй получает 409.
+_CONFLICT_MARKS = ("conflict", "terminated by other getupdates")
+
+
+def polling_trouble() -> str:
+    """Что мешает боту получать сообщения. Пусто — ничего.
+
+    Отдельной функцией, потому что ответ нужен и `/health`, и `/version`, и
+    сообщению продавцу.
+    """
+    if not POLLING["error"]:
+        return ""
+    if any(m in POLLING["error"].lower() for m in _CONFLICT_MARKS):
+        return ("бота запустили дважды с одним токеном — Telegram отдаёт "
+                "сообщения только одному, и второй молчит")
+    return POLLING["error"][:200]
+
+
+class WatchPolling(logging.Handler):
+    """Сделать молчание бота слышимым.
+
+    aiogram **проглатывает любую ошибку** получения обновлений: пишет строчку
+    в лог и повторяет попытку вечно. Процесс жив, порт слушает, health
+    отвечает «ok» — а бот при этом глухой, и продавец видит просто тишину в
+    ответ на `/start`. Логи контейнера он не читает и не должен.
+
+    Поэтому мы слушаем сам логгер aiogram: ошибку получения обновлений
+    записываем в `POLLING`, а продавцу пишем сообщением — отправка при этом
+    работает, потому что конфликтует только `getUpdates`, а не `sendMessage`.
+    """
+
+    def __init__(self, bot):
+        super().__init__(level=logging.INFO)
+        self.bot = bot
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            text = record.getMessage()
+        except Exception:                                  # pragma: no cover
+            return
+        now = _t.time()
+        if record.levelno >= logging.ERROR and "Failed to fetch updates" in text:
+            POLLING["error"] = text.split("- ", 1)[-1][:300]
+            POLLING["error_at"] = now
+            if not POLLING["failing_since"]:
+                POLLING["failing_since"] = now
+            self._tell(now)
+        elif "Connection established" in text and POLLING["error"]:
+            POLLING["error"] = ""
+            POLLING["failing_since"] = 0.0
+            POLLING["told_at"] = 0.0
+
+    def _tell(self, now: float) -> None:
+        """Сказать владельцу — один раз в десять минут, не чаще.
+
+        Реже нельзя: пока это молчит, бот выглядит просто сломанным. Чаще —
+        и чат завалит одинаковыми строчками, потому что попытка повторяется
+        каждые несколько секунд.
+        """
+        if now - POLLING["told_at"] < 600:
+            return
+        POLLING["told_at"] = now
+        why = polling_trouble()
+        text = ("🔇 <b>Бот не получает сообщения</b>\n\n"
+                f"{why}\n\n"
+                "<i>Отправлять я по-прежнему могу — это сообщение тому "
+                "доказательство. Не приходят именно входящие.</i>")
+        try:
+            import asyncio as _a
+            from storage import OWNER_ID
+            _a.create_task(self.bot.send_message(OWNER_ID, text))
+        except Exception:                                  # pragma: no cover
+            logger.exception("не смог сказать владельцу про молчание")
+
+
+class NoticeUpdates:
+    """Запоминает, когда бот в последний раз что-то получал.
+
+    Без этого «жив» и «слышит» неразличимы: процесс может держать порт и
+    отвечать на health, ничего не получая от Telegram.
+    """
+
+    async def __call__(self, handler, event, data):
+        POLLING["last_update"] = _t.time()
+        return await handler(event, data)
+
+
 def _install_error_reporter(dp: Dispatcher) -> None:
     """Показывать сбой обработчика пользователю, а не только в логах контейнера.
 
@@ -241,12 +340,19 @@ async def main() -> None:
     # Внешний и первый: он должен отработать до фильтров состояний, иначе
     # брошенная форма перехватит команду раньше, чем мы успеем вмешаться.
     dp.message.outer_middleware(CommandsEscapeForms())
+    # Раньше всех: отметка «мы что-то получили» нужна и тогда, когда
+    # сообщение никому не досталось.
+    dp.message.outer_middleware(NoticeUpdates())
+    dp.callback_query.outer_middleware(NoticeUpdates())
     dp.message.middleware(AccessMiddleware())
     dp.callback_query.middleware(AccessMiddleware())
     dp.message.middleware(YooMarketMiddleware())
     dp.callback_query.middleware(YooMarketMiddleware())
 
     _install_error_reporter(dp)
+    # Слушаем логгер aiogram: он единственный знает, что получение обновлений
+    # не работает, и по умолчанию рассказывает об этом только логу.
+    logging.getLogger("aiogram.dispatcher").addHandler(WatchPolling(bot))
 
     dp.include_router(admin.router)
     dp.include_router(start.router)
@@ -288,10 +394,17 @@ def health_payload() -> dict:
     """Что отдаёт `/health`. Вынесено отдельно, чтобы это можно было
     проверить тестом: от этого ответа зависит, сможет ли выкат отличить
     «код доехал» от «поднялась старая сборка»."""
+    trouble = polling_trouble()
+    last = POLLING["last_update"]
     return {
-        "status": "ok",
+        # «Жив» и «слышит» — разные вещи. Процесс может держать порт и
+        # отвечать сюда, ничего не получая от Telegram: именно так выглядит
+        # запущенный дважды бот. Поэтому статус не всегда «ok».
+        "status": "deaf" if trouble else "ok",
         "version": start.BOT_VERSION,
         "storage": "postgres" if os.environ.get("DATABASE_URL") else "files",
+        "polling": trouble or "ok",
+        "last_update_ago": (int(_t.time() - last) if last else None),
     }
 
 

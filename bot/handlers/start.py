@@ -12,7 +12,7 @@ from storage import delete_token, get_token, save_token, get_settings, save_sett
 router = Router()
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-08-17-proxycheck"
+BOT_VERSION = "2026-08-17-deaf"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -144,6 +144,23 @@ async def cmd_version(message: Message) -> None:
                  f" · {_lt.offset_label(_s)}")
 
     uptime = int((_time.time() - STARTED_AT) / 60)
+
+    # Получаем ли мы вообще сообщения. Если это читают — получаем; но строка
+    # нужна для случая «отвечает через раз», когда обновления достаются то
+    # нам, то второму экземпляру.
+    try:
+        from main import POLLING, polling_trouble
+        trouble = polling_trouble()
+        if trouble:
+            polling_line = f"🔇 <b>Приём сообщений:</b> {trouble}"
+        elif POLLING.get("last_update"):
+            ago = int(_time.time() - POLLING["last_update"])
+            polling_line = f"📡 Приём сообщений: 🟢 последнее {ago} с назад"
+        else:
+            polling_line = "📡 Приём сообщений: 🟢 работает"
+    except Exception:
+        polling_line = ""
+
     await message.answer(
         f"🤖 <b>Версия:</b> <code>{BOT_VERSION}</code>\n"
         f"🆔 Процесс: <code>{INSTANCE_ID}</code> · PID {os.getpid()} · "
@@ -154,6 +171,7 @@ async def cmd_version(message: Message) -> None:
         + "\n".join(storage_lines)
         + f"\n{redis_line}\n\n"
         + f"{token_line}\n{panel_line}\n{seed_line}\n{time_line}"
+        + (f"\n{polling_line}" if polling_line else "")
     )
 
 
