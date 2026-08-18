@@ -263,5 +263,99 @@ class TheSettingsAskForWhatRobuxActuallyNeed(unittest.TestCase):
         self.assertIn("Roblox аккаунт", said)
 
 
+class MakingAnAdHandsOverToTheWizardWhereTheWizardStillAsks(unittest.TestCase):
+    """Плагин подставляет то, что знает каталог, — и не больше.
+
+    Первая версия отдавала управление сразу на предпросмотр, зашив
+    количество единицей. С предпросмотра количество не правится: там есть
+    название, цена, описание и фото, а количества нет. Товар уходил бы с
+    витрины после первой же продажи, и продавец узнал бы об этом не от
+    бота, а по исчезнувшему объявлению.
+    """
+
+    def setUp(self):
+        import storage
+        self._creds = storage.get_ar_creds
+
+    def tearDown(self):
+        import storage
+        storage.get_ar_creds = self._creds
+
+    class Msg:
+        def __init__(self, text):
+            self.text = text
+            self.said: list = []
+            self.from_user = type("U", (), {"id": 1})()
+
+        async def answer(self, text="", **kw):
+            self.said.append(text)
+
+    class FSM:
+        def __init__(self, **data):
+            self.data = dict(data)
+            self.state = None
+            self.cleared = 0
+
+        async def set_state(self, s):
+            self.state = s
+
+        async def clear(self):
+            self.state = None
+            self.data = {}
+            self.cleared += 1
+
+        async def update_data(self, **kw):
+            self.data.update(kw)
+
+        async def get_data(self):
+            return dict(self.data)
+
+    def test_the_wizard_is_entered_at_the_quantity_step(self):
+        import asyncio
+        from handlers import plugins as P
+        from handlers.create_ad import CreateAdState
+
+        msg, fsm = self.Msg("990"), self.FSM(robux=1000)
+        asyncio.run(P.roblox_den_price(msg, fsm))
+
+        self.assertEqual(fsm.state, CreateAdState.quantity)
+        self.assertEqual(fsm.data.get("title"), "1000 Robux")
+        self.assertEqual(fsm.data.get("price"), 990)
+
+    def test_the_quantity_is_not_pinned_behind_the_sellers_back(self):
+        """Зашитое количество продавец не увидит и не поправит."""
+        import asyncio
+        from handlers import plugins as P
+
+        msg, fsm = self.Msg("990"), self.FSM(robux=1000)
+        asyncio.run(P.roblox_den_price(msg, fsm))
+
+        self.assertNotIn("quantity", fsm.data)
+
+    def test_going_back_from_the_price_step_closes_the_form(self):
+        """Брошенная форма ловит следующее сообщение и отвечает «нужно одно
+        число» на что угодно, включая команду."""
+        import asyncio
+        import storage
+        from handlers import plugins as P
+
+        storage.get_ar_creds = lambda uid: None
+        cb = type("CB", (), {
+            "data": "plugins:roblox:make_ads",
+            "from_user": type("U", (), {"id": 1})(),
+            "message": None,
+            "answer": lambda self, *a, **kw: _done(),
+        })()
+        fsm = self.FSM(robux=1000)
+        asyncio.run(P.roblox_make_ads_prompt(cb, fsm))
+
+        self.assertEqual(fsm.state, None)
+        self.assertNotIn("robux", fsm.data)
+
+
+async def _done():
+    return None
+
+
 if __name__ == "__main__":
     unittest.main()

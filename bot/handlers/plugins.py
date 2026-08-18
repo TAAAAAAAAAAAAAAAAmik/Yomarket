@@ -1842,7 +1842,7 @@ async def roblox_log(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "plugins:roblox:make_ads")
-async def roblox_make_ads_prompt(callback: CallbackQuery) -> None:
+async def roblox_make_ads_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     """Выбор номинала, с которого начнётся обычное создание объявления.
 
     Своего создания товаров здесь нет и не нужно: мастер уже написан и
@@ -1858,6 +1858,7 @@ async def roblox_make_ads_prompt(callback: CallbackQuery) -> None:
     from automation.robux import denominations
     from storage import get_ar_creds
 
+    await state.clear()  # Cancel с шага цены ведёт сюда — закрываем форму
     uid = callback.from_user.id
     creds = get_ar_creds(uid)
     if not creds or not creds.get("api_key"):
@@ -1918,16 +1919,26 @@ async def roblox_den_pick(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         f"🏷 <b>{robux} Robux</b>\n\n"
         f"Назовите цену в рублях, за которую продаёте — одним числом.\n\n"
-        f"Дальше откроется обычное создание объявления: название, описание и "
-        f"количество уже будут заполнены, останется выбрать категорию и "
-        f"опубликовать.",
+        f"Дальше откроется обычное создание объявления с этого же места: "
+        f"название и описание уже подставлены, а количество, фото и категорию "
+        f"мастер спросит сам.",
         reply_markup=_cancel_kb("plugins:roblox:make_ads"))
     await callback.answer()
 
 
 @router.message(PluginState.roblox_ads_rate)
 async def roblox_den_price(message: Message, state: FSMContext) -> None:
-    """Цена принята — передаём управление обычному мастеру объявления."""
+    """Цена принята — передаём управление обычному мастеру объявления.
+
+    Управление отдаётся на шаге количества, а не на предпросмотре. Разница
+    не косметическая: изменить количество с предпросмотра нельзя — там есть
+    правка названия, цены, описания и фото, а количества нет. Товар,
+    заведённый отсюда с зашитой единицей, продался бы один раз и пропал с
+    витрины, и продавец узнал бы об этом по исчезнувшему объявлению.
+
+    Заодно мастер сам спросит фото и сам предупредит, что панель без
+    картинки объявление может не принять.
+    """
     data = await state.get_data()
     robux = int(data.get("robux") or 0)
     digits = "".join(ch for ch in (message.text or "") if ch.isdigit())
@@ -1937,18 +1948,24 @@ async def roblox_den_price(message: Message, state: FSMContext) -> None:
     price = int(digits)
     await state.clear()
 
-    from handlers.create_ad import CreateAdState, _show_preview
-    await state.set_state(CreateAdState.confirm)
+    from handlers.create_ad import CreateAdState
+    await state.set_state(CreateAdState.quantity)
     await state.update_data(
         title=f"{robux} Robux",
         price=price,
         description=("Код на пополнение Robux. Активируется на roblox.com → "
                      "Пополнить → Использовать код.\n"
                      "Выдача сразу после оплаты."),
-        quantity=1,
-        photo_path=None,
     )
-    await _show_preview(message, state, edit=False)
+    b = InlineKeyboardBuilder()
+    b.button(text="1️⃣ Пропустить (кол-во = 1)", callback_data="create_ad:qty:1")
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    b.adjust(1)
+    await message.answer(
+        f"✅ Цена: <b>{price} ₽</b> за <b>{robux} Robux</b>\n\n"
+        f"Сколько таких кодов выставляем? Введите число или пропустите — "
+        f"но тогда объявление продастся один раз и уйдёт с витрины.",
+        reply_markup=b.as_markup())
 
 
 @router.callback_query(F.data == "plugins:roblox:set_note")
