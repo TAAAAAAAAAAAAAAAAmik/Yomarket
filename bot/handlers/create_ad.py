@@ -49,17 +49,28 @@ def _preview(data: dict) -> str:
     ]
     if category:
         lines.append(f"🏷 Категория: <b>{category}</b>")
-    lines.append(f"📷 Фото: <b>{'есть ✅' if data.get('photo_path') else 'нет'}</b>")
+    lines.append("📷 Фото: <b>есть ✅</b>" if data.get("photo_path")
+                 else "📷 Фото: <b>нет</b> — без него товар не создать")
     lines.append(f"\n📄 Описание:\n{description}")
     return "\n".join(lines)
 
 
 def _confirm_kb(has_photo: bool = False) -> InlineKeyboardMarkup:
+    """Клавиатура предпросмотра.
+
+    Без фото кнопки «Создать товар» здесь нет вовсе. Показывать её и
+    отвечать отказом на нажатие — то же самое, что обещать невыполнимое:
+    панель объявление без картинки не принимает. Дорога отсюда одна —
+    приложить фото, и она стоит первой.
+    """
     b = InlineKeyboardBuilder()
-    b.button(text="✅ Создать товар", callback_data="create_ad:submit")
-    b.button(text="💾 Сохранить как шаблон", callback_data="create_ad:save_template")
-    photo_label = "📷 Заменить фото" if has_photo else "📷 Добавить фото"
-    b.button(text=photo_label, callback_data="create_ad:edit:photo")
+    if has_photo:
+        b.button(text="✅ Создать товар", callback_data="create_ad:submit")
+        b.button(text="💾 Сохранить как шаблон", callback_data="create_ad:save_template")
+        b.button(text="📷 Заменить фото", callback_data="create_ad:edit:photo")
+    else:
+        b.button(text="📷 Добавить фото", callback_data="create_ad:edit:photo")
+        b.button(text="💾 Сохранить как шаблон", callback_data="create_ad:save_template")
     b.button(text="✏️ Изменить название", callback_data="create_ad:edit:title")
     b.button(text="✏️ Изменить цену", callback_data="create_ad:edit:price")
     b.button(text="✏️ Изменить описание", callback_data="create_ad:edit:description")
@@ -205,15 +216,20 @@ async def ad_quantity(message: Message, state: FSMContext) -> None:
 # ---------------------------------------------------------------------------
 
 async def _ask_photo(msg, state: FSMContext, edit: bool) -> None:
+    """Шаг фото. Пропуска здесь нет: панель без картинки товар не примет.
+
+    Кнопка «Без фото» тут была и вела в тупик — продавец доходил до конца
+    мастера, нажимал «Создать товар» и получал отказ панели, потратив на
+    объявление весь путь. Отказ на первом шаге дешевле отказа на последнем.
+    """
     await state.set_state(CreateAdState.photo)
     b = InlineKeyboardBuilder()
-    b.button(text="⏭ Без фото", callback_data="create_ad:photo_skip")
     b.button(text="❌ Отмена", callback_data="menu:ads")
     b.adjust(1)
     text = (
         "<b>Шаг 5/5</b> — Отправь <b>фото товара</b> 📷\n\n"
-        "<i>Панель YooMarket требует картинку для объявления.\n"
-        "Без фото создание может не пройти.</i>"
+        "<i>Панель YooMarket требует картинку для объявления — "
+        "без неё товар не создать.</i>"
     )
     if edit:
         await msg.edit_text(text, reply_markup=b.as_markup())
@@ -240,14 +256,20 @@ async def ad_photo(message: Message, state: FSMContext) -> None:
 
 @router.message(CreateAdState.photo)
 async def ad_photo_not_photo(message: Message) -> None:
-    await message.answer("📷 Отправьте фото (как изображение) или нажмите «Без фото».")
+    await message.answer("📷 Отправьте фото — именно изображением, а не файлом. "
+                         "Без него товар создать нельзя.")
 
 
 @router.callback_query(F.data == "create_ad:photo_skip")
 async def ad_photo_skip(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.update_data(photo_path=None)
-    await _show_preview(callback.message, state, edit=True)
-    await callback.answer()
+    """Кнопка снята, но висит в сообщениях, отправленных до обновления.
+
+    Обработчик оставлен нарочно: без него нажатие уходит в никуда — Telegram
+    крутит часы и гасит их молча, а продавец видит экран, который перестал
+    отвечать. Лучше сказать, что правило изменилось.
+    """
+    await callback.answer("Теперь фото обязательно", show_alert=True)
+    await _ask_photo(callback.message, state, edit=True)
 
 
 async def _show_preview(msg, state: FSMContext, edit: bool) -> None:
@@ -318,6 +340,18 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
 
     if not title or not price:
         await callback.answer("❌ Не хватает данных", show_alert=True)
+        return
+
+    # Фото проверяется ещё раз здесь, а не только кнопками. Сюда приходят
+    # из шаблона, у которого файл фото исчез при редеплое без volume, и со
+    # старых сообщений, где кнопка «Создать товар» осталась висеть. Панель
+    # такое объявление не примет, и узнать об этом от бота дешевле, чем от
+    # отказа на середине создания.
+    import os
+    if not data.get("photo_path") or not os.path.exists(data["photo_path"]):
+        await state.update_data(photo_path=None)
+        await callback.answer("❌ Без фото товар не создать", show_alert=True)
+        await _ask_photo(callback.message, state, edit=True)
         return
 
     values = {
@@ -883,7 +917,8 @@ async def use_template(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     import os
     photo_path = t.get("photo_path")
-    if photo_path and not os.path.exists(photo_path):
+    lost = bool(photo_path) and not os.path.exists(photo_path)
+    if lost:
         photo_path = None  # файл могли удалить при редеплое без volume
     await state.update_data(
         title=t.get("title", ""),
@@ -893,4 +928,8 @@ async def use_template(callback: CallbackQuery, state: FSMContext) -> None:
         photo_path=photo_path,
     )
     await _show_preview(callback.message, state, edit=True)
-    await callback.answer()
+    # Молчаливая пропажа фото выглядела бы как забывчивость шаблона: поля
+    # на месте, картинки нет, и почему — непонятно.
+    await callback.answer(
+        "Фото шаблона не найдено — приложите заново" if lost else "",
+        show_alert=lost)
