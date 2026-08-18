@@ -2235,13 +2235,28 @@ class TaskManager:
         from storage import get_ar_creds
 
         p = settings.get("plugins", {}).get("auto_roblox", {})
-        if not p.get("enabled"):
-            return
-        if not is_robux_order(title, p.get("keyword") or ""):
-            return
+        # Ручная выдача идёт этим же путём, а не своим. Второй путь к деньгам
+        # пришлось бы снабдить тем же порядком записей (намерение → код →
+        # отметка), и однажды он бы с этим разъехался. Продавец ставит заказ
+        # в очередь, покупает по-прежнему фоновый цикл.
+        forced: list = p.setdefault("force", [])
+        by_hand = order_id in forced
+        if not by_hand:
+            if not p.get("enabled"):
+                return
+            if not is_robux_order(title, p.get("keyword") or ""):
+                return
         # «Создан» деньгами не является: панель на таком заказе прямо
-        # предупреждает «не выдавайте товар».
+        # предупреждает «не выдавайте товар». Это правило не обходится и
+        # вручную: продавец видит статус в боте, а деньги — на маркетплейсе.
         if not is_paid(status):
+            if by_hand:
+                forced.remove(order_id)
+                await self._robux_stop(
+                    user_id, settings, order_id, 0,
+                    f"заказ не оплачен (статус «{status}»). Выдавать по "
+                    f"неоплаченному нельзя — маркетплейс сам об этом "
+                    f"предупреждает", record=False)
             return
         delivered: list = p.setdefault("delivered", [])
         if order_id in delivered:
@@ -2251,6 +2266,12 @@ class TaskManager:
         # Повторять его можно только той же ссылкой (см. ниже), а заводить
         # вторую запись нельзя: по ней потом не понять, что покупали.
         already = next((e for e in log if e.get("order") == order_id), None)
+
+        # Снимаем метку сразу: что бы дальше ни случилось, второй раз по
+        # ней заходить нельзя. Причину продавец узнает из уведомления.
+        if by_hand:
+            forced.remove(order_id)
+            save_settings(user_id, settings)
 
         qty = robux_quantity(title)
         region = str(p.get("region") or "GL").upper()

@@ -180,10 +180,35 @@ class TheScreenDoesNotPromiseWhatItCannotDo(unittest.TestCase):
 
     def test_the_stub_buttons_are_gone(self):
         cbs = self.keyboard()
-        for dead in ("plugins:roblox:manual", "plugins:roblox:accumulated",
-                     "plugins:roblox:profit", "plugins:roblox:balance",
-                     "plugins:roblox:notifs", "plugins:roblox:replies"):
+        for dead in ("plugins:roblox:accumulated", "plugins:roblox:profit",
+                     "plugins:roblox:balance", "plugins:roblox:notifs",
+                     "plugins:roblox:replies"):
             self.assertNotIn(dead, cbs)
+
+    def test_manual_delivery_asks_for_an_order_not_for_a_buyer(self):
+        """Кнопка вернулась, но означает другое. Прежняя спрашивала
+        @username — понятие звёзд; код уходит в чат заказа, и аккаунт
+        покупателя к делу не относится."""
+        import inspect
+        from handlers import plugins as P
+        self.assertIn("plugins:roblox:manual", self.keyboard())
+        # Смотрим на то, что увидит продавец, а не на докстринг: в нём
+        # @username упомянут нарочно — там объяснено, почему его больше нет.
+        shown = inspect.getsource(P.roblox_manual_prompt).split('"""')[-1]
+        self.assertIn("номер заказа", shown)
+        self.assertNotIn("@username", shown)
+
+    def test_making_an_ad_starts_from_a_denomination(self):
+        """Витрина и каталог обязаны сойтись: объявление на номинал, которого
+        у поставщика нет, автовыдаче недоступно."""
+        self.assertIn("plugins:roblox:make_ads", self.keyboard())
+
+    def test_the_plugin_does_not_create_ads_behind_the_wizards_back(self):
+        """Своего создания товаров тут быть не должно: мастер уже умеет
+        категории панели, обязательные поля, фото и публикацию."""
+        import inspect
+        from handlers import plugins as P
+        self.assertNotIn("panel_create_product_sync", inspect.getsource(P))
 
     def test_the_other_supplier_is_not_offered_here(self):
         """ns.gifts убран: поставщик выбран, а сравнение цены — не то, ради
