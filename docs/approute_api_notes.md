@@ -97,15 +97,46 @@ API, не наш код. Проверено чтением исходников 
 
 **Заказ:** `POST /orders`
 
-⚠️ **Здесь SDK и `openapi.yaml` расходятся, и до первой покупки это надо
-сверить живым вызовом.** SDK (`orders.create`) собирает тело
-`ordersType` + `referenceId` + `itemId` + `quantity`; схема `PurchaseRequest`
-в `openapi.yaml` требует `clientTime` + `reference` + `itemId` + `quantity`,
-про `ordersType` и `referenceId` не знает вовсе и лишние поля запрещает
-(`additionalProperties: false`). Сам файл предупреждает, что пути `/orders`
-в нём не описаны и источник истины по набору операций — SDK; но схему тела
-он при этом описывает. Пока расхождение не снято, выдачу писать нельзя —
-ровно так мы потеряли день на Fragment.
+✅ **Сверено живым вызовом 18.08 — и ошибались оба источника.**
+
+SDK (`orders.create`) собирает тело `ordersType` + `referenceId` + `itemId` +
+`quantity`; схема `PurchaseRequest` в `openapi.yaml` требует `clientTime` +
+`reference` + `itemId` + `quantity`. Сухой прогон обеими формами (`checkOnly`
+плюс несуществующий товар — не купив ничего) получил HTTP 422 на обе, и
+сервер сам перечислил, чего ждёт:
+
+```
+форма SDK      → orders: Field required
+                 itemId, quantity: Extra inputs are not permitted
+форма openapi  → ordersType: Field required
+                 orders: Field required
+                 itemId, quantity: Extra inputs are not permitted
+ordersType+orders[] → orders.0.denominationId: Field required
+                      orders.0.itemId: Extra inputs are not permitted
+```
+
+Настоящее тело — **позиции списком, а не одна наверху**:
+
+```json
+{"ordersType": "shop",
+ "orders": [{"denominationId": "…", "quantity": 1}],
+ "checkOnly": true}
+```
+
+**`denominationId` — это `id` номинала из `/services`**, то есть элемент
+вложенного массива `items[]`, а не `id` самой услуги. Ни в SDK, ни в
+`openapi.yaml` этого имени нет вовсе.
+
+Осталось непроверенным последнее звено: сухой прогон с настоящим
+`denominationId` — жалоб на поля быть уже не должно, но это не подтверждено.
+**Пока не подтверждено, выдачу писать нельзя** — ровно так мы потеряли день
+на Fragment.
+
+**Отказ по схеме приходит не там, где его ищут.** `errorCode` в нём `null`,
+`code` нет вовсе, а причина лежит в `errors[]` — `{field, code, message}`,
+с повторами. Разбор, смотрящий только на код отказа, отвечает «непонятно» на
+ответ, где сервер прямым текстом назвал недостающие поля. `_field_complaints`
+читает именно этот список.
 
 ```
 ordersType: "shop" (коды) | "dtu" (прямое пополнение счёта)
@@ -130,10 +161,12 @@ result.attributes: {ключ: значение}
 `vouchers`. То есть обрыв связи после отправки запроса **восстановим**: наш
 `reference_id` мы придумали до вызова, по нему и спросим, чем всё кончилось.
 
-**Баланс:** `GET /accounts` → `data.items[]`: `currency` (**только USDT**),
-`balance`, `available`, `overdraftLimit`, `recentActivity[]`. Плюс
-`GET /accounts/transactions`. У ns.gifts баланс в USD — сравнивая закупку,
-сравниваем деньги, а не числа.
+**Баланс:** `GET /accounts` → `data.items[]`: `currency`, `balance`,
+`available`, `reserved`, `overdraftLimit`. Плюс `GET /accounts/transactions`.
+
+⚠️ **«Только USDT» — было неверно.** Живой ответ 18.08 отдал три счёта:
+`USD`, `RUB`, `EUR`, и USDT среди них нет. Цены в каталоге тоже в USD.
+У ns.gifts баланс в USD — сравнивая закупку, сравниваем деньги, а не числа.
 **Пополнение:** `/funds/*` — счета, USDT, TON, Bybit UID.
 
 **Отказы** разделены самим API: нет в наличии, не хватает средств, лимит

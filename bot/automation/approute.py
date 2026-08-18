@@ -486,6 +486,196 @@ def probe_sync(creds: dict) -> list[dict]:
     return out
 
 
+# Две формы тела `POST /orders`. SDK (`orders.create`) собирает одну, схема
+# `PurchaseRequest` в `openapi.yaml` требует другую и лишние поля запрещает
+# (`additionalProperties: false`). Обе описаны в `docs/approute_api_notes.md`;
+# какую поставщик принимает на самом деле, документация не говорит, а ошибка
+# здесь стоит оплаченного заказа, ушедшего в никуда.
+ORDER_SHAPES = ("sdk", "openapi")
+
+# Товар, которого заведомо нет. Проба спрашивает про него нарочно: отказ
+# «такого товара нет» доказывает, что форму тела разобрали, а отказ про
+# проверку запроса — что не разобрали. Купить при этом нечего ни в одном
+# случае.
+PROBE_ITEM_ID = "approute-probe-no-such-item"
+
+# Отказы, по которым видно, что тело **разобрали**: поставщик дошёл до
+# товара и правил кабинета, то есть спор SDK против схемы решён в пользу
+# этой формы.
+_SHAPE_ACCEPTED = ("NOT_FOUND", "OUT_OF_STOCK", "CONFLICT",
+                   "INSUFFICIENT_FUNDS", "LIMIT_REACHED", "UPSTREAM_ERROR")
+# Отказ, по которому видно, что тело **не разобрали**.
+_SHAPE_REJECTED = ("VALIDATION_ERROR",)
+# Ключ не принят — про форму тела это не говорит ничего.
+_SHAPE_UNKNOWN = ("UNAUTHORIZED", "FORBIDDEN")
+
+
+def order_body(shape: str, item_id: str, reference: str, quantity: int = 1,
+               service_id: str = "", check_only: bool = True) -> dict:
+    """Тело `POST /orders` в одной из двух форм. camelCase — как на проводе.
+
+    `checkOnly` кладётся в обе: по схеме это сухой прогон, заказ не
+    создаётся. Полагаться на него одного нельзя — в SDK такого поля нет
+    вовсе, и что с ним сделает живой сервер, мы не видели, — поэтому проба
+    вдобавок спрашивает про несуществующий товар.
+    """
+    ref = str(reference or "")
+    body: dict = {"itemId": str(item_id or ""), "quantity": int(quantity or 1)}
+    if str(shape) == "sdk":
+        # Как собирает транспорт SDK: `orders_type` и `reference_id`
+        # переводятся им в camelCase перед отправкой.
+        body["ordersType"] = "shop"
+        body["referenceId"] = ref
+    else:
+        # Как требует `PurchaseRequest` в `openapi.yaml`: другое имя ссылки
+        # и обязательное время клиента.
+        body["reference"] = ref
+        body["clientTime"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                           time.gmtime())
+    if service_id:
+        body["serviceId"] = str(service_id)
+    if check_only:
+        body["checkOnly"] = True
+    return body
+
+
+def _field_complaints(body: dict) -> list[str]:
+    """Жалобы поставщика по конкретным полям — «поле: что с ним не так».
+
+    Ради этого проба и писалась. На отказ по схеме AppRoute отвечает списком
+    `errors` вида `{field, code, message}`, и в нём прямым текстом сказано,
+    чего не хватает (`Field required`) и что лишнее (`Extra inputs are not
+    permitted`). Повторы он присылает по нескольку раз — сворачиваем,
+    сохраняя порядок: он идёт от корня к вложенным полям.
+    """
+    out: list[str] = []
+    for item in (body.get("errors") or []):
+        if not isinstance(item, dict):
+            continue
+        field = str(item.get("field") or "").strip()
+        said = str(item.get("message") or item.get("code") or "").strip()
+        if not field and not said:
+            continue
+        line = f"{field}: {said}" if field and said else (field or said)
+        if line not in out:
+            out.append(line)
+    return out
+
+
+def _shape_reading(code: str, http: int, said: str) -> str:
+    """Что этот отказ говорит о форме тела — **чтение, а не факт**.
+
+    Решается по коду отказа, а не по словам поставщика: разбор чужой прозы
+    здесь уже приводил к неверным выводам. Чего код не покрывает — так и
+    называется непонятным, а не досочиняется.
+    """
+    up = str(code or "").upper()
+    if up in _SHAPE_REJECTED:
+        return "форму тела, похоже, НЕ приняли — отказ про проверку запроса"
+    if up in _SHAPE_ACCEPTED:
+        return ("форму тела, похоже, приняли: поставщик дошёл до товара "
+                "и отказал уже по делу")
+    if up in _SHAPE_UNKNOWN:
+        return ("про форму тела не говорит ничего: не принят ключ. "
+                "Сначала ключ и белый список IP, потом эта проба")
+    if not up and http and int(http) >= 500:
+        return "сбой на их стороне — о форме тела не говорит ничего"
+    return "непонятно: такого кода отказа мы ещё не видели"
+
+
+def order_shape_probe_sync(creds: dict, item_id: str = "",
+                           service_id: str = "",
+                           quantity: int = 1) -> list[dict]:
+    """Какую форму тела `POST /orders` принимает поставщик — обе пробуются.
+
+    Это тот самый невыясненный пункт, из-за которого автовыдача не написана:
+    SDK и `openapi.yaml` описывают тело по-разному, и **до первой покупки**
+    надо знать, кто из них прав. Гадать здесь нельзя — ровно так мы потеряли
+    день на Fragment.
+
+    **Денег проба не тратит.** Две защиты сразу: `checkOnly: true` (сухой
+    прогон по схеме) и заведомо несуществующий товар, если продавец не
+    назвал свой. Настоящий `itemId` можно передать, но тогда защита остаётся
+    одна — та, которую мы ещё не видели в работе.
+
+    Возвращает по строке на форму: что отправили, что ответили и как это
+    читается. Ключ в отчёт не попадает.
+    """
+    key = str((creds or {}).get("api_key") or "")
+    item = str(item_id or "").strip() or PROBE_ITEM_ID
+    invented = not str(item_id or "").strip()
+    session = _session(str((creds or {}).get("proxy") or ""))
+    base = base_url_of(creds)
+    out: list[dict] = []
+    for shape in ORDER_SHAPES:
+        # Ссылка придумывается ДО вызова: по ней потом спрашивают, чем
+        # кончилось, если связь оборвётся.
+        reference = f"probe-{shape}-{int(time.time())}"
+        body = order_body(shape, item, reference, quantity, service_id)
+        row = {"shape": shape, "sent": sorted(body), "reference": reference,
+               "item": item, "invented_item": invented, "http": 0,
+               "envelope": "нет", "code": "", "trace": "", "fields": {},
+               "data": "", "error": "", "reading": "", "complaints": []}
+        try:
+            r = session.post(
+                base + "/orders",
+                headers={"X-API-Key": key, "Accept": "application/json",
+                         "Content-Type": "application/json"},
+                json=body, timeout=TIMEOUT)
+            row["http"] = r.status_code
+            try:
+                got = r.json()
+            except ValueError:
+                row["error"] = _redact(r.text, key)[:200]
+                row["reading"] = "ответ не в формате JSON — отвечали не они"
+                out.append(row)
+                continue
+            if not isinstance(got, dict):
+                row["reading"] = "ответ не объект — о форме тела не говорит ничего"
+                out.append(row)
+                continue
+            row["trace"] = str(got.get("traceId") or "")
+            # Значения, а не имена полей: перечень имён отвечает «форма не
+            # та» и молчит о причине.
+            for name in ("status", "statusCode", "statusMessage", "errorCode",
+                         "code", "message", "error"):
+                if got.get(name) not in (None, ""):
+                    row["fields"][name] = _redact(str(got.get(name)), key)[:200]
+            if got.get("errors"):
+                row["fields"]["errors"] = _redact(str(got.get("errors")), key)[:300]
+            row["data"] = _describe_data(got.get("data"), key)
+            sdk_code = str(got.get("code") or "")
+            if sdk_code:
+                row["envelope"] = "SDK"
+                row["code"] = sdk_code
+            elif _looks_like_live_envelope(got):
+                row["envelope"] = "живой"
+                row["code"] = str(got.get("errorCode") or "")
+            # Разбор жалоб по полям идёт первым. Живая проба 18.08 вернула
+            # `errorCode: null`, а причину сложила в `errors` — и чтение,
+            # смотревшее только на код, честно сказало «непонятно» там, где
+            # сервер прямым текстом перечислил недостающие поля. Здесь
+            # лежит ответ на весь вопрос: какие поля он ждёт на самом деле.
+            row["complaints"] = _field_complaints(got)
+            if row["complaints"]:
+                row["reading"] = ("форму тела НЕ приняли — сервер назвал поля: "
+                                  + "; ".join(row["complaints"][:6]))
+            elif row["envelope"] != "нет" and not row["code"]:
+                # Ни кода отказа, ни жалоб — а заказ мы просили сухим
+                # прогоном. Успех это или нет, по именам полей не решить.
+                row["reading"] = ("отказа не назвали. Считать это согласием "
+                                  "нельзя: сухой прогон мог и пройти, и быть "
+                                  "не понят — смотрите data и statusCode")
+            else:
+                row["reading"] = _shape_reading(
+                    row["code"], r.status_code,
+                    str(row["fields"].get("statusMessage") or ""))
+        except requests.RequestException as e:
+            row["error"] = _redact(str(e), key)[:150]
+            row["reading"] = "не достучались — о форме тела не говорит ничего"
+        out.append(row)
+    return out
+
 def _describe_data(data, key: str) -> str:
     """Что лежит в `data` — коротко и без секретов.
 

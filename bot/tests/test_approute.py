@@ -90,12 +90,20 @@ class FakeSession:
         self.proxy = proxy
         self.proxies: dict = {}
         self.calls: list[dict] = []
+        self.posts: list[dict] = []
         if proxy:
             self.proxies.update({"http": proxy, "https": proxy})
 
     def get(self, url, headers=None, timeout=None):
         self.calls.append({"url": url, "headers": dict(headers or {}),
                            "proxies": dict(self.proxies)})
+        return self.answer(url)
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.calls.append({"url": url, "headers": dict(headers or {}),
+                           "proxies": dict(self.proxies), "body": json})
+        self.posts.append({"url": url, "headers": dict(headers or {}),
+                           "body": json})
         return self.answer(url)
 
 
@@ -744,20 +752,44 @@ class TheCatalogueIsReadAsItCame(unittest.TestCase):
 
 
 class NothingHereBuysAnything(unittest.TestCase):
-    """Диагностика, которая тратит деньги, — не диагностика. Пока не видно,
-    под каким `itemId` лежит Roblox и каких полей требует заказ, выдача была
-    бы гаданием на чужих деньгах."""
+    """Диагностика, которая тратит деньги, — не диагностика.
+
+    Запрет писался под условие: «пока не видно, под каким `itemId` лежит
+    Roblox и каких полей требует заказ, выдача была бы гаданием на чужих
+    деньгах». 18.08 условие выполнено — живой `/services` на настоящем ключе
+    отдал 1263 услуги, среди них 26 с Roblox: все типа `voucher`, `fields`
+    пустые, `itemId` известны.
+
+    Поэтому запрет **сужен, а не снят**: покупки по-прежнему нет. Разрешён
+    ровно один вызов `POST /orders` — сухой прогон формы тела. Что он
+    остаётся безопасным, проверяет `TheOrderProbeNeverBuysAnything`:
+    `checkOnly` в каждом теле и несуществующий товар, пока продавец не
+    назвал свой.
+    """
 
     def test_the_client_has_no_order_call(self):
         import inspect
         src = inspect.getsource(A)
         self.assertNotIn('"POST"', src.replace('json_body: dict | None = None', ''))
 
-    def test_the_screens_never_post(self):
+    def test_the_only_order_call_is_the_dry_run_probe(self):
+        """Место с `/orders` ровно одно, и оно сухое.
+
+        Появится второе — значит кто-то начал писать выдачу, не сверив форму
+        тела живым вызовом. Ровно этого запрет и не пускает.
+        """
+        import inspect
+        src = inspect.getsource(A)
+        self.assertEqual(src.count('"/orders"'), 1,
+                         "вызовов /orders стало больше одного")
+        self.assertIn("checkOnly", src)
+        self.assertNotIn("create_order", src)
+
+    def test_the_screens_never_place_a_real_order(self):
+        """Экранам покупка недоступна: они зовут пробу, а не заказ."""
         import inspect
         src = inspect.getsource(H)
-        for forbidden in ("create_order", "orders_type", "checkOnly",
-                          '"/orders"'):
+        for forbidden in ("create_order", "orders_type", '"/orders"'):
             self.assertNotIn(forbidden, src)
 
     def test_the_ready_made_calls_are_reads_only(self):
@@ -930,10 +962,25 @@ class TheAccessIsEnteredByButtons(unittest.TestCase):
         H.save_ar_creds = lambda uid, c: self.saved.update(c)
         H.get_ar_creds = lambda uid: dict(self.saved)
         H.delete_ar_creds = lambda uid: self.saved.clear()
+        # Ввод ключа сам спрашивает поставщика, поэтому сеть подменяется на
+        # весь класс: без этого тесты ввода уходили бы в настоящий API и
+        # ждали таймаута. Откат — в tearDown: подмена в общем модуле без
+        # отката однажды уронила тринадцать чужих тестов.
+        self._balance, self._whoami = A.balance_sync, A.whoami_sync
+        self.asked: list[str] = []
+        A.balance_sync = lambda creds: (
+            self.asked.append("balance"),
+            (True, {"items": [{"currency": "USD", "balance": 0.0,
+                               "available": 0.0}]}))[1]
+        A.whoami_sync = lambda creds: (
+            self.asked.append("whoami"),
+            (True, {"clientIp": "138.124.113.101", "allowlist": [],
+                    "allowlistMatches": True}))[1]
 
     def tearDown(self):
         H.save_ar_creds, H.get_ar_creds = self._save, self._get
         H.delete_ar_creds = self._del
+        A.balance_sync, A.whoami_sync = self._balance, self._whoami
 
     def screen(self):
         cb = CB("apr:creds")
@@ -1012,6 +1059,71 @@ class TheAccessIsEnteredByButtons(unittest.TestCase):
         asyncio.run(H.apr_set_key(CB("apr:set"), fsm))
         asyncio.run(H.apr_key_input(Msg("   "), fsm))
         self.assertNotIn("api_key", self.saved)
+
+    def test_saving_the_key_checks_it_without_a_second_tap(self):
+        """«Ключ сохранён» — про наше хранилище, а не про поставщика.
+
+        Раньше вход отвечал только этим, и принял ли ключ поставщик,
+        продавец узнавал, лишь нажав отдельную кнопку. Зелёная галочка там,
+        где ничего не проверено, — то же самое «Пак поднят · Поднято: 0».
+        """
+        fsm = FSM()
+        asyncio.run(H.apr_set_key(CB("apr:set"), fsm))
+        msg = Msg(KEY)
+        asyncio.run(H.apr_key_input(msg, fsm))
+        self.assertIn("balance", self.asked)
+        self.assertIn("принят", "\n".join(msg.said))
+
+    def test_the_login_also_names_the_address_the_supplier_sees(self):
+        """У них белый список IP: следующий вопрос после отказа — всегда
+        «а с какого адреса нас видно». Отвечаем сразу."""
+        fsm = FSM()
+        asyncio.run(H.apr_set_key(CB("apr:set"), fsm))
+        msg = Msg(KEY)
+        asyncio.run(H.apr_key_input(msg, fsm))
+        said = "\n".join(msg.said)
+        self.assertIn("whoami", self.asked)
+        self.assertIn("138.124.113.101", said)
+
+    def test_an_empty_allowlist_is_called_empty_not_a_reason_to_add_us(self):
+        """Пустой список означает «пускаем отовсюду». Советовать вписывать
+        адрес туда, где проверки нет, — совет о несуществующем."""
+        fsm = FSM()
+        asyncio.run(H.apr_set_key(CB("apr:set"), fsm))
+        msg = Msg(KEY)
+        asyncio.run(H.apr_key_input(msg, fsm))
+        said = "\n".join(msg.said)
+        self.assertIn("пуст", said)
+        self.assertNotIn("нет</b> в вашем белом списке", said)
+
+    def test_a_missing_allowlist_entry_is_stated_plainly(self):
+        A.whoami_sync = lambda creds: (True, {
+            "clientIp": "1.2.3.4", "allowlist": ["9.9.9.9"],
+            "allowlistMatches": False})
+        fsm = FSM()
+        asyncio.run(H.apr_set_key(CB("apr:set"), fsm))
+        msg = Msg(KEY)
+        asyncio.run(H.apr_key_input(msg, fsm))
+        said = "\n".join(msg.said)
+        self.assertIn("нет", said)
+        self.assertIn("1.2.3.4", said)
+
+    def test_a_refused_key_says_so_instead_of_reporting_it_saved(self):
+        A.balance_sync = lambda creds: (False, "ключ не принят")
+        fsm = FSM()
+        asyncio.run(H.apr_set_key(CB("apr:set"), fsm))
+        msg = Msg(KEY)
+        asyncio.run(H.apr_key_input(msg, fsm))
+        said = "\n".join(msg.said)
+        self.assertIn("не сработал", said)
+        self.assertNotIn("Ключ принят", said)
+
+    def test_the_verdict_still_does_not_echo_the_key(self):
+        fsm = FSM()
+        asyncio.run(H.apr_set_key(CB("apr:set"), fsm))
+        msg = Msg(KEY)
+        asyncio.run(H.apr_key_input(msg, fsm))
+        self.assertNotIn(KEY, "\n".join(msg.said))
 
     def test_deleting_clears_it(self):
         self.saved["api_key"] = KEY
@@ -1202,6 +1314,189 @@ class TheCommandsAreWiredIn(unittest.TestCase):
         src = inspect.getsource(H)
         self.assertNotIn('"ar:', src)
 
+
+class TheOrderProbeNeverBuysAnything(unittest.TestCase):
+    """Проба формы тела заказа не должна стоить денег.
+
+    Она бьёт в `POST /orders` — тот самый вызов, который тратит баланс
+    кабинета. Пока не выяснено, какую форму тела поставщик принимает, писать
+    выдачу нельзя; но и выяснять это покупкой нельзя тем более.
+    """
+
+    def rows(self, answer=None, **kw):
+        answer = answer or (lambda url: Reply(envelope("NOT_FOUND")))
+        made = patch_session(self, answer)
+        rows = A.order_shape_probe_sync(CREDS, **kw)
+        return rows, made
+
+    def test_without_an_item_it_asks_about_one_that_cannot_exist(self):
+        rows, made = self.rows()
+        for row in rows:
+            self.assertEqual(row["item"], A.PROBE_ITEM_ID)
+            self.assertTrue(row["invented_item"])
+        for call in made[0].posts:
+            self.assertEqual(call["body"]["itemId"], A.PROBE_ITEM_ID)
+
+    def test_every_body_asks_for_a_dry_run(self):
+        """`checkOnly` — вторая защита. Обе формы обязаны её нести."""
+        rows, made = self.rows()
+        self.assertTrue(made[0].posts)
+        for call in made[0].posts:
+            self.assertIs(call["body"].get("checkOnly"), True)
+
+    def test_a_seller_supplied_item_is_marked_as_such(self):
+        """С настоящим товаром защита остаётся одна — и отчёт это скажет."""
+        rows, made = self.rows(item_id="ITEM-7")
+        for row in rows:
+            self.assertEqual(row["item"], "ITEM-7")
+            self.assertFalse(row["invented_item"])
+
+    def test_it_goes_through_the_sellers_proxy_like_the_real_calls(self):
+        """Проба мимо прокси показала бы адрес, с которого нас не видят."""
+        made = patch_session(self, lambda url: Reply(envelope("NOT_FOUND")))
+        A.order_shape_probe_sync({"api_key": KEY, "proxy": "http://p:1"})
+        self.assertEqual(made[0].proxy, "http://p:1")
+
+
+class TheTwoBodyShapesGoOutExactlyAsDocumented(unittest.TestCase):
+    """SDK и `openapi.yaml` расходятся — поэтому шлём ровно обе, как описаны.
+
+    Придумать третью, «разумную» форму значит снова гадать: так мы потеряли
+    день на Fragment, где своя версия запроса проходила поиск и падала на
+    покупке.
+    """
+
+    def bodies(self):
+        made = patch_session(self, lambda url: Reply(envelope("NOT_FOUND")))
+        A.order_shape_probe_sync(CREDS)
+        return {c["body"].get("ordersType") and "sdk" or "openapi": c["body"]
+                for c in made[0].posts}
+
+    def test_the_sdk_shape_carries_orders_type_and_reference_id(self):
+        body = self.bodies()["sdk"]
+        self.assertEqual(body["ordersType"], "shop")
+        self.assertIn("referenceId", body)
+        self.assertNotIn("reference", body)
+        self.assertNotIn("clientTime", body)
+
+    def test_the_openapi_shape_carries_client_time_and_reference(self):
+        body = self.bodies()["openapi"]
+        self.assertIn("reference", body)
+        self.assertIn("clientTime", body)
+        self.assertNotIn("ordersType", body)
+        self.assertNotIn("referenceId", body)
+
+    def test_names_go_camel_case_because_we_ride_without_the_sdk(self):
+        """`item_id` осталось бы непонятым: переводит их транспорт SDK."""
+        for body in self.bodies().values():
+            self.assertIn("itemId", body)
+            self.assertNotIn("item_id", body)
+            self.assertNotIn("reference_id", body)
+            self.assertNotIn("client_time", body)
+
+    def test_the_reference_is_invented_before_the_call(self):
+        """По ней спрашивают, чем кончилось, если связь оборвалась."""
+        made = patch_session(self, lambda url: Reply(envelope("NOT_FOUND")))
+        rows = A.order_shape_probe_sync(CREDS)
+        refs = [r["reference"] for r in rows]
+        self.assertTrue(all(refs))
+        self.assertEqual(len(set(refs)), len(refs))
+        for call, ref in zip(made[0].posts, refs):
+            sent = call["body"].get("referenceId") or call["body"].get("reference")
+            self.assertEqual(sent, ref)
+
+
+class TheReadingOfARefusalIsNotPassedOffAsAFact(unittest.TestCase):
+    """Что отказ говорит о форме тела — вывод, и он обязан так и называться.
+
+    Правило проекта: догадка не подаётся как факт. Здесь цена ошибки — выдача,
+    написанная под форму, которую поставщик на самом деле не принимает.
+    """
+
+    def read(self, code, http=200):
+        return A._shape_reading(code, http, "")
+
+    def test_a_validation_error_reads_as_the_shape_being_rejected(self):
+        self.assertIn("НЕ приняли", self.read("VALIDATION_ERROR"))
+
+    def test_reaching_the_item_reads_as_the_shape_being_accepted(self):
+        for code in ("NOT_FOUND", "OUT_OF_STOCK", "INSUFFICIENT_FUNDS"):
+            self.assertIn("приняли", self.read(code))
+            self.assertNotIn("НЕ приняли", self.read(code))
+
+    def test_a_rejected_key_says_nothing_about_the_shape(self):
+        """Иначе продавец пойдёт чинить тело запроса вместо белого списка."""
+        for code in ("UNAUTHORIZED", "FORBIDDEN"):
+            said = self.read(code)
+            self.assertIn("ключ", said)
+            self.assertNotIn("приняли", said)
+
+    def test_an_unseen_code_is_called_unclear_rather_than_guessed(self):
+        said = self.read("SOMETHING_NEW")
+        self.assertIn("непонятно", said.lower())
+
+    def test_an_envelope_without_a_refusal_is_not_reported_as_agreement(self):
+        """Сухой прогон без жалоб — не доказательство, что форму поняли.
+
+        Принять молчание за согласие значит написать выдачу под форму,
+        которую поставщик, может быть, просто не разобрал.
+        """
+        patch_session(self, lambda url: Reply(
+            {"status": "ok", "statusCode": 200, "data": None, "traceId": "t"}))
+        rows = A.order_shape_probe_sync(CREDS)
+        for row in rows:
+            self.assertIn("нельзя", row["reading"])
+            self.assertNotIn("приняли", row["reading"])
+
+    def test_a_validation_refusal_is_read_from_errors_not_only_the_code(self):
+        """Живая проба 18.08: `errorCode` пуст, а причина — в `errors`.
+
+        Первая версия смотрела только на код и отвечала «непонятно» там, где
+        сервер прямым текстом перечислил недостающие поля. Именно этот
+        список и был ответом на вопрос, ради которого писалась проба.
+        """
+        patch_session(self, lambda url: Reply({
+            "status": "CANCELLED", "statusCode": 3,
+            "statusMessage": "Validation error", "errorCode": None,
+            "traceId": "t-9", "data": None,
+            "errors": [
+                {"field": "orders", "code": "INVALID_VALUE",
+                 "message": "Field required"},
+                {"field": "itemId", "code": "INVALID_VALUE",
+                 "message": "Extra inputs are not permitted"},
+                {"field": "orders", "code": "INVALID_VALUE",
+                 "message": "Field required"},
+            ]}, code=422))
+        rows = A.order_shape_probe_sync(CREDS)
+        for row in rows:
+            self.assertIn("НЕ приняли", row["reading"])
+            self.assertNotIn("непонятно", row["reading"].lower())
+            # Повтор свёрнут, порядок — от корня к вложенным.
+            self.assertEqual(row["complaints"],
+                             ["orders: Field required",
+                              "itemId: Extra inputs are not permitted"])
+
+    def test_the_named_fields_reach_the_report(self):
+        """Отчёт без имён полей отвечает «форму не ту» и молчит о том, какая
+        нужна, — а сервер это уже сказал."""
+        import inspect
+        self.assertIn("complaints", inspect.getsource(H._order_probe_report))
+
+    def test_a_refusal_prints_the_trace_id_for_their_support(self):
+        patch_session(self, lambda url: Reply(
+            {"errorCode": "OUT_OF_STOCK", "statusMessage": "нет",
+             "statusCode": 409, "traceId": "trace-77"}))
+        rows = A.order_shape_probe_sync(CREDS)
+        for row in rows:
+            self.assertEqual(row["trace"], "trace-77")
+            self.assertEqual(row["fields"].get("statusMessage"), "нет")
+
+    def test_the_key_never_reaches_the_report(self):
+        patch_session(self, lambda url: Reply(
+            {"errorCode": "VALIDATION_ERROR",
+             "statusMessage": f"ключ {KEY} не подошёл", "traceId": "t"}))
+        rows = A.order_shape_probe_sync(CREDS)
+        self.assertNotIn(KEY, json.dumps(rows, ensure_ascii=False))
 
 if __name__ == "__main__":
     unittest.main()

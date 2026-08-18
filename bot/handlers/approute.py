@@ -199,6 +199,87 @@ async def apr_whoami(message: Message) -> None:
     await status.edit_text(await _whoami_text(creds))
 
 
+@router.message(Command("apr_order_probe"))
+async def apr_order_probe(message: Message) -> None:
+    """Какую форму тела `POST /orders` принимает поставщик. Денег не тратит.
+
+    SDK и `openapi.yaml` описывают тело заказа по-разному, и до первой
+    покупки надо знать, кто прав: ошибка здесь — это оплаченный заказ, ушедший
+    в никуда. Проба спрашивает обе формы сухим прогоном про несуществующий
+    товар.
+
+    Свой `itemId` можно передать аргументом — тогда останется одна защита
+    (`checkOnly`), а её мы в работе ещё не видели.
+    """
+    creds, hint = _creds_or_hint(message.from_user.id)
+    if hint:
+        await message.answer(hint)
+        return
+    parts = (message.text or "").split()
+    item_id = parts[1] if len(parts) > 1 else ""
+    service_id = parts[2] if len(parts) > 2 else ""
+    status = await message.answer("⏳ Пробую обе формы тела заказа…")
+    await _order_probe_report(status, creds, item_id, service_id)
+
+
+async def _order_probe_report(target, creds: dict, item_id: str = "",
+                              service_id: str = "") -> None:
+    """Отчёт пробы форм тела — факты поставщика и осторожное чтение."""
+    from automation.approute import order_shape_probe_sync
+
+    say = target.edit_text if hasattr(target, "edit_text") else target.answer
+    loop = asyncio.get_event_loop()
+    try:
+        rows = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, lambda: order_shape_probe_sync(creds, item_id, service_id)),
+            timeout=120)
+    except Exception as e:
+        await say(f"❌ {html.escape(str(e)[:300])}")
+        return
+
+    lines = ["🧾 <b>Форма тела заказа</b>",
+             "<i>Сухой прогон. Денег не тратит, заказ не создаётся.</i>", ""]
+    invented = any(r.get("invented_item") for r in rows)
+    if invented:
+        lines.append("Товар спрошен заведомо несуществующий — "
+                     "покупать было нечего.")
+    else:
+        lines.append("⚠️ Спрошен <b>ваш</b> товар: защита осталась одна — "
+                     "<code>checkOnly</code>, а её поведение на живом сервере "
+                     "здесь ещё не проверялось.")
+    lines.append("")
+
+    for row in rows:
+        name = ("SDK — <code>ordersType</code> + <code>referenceId</code>"
+                if row["shape"] == "sdk" else
+                "openapi.yaml — <code>clientTime</code> + <code>reference</code>")
+        lines.append(f"<b>{name}</b>")
+        lines.append(f"   отправили: <code>{html.escape(', '.join(row['sent']))}</code>")
+        if row["error"]:
+            lines.append(f"   не достучались: <code>{html.escape(row['error'])}</code>")
+        else:
+            lines.append(f"   HTTP <b>{row['http']}</b>, конверт: "
+                         f"<b>{html.escape(row['envelope'])}</b>")
+            for field, value in (row.get("fields") or {}).items():
+                lines.append(f"   {html.escape(field)}: "
+                             f"<code>{html.escape(str(value))}</code>")
+            if row.get("data"):
+                lines.append(f"   data: <code>{html.escape(str(row['data']))}</code>")
+            # Ради этих строк проба и затевалась: сервер называет поля сам.
+            for complaint in (row.get("complaints") or [])[:8]:
+                lines.append(f"   • <code>{html.escape(str(complaint))}</code>")
+            if row["trace"]:
+                lines.append(f"   traceId: <code>{html.escape(row['trace'])}</code>")
+        lines.append(f"   ↳ {html.escape(row['reading'])}")
+        lines.append("")
+
+    lines.append("Строка после «↳» — <b>чтение отказа, а не факт</b>: она "
+                 "выведена из кода ошибки, а какую форму поставщик принимает "
+                 "на самом деле, документация не говорит. Выдачу писать "
+                 "только по форме, на которой он дошёл до товара.")
+    await say("\n".join(lines)[:4000])
+
 # ---------------------------------------------------------------------------
 # Отчёты — общие для команд и кнопок
 # ---------------------------------------------------------------------------
@@ -477,10 +558,11 @@ def _creds_text(creds: dict) -> str:
     if key:
         lines.append("«🧪 Проверить ключ» спросит баланс — это только чтение, "
                      "денег не тратит.")
-        lines.append("«📦 Каталог» покажет, есть ли Roblox, под каким itemId "
-                     "и почём.")
-        lines.append("«🪪 Наш IP у поставщика» — на случай белого списка: "
-                     "адрес сервера меняется при каждом выкате.")
+        lines.append("«📦 Каталог» покажет, есть ли Roblox, под каким номером "
+                     "номинала и почём.")
+        lines.append("«🪪 Наш IP у поставщика» — на случай белого списка. "
+                     "Адрес постоянный, пока бот живёт на своём сервере; на "
+                     "площадках вроде Railway он менялся при каждом выкате.")
         lines.append("")
         lines.append("Если ключ не проходит, причин обычно три: истёк срок "
                      "(временный ключ живёт 48 часов), наш адрес не в белом "
@@ -574,7 +656,60 @@ async def apr_key_input(message: Message, state: FSMContext) -> None:
                           "⚠️ Пустое значение — ничего не изменил.")
         return
     save_ar_creds(message.from_user.id, {"api_key": got["api_key"]})
-    await _show_creds(message, message.from_user.id, "✅ Ключ сохранён.")
+    # Проверяем сразу, не дожидаясь отдельного нажатия. «Ключ сохранён» —
+    # это про наше хранилище, а продавцу нужно знать другое: примет ли его
+    # поставщик. Разделять эти два ответа значит показать зелёную галочку
+    # там, где ничего ещё не проверено.
+    wait = await message.answer("⏳ Ключ сохранён, спрашиваю поставщика…")
+    note = await _login_verdict(get_ar_creds(message.from_user.id))
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+    await _show_creds(message, message.from_user.id, note)
+
+
+async def _login_verdict(creds: dict) -> str:
+    """Принял ли поставщик ключ — одним ответом сразу после входа.
+
+    Спрашивается и баланс, и `whoami`: у AppRoute белый список IP, и когда
+    ключ не проходит, следующий вопрос всегда «а с какого адреса нас видно».
+    Отвечать на него отдельным нажатием — заставлять продавца искать то, что
+    мы уже знаем.
+    """
+    from automation.approute import whoami_sync
+
+    ok, text = await _balance_text(creds)
+    if ok:
+        lines = [f"✅ <b>Ключ принят.</b>\n{text}"]
+    else:
+        lines = [f"❌ <b>Ключ не сработал.</b>\n{text}"]
+
+    loop = asyncio.get_event_loop()
+    try:
+        seen_ok, data = await asyncio.wait_for(
+            loop.run_in_executor(None, whoami_sync, creds), timeout=60)
+    except Exception:
+        seen_ok, data = False, ""
+    ip = ""
+    if seen_ok and isinstance(data, dict):
+        ip = str(data.get("clientIp") or "")
+    if ip:
+        lines.append(f"\n🪪 Поставщик видит нас с адреса <code>{html.escape(ip)}</code>.")
+        # Пустой список у них означает «пускаем отовсюду». Сказать про это
+        # прямо честнее, чем советовать вписывать адрес туда, где проверки
+        # нет вовсе.
+        if seen_ok and not (data.get("allowlist") or []):
+            lines.append("Белый список у вас пуст — значит доступ не ограничен "
+                         "по адресу. Если решите его включить, вписывать надо "
+                         "именно этот адрес.")
+        elif not data.get("allowlistMatches", True):
+            lines.append("⚠️ Этого адреса <b>нет</b> в вашем белом списке — "
+                         "добавьте его в кабинете, иначе ключ работать не будет.")
+    if not ok:
+        lines.append("\nЧто смотреть дальше: «🔎 Что отвечает сервер» — "
+                     "сырой ответ обоих кабинетов.")
+    return "\n".join(lines)
 
 
 @router.callback_query(F.data == "apr:proxy")
