@@ -205,7 +205,12 @@ _DEFAULT_SETTINGS = {
             "texts": {"ask": "", "remind": "", "sending": "", "done": "",
                       "failed": ""},
         },
-        "auto_roblox": {"enabled": False, "robux": 0, "note": ""},
+        # Robux выдаются кодом, а не зачислением на аккаунт, поэтому здесь
+        # нет ни ника покупателя, ни «сколько выдавать»: количество диктует
+        # заказ, а номинал берётся из каталога поставщика. Регион важен —
+        # глобальный и российский коды невзаимозаменяемы.
+        "auto_roblox": {"enabled": False, "region": "GL", "keyword": "",
+                        "note": "", "delivered": [], "log": []},
         "auto_gifts": {"enabled": False, "gift_type": "", "note": ""},
     },
 }

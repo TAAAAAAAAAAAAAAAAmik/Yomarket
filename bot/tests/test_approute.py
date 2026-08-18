@@ -996,10 +996,17 @@ class TheAccessIsEnteredByButtons(unittest.TestCase):
 
     def test_the_previous_supplier_is_still_reachable_for_price_comparison(self):
         """Выбрали AppRoute — но сравнивать закупочную цену не с чем, если
-        второй кабинет виден только по памяти."""
+        второй кабинет виден только по памяти.
+
+        Из раздела Robux ns.gifts убран: поставщик выбран, и сравнение цены
+        не то, ради чего открывают экран выдачи. Вход переехал в меню
+        плагинов — совсем убрать его нельзя, иначе экран остаётся
+        достижимым только командой, а про команду продавцу неоткуда узнать.
+        """
         from handlers import plugins as P
-        self.assertIn("ns:creds",
-                      callbacks(P._roblox_keyboard({"plugins": {"auto_roblox": {}}})))
+        self.assertNotIn("ns:creds",
+                         callbacks(P._roblox_keyboard({"plugins": {"auto_roblox": {}}})))
+        self.assertIn("ns:creds", callbacks(P._plugins_menu_keyboard()))
 
     def test_reading_the_catalogue_is_offered_only_once_the_key_is_there(self):
         cb = self.screen()

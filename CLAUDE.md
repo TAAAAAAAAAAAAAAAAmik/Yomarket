@@ -356,6 +356,7 @@ bot/
   automation/
     panel.py            панель Nova: вход, товары, продвижение, отзывы
     fragment.py         Fragment + TON: сессия, api-hash, покупка звёзд
+    robux.py            подбор номинала Robux под заказ; покупок нет
     position.py         слежение за позицией на витрине
     market.py           чтение витрины
   tasks/manager.py      фоновый цикл: заказы, чаты, автоответы, автовыдача

@@ -137,10 +137,10 @@ class PluginState(StatesGroup):
     stars_set_mnemonic = State()
     stars_set_keyword = State()
     stars_set_reply = State()
-    # AutoRoblox
-    roblox_manual_buyer = State()
-    roblox_manual_amount = State()
-    roblox_set_amount = State()
+    # AutoRoblox. Состояний ручной выдачи здесь больше нет: они спрашивали
+    # @username покупателя — понятие, взятое у звёзд. Robux выдаются кодом,
+    # и слать его некуда, кроме чата заказа.
+    roblox_set_keyword = State()
     roblox_set_note = State()
     # AutoGifts
     gifts_manual_buyer = State()
@@ -163,8 +163,14 @@ def _plugins_menu_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="⭐ AutoStars", callback_data="plugins:auto_stars")
     builder.button(text="🎮 AutoRoblox", callback_data="plugins:auto_roblox")
     builder.button(text="🎁 AutoGifts", callback_data="plugins:auto_gifts")
+    # Прежний поставщик переехал сюда из раздела Robux: там он был не к
+    # месту — поставщик выбран, и сравнение закупочной цены не то, ради чего
+    # открывают экран выдачи. Но убрать его совсем значило бы оставить экран
+    # ns.gifts вообще без входа: попасть в него можно было бы только
+    # командой, а про команду продавцу неоткуда узнать.
+    builder.button(text="🔑 ns.gifts (сравнить цену)", callback_data="ns:creds")
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
-    builder.adjust(2, 1, 1)
+    builder.adjust(2, 1, 1, 1)
     return builder.as_markup()
 
 
@@ -1561,61 +1567,116 @@ async def stars_reply_save(message: Message, state: FSMContext) -> None:
 def _roblox_text(settings: dict, shop_name: str = "") -> str:
     p = settings["plugins"]["auto_roblox"]
     enabled = p.get("enabled", False)
-    note = p.get("note") or "—"
+    note = p.get("note") or ""
     name_part = f" • {shop_name}" if shop_name else ""
-    # Тумблер ничего не включает: выдачи Robux ещё нет, и фоновый цикл этот
-    # раздел не читает. «🟢 Автовыдача включена» на таком экране — обещание,
-    # которого никто не выполнит.
+    # Тумблер по-прежнему ничего не включает: покупка у поставщика не
+    # написана, фоновый цикл этот раздел не читает. «🟢 Автовыдача включена»
+    # здесь было бы обещанием, которого никто не выполнит.
     status = ("🟢 Настройки сохранены" if enabled
               else "🔴 Настройки не сохранены")
-    return (
-        f"🎮 <b>Roblox — Robux{name_part}</b>\n\n"
-        f"🚧 <b>Раздел готовится.</b> Выдача Robux появится в следующем "
-        f"обновлении — сейчас можно только сохранить настройки.\n\n"
-        f"{status}\n"
-        f"{note}"
-    )
+    lines = [
+        f"🎮 <b>Roblox — Robux{name_part}</b>",
+        "",
+        "🚧 <b>Автовыдача ещё не работает.</b> Тумблер сохраняет настройки, "
+        "но заказы бот сам пока не выдаёт.",
+        "",
+        "<b>Что здесь выдаётся.</b> У поставщика Robux бывают только "
+        "<b>кодами</b>: покупатель получает код и активирует его сам на "
+        "roblox.com. Зачисления прямо на аккаунт у поставщика нет, поэтому "
+        "ник покупателя не нужен — в отличие от звёзд.",
+        "",
+        "<b>Номиналы фиксированные.</b> Продавать «сколько угодно Robux» "
+        "нельзя: есть только те номиналы, что лежат в каталоге. Заказ на "
+        "число, которого там нет, бот не подменит ближайшим — он скажет об "
+        "этом, а не выдаст другую сумму.",
+        "",
+        "<b>Регион кода имеет значение.</b> Глобальный и российский коды не "
+        "взаимозаменяемы; какой из них продаёте, выбирается в настройках.",
+        "",
+        status,
+    ]
+    if note:
+        lines.append(f"📝 {note}")
+    return "\n".join(lines)
 
 
 def _roblox_keyboard(settings: dict) -> InlineKeyboardMarkup:
+    """Кнопки раздела Robux.
+
+    Шесть кнопок отсюда убраны, и это не упрощение. «📦 Выдать накопленные»,
+    «💎 Прибыль», «💰 Баланс», «🔔 Уведомления», «💬 Ответы» отвечали
+    всплывающим «функция появится в следующем обновлении», а «🚀 Ручная
+    выдача» спрашивала @username покупателя — понятие, взятое у звёзд, где
+    выдача идёт на аккаунт. У Robux выдаётся код, и слать его некуда, кроме
+    чата заказа. Кнопка, которая заведомо не сработает, — то же обещание
+    невозможного, что и совет ответить в закрытый чат.
+
+    ns.gifts убран отсюда же: поставщик выбран, а сравнение цены — не то,
+    ради чего продавец открывает раздел выдачи. Его каталог никуда не делся
+    и открывается командой `/ns_stock`.
+    """
     enabled = settings["plugins"]["auto_roblox"].get("enabled", False)
     builder = InlineKeyboardBuilder()
-    builder.button(text="🚀 Ручная выдача", callback_data="plugins:roblox:manual")
-    builder.button(text="📦 Выдать накопленные", callback_data="plugins:roblox:accumulated")
-    builder.button(text="💎 Прибыль", callback_data="plugins:roblox:profit")
-    builder.button(text="💰 Баланс", callback_data="plugins:roblox:balance")
-    builder.button(text="🔔 Уведомления", callback_data="plugins:roblox:notifs")
-    builder.button(text="💬 Ответы", callback_data="plugins:roblox:replies")
     # Доступ к поставщику — отсюда же: искать его отдельной командой продавцу
-    # неоткуда, а без него в этом разделе не работает ничего. Поставщик
-    # выбран — AppRoute; ns.gifts остаётся второй кнопкой, потому что
-    # сравнивать закупочную цену не с чем, если кабинет виден только один.
+    # неоткуда, а без него в этом разделе не работает ничего.
     builder.button(text="🔑 Поставщик AppRoute", callback_data="apr:creds")
-    builder.button(text="🔑 ns.gifts (сравнить цену)", callback_data="ns:creds")
-    builder.button(text="▶️ Включить" if not enabled else "⏸ Выключить", callback_data="plugins:roblox:toggle")
+    builder.button(text="📦 Номиналы и остатки", callback_data="apr:stock")
+    builder.button(text="▶️ Включить" if not enabled else "⏸ Выключить",
+                   callback_data="plugins:roblox:toggle")
     builder.button(text="⚙️ Настройки", callback_data="plugins:roblox:settings")
     builder.button(text="⬅️ Назад", callback_data="plugins:menu")
-    builder.adjust(2, 2, 2, 1, 1, 1, 2)
+    builder.adjust(2, 2, 1)
     return builder.as_markup()
 
 
+_ROBUX_REGIONS = {
+    "GL": "🌍 глобальный — подходит большинству аккаунтов",
+    "RU": "🇷🇺 российский — только для аккаунтов с регионом RU",
+}
+
+
 def _roblox_settings_text(settings: dict) -> str:
+    """Настройки раздела.
+
+    Поля «Кол-во Robux» здесь больше нет, и это осознанно: количество
+    диктует заказ покупателя, а не наша настройка. Число, заданное заранее,
+    означало бы «выдать столько, сколько написано у нас», то есть выдать не
+    то, что оплачено. Если в названии заказа количества не видно — бот
+    скажет об этом, а не подставит запасное значение.
+    """
     p = settings["plugins"]["auto_roblox"]
-    robux = p.get("robux", 0)
+    region = str(p.get("region") or "GL").upper()
+    keyword = p.get("keyword") or ""
     note = p.get("note") or "—"
-    return (
-        f"⚙️ <b>Настройки AutoRoblox</b>\n\n"
-        f"🎮 Кол-во Robux: <b>{robux}</b>\n"
-        f"📝 Заметка: <i>{note}</i>"
-    )
+    lines = [
+        "⚙️ <b>Настройки AutoRoblox</b>",
+        "",
+        f"🌐 Регион кода: <b>{region}</b> — {_ROBUX_REGIONS.get(region, '')}",
+    ]
+    if keyword:
+        lines.append(f"🔤 Слово-опознаватель: <code>{keyword}</code> — "
+                     f"в работу пойдут только заказы с ним")
+    else:
+        lines.append("🔤 Слово-опознаватель: <i>не задано</i> — узнаём заказ "
+                     "по словам «robux», «робукс», «roblox»")
+        lines.append("   ⚠️ Если у вас есть товары вида «Roblox аккаунт», "
+                     "задайте слово: иначе они тоже попадут в выдачу Robux.")
+    lines.append(f"📝 Заметка: <i>{note}</i>")
+    return "\n".join(lines)
 
 
-def _roblox_settings_keyboard() -> InlineKeyboardMarkup:
+def _roblox_settings_keyboard(settings: dict | None = None) -> InlineKeyboardMarkup:
+    region = str(((settings or {}).get("plugins", {})
+                  .get("auto_roblox", {}) or {}).get("region") or "GL").upper()
+    other = "RU" if region == "GL" else "GL"
     builder = InlineKeyboardBuilder()
-    builder.button(text="✏️ Кол-во Robux", callback_data="plugins:roblox:set_amount")
+    builder.button(text=f"🌐 Регион: {region} → сменить на {other}",
+                   callback_data=f"plugins:roblox:region:{other}")
+    builder.button(text="🔤 Слово-опознаватель",
+                   callback_data="plugins:roblox:set_keyword")
     builder.button(text="📝 Заметка", callback_data="plugins:roblox:set_note")
     builder.button(text="⬅️ Назад", callback_data="plugins:auto_roblox")
-    builder.adjust(2, 1)
+    builder.adjust(1, 2, 1)
     return builder.as_markup()
 
 
@@ -1642,36 +1703,54 @@ async def roblox_toggle(callback: CallbackQuery) -> None:
 async def roblox_settings(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     settings = get_settings(callback.from_user.id)
-    await callback.message.edit_text(_roblox_settings_text(settings), reply_markup=_roblox_settings_keyboard())
+    await callback.message.edit_text(_roblox_settings_text(settings),
+                                     reply_markup=_roblox_settings_keyboard(settings))
     await callback.answer()
 
 
-@router.callback_query(F.data == "plugins:roblox:set_amount")
-async def roblox_set_amount_prompt(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(PluginState.roblox_set_amount)
-    cur = get_settings(callback.from_user.id)["plugins"]["auto_roblox"].get("robux", 0)
+@router.callback_query(F.data.startswith("plugins:roblox:region:"))
+async def roblox_region(callback: CallbackQuery) -> None:
+    """Регион кода. Глобальный и российский не взаимозаменяемы: код не того
+    региона покупатель активировать не сможет, и узнаем мы об этом от него."""
+    want = callback.data.split(":")[-1].upper()
+    uid = callback.from_user.id
+    settings = get_settings(uid)
+    settings["plugins"]["auto_roblox"]["region"] = "RU" if want == "RU" else "GL"
+    save_settings(uid, settings)
+    await callback.message.edit_text(_roblox_settings_text(settings),
+                                     reply_markup=_roblox_settings_keyboard(settings))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "plugins:roblox:set_keyword")
+async def roblox_set_keyword_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(PluginState.roblox_set_keyword)
+    cur = get_settings(callback.from_user.id)["plugins"]["auto_roblox"].get("keyword") or "—"
     await callback.message.edit_text(
-        f"🎮 Кол-во Robux (сейчас: <b>{cur}</b>)\n\nВведите число:",
+        f"🔤 <b>Слово-опознаватель</b>\n\nСейчас: <code>{cur}</code>\n\n"
+        f"Без него заказ узнаётся по словам «robux», «робукс», «roblox». "
+        f"Это удобно, но если у вас продаются ещё и аккаунты Roblox, они "
+        f"попадут в ту же выдачу.\n\n"
+        f"Пришлите своё слово — тогда в работу пойдут <b>только</b> заказы "
+        f"с ним. Точка «.» очистит настройку.",
         reply_markup=_cancel_kb("plugins:roblox:settings"),
     )
     await callback.answer()
 
 
-@router.message(PluginState.roblox_set_amount)
-async def roblox_set_amount_input(message: Message, state: FSMContext) -> None:
-    try:
-        amount = int((message.text or "").strip())
-        if amount < 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите целое неотрицательное число:")
-        return
+@router.message(PluginState.roblox_set_keyword)
+async def roblox_set_keyword_input(message: Message, state: FSMContext) -> None:
+    word = (message.text or "").strip()
+    if word == ".":
+        word = ""
     uid = message.from_user.id
     settings = get_settings(uid)
-    settings["plugins"]["auto_roblox"]["robux"] = amount
+    settings["plugins"]["auto_roblox"]["keyword"] = word
     save_settings(uid, settings)
     await state.clear()
-    await message.answer(f"✅ Кол-во Robux: <b>{amount}</b>", reply_markup=_roblox_settings_keyboard())
+    said = (f"✅ Слово-опознаватель: <code>{word}</code>" if word
+            else "✅ Слово убрано — узнаём заказ по обычным написаниям.")
+    await message.answer(said, reply_markup=_roblox_settings_keyboard(settings))
 
 
 @router.callback_query(F.data == "plugins:roblox:set_note")
@@ -1689,53 +1768,8 @@ async def roblox_set_note_input(message: Message, state: FSMContext) -> None:
     settings["plugins"]["auto_roblox"]["note"] = note
     save_settings(uid, settings)
     await state.clear()
-    await message.answer(f"✅ Заметка: <i>{note or '—'}</i>", reply_markup=_roblox_settings_keyboard())
-
-
-@router.callback_query(F.data == "plugins:roblox:manual")
-async def roblox_manual_prompt(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(PluginState.roblox_manual_buyer)
-    await callback.message.edit_text(
-        "🚀 <b>Ручная выдача Robux</b>\n\nВведите @username или Telegram ID покупателя:",
-        reply_markup=_cancel_kb("plugins:auto_roblox"),
-    )
-    await callback.answer()
-
-
-@router.message(PluginState.roblox_manual_buyer)
-async def roblox_manual_buyer_input(message: Message, state: FSMContext) -> None:
-    await state.update_data(buyer=message.text or "")
-    await state.set_state(PluginState.roblox_manual_amount)
-    default = get_settings(message.from_user.id)["plugins"]["auto_roblox"].get("robux", 0)
-    await message.answer(f"🎮 Кол-во Robux (по умолчанию: {default}), 0 = значение по умолчанию:")
-
-
-@router.message(PluginState.roblox_manual_amount)
-async def roblox_manual_amount_input(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    buyer = data.get("buyer", "—")
-    await state.clear()
-    try:
-        amount = int((message.text or "").strip())
-        if amount == 0:
-            amount = get_settings(message.from_user.id)["plugins"]["auto_roblox"].get("robux", 0)
-        if amount < 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите корректное число.")
-        return
-    await message.answer(
-        f"🎮 <b>Выдача Robux</b>\n\n"
-        f"👤 Покупатель: <b>{buyer}</b>\n"
-        f"🎮 Кол-во: <b>{amount}</b>\n\n"
-        f"⚠️ Функция отправки Robux будет доступна в следующем обновлении."
-    )
-
-
-@router.callback_query(F.data.in_({"plugins:roblox:accumulated", "plugins:roblox:profit",
-                                    "plugins:roblox:balance", "plugins:roblox:notifs", "plugins:roblox:replies"}))
-async def roblox_stub(callback: CallbackQuery) -> None:
-    await callback.answer("⚠️ Функция появится в следующем обновлении", show_alert=True)
+    await message.answer(f"✅ Заметка: <i>{note or '—'}</i>",
+                         reply_markup=_roblox_settings_keyboard(settings))
 
 
 # ---------------------------------------------------------------------------

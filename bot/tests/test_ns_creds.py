@@ -351,12 +351,18 @@ class TheAccessIsEnteredByButtons(unittest.TestCase):
         asyncio.run(H.ns_creds_screen(cb, FSM()))
         return cb
 
-    def test_the_roblox_plugin_leads_here(self):
+    def test_the_plugins_menu_leads_here(self):
         """Проверка проводки: экран может быть хорош, а попасть в него
-        неоткуда."""
+        неоткуда.
+
+        Вход был в разделе Robux и оттуда убран — там поставщик уже выбран.
+        Но экран без входа продавцу не существует, поэтому кнопка переехала
+        в меню плагинов, а не исчезла.
+        """
         from handlers import plugins as P
-        kb = P._roblox_keyboard({"plugins": {"auto_roblox": {}}})
-        self.assertIn("ns:creds", callbacks(kb))
+        self.assertIn("ns:creds", callbacks(P._plugins_menu_keyboard()))
+        self.assertNotIn("ns:creds",
+                         callbacks(P._roblox_keyboard({"plugins": {"auto_roblox": {}}})))
 
     def test_every_field_has_its_own_button(self):
         cb = self.screen()
