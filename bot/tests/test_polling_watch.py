@@ -150,7 +150,12 @@ class HealthTellsAliveApartFromHearing(unittest.TestCase):
         self.assertEqual(got["polling"], "ok")
 
     def test_a_deaf_bot_does_not_say_ok(self):
-        M.POLLING.update({"error": "TelegramConflictError: Conflict: …"})
+        """Текст берётся полностью, как его присылает Telegram: по обрезанному
+        причину не различить, и ответ будет «одна из двух» — а это уже другое
+        поведение, проверяемое в test_webhook.py."""
+        M.POLLING.update({"error": "TelegramConflictError: Telegram server "
+                                   "says - Conflict: terminated by other "
+                                   "getUpdates request"})
         got = M.health_payload()
         self.assertNotEqual(got["status"], "ok")
         self.assertIn("дважды", got["polling"])

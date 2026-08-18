@@ -135,11 +135,15 @@ POLLING: dict = {
     "error_at": 0.0,
     "failing_since": 0.0,
     "told_at": 0.0,         # когда об этом сказали продавцу
+    "webhook": "",          # вебхук, найденный при запуске (он ломает опрос)
 }
 
-# Признаки того, что бота запустили дважды с одним токеном. Telegram отдаёт
-# обновления только одному потребителю, второй получает 409.
-_CONFLICT_MARKS = ("conflict", "terminated by other getupdates")
+# У отказа получать обновления две разные причины, и обе приходят как 409.
+# Различать их обязательно: они лечатся противоположными действиями, а
+# подсказка «у вас запущен второй бот» человеку с одним сервером отправляет
+# искать несуществующее. Первая версия этого кода так и делала.
+_TWIN_MARKS = ("terminated by other getupdates",)
+_WEBHOOK_MARKS = ("webhook is active", "can't use getupdates")
 
 
 def polling_trouble() -> str:
@@ -150,9 +154,21 @@ def polling_trouble() -> str:
     """
     if not POLLING["error"]:
         return ""
-    if any(m in POLLING["error"].lower() for m in _CONFLICT_MARKS):
+    low = POLLING["error"].lower()
+    if any(m in low for m in _WEBHOOK_MARKS):
+        return ("на токене стоит вебхук — с ним Telegram не отдаёт сообщения "
+                "опросом вовсе. Снимается при запуске автоматически; если "
+                "видите это, снять не удалось")
+    if any(m in low for m in _TWIN_MARKS):
         return ("бота запустили дважды с одним токеном — Telegram отдаёт "
                 "сообщения только одному, и второй молчит")
+    if "conflict" in low:
+        # Обе причины дают 409. Назвать одну наугад — отправить человека
+        # проверять не то, а это дороже, чем признать неопределённость.
+        return ("Telegram отказал в получении сообщений (конфликт). Причины "
+                "две: где-то запущен второй бот с этим токеном или на токене "
+                "стоит вебхук. Что именно — скажет строка ниже: "
+                + POLLING["error"][:150])
     return POLLING["error"][:200]
 
 
@@ -211,6 +227,57 @@ class WatchPolling(logging.Handler):
             _a.create_task(self.bot.send_message(OWNER_ID, text))
         except Exception:                                  # pragma: no cover
             logger.exception("не смог сказать владельцу про молчание")
+
+
+async def clear_webhook(bot) -> str:
+    """Снять вебхук, если он остался на токене. Возвращает снятый адрес.
+
+    Это самая незаметная причина немоты. Пока вебхук стоит, Telegram **не
+    отдаёт обновления опросом вообще** — а отправка при этом работает, и со
+    стороны выглядит так: уведомления о заказах приходят, а на `/start` бот
+    не отвечает. Ровно этот случай и разбирался 17.08, причём подсказка про
+    «второй экземпляр» уводила в сторону: сервер был один.
+
+    Бот опрашивающий, поэтому оставшийся вебхук — всегда помеха, и он
+    снимается. Но не молча: снятие вебхука меняет настройку токена, и
+    продавец должен об этом узнать.
+
+    `drop_pending_updates=False` намеренно: накопившиеся сообщения покупателей
+    — это заказы, терять их нельзя.
+    """
+    try:
+        info = await bot.get_webhook_info()
+    except Exception as e:                                 # pragma: no cover
+        logger.warning("не удалось спросить про вебхук: %s", e)
+        return ""
+    url = str(getattr(info, "url", "") or "")
+    POLLING["webhook"] = url
+    if not url:
+        return ""
+
+    pending = getattr(info, "pending_update_count", 0) or 0
+    logger.error("На токене стоит вебхук %s — опрос с ним не работает. Снимаю.",
+                 url)
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception as e:                                 # pragma: no cover
+        logger.exception("вебхук снять не удалось: %s", e)
+        return ""
+    POLLING["webhook"] = ""
+
+    text = ("🔌 <b>Снял вебхук с токена</b>\n\n"
+            f"<code>{url[:120]}</code>\n\n"
+            "Пока он стоял, Telegram не отдавал боту ни одного сообщения — "
+            "при этом отправка работала, и со стороны это выглядело как "
+            "«уведомления приходят, а на команды бот не отвечает».\n"
+            f"Непрочитанных сообщений в очереди: <b>{pending}</b> — они не "
+            "потеряны, заберу их опросом.")
+    try:
+        from storage import OWNER_ID
+        await bot.send_message(OWNER_ID, text)
+    except Exception:                                      # pragma: no cover
+        logger.exception("не смог сказать владельцу про вебхук")
+    return url
 
 
 class NoticeUpdates:
@@ -381,6 +448,9 @@ async def main() -> None:
     dp.include_router(fallback.router)
 
     logger.info("Bot starting…")
+    # До опроса: с вебхуком на токене getUpdates не работает вовсе, и бот
+    # будет молчать, не подавая никаких признаков поломки.
+    await clear_webhook(bot)
     await _start_health_server()  # для Koyeb/Render/Fly (health-check по $PORT)
     try:
         await task_manager.start_all()
@@ -404,6 +474,7 @@ def health_payload() -> dict:
         "version": start.BOT_VERSION,
         "storage": "postgres" if os.environ.get("DATABASE_URL") else "files",
         "polling": trouble or "ok",
+        "webhook": POLLING["webhook"] or "",
         "last_update_ago": (int(_t.time() - last) if last else None),
     }
 

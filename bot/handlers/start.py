@@ -12,7 +12,7 @@ from storage import delete_token, get_token, save_token, get_settings, save_sett
 router = Router()
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-08-17-healthport"
+BOT_VERSION = "2026-08-18-webhook"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -158,6 +158,11 @@ async def cmd_version(message: Message) -> None:
             polling_line = f"📡 Приём сообщений: 🟢 последнее {ago} с назад"
         else:
             polling_line = "📡 Приём сообщений: 🟢 работает"
+        if POLLING.get("webhook"):
+            # Снять не удалось — значит опрос не заработает, и это важнее
+            # всего остального в этой строке.
+            polling_line += ("\n🔌 На токене висит вебхук — снять его не "
+                             "вышло, опросом сообщения не придут")
     except Exception:
         polling_line = ""
 
