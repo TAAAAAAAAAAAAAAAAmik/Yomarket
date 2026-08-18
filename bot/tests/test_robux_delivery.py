@@ -91,6 +91,7 @@ class Harness:
             p = s["plugins"]["auto_roblox"]
             self.saves.append({
                 "delivered": list(p.get("delivered") or []),
+                "force": list(p.get("force") or []),
                 "log": [dict(e) for e in (p.get("log") or [])],
             })
 
@@ -263,6 +264,168 @@ class MoneyIsNeverLostSilently(unittest.TestCase):
             h.send_result = (True, "")
             h.run()
             self.assertEqual(h.orders[0][2], first_ref)
+
+
+class TheDeliveredMarkSurvivesTheTwoHundredthOrder(unittest.TestCase):
+    """Список отметок обрезался с конца, куда сам же и дописывал.
+
+    После двухсотой выдачи отметка о ней не сохранялась вовсе: заказ снова
+    считался невыданным, и следующий проход покупал второй код за наши
+    деньги. Ошибка тихая — она ждала двести заказов, а не первый.
+    """
+
+    def test_the_two_hundred_and_first_order_is_remembered(self):
+        old = [str(i) for i in range(200)]
+        with Harness(self, settings=settings_with(delivered=old)) as h:
+            h.run(order_id="777")
+            self.assertIn("777", h.delivered)
+
+    def test_and_the_list_does_not_grow_without_bound(self):
+        old = [str(i) for i in range(200)]
+        with Harness(self, settings=settings_with(delivered=old)) as h:
+            h.run(order_id="777")
+            self.assertEqual(len(h.delivered), 200)
+
+    def test_a_second_pass_over_it_still_buys_nothing(self):
+        """Ради чего отметка и нужна."""
+        old = [str(i) for i in range(200)]
+        with Harness(self, settings=settings_with(delivered=old)) as h:
+            h.run(order_id="777")
+            h.orders.clear()
+            h.run(order_id="777")
+            self.assertEqual(h.orders, [])
+
+
+class TheManualQueueIsFreedAndTheFreeingIsWrittenDown(unittest.TestCase):
+    """Настройки читаются заново каждую минуту.
+
+    Снятие заказа с очереди, не записанное в хранилище, живёт до конца
+    прохода: следующий заказ возвращался в очередь сам собой. По
+    неоплаченному заказу это давало одно и то же уведомление раз в минуту,
+    пока покупатель не заплатит.
+    """
+
+    def test_an_unpaid_manual_order_leaves_the_queue_for_good(self):
+        with Harness(self, settings=settings_with(enabled=False,
+                                                  force=["777"])) as h:
+            h.run(status="created")
+            self.assertTrue(any(s["force"] == [] for s in h.saves),
+                            "снятие с очереди не записано в хранилище")
+
+    def test_an_unpaid_manual_order_buys_nothing(self):
+        with Harness(self, settings=settings_with(enabled=False,
+                                                  force=["777"])) as h:
+            h.run(status="created")
+            self.assertEqual(h.orders, [])
+
+    def test_an_already_delivered_order_leaves_the_queue_too(self):
+        """Заказ могли выдать уже после того, как поставили в очередь."""
+        with Harness(self, settings=settings_with(delivered=["777"],
+                                                  force=["777"])) as h:
+            h.run()
+            self.assertEqual(h.settings["plugins"]["auto_roblox"]["force"], [])
+            self.assertEqual(h.orders, [])
+
+    def test_and_the_seller_hears_about_it(self):
+        with Harness(self, settings=settings_with(delivered=["777"],
+                                                  force=["777"])) as h:
+            h.run()
+            self.assertTrue(h.notified)
+
+
+class TheManualQueueIsWalkedEvenWhenNothingChanged(unittest.TestCase):
+    """Кнопка «Выдать вручную» обещала отчёт и молчала.
+
+    Выдача вызывалась в двух местах: когда заказ увиден впервые и когда
+    пришла оплата. Оба — про перемену. А в очередь ставят обычно давно
+    оплаченный заказ, с которым ничего не происходит: по нему не
+    срабатывало ничего. Экран при этом отвечал «Куплю на ближайшем проходе»
+    и обещал отчёт «и если получится, и если нет».
+    """
+
+    def sweep(self, api, settings, tried=()):
+        from tasks.manager import TaskManager
+        mgr = TaskManager.__new__(TaskManager)
+        seen: list = []
+        stops: list = []
+
+        async def deliver(uid, api_, s, oid, title, chat_id, status=""):
+            seen.append((oid, title, chat_id, status))
+
+        async def stop(uid, s, oid, qty, why, record=True):
+            stops.append((oid, why))
+
+        mgr._maybe_deliver_robux = deliver
+        mgr._robux_stop = stop
+        # Хранилище тоже на подставке: тест, пишущий в настоящее, оставляет
+        # следы соседям — из-за такого здесь уже падали чужие тесты.
+        from tasks import manager as M
+        real_save, self.saved = M.save_settings, []
+        M.save_settings = lambda uid, s: self.saved.append(
+            list((s.get("plugins", {}).get("auto_roblox", {})
+                  .get("force") or [])))
+        try:
+            asyncio.run(mgr._robux_forced_sweep(4242, api, settings, set(tried)))
+        finally:
+            M.save_settings = real_save
+        return seen, stops
+
+    def api_with(self, order):
+        class API:
+            def __init__(self):
+                self.asked: list = []
+
+            async def get_order(self_, oid):
+                self_.asked.append(oid)
+                return order
+        return API()
+
+    def test_a_queued_order_is_read_by_number_and_delivered(self):
+        api = self.api_with({"data": {"id": "777", "status": "paid",
+                                      "chat_id": "chat-9",
+                                      "ad": {"title": "1000 Robux"}}})
+        seen, _ = self.sweep(api, settings_with(force=["777"]))
+        self.assertEqual([row[0] for row in seen], ["777"])
+
+    def test_the_order_is_taken_as_the_marketplace_reports_it_now(self):
+        """Статус берётся из свежей карточки, а не из того, что бот помнил."""
+        api = self.api_with({"data": {"id": "777", "status": "paid",
+                                      "chat_id": "chat-9",
+                                      "ad": {"title": "1000 Robux"}}})
+        seen, _ = self.sweep(api, settings_with(force=["777"]))
+        self.assertEqual(seen[0][3], "paid")
+
+    def test_an_order_handled_this_pass_is_not_handled_twice(self):
+        api = self.api_with({"data": {"id": "777", "status": "paid"}})
+        seen, _ = self.sweep(api, settings_with(force=["777"]), tried=["777"])
+        self.assertEqual(seen, [])
+        self.assertEqual(api.asked, [])
+
+    def test_an_order_the_marketplace_does_not_return_is_not_silent(self):
+        """Опечатка в номере оставляла запись в очереди навсегда, а продавца
+        — без обещанного отчёта."""
+        api = self.api_with({})
+        settings = settings_with(force=["999"])
+        _, stops = self.sweep(api, settings)
+        self.assertEqual([row[0] for row in stops], ["999"])
+
+    def test_and_that_order_leaves_the_queue(self):
+        api = self.api_with({})
+        settings = settings_with(force=["999"])
+        self.sweep(api, settings)
+        self.assertEqual(settings["plugins"]["auto_roblox"]["force"], [])
+
+    def test_and_the_freeing_is_written_down(self):
+        """Иначе запись вернётся следующим проходом — настройки читаются
+        заново каждую минуту."""
+        api = self.api_with({})
+        self.sweep(api, settings_with(force=["999"]))
+        self.assertIn([], self.saved)
+
+    def test_an_empty_queue_asks_the_marketplace_nothing(self):
+        api = self.api_with({"data": {"id": "777"}})
+        self.sweep(api, settings_with())
+        self.assertEqual(api.asked, [])
 
 
 if __name__ == "__main__":

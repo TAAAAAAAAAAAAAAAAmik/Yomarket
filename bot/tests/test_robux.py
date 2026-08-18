@@ -357,5 +357,182 @@ async def _done():
     return None
 
 
+class TheScreenExplainsWhyOldOrdersSitStill(unittest.TestCase):
+    """Продавец включает выдачу, оплаченный заказ лежит, ничего не
+    происходит — и это выглядит поломкой. Автовыдача срабатывает на
+    перемену: новый заказ или приход оплаты. Молчать об этом нельзя."""
+
+    def test_the_screen_says_old_orders_need_the_manual_button(self):
+        from handlers import plugins as P
+        said = P._roblox_text({"plugins": {"auto_roblox": {}}})
+        self.assertIn("до включения", said)
+        self.assertIn("вручную", said)
+
+
+class TheSellersOwnWordsDoNotBreakTheScreen(unittest.TestCase):
+    """Одиночный «<» в заметке или названии магазина роняет отправку всего
+    сообщения — а роняет он тот самый экран, через который заметку и
+    правят. Продавец остался бы с разделом, в который не войти.
+    """
+
+    def test_a_note_with_a_bracket_is_escaped_on_the_main_screen(self):
+        from handlers import plugins as P
+        said = P._roblox_text({"plugins": {"auto_roblox": {"note": "цена <3$"}}})
+        self.assertNotIn("<3$", said)
+        self.assertIn("&lt;3$", said)
+
+    def test_a_shop_name_with_a_bracket_is_escaped_too(self):
+        from handlers import plugins as P
+        said = P._roblox_text({"plugins": {"auto_roblox": {}}}, "Shop <A>")
+        self.assertNotIn("Shop <A>", said)
+
+    def test_a_keyword_with_a_bracket_is_escaped_in_the_settings(self):
+        from handlers import plugins as P
+        said = P._roblox_settings_text(
+            {"plugins": {"auto_roblox": {"keyword": "robux<x"}}})
+        self.assertNotIn("robux<x", said)
+
+    def test_a_note_with_a_bracket_is_escaped_in_the_settings(self):
+        from handlers import plugins as P
+        said = P._roblox_settings_text(
+            {"plugins": {"auto_roblox": {"note": "цена <3$"}}})
+        self.assertIn("&lt;3$", said)
+
+
+class TheSwitchDoesNotTurnOnWhatCannotWork(unittest.TestCase):
+    """«🟢 Автовыдача включена — бот сам купит код» без ключа поставщика —
+    обещание невыполнимого: покупать не на что.
+
+    Раньше это выяснялось на живом оплаченном заказе, то есть в самый
+    неподходящий момент и уже при ждущем покупателе.
+    """
+
+    def setUp(self):
+        import storage
+        from handlers import plugins as P
+        self._undo = []
+        self.settings = {"plugins": {"auto_roblox": {"enabled": False}}}
+        self.saved: list = []
+        for mod, name, val in (
+            (P, "get_settings", lambda uid: self.settings),
+            (P, "save_settings", lambda uid, s: self.saved.append(s)),
+            (P, "get_shop_name", lambda uid: ""),
+        ):
+            self._undo.append((mod, name, getattr(mod, name)))
+            setattr(mod, name, val)
+        self._undo.append((storage, "get_ar_creds", storage.get_ar_creds))
+        self.key = None
+        storage.get_ar_creds = lambda uid: self.key
+
+    def tearDown(self):
+        for mod, name, old in reversed(self._undo):
+            setattr(mod, name, old)
+
+    def toggle(self):
+        import asyncio
+        from handlers import plugins as P
+
+        class Screen:
+            def __init__(self):
+                self.texts: list = []
+
+            async def edit_text(self, text="", reply_markup=None, **kw):
+                self.texts.append(text)
+
+        cb = type("CB", (), {})()
+        cb.data = "plugins:roblox:toggle"
+        cb.from_user = type("U", (), {"id": 1})()
+        cb.message = Screen()
+        cb.alerts = []
+
+        async def answer(text="", **kw):
+            cb.alerts.append(text)
+
+        cb.answer = answer
+        asyncio.run(P.roblox_toggle(cb))
+        return cb
+
+    def test_without_a_supplier_key_it_stays_off(self):
+        cb = self.toggle()
+        self.assertFalse(self.settings["plugins"]["auto_roblox"]["enabled"])
+        self.assertEqual(self.saved, [])
+
+    def test_and_says_what_is_missing(self):
+        cb = self.toggle()
+        self.assertTrue(any("AppRoute" in a for a in cb.alerts))
+
+    def test_with_a_key_it_turns_on(self):
+        self.key = {"api_key": "k"}
+        self.toggle()
+        self.assertTrue(self.settings["plugins"]["auto_roblox"]["enabled"])
+
+    def test_turning_it_off_never_needs_a_key(self):
+        """Запрещать выключение нельзя ни по какой причине."""
+        self.settings["plugins"]["auto_roblox"]["enabled"] = True
+        self.toggle()
+        self.assertFalse(self.settings["plugins"]["auto_roblox"]["enabled"])
+
+
+class TheManualQueueRefusesWhatItCannotBuy(unittest.TestCase):
+    """«Куплю на ближайшем проходе» при незаданном ключе — обещание
+    отчёта, который придёт отказом."""
+
+    def setUp(self):
+        import storage
+        from handlers import plugins as P
+        self._undo = []
+        self.settings = {"plugins": {"auto_roblox": {"enabled": True}}}
+        self.saved: list = []
+        for mod, name, val in (
+            (P, "get_settings", lambda uid: self.settings),
+            (P, "save_settings", lambda uid, s: self.saved.append(s)),
+        ):
+            self._undo.append((mod, name, getattr(mod, name)))
+            setattr(mod, name, val)
+        self._undo.append((storage, "get_ar_creds", storage.get_ar_creds))
+        self.key = None
+        storage.get_ar_creds = lambda uid: self.key
+
+    def tearDown(self):
+        for mod, name, old in reversed(self._undo):
+            setattr(mod, name, old)
+
+    def queue(self, text="777"):
+        import asyncio
+        from handlers import plugins as P
+
+        said: list = []
+
+        class Msg:
+            def __init__(self):
+                self.text = text
+                self.from_user = type("U", (), {"id": 1})()
+
+            async def answer(self_, t="", **kw):
+                said.append(t)
+
+        class FSM:
+            async def clear(self):
+                return None
+
+        asyncio.run(P.roblox_manual_order_input(Msg(), FSM()))
+        return said
+
+    def test_without_a_key_the_order_is_not_queued(self):
+        self.queue()
+        self.assertEqual(self.settings["plugins"]["auto_roblox"].get("force"),
+                         None)
+
+    def test_without_a_key_the_seller_is_told_why(self):
+        said = self.queue()
+        self.assertTrue(any("AppRoute" in t for t in said))
+
+    def test_with_a_key_the_order_is_queued(self):
+        self.key = {"api_key": "k"}
+        self.queue()
+        self.assertEqual(self.settings["plugins"]["auto_roblox"]["force"],
+                         ["777"])
+
+
 if __name__ == "__main__":
     unittest.main()

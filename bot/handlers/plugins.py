@@ -1569,7 +1569,11 @@ def _roblox_text(settings: dict, shop_name: str = "") -> str:
     p = settings["plugins"]["auto_roblox"]
     enabled = p.get("enabled", False)
     note = p.get("note") or ""
-    name_part = f" • {shop_name}" if shop_name else ""
+    # Название магазина приходит с маркетплейса, заметку пишет продавец.
+    # Одиночный «<» в любом из них роняет отправку целиком — и роняет
+    # он тот самый экран, через который заметку и правят: выйти из
+    # такой ловушки было бы уже нечем.
+    name_part = f" • {html.escape(shop_name)}" if shop_name else ""
     # Теперь тумблер действительно включает выдачу: фоновый цикл читает этот
     # раздел и покупает код по оплаченному заказу. Но на живом заказе это
     # ещё не проверялось, и молчать об этом нельзя — продавец должен знать,
@@ -1597,10 +1601,17 @@ def _roblox_text(settings: dict, shop_name: str = "") -> str:
         "<b>Регион кода имеет значение.</b> Глобальный и российский коды не "
         "взаимозаменяемы; какой из них продаёте, выбирается в настройках.",
         "",
+        "<b>Заказы, оплаченные до включения, сами не подхватываются.</b> "
+        "Автовыдача срабатывает на новый заказ и на приход оплаты — то есть "
+        "на перемену. Со старыми бот так поступает нарочно: иначе после "
+        "чистки хранилища он скупил бы коды по всем прежним заказам разом, "
+        "включая давно выданные вручную. Такой заказ выдаётся кнопкой "
+        "«🚀 Выдать вручную» — она купит и отправит код в его чат.",
+        "",
         status,
     ]
     if note:
-        lines.append(f"📝 {note}")
+        lines.append(f"📝 {html.escape(note)}")
     return "\n".join(lines)
 
 
@@ -1666,14 +1677,14 @@ def _roblox_settings_text(settings: dict) -> str:
         f"🌐 Регион кода: <b>{region}</b> — {_ROBUX_REGIONS.get(region, '')}",
     ]
     if keyword:
-        lines.append(f"🔤 Слово-опознаватель: <code>{keyword}</code> — "
+        lines.append(f"🔤 Слово-опознаватель: <code>{html.escape(keyword)}</code> — "
                      f"в работу пойдут только заказы с ним")
     else:
         lines.append("🔤 Слово-опознаватель: <i>не задано</i> — узнаём заказ "
                      "по словам «robux», «робукс», «roblox»")
         lines.append("   ⚠️ Если у вас есть товары вида «Roblox аккаунт», "
                      "задайте слово: иначе они тоже попадут в выдачу Robux.")
-    lines.append(f"📝 Заметка: <i>{note}</i>")
+    lines.append(f"📝 Заметка: <i>{html.escape(note)}</i>")
     return "\n".join(lines)
 
 
@@ -1703,9 +1714,30 @@ async def roblox_screen(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "plugins:roblox:toggle")
 async def roblox_toggle(callback: CallbackQuery) -> None:
+    """Включение автовыдачи. Без ключа поставщика она не включается.
+
+    «🟢 Автовыдача включена — бот сам купит код» при незаданном ключе —
+    обещание невыполнимого: покупать не на что. Раньше это выяснялось
+    только на живом оплаченном заказе, то есть в самый неподходящий момент
+    и уже при ждущем покупателе.
+
+    Выключается тумблер всегда: запрещать выключение нельзя ни по какой
+    причине.
+    """
+    from storage import get_ar_creds
+
     uid = callback.from_user.id
     settings = get_settings(uid)
-    settings["plugins"]["auto_roblox"]["enabled"] = not settings["plugins"]["auto_roblox"].get("enabled", False)
+    p = settings["plugins"]["auto_roblox"]
+    want = not p.get("enabled", False)
+    if want:
+        creds = get_ar_creds(uid)
+        if not creds or not creds.get("api_key"):
+            await callback.answer(
+                "Сначала ключ AppRoute: без него покупать не на что — "
+                "кнопка «🔑 Поставщик AppRoute» выше", show_alert=True)
+            return
+    p["enabled"] = want
     save_settings(uid, settings)
     await callback.message.edit_text(_roblox_text(settings, get_shop_name(uid)), reply_markup=_roblox_keyboard(settings))
     await callback.answer()
@@ -1739,7 +1771,7 @@ async def roblox_set_keyword_prompt(callback: CallbackQuery, state: FSMContext) 
     await state.set_state(PluginState.roblox_set_keyword)
     cur = get_settings(callback.from_user.id)["plugins"]["auto_roblox"].get("keyword") or "—"
     await callback.message.edit_text(
-        f"🔤 <b>Слово-опознаватель</b>\n\nСейчас: <code>{cur}</code>\n\n"
+        f"🔤 <b>Слово-опознаватель</b>\n\nСейчас: <code>{html.escape(cur)}</code>\n\n"
         f"Без него заказ узнаётся по словам «robux», «робукс», «roblox». "
         f"Это удобно, но если у вас продаются ещё и аккаунты Roblox, они "
         f"попадут в ту же выдачу.\n\n"
@@ -1760,7 +1792,7 @@ async def roblox_set_keyword_input(message: Message, state: FSMContext) -> None:
     settings["plugins"]["auto_roblox"]["keyword"] = word
     save_settings(uid, settings)
     await state.clear()
-    said = (f"✅ Слово-опознаватель: <code>{word}</code>" if word
+    said = (f"✅ Слово-опознаватель: <code>{html.escape(word)}</code>" if word
             else "✅ Слово убрано — узнаём заказ по обычным написаниям.")
     await message.answer(said, reply_markup=_roblox_settings_keyboard(settings))
 
@@ -1803,6 +1835,18 @@ async def roblox_manual_order_input(message: Message, state: FSMContext) -> None
         await message.answer(
             f"⚠️ Заказ <b>{order_id}</b> уже выдан — второй раз бот покупать "
             f"не станет.\nЕсли код потерялся, он есть в «📜 Журнал выдач».",
+            reply_markup=_roblox_keyboard(settings))
+        return
+    from storage import get_ar_creds
+    creds = get_ar_creds(uid)
+    if not creds or not creds.get("api_key"):
+        # Поставить в очередь можно, купить — нет. Отвечать «куплю на
+        # ближайшем проходе», зная, что покупать не на что, значит послать
+        # продавца ждать отчёт, который придёт отказом.
+        await message.answer(
+            "❌ Ключ AppRoute не задан — покупать не на что.\n\n"
+            "Задайте его кнопкой «🔑 Поставщик AppRoute» и поставьте заказ "
+            "в очередь снова.",
             reply_markup=_roblox_keyboard(settings))
         return
     forced: list = p.setdefault("force", [])
@@ -1983,7 +2027,7 @@ async def roblox_set_note_input(message: Message, state: FSMContext) -> None:
     settings["plugins"]["auto_roblox"]["note"] = note
     save_settings(uid, settings)
     await state.clear()
-    await message.answer(f"✅ Заметка: <i>{note or '—'}</i>",
+    await message.answer(f"✅ Заметка: <i>{html.escape(note) or '—'}</i>",
                          reply_markup=_roblox_settings_keyboard(settings))
 
 

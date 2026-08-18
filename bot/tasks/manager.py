@@ -1130,6 +1130,10 @@ class TaskManager:
             # Заказы, взятые в работу «догоняющим» проходом (см. ниже).
             caught_up: list[str] = []
 
+            # По каким заказам выдача Robux в этом проходе уже вызывалась.
+            # Остальные из ручной очереди дочитываются поимённо ниже.
+            robux_tried: set[str] = set()
+
             # Сколько заказов дочитать за проход. Каждый — отдельный запрос,
             # поэтому на первом проходе полная витрина разбирается за
             # несколько кругов, а дальше дочитываются только новые.
@@ -1335,6 +1339,7 @@ class TaskManager:
                     await self._maybe_ask_stars_username(
                         api, settings, oid, title, chat_id, status)
                     # AutoRoblox: спрашивать нечего — выдаём код сразу
+                    robux_tried.add(oid)
                     await self._maybe_deliver_robux(
                         user_id, api, settings, oid, title, chat_id, status)
 
@@ -1402,6 +1407,7 @@ class TaskManager:
                             status = real or "work"
                         await self._maybe_ask_stars_username(
                             api, settings, oid, title, chat_id, status)
+                        robux_tried.add(oid)
                         await self._maybe_deliver_robux(
                             user_id, api, settings, oid, title, chat_id, status)
 
@@ -1431,6 +1437,8 @@ class TaskManager:
             settings["known_orders"] = known
             settings["known_order_ids"] = list(known.keys())
             settings["known_order_details"] = order_details
+
+            await self._robux_forced_sweep(user_id, api, settings, robux_tried)
 
             await self._check_messages(user_id, api, settings)
             await self._check_watched_chats(user_id, api, settings)
@@ -2252,6 +2260,11 @@ class TaskManager:
         if not is_paid(status):
             if by_hand:
                 forced.remove(order_id)
+                # Без записи снятие живёт до конца прохода: настройки
+                # читаются заново каждую минуту, заказ возвращался в очередь
+                # сам собой, и продавец получал одно и то же уведомление
+                # раз в минуту, пока покупатель не заплатит.
+                save_settings(user_id, settings)
                 await self._robux_stop(
                     user_id, settings, order_id, 0,
                     f"заказ не оплачен (статус «{status}»). Выдавать по "
@@ -2260,6 +2273,17 @@ class TaskManager:
             return
         delivered: list = p.setdefault("delivered", [])
         if order_id in delivered:
+            # Ручную очередь при этом надо освободить: заказ мог быть выдан
+            # уже после того, как его туда поставили, и запись осталась бы
+            # висеть, а бот молча заходил бы за ней каждый проход.
+            if by_hand:
+                forced.remove(order_id)
+                save_settings(user_id, settings)
+                await self._notify(user_id, _card(
+                    "🎮 <b>ROBUX УЖЕ ВЫДАНЫ</b>",
+                    [f"Заказ #{_esc(order_id)} выдан раньше — "
+                     f"второй раз бот покупать не станет.",
+                     "Код лежит в «📜 Журнал выдач»."]))
             return
         log: list = p.setdefault("log", [])
         # Заказ уже в журнале со ссылкой — значит вызов поставщика мог уйти.
@@ -2398,9 +2422,73 @@ class TaskManager:
         # выдаче, которой покупатель не видел.
         entry["state"] = "выдан"
         delivered.append(order_id)
-        del delivered[200:]
+        # Новые записи в конце, значит лишнее режется с начала. `del [200:]`
+        # срезал ровно то, что только что добавили: после двухсотой выдачи
+        # отметка не сохранялась вовсе, заказ снова считался невыданным — и
+        # следующий проход покупал второй код за наши деньги.
+        del delivered[:-200]
         save_settings(user_id, settings)
         logger.info("AutoRoblox: order %s delivered (%s Robux)", order_id, qty)
+
+    async def _robux_forced_sweep(self, user_id: int, api: YooMarketAPI,
+                                  settings: dict, tried: set) -> None:
+        """Ручная очередь Robux: заказы, до которых обычный проход не доходит.
+
+        Выдача вызывалась в двух местах — когда заказ увиден впервые и когда
+        пришла оплата. Оба — про **перемену**. А в очередь продавец ставит
+        обычно давно оплаченный заказ, с которым ничего не происходит:
+        статус не менялся, значит по нему не срабатывало ничего. Кнопка
+        «🚀 Выдать вручную» при этом отвечала «Куплю на ближайшем проходе»
+        и обещала отчёт «и если получится, и если нет» — а не делала ровно
+        ничего и молчала.
+
+        Заказ дочитывается поимённо, а не ищется в списке: список отдаёт
+        свежие заказы, и «нет в списке» не значит «нет такого заказа».
+        Не отдал маркетплейс — так и говорим, и очередь освобождаем: висеть
+        в ней вечно значит молчать вечно.
+        """
+        p = settings.get("plugins", {}).get("auto_roblox", {})
+        waiting = [o for o in list(p.get("force") or []) if o not in tried]
+        if not waiting:
+            return
+        from orderfields import describe as _describe
+        from orderfields import order_chat_id as _chat_of
+
+        for oid in waiting:
+            raw, err = {}, ""
+            try:
+                raw = await api.get_order(oid)
+            except Exception as e:
+                raw, err = {}, str(e)[:200]
+            node = (raw.get("data") if isinstance(raw, dict)
+                    and isinstance(raw.get("data"), dict) else raw)
+            node = node if isinstance(node, dict) else {}
+            if not node:
+                queue: list = p.setdefault("force", [])
+                if oid in queue:
+                    queue.remove(oid)
+                save_settings(user_id, settings)
+                # Из очереди заказ снимается в обоих случаях — и когда
+                # номер неверен, и когда оборвалась связь. Различить их
+                # здесь нечем, а оставлять запись «на всякий случай»
+                # значит молчать о ней каждый следующий проход.
+                await self._robux_stop(
+                    user_id, settings, oid, 0,
+                    "маркетплейс не отдал заказ с таким номером"
+                    + (f" ({err})" if err else "")
+                    + ". Проверьте номер; если это был сбой связи — "
+                    "поставьте заказ в очередь снова",
+                    record=False)
+                continue
+            d = _describe(node)
+            # `describe` номера чата не возвращает вовсе — его достаёт
+            # `order_chat_id`. Подставлять номер заказа приходится, когда
+            # чата в карточке нет: тогда отправка ответит ошибкой, и код
+            # останется у продавца в журнале, а не пропадёт.
+            chat_id = _chat_of(node) or oid
+            await self._maybe_deliver_robux(
+                user_id, api, settings, oid, d.get("title") or "—",
+                chat_id, d.get("status") or "")
 
     async def _robux_stop(self, user_id: int, settings: dict, order_id: str,
                           qty: int, why: str, record: bool = True) -> None:
