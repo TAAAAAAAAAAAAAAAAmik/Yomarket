@@ -251,6 +251,57 @@ class WhatCannotBeCheckedIsNotClaimed(DeployCase):
         self.assertIn("BOT_VERSION", got.stdout)
 
 
+class TheHealthPortIsFoundWhereItActuallyLives(DeployCase):
+    """На сервере порт бота лежит в `.env`, а в окружении того, кто запускает
+    выкат, его нет. Без этого выкат всегда отвечал «версия не сверена» — то
+    есть проверка была написана и не работала ни у кого."""
+
+    def env_with_port(self, port):
+        with open(os.path.join(self.work, ".env"), "w", encoding="utf-8") as f:
+            f.write(f"BOT_TOKEN=1:x\nPORT={port}\n")
+
+    def deploy_without_health(self, **extra):
+        env = {**os.environ, "DEPLOY_PATH": self.work, "DEPLOY_BRANCH": "main",
+               "DEPLOY_RESTART_CMD": "true", **extra}
+        env.pop("PORT", None)
+        env.pop("HEALTH_URL", None)
+        return subprocess.run(["bash", DEPLOY], env=env, capture_output=True,
+                              text=True, timeout=180)
+
+    def test_the_port_from_env_is_used_for_the_check(self):
+        self.push_new_version()
+        url = self.serve_version("версия-новая")
+        self.env_with_port(url.rsplit(":", 1)[-1].split("/")[0])
+        got = self.deploy_without_health()
+        self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+        self.assertIn(".env", got.stdout)
+        self.assertNotIn("не сверена", got.stdout)
+
+    def test_an_old_version_is_still_caught_that_way(self):
+        """Иначе порт нашёлся бы, а толку от него не было."""
+        self.push_new_version()
+        url = self.serve_version("версия-старая")
+        self.env_with_port(url.rsplit(":", 1)[-1].split("/")[0])
+        self.assertNotEqual(self.deploy_without_health().returncode, 0)
+
+    def test_without_a_port_anywhere_it_admits_it_did_not_check(self):
+        """Угадывать порт нельзя: промах превратил бы удачный выкат в
+        «бот не ответил», то есть в ложную тревогу."""
+        self.push_new_version()
+        got = self.deploy_without_health()
+        self.assertEqual(got.returncode, 0)
+        self.assertIn("не сверена", got.stdout)
+
+    def test_the_compose_file_actually_gives_the_bot_that_port(self):
+        """Проводка: скрипт может искать порт сколько угодно, если бот его
+        не слушает."""
+        path = os.path.join(REPO_ROOT, "docker-compose.yml")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("PORT:", text)
+        self.assertIn("127.0.0.1:", text, "порт health не должен смотреть наружу")
+
+
 class LocalWorkOnTheServerIsNeverThrownAway(DeployCase):
     """`git reset --hard` в выкате молча выбрасывает правки, сделанные на
     сервере, и найти их потом негде. Отказ с объяснением лучше."""

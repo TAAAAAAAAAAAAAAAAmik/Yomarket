@@ -10,6 +10,14 @@ services:
       # of the local one — the value here is only the fallback.
       DATABASE_URL: ${DATABASE_URL:-postgresql://bot:botpass@db:5432/botdb}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # Без PORT health-сервер не поднимается вовсе, и выкату нечем сверить,
+      # доехал ли код: он честно скажет «версия не сверена» и на этом всё.
+      PORT: ${PORT:-8080}
+    ports:
+      # Только на localhost. Наружу этот адрес отдавать незачем: он говорит
+      # версию бота и состояние приёма сообщений — это подсказка тому, кто
+      # будет искать, чем нас ковырять.
+      - "127.0.0.1:${PORT:-8080}:${PORT:-8080}"
     depends_on:
       - db
       - redis
