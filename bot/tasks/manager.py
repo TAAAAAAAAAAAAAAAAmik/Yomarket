@@ -945,6 +945,13 @@ def _match_panel_id(title, by_title: dict) -> str:
     return ""
 
 
+# Состояния записи журнала Robux, означающие «выдача начата и не доведена».
+# По ним `_robux_resume` находит то, что оборвалось посередине: контейнер
+# перезапускается при каждом выкате, а статус оплаченного заказа больше не
+# меняется — сам такой заказ не подхватится никогда.
+_ROBUX_UNFINISHED = ("собираемся покупать", "покупаем", "куплен, отправляем")
+
+
 class TaskManager:
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
@@ -955,6 +962,12 @@ class TaskManager:
         # them, whichever saves last silently clobbers the other's changes
         # (e.g. AutoStars pending / known_orders vs bump_schedule.last_runs).
         self._locks: dict[int, asyncio.Lock] = {}
+        # Каталог AppRoute на пару минут: он отдаётся ОДНИМ ответом на 1263
+        # услуги, а читался заново под каждый заказ. Два оплаченных заказа
+        # подряд — два тяжёлых чтения по 90 секунд таймаута, и всё это время
+        # опрос заказов этого продавца стоит. Срок нарочно короткий: остаток
+        # у номинала меняется, и решает всё равно сухой прогон перед покупкой.
+        self._ar_catalog: dict[int, tuple[float, object]] = {}
 
     def _lock(self, user_id: int) -> asyncio.Lock:
         lock = self._locks.get(user_id)
@@ -1439,6 +1452,9 @@ class TaskManager:
             settings["known_order_details"] = order_details
 
             await self._robux_forced_sweep(user_id, api, settings, robux_tried)
+            # После ручной очереди: сначала то, о чём продавец попросил
+            # явно, потом то, что оборвалось само.
+            await self._robux_resume(user_id, api, settings, robux_tried)
 
             await self._check_messages(user_id, api, settings)
             await self._check_watched_chats(user_id, api, settings)
@@ -2308,12 +2324,8 @@ class TaskManager:
             return
 
         loop = asyncio.get_event_loop()
-        from automation.approute import order_sync, services_sync
-        try:
-            ok, catalog = await asyncio.wait_for(
-                loop.run_in_executor(None, services_sync, creds), timeout=90)
-        except Exception as e:
-            ok, catalog = False, str(e)[:200]
+        from automation.approute import order_sync
+        ok, catalog = await self._robux_catalog(user_id, creds)
         if not ok:
             await self._robux_stop(user_id, settings, order_id, qty,
                                    f"каталог поставщика не прочитан: {catalog}")
@@ -2324,11 +2336,24 @@ class TaskManager:
             await self._robux_stop(user_id, settings, order_id, qty, why)
             return
 
-        reference = order_reference(order_id, qty)
+        # Ссылка при повторе берётся из записи, а не считается заново.
+        # Считалась она из номера заказа и количества, а количество читается
+        # из названия — правка названия на витрине давала другую ссылку, и
+        # повтор уходил бы к поставщику как НОВАЯ покупка: `IDEMPOTENCY_REPLAY`
+        # не сработал бы, и мы купили бы второй код за свои деньги. То же и с
+        # номиналом: покупать надо ровно то, о чём записано намерение.
+        reference = str((already or {}).get("reference") or "") \
+            or order_reference(order_id, qty)
+        denomination = str((already or {}).get("denomination") or "") \
+            or row["denomination_id"]
         entry = already or {"order": order_id, "robux": qty,
-                            "denomination": row["denomination_id"],
+                            "denomination": denomination,
                             "reference": reference, "region": region,
                             "price": row.get("price"), "at": time.time(),
+                            # Чат запоминается: возобновление оборванной
+                            # выдачи идёт из журнала, а карточки заказа под
+                            # рукой у него нет.
+                            "chat": str(chat_id or ""),
                             "codes": [], "state": "собираемся покупать"}
         if entry not in log:
             log.insert(0, entry)
@@ -2341,7 +2366,7 @@ class TaskManager:
         try:
             dry_ok, dry = await asyncio.wait_for(
                 loop.run_in_executor(
-                    None, lambda: order_sync(creds, row["denomination_id"],
+                    None, lambda: order_sync(creds, denomination,
                                              1, reference, True)),
                 timeout=90)
         except Exception as e:
@@ -2355,45 +2380,133 @@ class TaskManager:
                                    record=False)
             return
 
-        entry["state"] = "покупаем"
-        save_settings(user_id, settings)
+        await self._robux_finish(user_id, api, settings, entry, creds,
+                                 chat_id)
+
+    async def _robux_catalog(self, user_id: int, creds: dict) -> tuple[bool, object]:
+        """Каталог поставщика — свой на продавца, живёт две минуты.
+
+        Читался он под каждый заказ заново, а это один ответ на 1263 услуги:
+        три оплаченных заказа в одном проходе — три таких чтения подряд, и
+        всё это время опрос заказов стоит.
+
+        Срок короткий намеренно. По каталогу берётся остаток (`inStock`), а
+        он меняется; но решает не он, а сухой прогон прямо перед покупкой —
+        устаревший остаток обернётся честным отказом, а не выдачей того,
+        чего нет.
+        """
+        from automation.approute import services_sync
+
+        # Заводится лениво: менеджер создаётся и в обход `__init__` (так его
+        # строят тесты), и полагаться на атрибут из конструктора нельзя.
+        cache = getattr(self, "_ar_catalog", None)
+        if cache is None:
+            cache = {}
+            self._ar_catalog = cache
+        fresh = cache.get(user_id)
+        if fresh and (time.time() - fresh[0]) < 120:
+            return True, fresh[1]
+        loop = asyncio.get_event_loop()
         try:
-            bought, data = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, lambda: order_sync(creds, row["denomination_id"],
-                                             1, reference, False)),
-                timeout=120)
+            ok, catalog = await asyncio.wait_for(
+                loop.run_in_executor(None, services_sync, creds), timeout=90)
         except Exception as e:
-            bought, data = False, str(e)[:200]
-        if not bought:
-            entry["state"] = "поставщик отказал"
-            entry["why"] = str(data)[:300]
-            save_settings(user_id, settings)
-            await self._robux_stop(user_id, settings, order_id, qty,
-                                   f"поставщик отказал: {data}", record=False)
-            return
+            ok, catalog = False, str(e)[:200]
+        if ok:
+            cache[user_id] = (time.time(), catalog)
+        return ok, catalog
 
-        codes = codes_from_result(data)
+    async def _robux_finish(self, user_id: int, api: YooMarketAPI,
+                            settings: dict, entry: dict, creds: dict,
+                            chat_id: str, dry_first: bool = False) -> None:
+        """Купить (если ещё не купили), отправить код, отметить выданным.
+
+        **Единственный путь к деньгам.** Сюда приходят все три входа: новый
+        оплаченный заказ, ручная очередь и возобновление оборванной выдачи.
+        Второй такой путь пришлось бы снабдить тем же порядком записей —
+        намерение до вызова, код до отправки, отметка после — и однажды он
+        бы с ним разъехался.
+
+        Покупка не повторяется, если код уже куплен: он лежит в записи, и
+        достаточно доотправить. А если покупка была оборвана, повтор идёт
+        **той же ссылкой** — на неё поставщик отвечает `IDEMPOTENCY_REPLAY`,
+        то есть прежним результатом, а не вторым списанием.
+        """
+        from automation.approute import order_sync
+        from automation.robux import codes_from_result
+
+        order_id = str(entry.get("order") or "")
+        qty = int(entry.get("robux") or 0)
+        region = str(entry.get("region") or "")
+        denomination = str(entry.get("denomination") or "")
+        reference = str(entry.get("reference") or "")
+        p = settings.setdefault("plugins", {}).setdefault("auto_roblox", {})
+        loop = asyncio.get_event_loop()
+
+        codes = [str(c) for c in (entry.get("codes") or []) if c]
         if not codes:
-            # Двухсотый без кода — это не выдача. Деньги при этом могли уйти,
-            # поэтому молчать здесь нельзя: продавец должен посмотреть кабинет.
-            entry["state"] = "ответ без кода"
-            save_settings(user_id, settings)
-            await self._notify(user_id, _card(
-                "🎮 <b>ROBUX: ОТВЕТ БЕЗ КОДА</b>",
-                [f"Заказ #{_esc(order_id)}, {qty} Robux.",
-                 "Поставщик не отказал, но кода не прислал.",
-                 f"Ссылка покупки: <code>{_esc(reference)}</code>.",
-                 "",
-                 "Деньги могли списаться. Посмотрите кабинет по этой ссылке "
-                 "и выдайте код вручную, если он там есть."]))
-            return
+            if dry_first:
+                # Запись осталась в состоянии «собираемся покупать» — значит
+                # сухой прогон в тот раз не успел пройти, и пропускать его
+                # нельзя: он единственное, что стоит между неверной формой
+                # тела и потраченными деньгами.
+                try:
+                    dry_ok, dry = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None, lambda: order_sync(creds, denomination, 1,
+                                                     reference, True)),
+                        timeout=90)
+                except Exception as e:
+                    dry_ok, dry = False, str(e)[:200]
+                if not dry_ok:
+                    entry["state"] = "сухой прогон отказал"
+                    entry["why"] = str(dry)[:300]
+                    save_settings(user_id, settings)
+                    await self._robux_stop(user_id, settings, order_id, qty,
+                                           f"проверка заказа не прошла: {dry}",
+                                           record=False)
+                    return
 
-        # Код записывается ДО отправки: чат может быть закрыт, и тогда
-        # купленный код не должен остаться никому.
-        entry["codes"] = codes
-        entry["state"] = "куплен, отправляем"
-        save_settings(user_id, settings)
+            entry["state"] = "покупаем"
+            save_settings(user_id, settings)
+            try:
+                bought, data = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, lambda: order_sync(creds, denomination, 1,
+                                                 reference, False)),
+                    timeout=120)
+            except Exception as e:
+                bought, data = False, str(e)[:200]
+            if not bought:
+                entry["state"] = "поставщик отказал"
+                entry["why"] = str(data)[:300]
+                save_settings(user_id, settings)
+                await self._robux_stop(user_id, settings, order_id, qty,
+                                       f"поставщик отказал: {data}",
+                                       record=False)
+                return
+
+            codes = codes_from_result(data)
+            if not codes:
+                # Двухсотый без кода — это не выдача. Деньги при этом могли
+                # уйти, поэтому молчать нельзя: продавец смотрит кабинет.
+                entry["state"] = "ответ без кода"
+                save_settings(user_id, settings)
+                await self._notify(user_id, _card(
+                    "🎮 <b>ROBUX: ОТВЕТ БЕЗ КОДА</b>",
+                    [f"Заказ #{_esc(order_id)}, {qty} Robux.",
+                     "Поставщик не отказал, но кода не прислал.",
+                     f"Ссылка покупки: <code>{_esc(reference)}</code>.",
+                     "",
+                     "Деньги могли списаться. Посмотрите кабинет по этой "
+                     "ссылке и выдайте код вручную, если он там есть."]))
+                return
+
+            # Код записывается ДО отправки: чат может быть закрыт, и тогда
+            # купленный код не должен остаться никому.
+            entry["codes"] = codes
+            entry["state"] = "куплен, отправляем"
+            save_settings(user_id, settings)
 
         note = str(p.get("note") or "").strip()
         text = "\n".join(
@@ -2421,7 +2534,9 @@ class TaskManager:
         # Только теперь. Отметка по факту покупки однажды доложила бы о
         # выдаче, которой покупатель не видел.
         entry["state"] = "выдан"
-        delivered.append(order_id)
+        delivered: list = p.setdefault("delivered", [])
+        if order_id not in delivered:
+            delivered.append(order_id)
         # Новые записи в конце, значит лишнее режется с начала. `del [200:]`
         # срезал ровно то, что только что добавили: после двухсотой выдачи
         # отметка не сохранялась вовсе, заказ снова считался невыданным — и
@@ -2489,6 +2604,76 @@ class TaskManager:
             await self._maybe_deliver_robux(
                 user_id, api, settings, oid, d.get("title") or "—",
                 chat_id, d.get("status") or "")
+
+    async def _robux_resume(self, user_id: int, api: YooMarketAPI,
+                            settings: dict, tried: set) -> None:
+        """Довести до конца выдачи, оборванные посередине.
+
+        Выдача срабатывает на **перемену**: заказ увиден впервые или пришла
+        оплата. А обрыв случается в середине — и чаще всего не от сбоя, а от
+        обычного выката: контейнер перезапускается, задача умирает между
+        «покупаем» и «выдан». После этого статус заказа больше не меняется
+        никогда, значит по нему уже ничего не сработает: деньги потрачены,
+        покупатель без кода, продавец без единого слова.
+
+        Повтор безопасен ровно потому, что ссылка та же: у поставщика он
+        отвечает `IDEMPOTENCY_REPLAY` — прежним результатом, а не вторым
+        списанием. А если код уже куплен и лежит в записи, покупки не будет
+        вовсе: останется доотправить.
+        """
+        from storage import get_ar_creds
+
+        p = settings.get("plugins", {}).get("auto_roblox", {})
+        log = list(p.get("log") or [])
+        delivered = p.get("delivered") or []
+        stuck = [e for e in log
+                 if isinstance(e, dict)
+                 and str(e.get("state") or "") in _ROBUX_UNFINISHED
+                 and str(e.get("order") or "")
+                 and str(e.get("order")) not in tried
+                 and str(e.get("order")) not in delivered]
+        if not stuck:
+            return
+
+        creds = get_ar_creds(user_id)
+        if not creds or not creds.get("api_key"):
+            # Без ключа доводить нечем. Но и молчать нельзя: записи с
+            # купленными кодами — это чужие деньги, лежащие без движения.
+            for entry in stuck:
+                if entry.get("codes"):
+                    await self._robux_stop(
+                        user_id, settings, str(entry.get("order")),
+                        int(entry.get("robux") or 0),
+                        "выдача осталась незаконченной, а ключ AppRoute не "
+                        "задан. Код уже куплен и лежит в «📜 Журнал выдач» — "
+                        "передайте его покупателю", record=False)
+            return
+
+        from orderfields import order_chat_id as _chat_of
+
+        for entry in stuck:
+            oid = str(entry.get("order"))
+            tried.add(oid)
+            chat_id = str(entry.get("chat") or "")
+            if not chat_id:
+                # Записи, сделанные до того, как чат стал запоминаться.
+                # Дочитываем заказ поимённо: «нет в списке» не значит
+                # «нет такого заказа».
+                try:
+                    raw = await api.get_order(oid)
+                except Exception:
+                    raw = {}
+                node = (raw.get("data") if isinstance(raw, dict)
+                        and isinstance(raw.get("data"), dict) else raw)
+                chat_id = _chat_of(node if isinstance(node, dict) else {}) or oid
+                entry["chat"] = chat_id
+            logger.info("AutoRoblox: доводим оборванную выдачу по заказу %s "
+                        "(состояние «%s»)", oid, entry.get("state"))
+            await self._robux_finish(
+                user_id, api, settings, entry, creds, chat_id,
+                # «Собираемся покупать» означает, что сухой прогон в тот раз
+                # не успел пройти, — значит он нужен снова.
+                dry_first=str(entry.get("state")) == "собираемся покупать")
 
     async def _robux_stop(self, user_id: int, settings: dict, order_id: str,
                           qty: int, why: str, record: bool = True) -> None:

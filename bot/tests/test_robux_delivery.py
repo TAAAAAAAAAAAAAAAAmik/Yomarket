@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 import os
 import sys
@@ -118,6 +119,27 @@ class Harness:
         mgr._notify = notify
         asyncio.run(mgr._maybe_deliver_robux(
             self.uid, object(), self.settings, order_id, title, "chat-1", status))
+        return self
+
+    def resume(self, order=None):
+        """Проход возобновления — тот, что доводит оборванные выдачи."""
+        from tasks.manager import TaskManager
+        mgr = TaskManager.__new__(TaskManager)
+
+        async def send_chat(api, chat_id, text, settings=None):
+            self.chat_sent.append((chat_id, text))
+            return self.send_result
+
+        async def notify(uid, text):
+            self.notified.append(text)
+
+        class Api:
+            async def get_order(_self, oid):
+                return {"data": {"id": oid}}
+
+        mgr._send_chat = send_chat
+        mgr._notify = notify
+        asyncio.run(mgr._robux_resume(self.uid, Api(), self.settings, set()))
         return self
 
     @property
@@ -426,6 +448,184 @@ class TheManualQueueIsWalkedEvenWhenNothingChanged(unittest.TestCase):
         api = self.api_with({"data": {"id": "777"}})
         self.sweep(api, settings_with())
         self.assertEqual(api.asked, [])
+
+
+class AnInterruptedDeliveryIsFinishedNotForgotten(unittest.TestCase):
+    """Выдача срабатывает на перемену: заказ увиден или оплачен. А обрыв
+    случается в середине — и чаще всего не от сбоя, а от обычного выката:
+    контейнер перезапускается, задача умирает между «покупаем» и «выдан».
+    После этого статус заказа не меняется больше никогда, значит по нему уже
+    ничего не сработает: деньги потрачены, покупатель без кода, продавец без
+    единого слова."""
+
+    def stuck(self, state, codes=(), **over):
+        entry = {"order": "777", "robux": 1000, "denomination": "gl-1000",
+                 "reference": "yoo-777-1000", "region": "GL",
+                 "chat": "chat-1", "codes": list(codes), "state": state}
+        entry.update(over)
+        return settings_with(log=[entry], delivered=[])
+
+    def test_a_purchase_cut_off_midway_is_repeated_with_the_same_reference(self):
+        """Той же ссылкой — иначе это не повтор, а вторая покупка."""
+        with Harness(self, settings=self.stuck("покупаем")) as h:
+            h.resume()
+            real = [o for o in h.orders if not o[3]]
+            self.assertEqual(len(real), 1)
+            self.assertEqual(real[0][2], "yoo-777-1000")
+
+    def test_and_the_buyer_finally_gets_the_code(self):
+        with Harness(self, settings=self.stuck("покупаем")) as h:
+            h.resume()
+            self.assertTrue(h.chat_sent)
+            self.assertIn("AAAA-1111", h.chat_sent[-1][1])
+            self.assertIn("777", h.delivered)
+
+    def test_a_code_already_bought_is_not_bought_again(self):
+        """Код лежит в записи — покупать нечего, надо доотправить."""
+        with Harness(self, settings=self.stuck("куплен, отправляем",
+                                               codes=["BBBB-2222"])) as h:
+            h.resume()
+            self.assertEqual([o for o in h.orders if not o[3]], [])
+            self.assertIn("BBBB-2222", h.chat_sent[-1][1])
+            self.assertIn("777", h.delivered)
+
+    def test_an_unstarted_purchase_still_gets_its_dry_run(self):
+        """«Собираемся покупать» значит, что прогон не успел пройти. Он
+        единственное, что стоит между неверной формой тела и деньгами."""
+        with Harness(self, settings=self.stuck("собираемся покупать")) as h:
+            h.resume()
+            self.assertTrue([o for o in h.orders if o[3]], "прогона не было")
+
+    def test_a_finished_delivery_is_left_alone(self):
+        with Harness(self, settings=self.stuck("выдан", codes=["X"])) as h:
+            h.resume()
+            self.assertEqual(h.orders, [])
+            self.assertEqual(h.chat_sent, [])
+
+    def test_a_refusal_is_left_alone_too(self):
+        """«Поставщик отказал» — законченное состояние: повторять его значит
+        ломиться в ту же дверь каждую минуту."""
+        with Harness(self, settings=self.stuck("поставщик отказал")) as h:
+            h.resume()
+            self.assertEqual(h.orders, [])
+
+    def test_an_order_already_marked_delivered_is_not_touched(self):
+        s = self.stuck("покупаем")
+        s["plugins"]["auto_roblox"]["delivered"] = ["777"]
+        with Harness(self, settings=s) as h:
+            h.resume()
+            self.assertEqual(h.orders, [])
+
+    def test_an_order_handled_this_pass_is_not_done_twice(self):
+        """`tried` копится за проход: иначе обычная выдача и возобновление
+        сойдутся на одном заказе."""
+        from tasks.manager import TaskManager
+        with Harness(self, settings=self.stuck("покупаем")) as h:
+            mgr = TaskManager.__new__(TaskManager)
+
+            async def send_chat(api, chat_id, text, settings=None):
+                h.chat_sent.append((chat_id, text))
+                return (True, "")
+
+            async def notify(uid, text):
+                h.notified.append(text)
+
+            mgr._send_chat, mgr._notify = send_chat, notify
+            asyncio.run(mgr._robux_resume(h.uid, object(), h.settings, {"777"}))
+            self.assertEqual(h.orders, [])
+
+    def test_without_a_key_a_bought_code_is_still_reported(self):
+        """Ключ убрали, а код уже куплен — это чужие деньги, лежащие без
+        движения. Молчать о них нельзя."""
+        s = self.stuck("куплен, отправляем", codes=["CCCC-3333"])
+        with Harness(self, settings=s) as h:
+            from tasks import manager as M
+            h._patch(M, "get_ar_creds", lambda uid: {})
+            # Внутри метода ключ берётся `from storage import ...`, поэтому
+            # подменить надо и там: иначе тест проверял бы не тот путь.
+            h._patch(storage, "get_ar_creds", lambda uid: {})
+            h.resume()
+            self.assertTrue(any("Журнал выдач" in n for n in h.notified))
+
+    def test_the_chat_is_remembered_so_resuming_knows_where_to_send(self):
+        """Возобновление идёт из журнала, карточки заказа под рукой нет."""
+        with Harness(self, settings=settings_with()) as h:
+            h.run(title="1000 Robux")
+            self.assertEqual(h.log[0].get("chat"), "chat-1")
+
+
+class TheReferenceSurvivesARenamedOrder(unittest.TestCase):
+    """Ссылка считалась из номера заказа и количества, а количество читается
+    из названия. Правка названия на витрине давала другую ссылку — и повтор
+    уходил бы к поставщику как новая покупка: `IDEMPOTENCY_REPLAY` не
+    сработал бы, и мы купили бы второй код за свои деньги."""
+
+    def test_a_repeat_uses_the_reference_from_the_record(self):
+        entry = {"order": "777", "robux": 1000, "denomination": "gl-1000",
+                 "reference": "yoo-777-1000", "region": "GL",
+                 "chat": "chat-1", "codes": [], "state": "покупаем"}
+        with Harness(self, settings=settings_with(log=[entry])) as h:
+            # Название изменилось: количество прочтётся другое.
+            h.run(title="800 Robux", order_id="777")
+            refs = {o[2] for o in h.orders}
+            self.assertEqual(refs, {"yoo-777-1000"},
+                             "повтор ушёл под новой ссылкой — это вторая покупка")
+
+    def test_and_buys_the_denomination_it_promised(self):
+        entry = {"order": "777", "robux": 1000, "denomination": "gl-1000",
+                 "reference": "yoo-777-1000", "region": "GL",
+                 "chat": "chat-1", "codes": [], "state": "покупаем"}
+        with Harness(self, settings=settings_with(log=[entry])) as h:
+            h.run(title="800 Robux", order_id="777")
+            self.assertEqual({o[0] for o in h.orders}, {"gl-1000"})
+
+
+class TheCatalogueIsNotRereadForEveryOrder(unittest.TestCase):
+    """Каталог отдаётся одним ответом на 1263 услуги. Читался он под каждый
+    заказ заново: три оплаченных заказа в проходе — три тяжёлых чтения по 90
+    секунд таймаута, и всё это время опрос заказов стоит."""
+
+    def test_two_orders_in_a_row_read_it_once(self):
+        from tasks.manager import TaskManager
+        with Harness(self, settings=settings_with()) as h:
+            reads = []
+            from automation import approute
+            real = approute.services_sync
+            approute.services_sync = lambda creds: (reads.append(1)
+                                                    or real(creds))
+            mgr = TaskManager.__new__(TaskManager)
+
+            async def send_chat(api, chat_id, text, settings=None):
+                h.chat_sent.append((chat_id, text))
+                return (True, "")
+
+            async def notify(uid, text):
+                h.notified.append(text)
+
+            mgr._send_chat, mgr._notify = send_chat, notify
+            for oid in ("801", "802"):
+                asyncio.run(mgr._maybe_deliver_robux(
+                    h.uid, object(), h.settings, oid, "1000 Robux",
+                    "chat-1", "work"))
+            self.assertEqual(len(reads), 1, "каталог прочитан дважды")
+            self.assertEqual(len([o for o in h.orders if not o[3]]), 2)
+
+    def test_a_stale_cache_does_not_outlive_two_minutes(self):
+        from tasks.manager import TaskManager
+        mgr = TaskManager.__new__(TaskManager)
+        mgr._ar_catalog = {1: (time.time() - 121, {"items": []})}
+        with Harness(self, settings=settings_with()) as h:
+            got = asyncio.run(mgr._robux_catalog(1, {"api_key": "k"}))
+            self.assertEqual(got[1], CATALOG, "отдан просроченный каталог")
+
+    def test_a_failed_read_is_not_cached(self):
+        """Иначе первая же сетевая заминка отключила бы выдачу на две минуты."""
+        from tasks.manager import TaskManager
+        mgr = TaskManager.__new__(TaskManager)
+        with Harness(self, settings=settings_with(), catalog=None) as h:
+            ok, _ = asyncio.run(mgr._robux_catalog(1, {"api_key": "k"}))
+            self.assertFalse(ok)
+            self.assertEqual(getattr(mgr, "_ar_catalog", {}), {})
 
 
 if __name__ == "__main__":
