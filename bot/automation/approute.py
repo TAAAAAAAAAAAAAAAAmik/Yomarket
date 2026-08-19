@@ -476,6 +476,58 @@ def order_sync(creds: dict, denomination_id: str, quantity: int = 1,
                                                 json_body=body))
 
 
+def dry_run_check_sync(creds: dict, denomination_id: str) -> dict:
+    """Сухой ли на самом деле наш сухой прогон. Читает результат обратно.
+
+    Повод: в документации поставщика (approute.ru → «Документация и SDK»)
+    `POST /orders` перечислен четырежды — Shop, DTU, eSIM и отдельной
+    строкой **«Проверка DTU»**. То есть проверка описана только для
+    пополнений, а мы шлём `checkOnly` вместе с `ordersType: "shop"`. Что
+    сервер делает с ним в этом случае — не сказано нигде.
+
+    Разница денежная. Если `checkOnly` для shop игнорируется, то «сухой
+    прогон» перед каждой покупкой — это сама покупка, и защиты, о которой
+    написано в `docs/robux_delivery.md`, попросту нет.
+
+    Выясняется единственным честным способом: сделать прогон со **своей**
+    ссылкой и тут же спросить `GET /orders?referenceId=…`. Появился заказ —
+    прогон не сухой. Это то же правило, что и везде здесь: сделали —
+    перечитайте и сравните, ответ «HTTP 200» сам по себе ничего не значит.
+
+    Возвращает факты dict-ом, а не готовый текст: разбирать собственную
+    прозу вместо структурных данных в этом проекте уже приводило к ошибкам.
+    """
+    reference = f"probe-{int(time.time())}"
+    out = {"reference": reference, "denomination": str(denomination_id or ""),
+           "sent_ok": False, "sent_why": "", "looked": False,
+           "found": False, "rows": 0, "codes": 0}
+
+    ok, data = order_sync(creds, denomination_id, 1, reference, True)
+    out["sent_ok"] = bool(ok)
+    out["sent_why"] = "" if ok else str(data)[:300]
+    if ok:
+        out["codes"] = len(codes_of(data))
+
+    found_ok, rows = order_by_reference_sync(creds, reference)
+    out["looked"] = bool(found_ok)
+    if found_ok:
+        items = rows.get("items") if isinstance(rows, dict) else rows
+        items = [r for r in (items or []) if isinstance(r, dict)]
+        out["rows"] = len(items)
+        out["found"] = bool(items)
+    return out
+
+
+def codes_of(data) -> list[str]:
+    """Коды из ответа — тем же чтением, что и у выдачи.
+
+    Ответ сухого прогона, в котором лежат коды, сам по себе доказывает, что
+    прогон не сухой: коды выдаются только за деньги.
+    """
+    from automation.robux import codes_from_result
+    return codes_from_result(data)
+
+
 def order_by_reference_sync(creds: dict, reference: str) -> tuple[bool, object]:
     """Чем кончился заказ с этой ссылкой — на случай обрыва связи.
 

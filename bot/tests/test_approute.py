@@ -1517,5 +1517,139 @@ class TheReadingOfARefusalIsNotPassedOffAsAFact(unittest.TestCase):
         rows = A.order_shape_probe_sync(CREDS)
         self.assertNotIn(KEY, json.dumps(rows, ensure_ascii=False))
 
+class WhetherTheDryRunIsDryIsCheckedNotAssumed(unittest.TestCase):
+    """В документации поставщика `POST /orders` перечислен четырежды: Shop,
+    DTU, eSIM и отдельно «Проверка DTU». То есть проверка описана только для
+    пополнений, а мы шлём `checkOnly` вместе с `ordersType: "shop"`.
+
+    Если для shop он игнорируется, «сухой прогон» перед каждой покупкой — это
+    сама покупка, и защиты, которую обещает `docs/robux_delivery.md`, нет.
+    Верить ответу нельзя: HTTP 200 не говорит, создан заказ или нет. Значит
+    надо перечитать — то же правило, что и во всём остальном проекте."""
+
+    def setUp(self):
+        self.sent: list = []
+        self._order = A.order_sync
+        self._by_ref = A.order_by_reference_sync
+        self.addCleanup(lambda: setattr(A, "order_sync", self._order))
+        self.addCleanup(lambda: setattr(A, "order_by_reference_sync",
+                                        self._by_ref))
+
+    def arrange(self, order_answer, lookup_answer):
+        def order_sync(creds, denomination_id, quantity=1, reference="",
+                       check_only=False):
+            self.sent.append({"denomination": denomination_id,
+                              "reference": reference, "check": check_only})
+            return order_answer
+
+        A.order_sync = order_sync
+        A.order_by_reference_sync = lambda creds, ref: lookup_answer
+
+    def test_the_probe_asks_for_a_dry_run(self):
+        self.arrange((True, {}), (True, {"items": []}))
+        A.dry_run_check_sync(CREDS, "gl-1000")
+        self.assertTrue(self.sent[0]["check"], "прогон ушёл не сухим")
+
+    def test_it_uses_its_own_reference_not_an_order_one(self):
+        """Чужой ссылкой проверять нельзя: она принадлежит покупателю."""
+        self.arrange((True, {}), (True, {"items": []}))
+        got = A.dry_run_check_sync(CREDS, "gl-1000")
+        self.assertTrue(got["reference"].startswith("probe-"))
+        self.assertEqual(self.sent[0]["reference"], got["reference"])
+
+    def test_an_order_found_afterwards_means_the_run_was_not_dry(self):
+        self.arrange((True, {}), (True, {"items": [{"id": "1"}]}))
+        got = A.dry_run_check_sync(CREDS, "gl-1000")
+        self.assertTrue(got["found"])
+        self.assertEqual(got["rows"], 1)
+
+    def test_nothing_found_leaves_found_false(self):
+        self.arrange((True, {}), (True, {"items": []}))
+        self.assertFalse(A.dry_run_check_sync(CREDS, "gl-1000")["found"])
+
+    def test_codes_in_the_answer_are_counted_because_they_cost_money(self):
+        """Коды выдаются только за деньги — их наличие само доказывает, что
+        прогон не сухой, даже если список заказов промолчал."""
+        self.arrange((True, {"result": {"vouchers": [{"pin": "AAA"}]}}),
+                     (True, {"items": []}))
+        self.assertEqual(A.dry_run_check_sync(CREDS, "gl-1000")["codes"], 1)
+
+    def test_a_failed_lookup_is_admitted_not_read_as_absence(self):
+        """«Не прочитали список» и «заказа нет» — разные ответы."""
+        self.arrange((True, {}), (False, "не достучались"))
+        got = A.dry_run_check_sync(CREDS, "gl-1000")
+        self.assertFalse(got["looked"])
+        self.assertFalse(got["found"])
+
+    def test_a_refused_run_keeps_the_reason(self):
+        self.arrange((False, "нет такого номинала"), (True, {"items": []}))
+        got = A.dry_run_check_sync(CREDS, "gl-1000")
+        self.assertFalse(got["sent_ok"])
+        self.assertIn("номинала", got["sent_why"])
+
+
+class TheCheckRefusesToSpendMoneyWithoutBeingTold(unittest.TestCase):
+    """Проверка потому и нужна, что мы не знаем, сухой ли прогон. При
+    ненулевом балансе она сама может оказаться той тратой, которую
+    проверяет, — поэтому спрашивает подтверждение."""
+
+    def report(self, balance, confirmed=False, checked=None):
+        real_balance, real_check = A.balance_sync, A.dry_run_check_sync
+        A.balance_sync = lambda creds: (True, balance)
+        A.dry_run_check_sync = lambda creds, d: (checked or {
+            "reference": "probe-1", "denomination": d, "sent_ok": True,
+            "sent_why": "", "looked": True, "found": False, "rows": 0,
+            "codes": 0})
+        try:
+            screen = Screen()
+            asyncio.run(H._dry_check_report(screen, CREDS, "gl-1000",
+                                            confirmed))
+            return screen.last
+        finally:
+            A.balance_sync, A.dry_run_check_sync = real_balance, real_check
+
+    ZERO = {"items": [{"currency": "USD", "balance": 0, "available": 0}]}
+    MONEY = {"items": [{"currency": "USD", "balance": 12.5, "available": 12.5}]}
+
+    def test_with_an_empty_balance_it_just_runs(self):
+        """Даже если прогон окажется покупкой, она упрётся в нехватку денег."""
+        said = self.report(self.ZERO)
+        self.assertIn("прогон", said.lower())
+        self.assertNotIn("повторите с подтверждением", said.lower())
+
+    def test_with_money_it_asks_first(self):
+        said = self.report(self.MONEY)
+        self.assertIn("деньги спишутся", said)
+        self.assertIn("точно", said)
+
+    def test_and_proceeds_once_told(self):
+        said = self.report(self.MONEY, confirmed=True)
+        self.assertNotIn("деньги спишутся", said)
+
+    def test_a_created_order_is_called_out_plainly(self):
+        said = self.report(self.ZERO, checked={
+            "reference": "probe-1", "denomination": "gl-1000",
+            "sent_ok": True, "sent_why": "", "looked": True, "found": True,
+            "rows": 1, "codes": 0})
+        self.assertIn("НЕ сухой", said)
+        self.assertIn("Выдачу включать нельзя", said)
+
+    def test_an_absent_order_is_not_sold_as_proof(self):
+        """Отсутствие в списке слабее, чем присутствие: заказ мог не успеть
+        в него попасть, и выдавать это за доказательство нельзя."""
+        said = self.report(self.ZERO)
+        self.assertIn("Похоже", said)
+
+    def test_an_unreadable_balance_stops_it(self):
+        real = A.balance_sync
+        A.balance_sync = lambda creds: (False, "ключ не принят")
+        try:
+            screen = Screen()
+            asyncio.run(H._dry_check_report(screen, CREDS, "gl-1000", False))
+            self.assertIn("не прочитан", screen.last)
+        finally:
+            A.balance_sync = real
+
+
 if __name__ == "__main__":
     unittest.main()

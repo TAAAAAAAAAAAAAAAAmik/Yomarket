@@ -199,6 +199,138 @@ async def apr_whoami(message: Message) -> None:
     await status.edit_text(await _whoami_text(creds))
 
 
+@router.message(Command("apr_dry_check"))
+async def apr_dry_check(message: Message) -> None:
+    """Сухой ли наш сухой прогон. Перечитывает результат, а не верит ответу.
+
+    В документации поставщика `POST /orders` перечислен четырежды: Shop, DTU,
+    eSIM и отдельно **«Проверка DTU»**. То есть проверка описана только для
+    пополнений, а мы шлём `checkOnly` вместе с `ordersType: "shop"`. Если для
+    shop он игнорируется, то «сухой прогон» перед каждой покупкой — это сама
+    покупка, и защиты, которую обещает `docs/robux_delivery.md`, нет вовсе.
+
+    Проверяется чтением обратно: сделали прогон со своей ссылкой — спросили
+    `GET /orders?referenceId=…`. Появился заказ — прогон не сухой.
+
+    **Пока баланс кабинета нулевой, проверка ничего не стоит:** даже если
+    прогон окажется покупкой, она упрётся в нехватку средств. При ненулевом
+    балансе команда требует подтверждения словом — иначе она сама может
+    оказаться той тратой, которую проверяет.
+    """
+    creds, hint = _creds_or_hint(message.from_user.id)
+    if hint:
+        await message.answer(hint)
+        return
+    parts = (message.text or "").split()
+    denomination = parts[1] if len(parts) > 1 else ""
+    confirmed = len(parts) > 2 and parts[2].lower() in ("точно", "да", "yes")
+    if not denomination:
+        await message.answer(
+            "🧪 <b>Проверка сухого прогона</b>\n\n"
+            "<code>/apr_dry_check ID_НОМИНАЛА</code>\n\n"
+            "ID номинала — из «📦 Каталог» (строка <code>itemId=…</code>).\n\n"
+            "Проверка делает прогон и тут же спрашивает поставщика, "
+            "появился ли заказ. Пока баланс нулевой, это ничего не стоит.")
+        return
+    await _dry_check_report(message, creds, denomination, confirmed)
+
+
+async def _dry_check_report(target, creds: dict, denomination: str,
+                            confirmed: bool) -> None:
+    from automation.approute import balance_lines, balance_sync, dry_run_check_sync
+
+    say = target.edit_text if hasattr(target, "edit_text") else target.answer
+    loop = asyncio.get_event_loop()
+
+    # Сначала баланс: он решает, безопасна ли проверка вообще.
+    try:
+        ok, money = await asyncio.wait_for(
+            loop.run_in_executor(None, balance_sync, creds), timeout=60)
+    except Exception as e:
+        ok, money = False, str(e)[:200]
+    if not ok:
+        await say(f"❌ Баланс не прочитан: {html.escape(str(money)[:300])}\n\n"
+                  f"<i>Без него неизвестно, во что обойдётся проверка, — "
+                  f"поэтому не делаю.</i>")
+        return
+    lines = balance_lines(money)
+    has_money = any(_positive_amount(l) for l in lines)
+    if has_money and not confirmed:
+        await say(
+            "⚠️ <b>На кабинете есть деньги</b>\n\n"
+            + "\n".join(f"• {html.escape(l)}" for l in lines)
+            + "\n\nПроверка потому и нужна, что мы не знаем, сухой ли "
+              "прогон. Если он не сухой — это будет настоящая покупка, и "
+              "деньги спишутся.\n\n"
+              "Если согласны — повторите с подтверждением:\n"
+              f"<code>/apr_dry_check {html.escape(denomination)} точно</code>")
+        return
+
+    await say("⏳ Делаю прогон и перечитываю, появился ли заказ…")
+    try:
+        got = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, lambda: dry_run_check_sync(creds, denomination)),
+            timeout=150)
+    except Exception as e:
+        await say(f"❌ {html.escape(str(e)[:300])}")
+        return
+
+    out = ["🧪 <b>Сухой ли прогон</b>", "",
+           f"Ссылка проверки: <code>{html.escape(got['reference'])}</code>",
+           f"Прогон принят: <b>{'да' if got['sent_ok'] else 'нет'}</b>"]
+    if not got["sent_ok"]:
+        out.append(f"   причина: {html.escape(got['sent_why'])}")
+    if got["codes"]:
+        out.append(f"   ⚠️ в ответе пришли коды: <b>{got['codes']}</b>")
+    out.append(f"Заказ по ссылке найден: "
+               f"<b>{'да' if got['found'] else 'нет'}</b>"
+               + ("" if got["looked"] else " <i>(список заказов не прочитан)</i>"))
+    out.append("")
+
+    if got["found"] or got["codes"]:
+        out += ["❌ <b>Прогон НЕ сухой: заказ создан.</b>",
+                "Значит `checkOnly` для shop-заказов не работает, и защиты "
+                "перед покупкой у нас нет. Выдачу включать нельзя, пока это "
+                "не переделано.",
+                "",
+                "Проверьте кабинет по ссылке выше — заказ там."]
+    elif got["sent_ok"] and got["looked"]:
+        out += ["✅ <b>Похоже, прогон сухой:</b> поставщик принял запрос, а "
+                "заказа по ссылке нет.",
+                "",
+                "<i>«Похоже» — потому что отсутствие в списке слабее, чем "
+                "присутствие: заказ мог не успеть в него попасть. Но это "
+                "лучшее, что можно узнать, не тратя денег.</i>"]
+    elif got["sent_ok"]:
+        out += ["🤷 Прогон принят, но список заказов прочитать не вышло — "
+                "сказать, создан заказ или нет, нечем.",
+                "Повторите проверку позже."]
+    else:
+        out += ["🤷 Прогон не принят, и заказа нет.",
+                "Это не ответ на вопрос: отказать могли и по другой причине "
+                "(нет такого номинала, нет денег, ключ). Смотрите причину "
+                "выше."]
+    await say("\n".join(out)[:4000])
+
+
+def _positive_amount(line: str) -> bool:
+    """Есть ли в строке баланса число больше нуля.
+
+    Строки приходят вида «USD: 12.5 (доступно 10.0)». Разбирать текст здесь
+    приходится, потому что `balance_lines` отдаёт уже готовые строки; зато
+    решение принимается в сторону осторожности: не разобрали — считаем, что
+    деньги есть, и спросим подтверждение.
+    """
+    numbers = re.findall(r"\d+[.,]?\d*", str(line or ""))
+    if not numbers:
+        return True
+    try:
+        return any(float(n.replace(",", ".")) > 0 for n in numbers)
+    except ValueError:                                     # pragma: no cover
+        return True
+
+
 @router.message(Command("apr_order_probe"))
 async def apr_order_probe(message: Message) -> None:
     """Какую форму тела `POST /orders` принимает поставщик. Денег не тратит.
