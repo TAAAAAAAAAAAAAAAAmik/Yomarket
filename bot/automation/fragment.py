@@ -30,6 +30,7 @@ TONCENTER_SEND = "https://toncenter.com/api/v2/sendBoc"
 # бы проваленным на ровном месте.
 TONCENTER_SEND_FALLBACK = "https://toncenter.net/api/v2/sendBoc"
 TONCENTER_RUN = "https://toncenter.com/api/v2/runGetMethod"
+TONCENTER_INFO = "https://toncenter.com/api/v2/getAddressInformation"
 MAINNET_CHAIN = "-239"
 # Зашитого хеша больше нет. Он был чужой, из образца, и это первая из пяти
 # причин, по которым выдача не работала: Fragment отвечал «Bad request», а
@@ -296,17 +297,10 @@ def _read_seqno(address_str: str) -> tuple[int, bool]:
 def _get_seqno(address_str: str) -> int:
     """Счётчик отправок кошелька. Повтор — против одиночного сбоя TonCenter.
 
-    Ноль здесь бывает настоящим: у кошелька, с которого ещё ни разу не
-    отправляли, seqno и правда ноль, а первый перевод его разворачивает.
-    Отличить такой ноль от «сервер не ответил» по одному ответу нельзя, а
-    цена ошибки разная: с чужим нулём перевод подписывается недействительным,
-    сеть его не проводит, и деньги остаются на месте — но бот, увидев
-    принятый узлом BOC, доложил бы об отправке.
-
-    Гадать не будем, а повторить чтение дёшево: запрос только на чтение, и
-    он закрывает самую вероятную причину — секундную неудачу TonCenter.
-    Если ноль всё-таки чужой, это увидит ожидание seqno после отправки, и в
-    ответе будет сказано, что подтверждения в сети не было.
+    Читается для сравнения «сдвинулся или нет» после отправки, где неудача
+    чтения ничем не грозит: она просто означает «подтверждения пока не
+    видно». Перед подписью перевода нужен не этот вызов, а
+    `_seqno_for_transfer` — он имеет право отказать.
     """
     last = 0
     for attempt in range(_SEQNO_READ_TRIES):
@@ -317,6 +311,65 @@ def _get_seqno(address_str: str) -> int:
         if attempt + 1 < _SEQNO_READ_TRIES:
             time.sleep(1)
     return last
+
+
+def _account_state(address_str: str) -> str:
+    """Состояние счёта в сети: ``active``, ``uninitialized`` или "" — не узнали.
+
+    Нужно ровно для одного вопроса: настоящий ли ноль вернул счётчик
+    отправок. У неразвёрнутого кошелька он настоящий, у развёрнутого —
+    признак того, что TonCenter не ответил.
+    """
+    try:
+        r = requests.get(TONCENTER_INFO, params={"address": address_str},
+                         timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        logger.warning("getAddressInformation: %s", e)
+        return ""
+    if not isinstance(data, dict) or not data.get("ok"):
+        return ""
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return ""
+    return str(result.get("state") or "").strip().lower()
+
+
+def _seqno_for_transfer(address_str: str) -> tuple[int, str]:
+    """Счётчик отправок перед подписью → (seqno, причина отказа).
+
+    Отличается от `_get_seqno` тем, что имеет право отказать. Там, где
+    счётчик нужен только для сравнения «сдвинулся или нет», ошибка чтения
+    ничего не стоит. Здесь по нему подписывается перевод: с чужим номером
+    сеть его не проведёт, деньги останутся на месте — а бот, увидев принятый
+    узлом BOC, доложит продавцу об отправке. Это ровно та ложь, которой в
+    этом проекте быть не должно.
+
+    Ноль при этом бывает настоящим: у кошелька, с которого ещё ни разу не
+    отправляли, seqno и правда ноль, а первый же перевод его разворачивает.
+    Отличить настоящий ноль от молчания TonCenter по ответу `runGetMethod`
+    нельзя — там в обоих случаях `ok: false`. Зато это видно по состоянию
+    счёта: `uninitialized` — ноль настоящий, `active` — счётчик у кошелька
+    есть, и мы его просто не прочитали.
+    """
+    for attempt in range(_SEQNO_READ_TRIES):
+        value, sure = _read_seqno(address_str)
+        if sure:
+            return value, ""
+        if attempt + 1 < _SEQNO_READ_TRIES:
+            time.sleep(1)
+    state = _account_state(address_str)
+    if state == "uninitialized":
+        return 0, ""
+    if state == "active":
+        return 0, ("Кошелёк развёрнут, но TonCenter не отдал счётчик его "
+                   "отправок. Подписывать перевод вслепую нельзя: сеть его "
+                   "не проведёт, а звёзды не начислятся. Деньги не тронуты — "
+                   "повторите через минуту.")
+    return 0, ("TonCenter не ответил ни счётчиком кошелька, ни состоянием "
+               "счёта. Перевод не подписан, деньги не тронуты — повторите "
+               "через минуту.")
 
 
 def _send_boc(boc_b64: str) -> bool:
@@ -366,6 +419,54 @@ def get_wallet_balance_sync(
     except (KeyError, ValueError, TypeError):
         nano = 0
     return True, {"ton": nano / 1_000_000_000, "nano": nano, "address": address}
+
+
+def explain_fragment_error(text: str) -> str:
+    """Ответ Fragment по-русски. Оригинал остаётся в скобках.
+
+    Правило простое: английский код ошибки на экране продавца — это
+    отписка. Fragment отвечает своими фразами («You can buy a minimum of 50
+    stars», «Session expired»), и до сих пор они доходили до продавца как
+    есть — вместе с сообщением о том, что заказ не выдан. Понять по ним,
+    что делать, нельзя.
+
+    Оригинал не выбрасывается: по нему продавец найдёт наши же записи в
+    журнале и сможет переслать нам ответ дословно.
+    """
+    said = str(text or "").strip()
+    if not said:
+        return ""
+    low = said.lower()
+    for needle, human in _FRAGMENT_ERRORS:
+        if needle in low:
+            return f"{human} (Fragment: «{said[:120]}»)"
+    return said[:150]
+
+
+# Фразы Fragment и то, что они значат для продавца. Порядок важен:
+# «minimum of 50» проверяется раньше общего «minimum».
+_FRAGMENT_ERRORS = (
+    ("access denied",
+     "Fragment не принимает заявку на покупку"),
+    ("bad request",
+     "Fragment не принял запрос — чаще всего это истёкшие куки"),
+    ("session expired",
+     "Сессия Fragment истекла — переснимите куки"),
+    ("invalid method",
+     "Fragment не знает такого метода — это уже наша ошибка, сообщите нам"),
+    ("no telegram users found",
+     "Fragment не нашёл такой ник в Telegram"),
+    ("minimum of 50",
+     "Fragment продаёт не меньше 50 звёзд за раз"),
+    ("minimum",
+     "Количество меньше того, что Fragment продаёт за раз"),
+    ("not enough",
+     "На кошельке не хватает средств"),
+    ("too many requests",
+     "Fragment просит подождать — слишком много запросов подряд"),
+    ("unknown error",
+     "Fragment ответил «неизвестная ошибка» — повторите через минуту"),
+)
 
 
 def buy_stars_sync(
@@ -483,7 +584,8 @@ def buy_stars_sync(
         if recipient:
             break
     if not recipient:
-        err = search.get("error") or search.get("error_message") or "не найден"
+        err = explain_fragment_error(
+            search.get("error") or search.get("error_message")) or "не найден"
         return False, f"@{username}: {err}. Проверьте username и cookies."
 
     # 4. Заявка → req_id.
@@ -491,9 +593,10 @@ def buy_stars_sync(
                                         "quantity": quantity})
     req_id = init.get("req_id")
     if not req_id:
-        err = str(init.get("error") or init.get("error_message")
+        raw = str(init.get("error") or init.get("error_message")
                   or str(init)[:120])
-        if "access denied" in err.lower():
+        err = explain_fragment_error(raw) or raw
+        if "access denied" in raw.lower():
             return False, (
                 "Fragment: «Access denied» — заявку на покупку он не "
                 "принимает. Поиск получателя при этом проходит, но он "
@@ -532,7 +635,9 @@ def buy_stars_sync(
     tx = link.get("transaction") or {}
     messages = tx.get("messages") or []
     if not messages:
-        err = link.get("error") or link.get("error_message") or str(link)[:150]
+        err = (explain_fragment_error(
+            link.get("error") or link.get("error_message"))
+            or str(link)[:150])
         return False, f"getBuyStarsLink не дал транзакцию: {err}"
 
     # Раздел 6 документа: берётся первое сообщение. Мы платили по всем
@@ -548,9 +653,13 @@ def buy_stars_sync(
 
     # 7. Подпись и отправка.
     try:
-        seqno = _get_seqno(bounce_addr)
+        seqno, why = _seqno_for_transfer(bounce_addr)
     except Exception as e:
         return False, f"Не удалось получить seqno кошелька: {str(e)[:80]}"
+    if why:
+        # До подписи и до отправки: отказ здесь ничего не стоит, а перевод с
+        # чужим номером стоил бы заказа.
+        return False, why
     try:
         boc = _build_signed_boc(wallet, destination, amount_nano, payload, seqno)
     except Exception as e:
@@ -582,7 +691,8 @@ def buy_stars_sync(
     # 8. Подтверждение. Его ответ и решает, засчитана ли оплата.
     confirm = post("confirmReq", {"id": req_id, "boc": boc,
                                   "account": account})
-    cerr = confirm.get("error") or confirm.get("error_message")
+    cerr = explain_fragment_error(
+        confirm.get("error") or confirm.get("error_message"))
     if cerr:
         if report is not None:
             report["confirm_error"] = str(cerr)[:120]

@@ -760,11 +760,17 @@ def _stars_failure_hint(result) -> str:
         return ("🔑 Похоже, истекли куки Fragment — сессия отдаётся как гостю. "
                 "Обновите их: Плагины → AutoStars → 🔑 Данные Fragment "
                 "→ «🧪 Проверить вход» покажет, что именно отвалилось.\n\n")
-    if "не найден" in said or "not found" in said or "assigned to a user" in said:
+    if ("не найден" in said or "не нашёл такой ник" in said
+            or "not found" in said or "users found" in said
+            or "assigned to a user" in said):
         return ("👤 Fragment не нашёл такой ник. Уточните его у покупателя — "
                 "возможно, аккаунт скрыт или ник написан с ошибкой.\n\n")
     if "ton" in said and ("баланс" in said or "недостат" in said):
         return "💎 Пополните TON-кошелёк — на покупку не хватило.\n\n"
+    if "не меньше 50" in said or "minimum of 50" in said:
+        return ("⭐ Fragment продаёт не меньше 50 звёзд за раз. Заказ на "
+                "меньшее количество он не примет — выдайте вручную или "
+                "уберите такой товар с продажи.\n\n")
     return ""
 
 

@@ -325,7 +325,7 @@ class AnswerOfConfirmReqIsNotThrownAway(Case):
     def _buy(self):
         report: dict = {}
         saved = {name: getattr(F, name) for name in
-                 ("_build_signed_boc", "_send_boc", "_get_seqno",
+                 ("_build_signed_boc", "_send_boc", "_seqno_for_transfer",
                   "_wait_seqno_advance", "_wallet_from_mnemonic")}
         # tonsdk в окружении тестов нет, да и подписывать здесь нечего:
         # проверяется, что делает бот с ответом Fragment, а не арифметика TON.
@@ -333,7 +333,7 @@ class AnswerOfConfirmReqIsNotThrownAway(Case):
         F._wallet_from_mnemonic = lambda m, v: type("W", (), {"address": addr})()
         F._build_signed_boc = lambda *a, **k: "BOC"
         F._send_boc = lambda boc: True
-        F._get_seqno = lambda a: 5
+        F._seqno_for_transfer = lambda a: (5, "")
         F._wait_seqno_advance = lambda a, n: True
         try:
             ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
@@ -1349,7 +1349,7 @@ class OnlyTheFirstMessageIsPaid(Case):
 
         sess.post = post
         saved = {n: getattr(F, n) for n in
-                 ("_build_signed_boc", "_send_boc", "_get_seqno",
+                 ("_build_signed_boc", "_send_boc", "_seqno_for_transfer",
                   "_wait_seqno_advance", "_wallet_from_mnemonic",
                   "_make_session")}
         addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
@@ -1358,7 +1358,7 @@ class OnlyTheFirstMessageIsPaid(Case):
         F._build_signed_boc = lambda w, to, amount, p, s: sent.append(
             (to, amount)) or "BOC"
         F._send_boc = lambda boc: True
-        F._get_seqno = lambda a: 5
+        F._seqno_for_transfer = lambda a: (5, "")
         F._wait_seqno_advance = lambda a, n: True
         report: dict = {}
         try:
@@ -1586,7 +1586,7 @@ class MoneyIsNeverSentWithoutFragmentsComment(unittest.TestCase):
         """И, главное, до отправки денег: `_send_boc` не должен вызваться."""
         sent: list = []
         saved = {n: getattr(F, n) for n in
-                 ("_build_signed_boc", "_send_boc", "_get_seqno",
+                 ("_build_signed_boc", "_send_boc", "_seqno_for_transfer",
                   "_wallet_from_mnemonic", "_make_session")}
         fake = FakeFragment()
         sess = fake.session()
@@ -1607,7 +1607,7 @@ class MoneyIsNeverSentWithoutFragmentsComment(unittest.TestCase):
         addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
         F._wallet_from_mnemonic = lambda m, v: type("W", (), {"address": addr})()
         F._make_session = lambda cookies, proxy='': sess
-        F._get_seqno = lambda a: 5
+        F._seqno_for_transfer = lambda a: (5, "")
         F._send_boc = lambda boc: sent.append(boc) or True
         report: dict = {}
         try:
@@ -1709,7 +1709,7 @@ class ConfirmedInTheNetworkOnlyWhenItIs(Case):
 
         sess.post = post
         saved = {n: getattr(F, n) for n in
-                 ("_build_signed_boc", "_send_boc", "_get_seqno",
+                 ("_build_signed_boc", "_send_boc", "_seqno_for_transfer",
                   "_wait_seqno_advance", "_wallet_from_mnemonic",
                   "_make_session")}
         addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
@@ -1717,7 +1717,7 @@ class ConfirmedInTheNetworkOnlyWhenItIs(Case):
         F._make_session = lambda cookies, proxy='': sess
         F._build_signed_boc = lambda *a, **k: "BOC"
         F._send_boc = lambda boc: True
-        F._get_seqno = lambda a: 5
+        F._seqno_for_transfer = lambda a: (5, "")
         F._wait_seqno_advance = lambda a, n: advanced
         report: dict = {}
         try:
@@ -2438,6 +2438,181 @@ class WhichCookieActuallyDoesAnything(Case):
         finally:
             FR.requests.Session = old
         self.assertNotIn(secret, got)
+
+
+
+class TheCounterIsReadBeforeSigningOrNothingIsSigned(unittest.TestCase):
+    """Ноль вместо счётчика подписывал перевод, который сеть не проведёт.
+
+    Повтор чтения закрывал секундную неудачу TonCenter, но не молчание
+    подольше: после трёх попыток брался ноль и с ним подписывался перевод.
+    Деньги при этом остаются на месте — и это худший вид поломки в этом
+    проекте: узел BOC принял, бот доложил об отправке, звёзд нет.
+
+    Ноль запрещать нельзя: у кошелька, с которого ещё не отправляли, он
+    настоящий. Отличает их состояние счёта — `uninitialized` против
+    `active`.
+    """
+
+    def setUp(self):
+        self.posts: list = []
+        self.gets: list = []
+        self.state = {"ok": True, "result": {"state": "active"}}
+        self._post, self._get = F.requests.post, F.requests.get
+        self._sleep = F.time.sleep
+        F.time.sleep = lambda s: None
+
+    def tearDown(self):
+        F.requests.post, F.requests.get = self._post, self._get
+        F.time.sleep = self._sleep
+
+    def answer(self, *payloads):
+        queue = list(payloads)
+
+        def post(url, **kw):
+            self.posts.append(url)
+            return Reply(queue.pop(0) if queue else {"ok": False})
+
+        def get(url, **kw):
+            self.gets.append(url)
+            if self.state is None:
+                raise Exception("TonCenter недоступен")
+            return Reply(self.state)
+
+        F.requests.post, F.requests.get = post, get
+
+    def test_a_counter_that_was_read_is_used_as_is(self):
+        self.answer({"ok": True, "result": {"stack": [["num", "0x2a"]]}})
+        self.assertEqual(F._seqno_for_transfer("EQ..."), (42, ""))
+        self.assertEqual(self.gets, [], "состояние счёта спрашивать незачем")
+
+    def test_a_wallet_that_never_sent_may_still_buy(self):
+        self.state = {"ok": True, "result": {"state": "uninitialized"}}
+        self.answer({"ok": False}, {"ok": False}, {"ok": False})
+        self.assertEqual(F._seqno_for_transfer("EQ..."), (0, ""))
+
+    def test_silence_about_a_live_wallet_stops_the_purchase(self):
+        self.answer({"ok": False}, {"ok": False}, {"ok": False})
+        seqno, why = F._seqno_for_transfer("EQ...")
+        self.assertEqual(seqno, 0)
+        self.assertIn("не тронуты", why)
+
+    def test_silence_about_everything_stops_it_too(self):
+        self.state = None                      # и состояние счёта не узнать
+        self.answer({"ok": False}, {"ok": False}, {"ok": False})
+        _seqno, why = F._seqno_for_transfer("EQ...")
+        self.assertIn("не тронуты", why)
+
+    def test_a_refusal_reaches_the_buyer_before_anything_is_signed(self):
+        """Главное следствие: ни подписи, ни отправки, ни отметки о трате."""
+        signed: list = []
+        sent: list = []
+
+        class Sess:
+            headers: dict = {}
+            cookies = type("C", (), {"update": staticmethod(lambda *a: None),
+                                     "__iter__": lambda self: iter(())})()
+
+            def get(self, url, **kw):
+                return Reply(None, 200, PAGE)
+
+            def post(self, url, params=None, **kw):
+                q = dict(params or {})
+                if q.get("method") == "searchStarsRecipient":
+                    return Reply({"ok": True, "found": {"recipient": "R1"}})
+                if q.get("method") == "initBuyStarsRequest":
+                    return Reply({"ok": True, "req_id": "REQ-1"})
+                if q.get("method") == "getBuyStarsLink":
+                    return Reply({"transaction": {"messages": [
+                        {"address": "EQ" + "A" * 46, "amount": "1500000000",
+                         "payload": "cGF5"}]}})
+                return Reply({"ok": True})
+
+        addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
+        saved = {n: getattr(F, n) for n in
+                 ("_build_signed_boc", "_send_boc", "_wallet_from_mnemonic",
+                  "_make_session", "_seqno_for_transfer")}
+        F._wallet_from_mnemonic = lambda m, v: type("W", (), {"address": addr})()
+        F._make_session = lambda cookies, proxy="": Sess()
+        F._build_signed_boc = lambda *a, **k: signed.append(a) or "BOC"
+        F._send_boc = lambda boc: sent.append(boc) or True
+        F._seqno_for_transfer = lambda a: (0, "TonCenter молчит, деньги не тронуты")
+        report: dict = {}
+        try:
+            ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
+                                       100, api_hash=REAL_HASH, report=report)
+        finally:
+            for name, value in saved.items():
+                setattr(F, name, value)
+        self.assertFalse(ok)
+        self.assertIn("не тронуты", msg)
+        self.assertEqual(signed, [], "перевод подписан вслепую")
+        self.assertEqual(sent, [], "деньги ушли по непрочитанному счётчику")
+        self.assertFalse(report.get("sent_onchain"))
+
+
+
+class FragmentSpeaksEnglishTheSellerDoesNot(unittest.TestCase):
+    """Ответ Fragment доходил до продавца дословно, по-английски.
+
+    «You can buy a minimum of 50 stars» приходило вместе с «заказ не выдан»,
+    и что с этим делать, продавцу было неоткуда узнать. Правило проекта:
+    английский код ошибки на экране — это отписка.
+
+    Оригинал при этом не выбрасывается: по нему продавец перешлёт нам ответ
+    дословно, а подсказка в менеджере ищет в тексте свои приметы.
+    """
+
+    def said(self, text: str) -> str:
+        return F.explain_fragment_error(text)
+
+    def test_the_minimum_is_explained_not_quoted(self):
+        got = self.said("You can buy a minimum of 50 stars")
+        self.assertIn("не меньше 50", got)
+
+    def test_an_expired_session_says_what_to_do(self):
+        self.assertIn("переснимите куки", self.said("Session expired").lower())
+
+    def test_a_missing_nick_is_about_the_nick(self):
+        self.assertIn("ник", self.said("No Telegram users found."))
+
+    def test_the_original_survives_for_forwarding(self):
+        got = self.said("Session expired")
+        self.assertIn("Session expired", got)
+
+    def test_an_unknown_answer_is_passed_through_rather_than_guessed(self):
+        self.assertEqual(self.said("Teapot on fire"), "Teapot on fire")
+
+    def test_nothing_said_stays_nothing(self):
+        self.assertEqual(self.said(""), "")
+        self.assertEqual(self.said(None), "")
+
+    def test_the_seller_sees_it_in_the_actual_refusal(self):
+        """Следствие, а не текст функции: перевод доходит до сообщения."""
+        class Sess:
+            headers: dict = {}
+            cookies = type("C", (), {"update": staticmethod(lambda *a: None),
+                                     "__iter__": lambda self: iter(())})()
+
+            def get(self, url, **kw):
+                return Reply(None, 200, PAGE)
+
+            def post(self, url, params=None, **kw):
+                q = dict(params or {})
+                if q.get("method") == "searchStarsRecipient":
+                    return Reply({"ok": True, "found": {"recipient": "R1"}})
+                return Reply({"ok": False,
+                              "error": "You can buy a minimum of 50 stars"})
+
+        old = F._make_session
+        F._make_session = lambda cookies, proxy="": Sess()
+        try:
+            ok, msg = F.buy_stars_sync(COOKIES, " ".join(["w"] * 24), "durov",
+                                       25, api_hash=REAL_HASH)
+        finally:
+            F._make_session = old
+        self.assertFalse(ok)
+        self.assertIn("не меньше 50", msg)
 
 
 if __name__ == "__main__":
