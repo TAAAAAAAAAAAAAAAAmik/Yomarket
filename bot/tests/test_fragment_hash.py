@@ -26,6 +26,13 @@ try:
     _HAS_TONSDK = True
 except Exception:
     _HAS_TONSDK = False
+# Настоящий адрес TON, а не похожая на него строка. У дружественной формы
+# есть контрольная сумма, и `tonsdk` отвергает выдуманный адрес прежде, чем
+# тест дойдёт до своей проверки: «EQ» и 46 букв «A» роняли
+# test_a_good_payload_still_goes_through на InvalidAddressError, то есть
+# удачный путь сборки транзакции не проверялся ничем — а это единственное
+# место, где деньги уходят.
+TON_ADDR = "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c"
 REAL_HASH = "0123456789abcdef"
 SIGNED_IN = '<a href="/logout">Log out</a>'          # признак вошедшего
 PAGE = ('<html>' + SIGNED_IN + '<script>var x = "/api?hash=' + REAL_HASH
@@ -329,7 +336,7 @@ class AnswerOfConfirmReqIsNotThrownAway(Case):
                   "_wait_seqno_advance", "_wallet_from_mnemonic")}
         # tonsdk в окружении тестов нет, да и подписывать здесь нечего:
         # проверяется, что делает бот с ответом Fragment, а не арифметика TON.
-        addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
+        addr = type("A", (), {"to_string": lambda self, *a: TON_ADDR})()
         F._wallet_from_mnemonic = lambda m, v: type("W", (), {"address": addr})()
         F._build_signed_boc = lambda *a, **k: "BOC"
         F._send_boc = lambda boc: True
@@ -1399,7 +1406,7 @@ class OnlyTheFirstMessageIsPaid(Case):
                  ("_build_signed_boc", "_send_boc", "_get_seqno",
                   "_wait_seqno_advance", "_wallet_from_mnemonic",
                   "_make_session")}
-        addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
+        addr = type("A", (), {"to_string": lambda self, *a: TON_ADDR})()
         F._wallet_from_mnemonic = lambda m, v: type("W", (), {"address": addr})()
         F._make_session = lambda cookies, proxy='': sess
         F._build_signed_boc = lambda w, to, amount, p, s: sent.append(
@@ -1416,7 +1423,7 @@ class OnlyTheFirstMessageIsPaid(Case):
                 setattr(F, name, value)
         return ok, msg, report, sent
 
-    TWO = [{"address": "EQ" + "A" * 46, "amount": "1500000000", "payload": ""},
+    TWO = [{"address": TON_ADDR, "amount": "1500000000", "payload": ""},
            {"address": "EQ" + "B" * 46, "amount": "900000000", "payload": ""}]
 
     def test_a_single_message_is_paid_as_before(self):
@@ -1619,14 +1626,14 @@ class MoneyIsNeverSentWithoutFragmentsComment(unittest.TestCase):
     """
 
     def build(self, payload):
-        addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
+        addr = type("A", (), {"to_string": lambda self, *a: TON_ADDR})()
         wallet = type("W", (), {
             "address": addr,
             "create_transfer_message": staticmethod(
                 lambda **kw: {"message": type("M", (), {
                     "to_boc": staticmethod(lambda x: b"BOC")})()}),
         })()
-        return F._build_signed_boc(wallet, "EQ" + "A" * 46, 1500000000,
+        return F._build_signed_boc(wallet, TON_ADDR, 1500000000,
                                    payload, 5)
 
     def test_an_empty_payload_stops_the_payment(self):
@@ -1674,12 +1681,12 @@ class MoneyIsNeverSentWithoutFragmentsComment(unittest.TestCase):
                 return Reply({"ok": True, "req_id": "REQ-1"})
             if q.get("method") == "getBuyStarsLink":
                 return Reply({"transaction": {"messages": [
-                    {"address": "EQ" + "A" * 46, "amount": "1500000000",
+                    {"address": TON_ADDR, "amount": "1500000000",
                      "payload": ""}]}})
             return Reply({"ok": True})
 
         sess.post = post
-        addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
+        addr = type("A", (), {"to_string": lambda self, *a: TON_ADDR})()
         F._wallet_from_mnemonic = lambda m, v: type("W", (), {"address": addr})()
         F._make_session = lambda cookies, proxy='': sess
         F._get_seqno = lambda a: 5
@@ -1778,7 +1785,7 @@ class ConfirmedInTheNetworkOnlyWhenItIs(Case):
                 return Reply({"ok": True, "req_id": "REQ-1"})
             if q.get("method") == "getBuyStarsLink":
                 return Reply({"transaction": {"messages": [
-                    {"address": "EQ" + "A" * 46, "amount": "1500000000",
+                    {"address": TON_ADDR, "amount": "1500000000",
                      "payload": ""}]}})
             return Reply({"ok": True})
 
@@ -1787,7 +1794,7 @@ class ConfirmedInTheNetworkOnlyWhenItIs(Case):
                  ("_build_signed_boc", "_send_boc", "_get_seqno",
                   "_wait_seqno_advance", "_wallet_from_mnemonic",
                   "_make_session")}
-        addr = type("A", (), {"to_string": lambda self, *a: "EQ" + "A" * 46})()
+        addr = type("A", (), {"to_string": lambda self, *a: TON_ADDR})()
         F._wallet_from_mnemonic = lambda m, v: type("W", (), {"address": addr})()
         F._make_session = lambda cookies, proxy='': sess
         F._build_signed_boc = lambda *a, **k: "BOC"
