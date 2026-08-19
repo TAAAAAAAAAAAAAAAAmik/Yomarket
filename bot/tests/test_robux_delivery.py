@@ -534,18 +534,25 @@ class AnInterruptedDeliveryIsFinishedNotForgotten(unittest.TestCase):
             asyncio.run(mgr._robux_resume(h.uid, object(), h.settings, {"777"}))
             self.assertEqual(h.orders, [])
 
-    def test_without_a_key_a_bought_code_is_still_reported(self):
+    def test_without_a_key_a_bought_code_is_still_not_left_lying(self):
         """Ключ убрали, а код уже куплен — это чужие деньги, лежащие без
-        движения. Молчать о них нельзя."""
+        движения. Молчать о них нельзя.
+
+        Прежде здесь проверялось уведомление «передайте вручную»: без ключа
+        возобновление останавливалось целиком. Но ключ нужен, только чтобы
+        купить, — код уже куплен, и его теперь просто отправляют
+        (см. AKeyIsNeededToBuyAndOnlyToBuy). Молчания не случается и когда
+        отправить не вышло: тогда продавец получает сам код.
+        """
         s = self.stuck("куплен, отправляем", codes=["CCCC-3333"])
-        with Harness(self, settings=s) as h:
+        with Harness(self, settings=s, send=(False, "чат закрыт")) as h:
             from tasks import manager as M
             h._patch(M, "get_ar_creds", lambda uid: {})
             # Внутри метода ключ берётся `from storage import ...`, поэтому
             # подменить надо и там: иначе тест проверял бы не тот путь.
             h._patch(storage, "get_ar_creds", lambda uid: {})
             h.resume()
-            self.assertTrue(any("Журнал выдач" in n for n in h.notified))
+            self.assertTrue(any("CCCC-3333" in n for n in h.notified))
 
     def test_the_chat_is_remembered_so_resuming_knows_where_to_send(self):
         """Возобновление идёт из журнала, карточки заказа под рукой нет."""
@@ -626,6 +633,63 @@ class TheCatalogueIsNotRereadForEveryOrder(unittest.TestCase):
             ok, _ = asyncio.run(mgr._robux_catalog(1, {"api_key": "k"}))
             self.assertFalse(ok)
             self.assertEqual(getattr(mgr, "_ar_catalog", {}), {})
+
+
+class AKeyIsNeededToBuyAndOnlyToBuy(unittest.TestCase):
+    """Код уже куплен — ключ поставщика к нему больше не относится.
+
+    Возобновление упиралось в ключ целиком: запись с готовым кодом ждала
+    его наравне с записями, где ещё предстояла покупка. Код при этом никуда
+    не уходил, а продавцу раз в минуту приходило одно и то же «передайте
+    вручную» — по оплаченному заказу, который бот мог закрыть сам.
+    """
+
+    def stuck(self, state, codes=()):
+        return settings_with(log=[{
+            "order": "777", "robux": 1000, "denomination": "gl-1000",
+            "reference": "yoo-777-1000", "region": "GL", "chat": "chat-1",
+            "codes": list(codes), "state": state}], delivered=[])
+
+    def without_key(self, h):
+        """Ключа нет — но подставки поставщика остаются на месте."""
+        import storage
+        from tasks import manager as M
+        for mod in (storage, M):
+            setattr(mod, "get_ar_creds", lambda uid: None)
+        return h
+
+    def test_a_bought_code_reaches_the_buyer_without_any_key(self):
+        with Harness(self, settings=self.stuck("куплен, отправляем",
+                                               ["AAAA-1111"])) as h:
+            self.without_key(h).resume()
+            self.assertTrue(h.chat_sent)
+            self.assertIn("AAAA-1111", h.chat_sent[-1][1])
+
+    def test_and_nothing_is_bought_a_second_time(self):
+        with Harness(self, settings=self.stuck("куплен, отправляем",
+                                               ["AAAA-1111"])) as h:
+            self.without_key(h).resume()
+            self.assertEqual(h.orders, [])
+
+    def test_and_the_order_is_finally_marked_delivered(self):
+        with Harness(self, settings=self.stuck("куплен, отправляем",
+                                               ["AAAA-1111"])) as h:
+            self.without_key(h).resume()
+            self.assertIn("777", h.delivered)
+
+    def test_an_entry_still_needing_a_purchase_is_named_once_not_hourly(self):
+        """Настройки читаются заново каждую минуту — без отметки это
+        уведомление раз в минуту, пока ключ не появится."""
+        with Harness(self, settings=self.stuck("покупаем")) as h:
+            self.without_key(h)
+            h.resume()
+            h.resume()
+            self.assertEqual(len(h.notified), 1)
+
+    def test_and_that_entry_says_what_is_missing(self):
+        with Harness(self, settings=self.stuck("покупаем")) as h:
+            self.without_key(h).resume()
+            self.assertTrue(any("AppRoute" in t for t in h.notified))
 
 
 if __name__ == "__main__":

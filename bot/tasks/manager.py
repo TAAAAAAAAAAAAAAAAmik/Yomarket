@@ -2637,17 +2637,30 @@ class TaskManager:
 
         creds = get_ar_creds(user_id)
         if not creds or not creds.get("api_key"):
-            # Без ключа доводить нечем. Но и молчать нельзя: записи с
-            # купленными кодами — это чужие деньги, лежащие без движения.
-            for entry in stuck:
-                if entry.get("codes"):
-                    await self._robux_stop(
-                        user_id, settings, str(entry.get("order")),
-                        int(entry.get("robux") or 0),
-                        "выдача осталась незаконченной, а ключ AppRoute не "
-                        "задан. Код уже куплен и лежит в «📜 Журнал выдач» — "
-                        "передайте его покупателю", record=False)
-            return
+            # Ключ нужен, только чтобы **купить**. Записи с уже купленным
+            # кодом его не требуют вовсе: покупать нечего, осталось
+            # отправить — и раньше такой код не уходил никуда, а продавцу
+            # каждую минуту приходило одно и то же «передайте вручную».
+            # Оплаченный заказ ждал ключа, который к нему не относится.
+            ready = [e for e in stuck if e.get("codes")]
+            rest = [e for e in stuck if not e.get("codes")]
+            for entry in rest:
+                # Здесь ключ действительно нужен, но сказать об этом хватит
+                # одного раза на запись: настройки читаются заново каждую
+                # минуту, и без отметки это уведомление раз в минуту.
+                if entry.get("said_no_key"):
+                    continue
+                entry["said_no_key"] = True
+                save_settings(user_id, settings)
+                await self._robux_stop(
+                    user_id, settings, str(entry.get("order")),
+                    int(entry.get("robux") or 0),
+                    "выдача осталась незаконченной, а ключ AppRoute не задан "
+                    "— довести её нечем", record=False)
+            if not ready:
+                return
+            creds = creds or {}
+            stuck = ready
 
         from orderfields import order_chat_id as _chat_of
 

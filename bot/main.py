@@ -301,6 +301,7 @@ def _install_error_reporter(dp: Dispatcher) -> None:
     не читает — и не должен.
     """
     import time as _time
+    import html as _html
     import traceback
 
     from aiogram.types import ErrorEvent
@@ -324,10 +325,15 @@ def _install_error_reporter(dp: Dispatcher) -> None:
             return True
         _LAST_ERROR_AT[user.id] = now
 
-        where = getattr(cq, "data", "") or "сообщение"
+        # Текст ошибки — чужой: в нём бывает разметка, из-за которой она и
+        # случилась. 19.08 отказ Telegram содержал обрывок тега, рассказ о
+        # нём падал на том же самом обрыве, и продавец не увидел ни отчёта,
+        # ни сообщения о сбое — экран просто замер.
+        where = _html.escape(getattr(cq, "data", "") or "сообщение")
+        why = _html.escape(str(exc)[:250] or type(exc).__name__)
         text = (f"⚠️ <b>Сбой</b>\n\n"
                 f"Действие: <code>{where[:60]}</code>\n"
-                f"Причина: <code>{str(exc)[:250] or type(exc).__name__}</code>\n\n"
+                f"Причина: <code>{why}</code>\n\n"
                 "<i>Это сообщение вместо молчания: раньше такая ошибка просто "
                 "ничего не делала.</i>")
         # Бот берётся из самого события, а не запоминается при установке:
@@ -337,7 +343,12 @@ def _install_error_reporter(dp: Dispatcher) -> None:
             if cq is not None:
                 await cq.answer()          # снять «часики» с кнопки
             if target is not None:
-                await target.send_message(user.id, text)
+                try:
+                    await target.send_message(user.id, text)
+                except Exception:
+                    # Последняя попытка — без разметки вовсе. Рассказ о
+                    # сбое, падающий сам, оставляет продавца в тишине.
+                    await target.send_message(user.id, text, parse_mode=None)
         except Exception:
             logger.warning("could not report error to %s: %s", user.id,
                            traceback.format_exc(limit=1))

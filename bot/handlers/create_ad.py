@@ -6,6 +6,7 @@ import html
 import logging
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
@@ -284,6 +285,38 @@ async def ad_photo_skip(callback: CallbackQuery, state: FSMContext) -> None:
     """
     await callback.answer("Теперь фото обязательно", show_alert=True)
     await _ask_photo(callback.message, state, edit=True)
+
+
+async def _edit_safely(msg, text: str, reply_markup=None) -> None:
+    """Показать отчёт так, чтобы он дошёл даже при чужой разметке внутри.
+
+    19.08 экран замер на «⏳ Товар создан, делаю публичным…» и остался так
+    навсегда. В отчёт вставляется ответ панели, панель отвечает своим HTML,
+    ответ обрезается по длине — и в сообщение попадает половина тега.
+    Telegram отказал всему сообщению целиком
+    (`can't parse entities: Unsupported start tag "co</i"`), обработчик
+    упал на этой строке, а продавец остался с «делаю публичным» и без
+    единого слова о том, что товар вообще создан.
+
+    Чужие куски экранируются по месту, но одного этого мало: следующий
+    такой кусок добавят завтра. Поэтому здесь последняя защита — не вышло
+    с разметкой, шлём без неё. Некрасивый отчёт лучше замершего экрана.
+    """
+    try:
+        await msg.edit_text(text, reply_markup=reply_markup)
+        return
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return
+        logger.warning("Telegram не принял разметку (%s) — шлю без неё",
+                       str(e)[:120])
+    try:
+        await msg.edit_text(text[:4000], reply_markup=reply_markup,
+                            parse_mode=None)
+    except Exception as e:
+        # Дальше идти некуда: сказать продавцу больше нечем, но в логе
+        # это должно остаться — молчаливый экран мы уже проходили.
+        logger.error("отчёт не доставлен: %s", str(e)[:200])
 
 
 async def _show_preview(msg, state: FSMContext, edit: bool) -> None:
@@ -767,7 +800,8 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
             except Exception as e:
                 pub_ok, pub_msg = False, f"ошибка: {str(e)[:80]}"
             if pub_ok:
-                pub_note = f"\n🕓 Отправлен на модерацию ({pub_msg})"
+                pub_note = ("\n🕓 Отправлен на модерацию "
+                            f"({html.escape(str(pub_msg)[:150])})")
             else:
                 # A fresh listing usually has nothing to sell yet, and the
                 # marketplace refuses to publish an empty one — say what to do
@@ -782,7 +816,8 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
                     "\n\n📦 <b>На модерацию пока не отправлен.</b>"
                     "\n1. Добавьте остатки — без них публиковать нечего."
                     "\n2. Нажмите «🚀 На модерацию»."
-                    f"\n\n<i>Панель ответила: {pub_msg[:150]}</i>"
+                    f"\n\n<i>Панель ответила: "
+                    f"{html.escape(str(pub_msg)[:150])}</i>"
                 )
 
         b = InlineKeyboardBuilder()
@@ -794,9 +829,10 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
         b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
         b.button(text="📦 Мои товары", callback_data="menu:ads")
         b.adjust(1)
-        await msg.edit_text(
+        await _edit_safely(
+            msg,
             f"✅ <b>Товар создан через панель!</b>\n\n"
-            f"📝 {values['title']}\n💰 {values['price']} ₽"
+            f"📝 {html.escape(str(values['title']))}\n"            f"💰 {values['price']} ₽"
             f"{chr(10) + '🆔 ' + item_id if item_id else ''}"
             f"{pub_note}",
             reply_markup=b.as_markup(),
@@ -828,13 +864,14 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
     # делать, было нельзя. Ставим разбор первым, отчёт оставляем ниже.
     from automation.panel import explain_validation
     why = explain_validation(result_msg)
-    body = f"<b>Панель не приняла:</b>\n{html.escape(why)}\n\n{result_msg}" \
-        if why else result_msg
+    # Ответ панели — чужой текст с чужой разметкой, и попадал он сюда
+    # сырым. Наши собственные заголовки внутри него станут видны буквами:
+    # это некрасиво, но читается, а непрошедшее сообщение не читается вовсе.
+    said = html.escape(str(result_msg))
+    body = f"<b>Панель не приняла:</b>\n{html.escape(why)}\n\n{said}" \
+        if why else said
 
-    await msg.edit_text(
-        f"{header}\n\n{body}",
-        reply_markup=b.as_markup(),
-    )
+    await _edit_safely(msg, f"{header}\n\n{body}", b.as_markup())
 
 
 @router.callback_query(F.data.startswith("cadpub:"))
@@ -871,16 +908,14 @@ async def publish_item(callback: CallbackQuery) -> None:
     b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
     b.button(text="📦 Мои товары", callback_data="menu:ads")
     b.adjust(1)
-    result = (f"🕓 <b>Товар {item_id} отправлен на модерацию</b> ({msg_text})"
+    said = html.escape(str(msg_text)[:300])
+    result = (f"🕓 <b>Товар {item_id} отправлен на модерацию</b> ({said})"
               f"\nПоявится в маркете после проверки." if ok
               else (f"⚠️ <b>Товар {item_id} на модерацию не отправлен</b>\n\n"
                     f"Чаще всего причина одна: у товара нет остатков, а пустой "
                     f"маркетплейс не публикует.\n\n"
-                    f"<i>Панель ответила: {msg_text}</i>"))
-    try:
-        await callback.message.edit_text(result, reply_markup=b.as_markup())
-    except Exception:
-        await callback.message.answer(result, reply_markup=b.as_markup())
+                    f"<i>Панель ответила: {said}</i>"))
+    await _edit_safely(callback.message, result, b.as_markup())
 
 
 # ---------------------------------------------------------------------------
