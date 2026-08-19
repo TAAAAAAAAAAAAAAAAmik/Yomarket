@@ -37,23 +37,74 @@ def _cancel_kb() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+# Шаги мастера по порядку. Здесь их пять, и раньше первые четыре экрана
+# говорили «Шаг N/4», а пятый — «Шаг 5/5»: продавцу обещали четыре шага и
+# показывали пятый. Считать шаги в двух местах по памяти — верный способ
+# снова разойтись, поэтому порядок задан один раз и здесь.
+_STEPS = ("title", "price", "description", "quantity", "photo")
+_STEP_NAMES = {
+    "title": "Название",
+    "price": "Цена",
+    "description": "Описание",
+    "quantity": "Количество",
+    "photo": "Фото",
+}
+# С какого шага возвращает «⬅️ Назад». Опечатка в цене на четвёртом шаге
+# означала пройти мастер заново: назад было нельзя, только «Отмена».
+_STEP_BACK = {"price": "title", "description": "price",
+              "quantity": "description", "photo": "quantity"}
+
+
+def _step_header(step: str) -> str:
+    """Заголовок шага с полосой: видно, сколько пройдено и сколько осталось."""
+    n = _STEPS.index(step) + 1
+    total = len(_STEPS)
+    bar = "▰" * n + "▱" * (total - n)
+    return (f"<b>Шаг {n} из {total}</b> · {bar}\n"
+            f"<b>{_STEP_NAMES[step]}</b>")
+
+
+def _step_kb(step: str, extra: list | None = None) -> InlineKeyboardMarkup:
+    """Кнопки шага: сначала свои, потом «Назад» и «Отмена».
+
+    «Назад» ведёт на предыдущий шаг, а не в меню: заново вводить всё из-за
+    одной опечатки — то же самое, что не дать исправить её вовсе.
+    """
+    b = InlineKeyboardBuilder()
+    for text, data in (extra or []):
+        b.button(text=text, callback_data=data)
+    if step in _STEP_BACK:
+        b.button(text="⬅️ Назад", callback_data=f"create_ad:back:{_STEP_BACK[step]}")
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    b.adjust(1)
+    return b.as_markup()
+
+
 def _preview(data: dict) -> str:
-    title = data.get("title", "—")
+    """Карточка перед созданием.
+
+    Всё, что ввёл продавец, экранируется: одиночный `<` в названии или
+    описании роняет отправку целиком, и вместо предпросмотра он увидит
+    молчание. Это уже случалось в этом проекте с ответом панели.
+    """
+    title = html.escape(str(data.get("title") or "—"))
     price = data.get("price", "—")
-    description = data.get("description", "—")
+    description = html.escape(str(data.get("description") or "—"))
     quantity = data.get("quantity", 1)
-    category = data.get("category", "")
+    category = html.escape(str(data.get("category") or ""))
     lines = [
-        "📦 <b>Новый товар — предпросмотр</b>\n",
-        f"📝 Название: <b>{title}</b>",
-        f"💰 Цена: <b>{price} ₽</b>",
-        f"🔢 Количество: <b>{quantity}</b>",
+        "📦 <b>Предпросмотр товара</b>",
+        "━━━━━━━━━━━━━━",
+        f"📝 <b>{title}</b>",
+        f"💰 {price} ₽   ·   🔢 {quantity} шт.",
     ]
     if category:
-        lines.append(f"🏷 Категория: <b>{category}</b>")
-    lines.append("📷 Фото: <b>есть ✅</b>" if data.get("photo_path")
+        lines.append(f"🏷 {category}")
+    lines.append("📷 Фото: есть ✅" if data.get("photo_path")
                  else "📷 Фото: <b>нет</b> — без него товар не создать")
-    lines.append(f"\n📄 Описание:\n{description}")
+    lines.append("")
+    lines.append("📄 <b>Описание</b>")
+    lines.append(description)
     return "\n".join(lines)
 
 
@@ -97,10 +148,44 @@ async def create_ad_start(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data="menu:ads")
     b.adjust(1)
     await callback.message.edit_text(
-        "➕ <b>Добавить товар</b>\n\n"
-        "<b>Шаг 1/4</b> — Введи название товара:",
+        "➕ <b>Новый товар</b>\n\n"
+        + _step_header("title")
+        + "\n\nПришлите название товара — то, что увидит покупатель на "
+          "витрине.",
         reply_markup=b.as_markup(),
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("create_ad:back:"))
+async def create_ad_back(callback: CallbackQuery, state: FSMContext) -> None:
+    """Шаг назад. Введённое не теряется — оно уже в состоянии.
+
+    Раньше отсюда вела одна дорога: «Отмена», то есть заново весь мастер
+    из-за одной опечатки. Это то же самое, что не дать исправить её вовсе.
+    """
+    step = callback.data.split(":")[-1]
+    if step not in _STEPS:
+        await callback.answer("Такого шага нет", show_alert=True)
+        return
+    data = await state.get_data()
+    was = {"title": data.get("title"), "price": data.get("price"),
+           "description": data.get("description"),
+           "quantity": data.get("quantity")}.get(step)
+    await state.set_state(getattr(CreateAdState, step))
+    hint = {
+        "title": "Пришлите название товара.",
+        "price": "Пришлите цену в рублях, одним числом.",
+        "description": "Пришлите описание. Ссылки панель не примет.",
+        "quantity": "Сколько штук в наличии? Одним числом.",
+    }[step]
+    было = (f"\n\nСейчас: <b>{html.escape(str(was))}</b> — пришлите новое "
+            f"значение, чтобы заменить." if was not in (None, "") else "")
+    extra = ([("1️⃣ Пропустить — одна штука", "create_ad:qty:1")]
+             if step == "quantity" else [])
+    await callback.message.edit_text(
+        _step_header(step) + "\n\n" + hint + было,
+        reply_markup=_step_kb(step, extra))
     await callback.answer()
 
 
@@ -124,11 +209,11 @@ async def ad_title(message: Message, state: FSMContext) -> None:
         await _show_preview(message, state, edit=False)
         return
     await state.set_state(CreateAdState.price)
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data="menu:ads")
     await message.answer(
-        f"✅ Название: <b>{title}</b>\n\n<b>Шаг 2/4</b> — Введи цену (₽):",
-        reply_markup=b.as_markup(),
+        f"✅ Название: <b>{html.escape(title)}</b>\n\n"
+        + _step_header("price")
+        + "\n\nПришлите цену в рублях, одним числом.",
+        reply_markup=_step_kb("price"),
     )
 
 
@@ -140,12 +225,19 @@ async def ad_title(message: Message, state: FSMContext) -> None:
 async def ad_price(message: Message, state: FSMContext) -> None:
     raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
     try:
-        price = int(float(raw))
+        exact = float(raw)
+        price = int(exact)
         if price <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введи цену числом, например: <b>500</b>")
+        await message.answer("❌ Цену нужно числом, например: <b>500</b>")
         return
+    # Копейки панель не берёт, и раньше 500.9 молча становились 500 — про
+    # чужие деньги молчать нельзя даже в мелочи.
+    if exact != price:
+        await message.answer(
+            f"⚠️ Копейки панель не принимает: беру <b>{price} ₽</b> "
+            f"вместо {exact:g}. Если нужно дороже — пришлите другое число.")
     data = await state.get_data()
     await state.update_data(price=price)
     if data.get("editing"):
@@ -153,11 +245,12 @@ async def ad_price(message: Message, state: FSMContext) -> None:
         await _show_preview(message, state, edit=False)
         return
     await state.set_state(CreateAdState.description)
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data="menu:ads")
     await message.answer(
-        f"✅ Цена: <b>{price} ₽</b>\n\n<b>Шаг 3/4</b> — Введи описание товара:",
-        reply_markup=b.as_markup(),
+        f"✅ Цена: <b>{price} ₽</b>\n\n"
+        + _step_header("description")
+        + "\n\nПришлите описание. Ссылки панель не примет — кроме "
+          "видеосервисов и дисков из её белого списка.",
+        reply_markup=_step_kb("description"),
     )
 
 
@@ -191,13 +284,12 @@ async def ad_description(message: Message, state: FSMContext) -> None:
         await _show_preview(message, state, edit=False)
         return
     await state.set_state(CreateAdState.quantity)
-    b = InlineKeyboardBuilder()
-    b.button(text="1️⃣ Пропустить (кол-во = 1)", callback_data="create_ad:qty:1")
-    b.button(text="❌ Отмена", callback_data="menu:ads")
-    b.adjust(1)
     await message.answer(
-        "<b>Шаг 4/4</b> — Введи количество товаров или пропусти:",
-        reply_markup=b.as_markup(),
+        _step_header("quantity")
+        + "\n\nСколько штук в наличии? Одним числом — или пропустите, "
+          "тогда будет одна.",
+        reply_markup=_step_kb(
+            "quantity", [("1️⃣ Пропустить — одна штука", "create_ad:qty:1")]),
     )
 
 
@@ -238,18 +330,17 @@ async def _ask_photo(msg, state: FSMContext, edit: bool) -> None:
     объявление весь путь. Отказ на первом шаге дешевле отказа на последнем.
     """
     await state.set_state(CreateAdState.photo)
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data="menu:ads")
-    b.adjust(1)
     text = (
-        "<b>Шаг 5/5</b> — Отправь <b>фото товара</b> 📷\n\n"
-        "<i>Панель YooMarket требует картинку для объявления — "
-        "без неё товар не создать.</i>"
+        _step_header("photo")
+        + "\n\nПришлите фото товара — картинкой, не файлом.\n\n"
+          "<i>Панель требует картинку: без неё объявление не создать, и "
+          "пропустить этот шаг нельзя.</i>"
     )
+    kb = _step_kb("photo")
     if edit:
-        await msg.edit_text(text, reply_markup=b.as_markup())
+        await msg.edit_text(text, reply_markup=kb)
     else:
-        await msg.answer(text, reply_markup=b.as_markup())
+        await msg.answer(text, reply_markup=kb)
 
 
 @router.message(CreateAdState.photo, F.photo)
