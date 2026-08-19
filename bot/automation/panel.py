@@ -2816,6 +2816,82 @@ def panel_clone_item_sync(
     return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
 
 
+# Панель запрещает ссылки в описании товара, кроме короткого белого списка.
+# Узнано живым отказом 19.08:
+#   {"content": ["Ссылки запрещены. Разрешены только: Warface, YouTube,
+#    Rutube, VKVideo, Google Диск, Яндекс Диск, Майл Диск"]}
+# Проверка нужна заранее: без неё продавец проходит все пять шагов мастера и
+# получает отказ на последнем, когда всё уже введено.
+PANEL_LINK_ALLOWED = ("warface", "youtube.com", "youtu.be", "rutube",
+                      "vkvideo", "vk.video", "drive.google", "disk.yandex",
+                      "cloud.mail", "mail.ru")
+
+# Домены ловим по концу: «roblox.com» — ссылка, «1.500 руб» — нет.
+# Хост берётся ЦЕЛИКОМ, вместе с поддоменами: из «disk.yandex.ru» иначе
+# доставалось «yandex.ru», и белый список не срабатывал — то есть разрешённый
+# сервис объявлялся запрещённым.
+_LINK_RE = re.compile(
+    r"(https?://\S+|www\.\S+|\b[a-z0-9][a-z0-9.-]*\.(?:com|ru|net|org|io|gg"
+    r"|me|tv|app|dev|xyz|site|online|shop|store|club|pro|info|biz|cc|to)\b)",
+    re.IGNORECASE)
+
+
+def link_trouble(text: str) -> str:
+    """Ссылка в тексте, которую панель не примет. Пусто — таких нет.
+
+    Возвращает саму находку, а не «да/нет»: продавцу надо показать, что
+    именно править, иначе он будет искать её в своём же описании глазами.
+    """
+    for found in _LINK_RE.findall(str(text or "")):
+        low = str(found).lower()
+        if any(good in low for good in PANEL_LINK_ALLOWED):
+            continue
+        return str(found)
+    return ""
+
+
+# Как панель называет поля и как их называет продавец.
+_PANEL_FIELDS = {
+    "content": "описание", "title": "название", "price": "цена",
+    "images": "фото", "category": "категория", "subcategory": "подкатегория",
+    "type": "тип товара", "has_points": "остатки",
+}
+
+
+def explain_validation(raw: str) -> str:
+    """Отказ панели по полям — по-русски и по делу. Пусто, если не разобрали.
+
+    Панель отвечает `{"content": ["Ссылки запрещены. …"]}`, а продавец видел
+    это как есть, внутри отладочной простыни: сообщение на экране было, а
+    прочитать в нём, что делать, было нельзя.
+    """
+    text = str(raw or "")
+    # Берём ПЕРВЫЙ полный объект, а не «от первой скобки до последней»: в
+    # отчёте их два — отказ панели и наше «Отправлено: {…}», — и жадный
+    # захват давал невалидный JSON, то есть молчание вместо объяснения.
+    body = None
+    decoder = _json.JSONDecoder()
+    at = text.find("{")
+    while at >= 0:
+        try:
+            body, _end = decoder.raw_decode(text[at:])
+            break
+        except ValueError:
+            at = text.find("{", at + 1)
+    if not isinstance(body, dict):
+        return ""
+    out: list[str] = []
+    for field, complaints in body.items():
+        if isinstance(complaints, str):
+            complaints = [complaints]
+        if not isinstance(complaints, list):
+            continue
+        name = _PANEL_FIELDS.get(str(field), str(field))
+        for complaint in complaints[:2]:
+            out.append(f"• {name}: {str(complaint).strip()}")
+    return "\n".join(out)
+
+
 def panel_create_product_sync(
     cookie_string: str,
     title: str,

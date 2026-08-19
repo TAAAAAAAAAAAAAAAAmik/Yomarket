@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 
 from aiogram import F, Router
@@ -168,6 +169,19 @@ async def ad_description(message: Message, state: FSMContext) -> None:
     desc = (message.text or "").strip()
     if not desc:
         await message.answer("❌ Описание не может быть пустым:")
+        return
+    # Панель запрещает ссылки и отказывает 422 — но только на последнем шаге,
+    # когда введено уже всё. Отказ здесь дешевле отказа в конце: править одно
+    # поле, а не проходить мастер заново.
+    from automation.panel import PANEL_LINK_ALLOWED, link_trouble
+    found = link_trouble(desc)
+    if found:
+        await message.answer(
+            f"❌ Панель не примет описание со ссылкой: "
+            f"<code>{html.escape(found)}</code>\n\n"
+            f"Разрешены только: {', '.join(PANEL_LINK_ALLOWED[:6])} и подобные "
+            f"видеосервисы и диски.\n\n"
+            f"Уберите ссылку и пришлите описание ещё раз.")
         return
     data = await state.get_data()
     await state.update_data(description=desc)
@@ -809,8 +823,16 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
     if is_found:
         header = "⚠️ <b>Ресурс найден, но есть ошибка валидации</b>"
 
+    # Панель объясняет отказ по полям, но внутри JSON, а тот — внутри
+    # отладочной простыни: сообщение на экране было, а прочитать в нём, что
+    # делать, было нельзя. Ставим разбор первым, отчёт оставляем ниже.
+    from automation.panel import explain_validation
+    why = explain_validation(result_msg)
+    body = f"<b>Панель не приняла:</b>\n{html.escape(why)}\n\n{result_msg}" \
+        if why else result_msg
+
     await msg.edit_text(
-        f"{header}\n\n{result_msg}",
+        f"{header}\n\n{body}",
         reply_markup=b.as_markup(),
     )
 
