@@ -1354,7 +1354,8 @@ class TheOrderProbeNeverBuysAnything(unittest.TestCase):
             self.assertEqual(row["item"], A.PROBE_ITEM_ID)
             self.assertTrue(row["invented_item"])
         for call in made[0].posts:
-            self.assertEqual(call["body"]["itemId"], A.PROBE_ITEM_ID)
+            self.assertEqual(call["body"]["orders"][0]["denominationId"],
+                             A.PROBE_ITEM_ID)
 
     def test_every_body_asks_for_a_dry_run(self):
         """`checkOnly` — вторая защита. Обе формы обязаны её нести."""
@@ -1377,52 +1378,97 @@ class TheOrderProbeNeverBuysAnything(unittest.TestCase):
         self.assertEqual(made[0].proxy, "http://p:1")
 
 
-class TheTwoBodyShapesGoOutExactlyAsDocumented(unittest.TestCase):
-    """SDK и `openapi.yaml` расходятся — поэтому шлём ровно обе, как описаны.
+class TheReferenceRidesAtTheTopWhereTheModelPutsIt(unittest.TestCase):
+    """На ссылке держится защита от двойной покупки: повтор после обрыва
+    связи безопасен ровно потому, что поставщик её узнаёт и отвечает
+    `IDEMPOTENCY_REPLAY`.
 
-    Придумать третью, «разумную» форму значит снова гадать: так мы потеряли
-    день на Fragment, где своя версия запроса проходила поиск и падала на
-    покупке.
-    """
+    Мы клали её **внутрь позиции**, а официальная модель кладёт наверх:
+    `OrderCreateRequest` — это `orders_type`, `reference_id`, `reference`,
+    `check_only`, `orders[]`; а у позиции (`OrderItemInput`) полей ровно
+    шесть, и ссылки среди них нет. Не на своём месте она невидима, и повтор
+    стал бы второй покупкой — той самой потерей, ради которой весь этот
+    порядок и заведён."""
+
+    def test_the_reference_is_a_top_level_field(self):
+        body = A.live_order_body("den-1", 1, "yoo-777-1000")
+        self.assertEqual(body.get("reference"), "yoo-777-1000")
+
+    def test_and_never_inside_the_position(self):
+        body = A.live_order_body("den-1", 1, "yoo-777-1000")
+        self.assertNotIn("reference", body["orders"][0])
+
+    def test_the_position_carries_only_what_the_model_allows(self):
+        """`OrderItemInput`: denomination_id, item_id, quantity, fields,
+        amount_currency_code, is_long_order. Лишнее эта схема запрещает."""
+        allowed = {"denominationId", "itemId", "quantity", "fields",
+                   "amountCurrencyCode", "isLongOrder"}
+        body = A.live_order_body("den-1", 2, "ref")
+        self.assertTrue(set(body["orders"][0]) <= allowed,
+                        f"лишние поля: {set(body['orders'][0]) - allowed}")
+
+    def test_no_reference_means_no_field_at_all(self):
+        """Пустая ссылка — не пустая строка: лишние поля схема запрещает."""
+        body = A.live_order_body("den-1", 1, "")
+        self.assertNotIn("reference", body)
+        self.assertNotIn("referenceId", body)
+
+    def test_the_dry_run_flag_sits_beside_orders_type(self):
+        """`check_only` — поле общего запроса, а не DTU-шное: в модели оно
+        стоит рядом с `orders_type` и по умолчанию `False`. «Проверка DTU» на
+        странице документации — это метод SDK, а не ограничение поля."""
+        body = A.live_order_body("den-1", 1, "ref", check_only=True)
+        self.assertTrue(body["checkOnly"])
+        self.assertEqual(body["ordersType"], "shop")
+
+
+class WhereTheReferenceGoesIsAskedOfTheServer(unittest.TestCase):
+    """Форма тела больше не спорная: `ordersType` + позиции с
+    `denominationId` — это подтвердили и живой прогон 18.08, и официальная
+    модель `OrderItemInput`. Спорным осталось **место ссылки**, и оно
+    денежное: на ней держится защита от двойной покупки. Не там — поставщик
+    её не увидит, и повтор после обрыва станет второй покупкой.
+
+    По модели `OrderCreateRequest` ссылка лежит наверху (`reference` или
+    `referenceId`), внутри позиции такого поля нет вовсе. Но спрашиваем всё
+    равно у сервера, включая наш прежний вариант: гадать здесь нельзя."""
 
     def bodies(self):
         made = patch_session(self, lambda url: Reply(envelope("NOT_FOUND")))
         A.order_shape_probe_sync(CREDS)
-        return {c["body"].get("ordersType") and "sdk" or "openapi": c["body"]
-                for c in made[0].posts}
+        return [c["body"] for c in made[0].posts]
 
-    def test_the_sdk_shape_carries_orders_type_and_reference_id(self):
-        body = self.bodies()["sdk"]
-        self.assertEqual(body["ordersType"], "shop")
-        self.assertIn("referenceId", body)
-        self.assertNotIn("reference", body)
-        self.assertNotIn("clientTime", body)
+    def test_all_three_placements_are_tried(self):
+        got = self.bodies()
+        self.assertEqual(len(got), 3)
+        top = [b for b in got if b.get("reference")]
+        top_id = [b for b in got if b.get("referenceId")]
+        inner = [b for b in got if b["orders"][0].get("reference")]
+        self.assertEqual((len(top), len(top_id), len(inner)), (1, 1, 1))
 
-    def test_the_openapi_shape_carries_client_time_and_reference(self):
-        body = self.bodies()["openapi"]
-        self.assertIn("reference", body)
-        self.assertIn("clientTime", body)
-        self.assertNotIn("ordersType", body)
-        self.assertNotIn("referenceId", body)
+    def test_every_body_is_the_form_the_server_already_accepted(self):
+        """Плоские тела из SDK и openapi живой прогон отверг — спрашивать их
+        снова значит тратить ответы сервера на решённый вопрос."""
+        for body in self.bodies():
+            self.assertEqual(body["ordersType"], "shop")
+            self.assertIn("denominationId", body["orders"][0])
+            self.assertNotIn("itemId", body)
+            self.assertNotIn("clientTime", body)
 
     def test_names_go_camel_case_because_we_ride_without_the_sdk(self):
-        """`item_id` осталось бы непонятым: переводит их транспорт SDK."""
-        for body in self.bodies().values():
-            self.assertIn("itemId", body)
-            self.assertNotIn("item_id", body)
+        """`denomination_id` осталось бы непонятым: имена переводит транспорт
+        SDK, а мы идём без него."""
+        for body in self.bodies():
+            self.assertNotIn("orders_type", body)
             self.assertNotIn("reference_id", body)
-            self.assertNotIn("client_time", body)
+            self.assertNotIn("denomination_id", body["orders"][0])
 
-    def test_the_reference_is_invented_before_the_call(self):
-        """По ней спрашивают, чем кончилось, если связь оборвалась."""
-        made = patch_session(self, lambda url: Reply(envelope("NOT_FOUND")))
-        rows = A.order_shape_probe_sync(CREDS)
-        refs = [r["reference"] for r in rows]
-        self.assertTrue(all(refs))
-        self.assertEqual(len(set(refs)), len(refs))
-        for call, ref in zip(made[0].posts, refs):
-            sent = call["body"].get("referenceId") or call["body"].get("reference")
-            self.assertEqual(sent, ref)
+    def test_none_of_them_can_buy(self):
+        """Две защиты: сухой прогон и заведомо несуществующий номинал."""
+        for body in self.bodies():
+            self.assertTrue(body.get("checkOnly"))
+            self.assertEqual(body["orders"][0]["denominationId"],
+                             A.PROBE_ITEM_ID)
 
 
 class TheReadingOfARefusalIsNotPassedOffAsAFact(unittest.TestCase):

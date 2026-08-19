@@ -436,8 +436,27 @@ def live_order_body(denomination_id: str, quantity: int = 1,
         {"ordersType": "shop",
          "orders": [{"denominationId": "…", "quantity": 1}]}
 
-    `reference` кладётся, только если задан: лишние поля эта схема
-    запрещает, а был ли он принят — покажет первый живой ответ.
+    **Ссылка кладётся наверх, а не внутрь позиции.** Это исправление, и оно
+    денежное. Официальная модель запроса (`OrderCreateRequest` в SDK) выглядит
+    так:
+
+        orders_type, reference_id, reference, check_only, orders[]
+
+    а внутри позиции (`OrderItemInput`) полей ровно шесть — `denomination_id`,
+    `item_id`, `quantity`, `fields`, `amount_currency_code`, `is_long_order`, —
+    и `reference` среди них нет. Мы клали его туда, и на этом держалась вся
+    защита от двойной покупки: повтор после обрыва связи безопасен ровно
+    потому, что поставщик узнаёт ссылку и отвечает `IDEMPOTENCY_REPLAY`.
+    Ссылка не на своём месте — значит он её не видел, значит повтор был бы
+    **второй покупкой**, а не повтором.
+
+    Из двух имён берётся `reference`: именно оно возвращается в строке заказа
+    (`TransactionListItem.reference`), то есть его поставщик и хранит.
+    `referenceId` — имя фильтра в `GET /orders`, им мы заказ ищем.
+
+    Что схема примет на самом деле, проверяется `/apr_order_probe`: он
+    спрашивает поставщика тремя телами с заведомо несуществующим номиналом —
+    денег не тратит ни одно.
     """
     body: dict = {
         "ordersType": "shop",
@@ -445,8 +464,11 @@ def live_order_body(denomination_id: str, quantity: int = 1,
                     "quantity": int(quantity or 1)}],
     }
     if reference:
-        body["orders"][0]["reference"] = str(reference)
+        body["reference"] = str(reference)
     if check_only:
+        # Поле общего запроса, а не DTU-шное: в модели оно стоит рядом с
+        # `orders_type` и по умолчанию `False`. На странице документации
+        # «Проверка DTU» — это отдельный метод SDK, а не ограничение поля.
         body["checkOnly"] = True
     return body
 
@@ -606,7 +628,13 @@ def probe_sync(creds: dict) -> list[dict]:
 # (`additionalProperties: false`). Обе описаны в `docs/approute_api_notes.md`;
 # какую поставщик принимает на самом деле, документация не говорит, а ошибка
 # здесь стоит оплаченного заказа, ушедшего в никуда.
-ORDER_SHAPES = ("sdk", "openapi")
+# Формы, которые проба спрашивает у сервера. Плоские тела из SDK и из
+# `openapi.yaml` здесь больше не нужны: 18.08 живой прогон отверг обе
+# («orders: Field required», «itemId: Extra inputs are not permitted»), это
+# записано в `docs/approute_api_notes.md`. Осталось выяснить единственное
+# невыясненное — **куда кладётся ссылка**, а от неё зависит, будет ли повтор
+# повтором или второй покупкой.
+ORDER_SHAPES = ("reference-сверху", "referenceId-сверху", "reference-внутри")
 
 # Товар, которого заведомо нет. Проба спрашивает про него нарочно: отказ
 # «такого товара нет» доказывает, что форму тела разобрали, а отказ про
@@ -627,28 +655,33 @@ _SHAPE_UNKNOWN = ("UNAUTHORIZED", "FORBIDDEN")
 
 def order_body(shape: str, item_id: str, reference: str, quantity: int = 1,
                service_id: str = "", check_only: bool = True) -> dict:
-    """Тело `POST /orders` в одной из двух форм. camelCase — как на проводе.
+    """Тело `POST /orders` с ссылкой в одном из трёх мест. camelCase.
 
-    `checkOnly` кладётся в обе: по схеме это сухой прогон, заказ не
-    создаётся. Полагаться на него одного нельзя — в SDK такого поля нет
-    вовсе, и что с ним сделает живой сервер, мы не видели, — поэтому проба
-    вдобавок спрашивает про несуществующий товар.
+    Форма самого тела больше не спорная: `ordersType` + позиции списком с
+    `denominationId` — это подтвердил и живой прогон 18.08, и официальная
+    модель `OrderItemInput`. Спорным осталось место ссылки, и оно денежное:
+    на ней держится защита от двойной покупки. Не там — поставщик её не
+    увидит, и повтор после обрыва связи станет второй покупкой.
+
+    По модели `OrderCreateRequest` ссылка лежит **наверху** и зовётся
+    `reference` либо `referenceId`; внутри позиции такого поля нет вовсе.
+    Проба спрашивает все три варианта, включая наш прежний (внутри), — чтобы
+    ответ дал сервер, а не мы.
+
+    **Денег не тратит:** `checkOnly` плюс заведомо несуществующий номинал.
     """
     ref = str(reference or "")
-    body: dict = {"itemId": str(item_id or ""), "quantity": int(quantity or 1)}
-    if str(shape) == "sdk":
-        # Как собирает транспорт SDK: `orders_type` и `reference_id`
-        # переводятся им в camelCase перед отправкой.
-        body["ordersType"] = "shop"
+    position: dict = {"denominationId": str(item_id or ""),
+                      "quantity": int(quantity or 1)}
+    body: dict = {"ordersType": "shop", "orders": [position]}
+    if str(shape) == "referenceId-сверху":
         body["referenceId"] = ref
+    elif str(shape) == "reference-внутри":
+        position["reference"] = ref
     else:
-        # Как требует `PurchaseRequest` в `openapi.yaml`: другое имя ссылки
-        # и обязательное время клиента.
         body["reference"] = ref
-        body["clientTime"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                           time.gmtime())
     if service_id:
-        body["serviceId"] = str(service_id)
+        position["serviceId"] = str(service_id)
     if check_only:
         body["checkOnly"] = True
     return body
