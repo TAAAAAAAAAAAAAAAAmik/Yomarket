@@ -199,119 +199,75 @@ async def apr_whoami(message: Message) -> None:
     await status.edit_text(await _whoami_text(creds))
 
 
-@router.message(Command("apr_dry_check"))
-async def apr_dry_check(message: Message) -> None:
-    """Сухой ли наш сухой прогон. Перечитывает результат, а не верит ответу.
+@router.message(Command("apr_item"))
+async def apr_item(message: Message) -> None:
+    """Цена и остаток одного номинала — тем же путём, каким их читает выдача.
 
-    В документации поставщика `POST /orders` перечислен четырежды: Shop, DTU,
-    eSIM и отдельно **«Проверка DTU»**. То есть проверка описана только для
-    пополнений, а мы шлём `checkOnly` вместе с `ordersType: "shop"`. Если для
-    shop он игнорируется, то «сухой прогон» перед каждой покупкой — это сама
-    покупка, и защиты, которую обещает `docs/robux_delivery.md`, нет вовсе.
+    Заменяет `/apr_dry_check`, отменённую по существу: сухого прогона для
+    магазинных заказов не существует — `checkOnly` разрешён только при
+    `ordersType=dtu`, а Robux это `voucher`. Команда, отвечавшая на вопрос
+    «сухой ли наш сухой прогон», осталась без предмета.
 
-    Проверяется чтением обратно: сделали прогон со своей ссылкой — спросили
-    `GET /orders?referenceId=…`. Появился заказ — прогон не сухой.
-
-    **Пока баланс кабинета нулевой, проверка ничего не стоит:** даже если
-    прогон окажется покупкой, она упрётся в нехватку средств. При ненулевом
-    балансе команда требует подтверждения словом — иначе она сама может
-    оказаться той тратой, которую проверяет.
+    Здесь же проверяются права ключа на чтение — одним дешёвым запросом
+    (120 в минуту против 2 у полного каталога).
     """
     creds, hint = _creds_or_hint(message.from_user.id)
     if hint:
         await message.answer(hint)
         return
     parts = (message.text or "").split()
-    denomination = parts[1] if len(parts) > 1 else ""
-    confirmed = len(parts) > 2 and parts[2].lower() in ("точно", "да", "yes")
-    if not denomination:
+    if len(parts) < 3:
         await message.answer(
-            "🧪 <b>Проверка сухого прогона</b>\n\n"
-            "<code>/apr_dry_check ID_НОМИНАЛА</code>\n\n"
-            "ID номинала — из «📦 Каталог» (строка <code>itemId=…</code>).\n\n"
-            "Проверка делает прогон и тут же спрашивает поставщика, "
-            "появился ли заказ. Пока баланс нулевой, это ничего не стоит.")
+            "🔎 <b>Цена и остаток номинала</b>\n\n"
+            "<code>/apr_item ID_УСЛУГИ ID_НОМИНАЛА</code>\n\n"
+            "Оба идентификатора показывает <code>/apr_stock robux</code>: "
+            "первый — у услуги, второй — у строки с номиналом. Ничего не "
+            "покупает.")
         return
-    await _dry_check_report(message, creds, denomination, confirmed)
+    service_id, item_id = parts[1], parts[2]
+    status = await message.answer("⏳ Спрашиваю номинал…")
+    await status.edit_text(await _item_text(creds, service_id, item_id))
 
 
-async def _dry_check_report(target, creds: dict, denomination: str,
-                            confirmed: bool) -> None:
-    from automation.approute import balance_lines, balance_sync, dry_run_check_sync
+async def _item_text(creds: dict, service_id: str, item_id: str) -> str:
+    from automation.approute import item_sync
 
-    say = target.edit_text if hasattr(target, "edit_text") else target.answer
     loop = asyncio.get_event_loop()
-
-    # Сначала баланс: он решает, безопасна ли проверка вообще.
     try:
-        ok, money = await asyncio.wait_for(
-            loop.run_in_executor(None, balance_sync, creds), timeout=60)
-    except Exception as e:
-        ok, money = False, str(e)[:200]
-    if not ok:
-        await say(f"❌ Баланс не прочитан: {html.escape(str(money)[:300])}\n\n"
-                  f"<i>Без него неизвестно, во что обойдётся проверка, — "
-                  f"поэтому не делаю.</i>")
-        return
-    lines = balance_lines(money)
-    has_money = any(_positive_amount(l) for l in lines)
-    if has_money and not confirmed:
-        await say(
-            "⚠️ <b>На кабинете есть деньги</b>\n\n"
-            + "\n".join(f"• {html.escape(l)}" for l in lines)
-            + "\n\nПроверка потому и нужна, что мы не знаем, сухой ли "
-              "прогон. Если он не сухой — это будет настоящая покупка, и "
-              "деньги спишутся.\n\n"
-              "Если согласны — повторите с подтверждением:\n"
-              f"<code>/apr_dry_check {html.escape(denomination)} точно</code>")
-        return
-
-    await say("⏳ Делаю прогон и перечитываю, появился ли заказ…")
-    try:
-        got = await asyncio.wait_for(
+        ok, data = await asyncio.wait_for(
             loop.run_in_executor(
-                None, lambda: dry_run_check_sync(creds, denomination)),
-            timeout=150)
+                None, lambda: item_sync(creds, service_id, item_id)),
+            timeout=60)
     except Exception as e:
-        await say(f"❌ {html.escape(str(e)[:300])}")
-        return
-
-    out = ["🧪 <b>Сухой ли прогон</b>", "",
-           f"Ссылка проверки: <code>{html.escape(got['reference'])}</code>",
-           f"Прогон принят: <b>{'да' if got['sent_ok'] else 'нет'}</b>"]
-    if not got["sent_ok"]:
-        out.append(f"   причина: {html.escape(got['sent_why'])}")
-    if got["codes"]:
-        out.append(f"   ⚠️ в ответе пришли коды: <b>{got['codes']}</b>")
-    out.append(f"Заказ по ссылке найден: "
-               f"<b>{'да' if got['found'] else 'нет'}</b>"
-               + ("" if got["looked"] else " <i>(список заказов не прочитан)</i>"))
-    out.append("")
-
-    if got["found"] or got["codes"]:
-        out += ["❌ <b>Прогон НЕ сухой: заказ создан.</b>",
-                "Значит `checkOnly` для shop-заказов не работает, и защиты "
-                "перед покупкой у нас нет. Выдачу включать нельзя, пока это "
-                "не переделано.",
-                "",
-                "Проверьте кабинет по ссылке выше — заказ там."]
-    elif got["sent_ok"] and got["looked"]:
-        out += ["✅ <b>Похоже, прогон сухой:</b> поставщик принял запрос, а "
-                "заказа по ссылке нет.",
-                "",
-                "<i>«Похоже» — потому что отсутствие в списке слабее, чем "
-                "присутствие: заказ мог не успеть в него попасть. Но это "
-                "лучшее, что можно узнать, не тратя денег.</i>"]
-    elif got["sent_ok"]:
-        out += ["🤷 Прогон принят, но список заказов прочитать не вышло — "
-                "сказать, создан заказ или нет, нечем.",
-                "Повторите проверку позже."]
+        ok, data = False, str(e)[:300]
+    if not ok:
+        return f"❌ {html.escape(str(data)[:600])}"
+    if not isinstance(data, dict) or not data:
+        return ("🤷 Поставщик ответил пусто. Это не «нет такого номинала» и "
+                "не «есть» — проверьте идентификаторы по "
+                "<code>/apr_stock robux</code>.")
+    stock = data.get("inStock")
+    lines = [
+        "🔎 <b>Номинал у поставщика</b>", "",
+        f"Название: {html.escape(str(data.get('name') or '—'))}",
+        f"Цена: <b>{data.get('price')}</b> {html.escape(str(data.get('currency') or ''))}",
+        f"Остаток: <b>{stock}</b>",
+    ]
+    if data.get("isLongOrder"):
+        lines.append("⏳ Долгий заказ: код приходит не сразу, выдача "
+                     "дожидается его опросом.")
+    if data.get("minQtyToLongOrder"):
+        lines.append(f"   с количества {data.get('minQtyToLongOrder')} заказ "
+                     f"становится долгим")
+    lines.append("")
+    if isinstance(stock, (int, float)) and stock <= 0:
+        lines.append("❌ Остаток нулевой — выдача откажет честно, ничего не "
+                     "потратив.")
     else:
-        out += ["🤷 Прогон не принят, и заказа нет.",
-                "Это не ответ на вопрос: отказать могли и по другой причине "
-                "(нет такого номинала, нет денег, ключ). Смотрите причину "
-                "выше."]
-    await say("\n".join(out)[:4000])
+        lines.append("Это ровно то чтение, которое выдача делает перед "
+                     "покупкой вместо сухого прогона: его для магазинных "
+                     "заказов не существует.")
+    return "\n".join(lines)
 
 
 def _positive_amount(line: str) -> bool:

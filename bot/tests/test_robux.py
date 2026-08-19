@@ -168,6 +168,36 @@ class AnEmptyResultIsARefusalNotADelivery(unittest.TestCase):
             self.assertEqual(R.codes_from_result(data), [])
 
 
+class AMaskedCodeIsNotACode(unittest.TestCase):
+    """`GET /orders` без `unhide=true` отдаёт коды скрытыми: `****9012`.
+
+    Отправить такое покупателю значит отчитаться о выдаче, которой не было,
+    — притом ответ приходит успешный, поле на месте, и заметить нечем.
+    Проверка стоит не потому, что мы забудем `unhide`, а потому что забыть
+    его — единственный способ ошибиться незаметно.
+    """
+
+    def test_a_masked_pin_is_recognised(self):
+        for masked in ("****9012", "  ****1234", "*"):
+            self.assertTrue(R.is_masked_code(masked), masked)
+
+    def test_a_real_pin_is_not(self):
+        for code in ("AAAA-BBBB", "1234567890"):
+            self.assertFalse(R.is_masked_code(code), code)
+
+    def test_masked_codes_are_dropped_and_leave_nothing(self):
+        """Не осталось ни одного — это «кода нет», а не «выдали»."""
+        data = {"result": {"vouchers": [{"pin": "****9012"}]}}
+        self.assertEqual(R.codes_from_result(data), [])
+
+    def test_codes_are_read_from_the_orders_listing_shape(self):
+        """У `GET /orders` форма другая: `data.page.items[].vouchers[].pin`.
+        Не зная её, мы после обрыва связи не нашли бы код даже там, где он
+        есть."""
+        data = {"page": {"items": [{"vouchers": [{"pin": "AAAA-BBBB"}]}]}}
+        self.assertEqual(R.codes_from_result(data), ["AAAA-BBBB"])
+
+
 class TheScreenDoesNotPromiseWhatItCannotDo(unittest.TestCase):
     """Шесть кнопок раздела отвечали «функция появится в следующем
     обновлении», а «Ручная выдача» спрашивала @username — понятие звёзд.

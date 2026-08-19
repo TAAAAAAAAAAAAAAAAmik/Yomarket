@@ -265,6 +265,60 @@ class AnAnswerWithoutTheEnvelopeIsExplainedNotJustNumbered(unittest.TestCase):
         self.assertNotIn("apr_debug", e.why)
 
 
+class SuccessIsDecidedByTheNumericStatusCode(unittest.TestCase):
+    """Кодов успеха три, а не один — документация поставщика, 19.08.
+
+    Раньше признак успеха был выведен из имён полей, и два ответа из трёх
+    успешных читались как отказ:
+
+    * `1` ACCEPTED — «заказ принят, код будет позже». Деньги ушли, а бот
+      докладывал, что покупки не было.
+    * `2` IDEMPOTENCY_REPLAY — «такой referenceId уже был, отдаю прежний
+      результат». Прочитанный как отказ, он приводит ко второй покупке —
+      ровно к тому, от чего строилась защита от обрыва связи.
+    """
+
+    def call(self, body, http=200):
+        fake = Fake(Reply(body, code=http))
+        return client(fake).call("GET", "/x")
+
+    def test_an_accepted_order_is_not_reported_as_a_refusal(self):
+        data = self.call({"status": "IN_PROGRESS", "statusCode": 1,
+                          "traceId": "t", "errorCode": None,
+                          "data": {"orderId": "o1", "result": None}}, http=202)
+        self.assertEqual(data["orderId"], "o1")
+
+    def test_an_idempotency_replay_is_a_success_not_a_second_purchase(self):
+        data = self.call({"status": "SUCCESS", "statusCode": 2, "traceId": "t",
+                          "data": {"result": {"vouchers": [{"pin": "AAAA"}]}}})
+        self.assertEqual(data["result"]["vouchers"][0]["pin"], "AAAA")
+
+    def test_an_empty_data_at_success_is_still_a_success(self):
+        """У ACCEPTED внутри ещё пусто. Требовать непустоту значит объявить
+        отказом принятый заказ; есть ли код — решает выдача, не разбор."""
+        self.assertIsNone(self.call(
+            {"status": "IN_PROGRESS", "statusCode": 1, "data": None}))
+
+    def test_a_refusal_names_the_reason_in_russian_with_a_trace(self):
+        with self.assertRaises(A.ARError) as e:
+            self.call({"status": "CANCELLED", "statusCode": 9,
+                       "statusMessage": "out of stock", "traceId": "tr-9"})
+        self.assertIn("нет в наличии", e.exception.why)
+        self.assertEqual(e.exception.trace_id, "tr-9")
+
+    def test_an_unknown_code_is_a_refusal_not_a_success(self):
+        """Семёрки в enum нет. Незнакомый код — отказ: сомнение здесь
+        решается в сторону «денег не потратили»."""
+        with self.assertRaises(A.ARError):
+            self.call({"statusCode": 7, "data": {"x": 1}})
+
+    def test_a_boolean_status_does_not_pass_for_code_zero(self):
+        """`False` в Python это ноль, а ноль — успех. Чужой булев `status`
+        в этом поле притворился бы удачной покупкой."""
+        with self.assertRaises(A.ARError):
+            self.call({"statusCode": False, "data": None})
+
+
 class TheLiveEnvelopeIsNotTheOneInTheirSdk(unittest.TestCase):
     """Снято пробой на настоящем ключе 17.08. На проводе приходит
 
@@ -283,15 +337,18 @@ class TheLiveEnvelopeIsNotTheOneInTheirSdk(unittest.TestCase):
         return client(fake, max_retries=0)
 
     def live(self, **over):
+        # `statusCode` — числовой enum поставщика, а не HTTP. Здесь стояли
+        # 200/401/403: догадка, которую живые ответы 19.08 опровергли —
+        # успех приходит с `0`, отказ по схеме с `3`.
         body = {"data": None, "errorCode": None, "errors": None,
-                "status": True, "statusCode": 200, "statusMessage": "OK",
+                "status": "SUCCESS", "statusCode": 0, "statusMessage": "OK",
                 "traceId": "4af69e7d"}
         body.update(over)
         return body
 
     def test_an_error_code_is_a_refusal_even_at_http_200(self):
-        c = self.answer(self.live(errorCode="UNAUTHORIZED",
-                                  statusCode=401, statusMessage="Invalid key"))
+        c = self.answer(self.live(errorCode="UNAUTHORIZED", status="CANCELLED",
+                                  statusCode=4, statusMessage="Invalid key"))
         with self.assertRaises(A.ARError) as e:
             c.call("GET", "/accounts")
         self.assertEqual(e.exception.code, "UNAUTHORIZED")
@@ -316,24 +373,23 @@ class TheLiveEnvelopeIsNotTheOneInTheirSdk(unittest.TestCase):
         c = self.answer(self.live(data={"ip": "1.2.3.4"}))
         self.assertEqual(c.call("GET", "/whoami"), {"ip": "1.2.3.4"})
 
-    def test_an_empty_data_without_complaints_is_not_called_success(self):
-        """`data: null` и никаких жалоб — это «непонятно», а не «получилось».
-        У чтения каталога и баланса ответ всегда содержателен."""
-        c = self.answer(self.live(data=None))
-        with self.assertRaises(A.ARError):
-            c.call("GET", "/accounts")
+    def test_an_empty_data_at_a_success_code_is_no_longer_refused(self):
+        """Прежде пустой `data` считался «непонятно» — правило снято.
 
-    def test_a_failing_status_flag_is_a_refusal(self):
-        c = self.answer(self.live(status=False, data={"x": 1}))
-        with self.assertRaises(A.ARError):
-            c.call("GET", "/accounts")
+        У `ACCEPTED` внутри законно пусто: заказ принят, кода ещё нет.
+        Объявлять это отказом значит терять оплаченный заказ. Есть ли код —
+        решает выдача, а не разбор конверта.
+        """
+        c = self.answer(self.live(data=None))
+        self.assertIsNone(c.call("GET", "/accounts"))
 
     def test_a_non_success_status_code_inside_the_body_is_a_refusal(self):
         """Внутренний `statusCode` важнее внешнего HTTP: снаружи всегда 200."""
-        c = self.answer(self.live(statusCode=403, data={"x": 1}))
+        c = self.answer(self.live(statusCode=9, status="CANCELLED",
+                                  data={"x": 1}))
         with self.assertRaises(A.ARError) as e:
             c.call("GET", "/accounts")
-        self.assertIn("403", e.exception.why)
+        self.assertIn("нет в наличии", e.exception.why)
 
     def test_field_errors_alone_are_enough_to_refuse(self):
         c = self.answer(self.live(data={"x": 1},
@@ -789,12 +845,36 @@ class NothingHereBuysAnything(unittest.TestCase):
         self.assertNotIn("clientTime", body)
         self.assertNotIn("checkOnly", body)
 
-    def test_a_dry_run_says_so_in_the_same_body(self):
-        """Проверять форму телом, отличным от боевого, значит проверять не то."""
-        dry = A.live_order_body("den-1", 2, "ref-1", check_only=True)
-        real = A.live_order_body("den-1", 2, "ref-1")
-        self.assertIs(dry.pop("checkOnly"), True)
-        self.assertEqual(dry, real)
+    def test_the_stock_is_reread_instead_of_a_dry_run(self):
+        """Прогон заменён чтением одного номинала — 120 запросов в минуту
+        против 2 у полного каталога, и отвечает на оба вопроса, которые
+        каталог мог соврать: есть ли остаток и не изменилась ли цена."""
+        fake = Fake(Reply({"statusCode": 0, "data": {
+            "id": "gl-1000", "price": 11.22, "inStock": 994}}))
+        real = A._client
+        A._client = lambda creds, f=fake: client(f)
+        try:
+            ok, data = A.item_sync(CREDS, "svc-GL", "gl-1000")
+        finally:
+            A._client = real
+        self.assertTrue(ok)
+        self.assertEqual(data["inStock"], 994)
+        self.assertEqual(fake.seen[-1]["method"], "GET")
+        self.assertIn("/services/svc-GL/items/gl-1000", fake.seen[-1]["url"])
+
+    def test_the_lookup_asks_for_unhidden_codes(self):
+        """Без `unhide=true` коды приходят замазанными, а фильтр обязателен
+        вместе с ним: `unhide` без `referenceId` отвергается HTTP 422."""
+        fake = Fake(Reply({"statusCode": 0, "data": {"page": {"items": []}}}))
+        real = A._client
+        A._client = lambda creds, f=fake: client(f)
+        try:
+            A.order_by_reference_sync(CREDS, "yoo-777-1000")
+        finally:
+            A._client = real
+        params = fake.seen[-1]["params"] or {}
+        self.assertEqual(params.get("unhide"), "true")
+        self.assertEqual(params.get("referenceId"), "yoo-777-1000")
 
     def test_the_screens_never_place_an_order_themselves(self):
         """Выдача — дело фонового цикла: он умеет записать намерение до
@@ -1378,21 +1458,22 @@ class TheOrderProbeNeverBuysAnything(unittest.TestCase):
         self.assertEqual(made[0].proxy, "http://p:1")
 
 
-class TheReferenceRidesAtTheTopWhereTheModelPutsIt(unittest.TestCase):
+class TheReferenceGoesIntoTheFieldTheProviderReads(unittest.TestCase):
     """На ссылке держится защита от двойной покупки: повтор после обрыва
     связи безопасен ровно потому, что поставщик её узнаёт и отвечает
     `IDEMPOTENCY_REPLAY`.
 
-    Мы клали её **внутрь позиции**, а официальная модель кладёт наверх:
-    `OrderCreateRequest` — это `orders_type`, `reference_id`, `reference`,
-    `check_only`, `orders[]`; а у позиции (`OrderItemInput`) полей ровно
-    шесть, и ссылки среди них нет. Не на своём месте она невидима, и повтор
-    стал бы второй покупкой — той самой потерей, ради которой весь этот
-    порядок и заведён."""
+    Имя поля — **`referenceId`**. Прежняя запись «берётся `reference`, ведь
+    оно возвращается в строке заказа» перепутала запрос с ответом:
+    `reference` есть только в *ответе* `GET /orders`, как эхо нашего
+    значения, а в схеме запроса его нет вовсе. Поставщик такого поля не
+    видел — значит идемпотентности не было, и повтор был бы второй
+    покупкой."""
 
-    def test_the_reference_is_a_top_level_field(self):
+    def test_the_order_reference_goes_into_the_field_the_provider_reads(self):
         body = A.live_order_body("den-1", 1, "yoo-777-1000")
-        self.assertEqual(body.get("reference"), "yoo-777-1000")
+        self.assertEqual(body.get("referenceId"), "yoo-777-1000")
+        self.assertNotIn("reference", body)
 
     def test_and_never_inside_the_position(self):
         body = A.live_order_body("den-1", 1, "yoo-777-1000")
@@ -1413,13 +1494,21 @@ class TheReferenceRidesAtTheTopWhereTheModelPutsIt(unittest.TestCase):
         self.assertNotIn("reference", body)
         self.assertNotIn("referenceId", body)
 
-    def test_the_dry_run_flag_sits_beside_orders_type(self):
-        """`check_only` — поле общего запроса, а не DTU-шное: в модели оно
-        стоит рядом с `orders_type` и по умолчанию `False`. «Проверка DTU» на
-        странице документации — это метод SDK, а не ограничение поля."""
-        body = A.live_order_body("den-1", 1, "ref", check_only=True)
-        self.assertTrue(body["checkOnly"])
+    def test_the_shop_order_body_carries_no_check_only_field(self):
+        """Сухого прогона для магазина не существует: `checkOnly` разрешён
+        только при `ordersType=dtu`. Этот тест — единственное, что не даст
+        вернуть прогон обратно «по памяти»."""
+        body = A.live_order_body("den-1", 1, "ref")
+        self.assertNotIn("checkOnly", body)
         self.assertEqual(body["ordersType"], "shop")
+
+    def test_a_reference_longer_than_forty_chars_is_cut_the_same_way_everywhere(self):
+        """Разойдутся на символ — заказ не найдётся, и после обрыва связи мы
+        решим, что покупки не было."""
+        long_ref = "yoo-" + "9" * 60
+        body = A.live_order_body("den-1", 1, long_ref)
+        self.assertEqual(len(body["referenceId"]), 40)
+        self.assertEqual(body["referenceId"], A.cut_reference(long_ref))
 
 
 class WhereTheReferenceGoesIsAskedOfTheServer(unittest.TestCase):
@@ -1562,140 +1651,6 @@ class TheReadingOfARefusalIsNotPassedOffAsAFact(unittest.TestCase):
              "statusMessage": f"ключ {KEY} не подошёл", "traceId": "t"}))
         rows = A.order_shape_probe_sync(CREDS)
         self.assertNotIn(KEY, json.dumps(rows, ensure_ascii=False))
-
-class WhetherTheDryRunIsDryIsCheckedNotAssumed(unittest.TestCase):
-    """В документации поставщика `POST /orders` перечислен четырежды: Shop,
-    DTU, eSIM и отдельно «Проверка DTU». То есть проверка описана только для
-    пополнений, а мы шлём `checkOnly` вместе с `ordersType: "shop"`.
-
-    Если для shop он игнорируется, «сухой прогон» перед каждой покупкой — это
-    сама покупка, и защиты, которую обещает `docs/robux_delivery.md`, нет.
-    Верить ответу нельзя: HTTP 200 не говорит, создан заказ или нет. Значит
-    надо перечитать — то же правило, что и во всём остальном проекте."""
-
-    def setUp(self):
-        self.sent: list = []
-        self._order = A.order_sync
-        self._by_ref = A.order_by_reference_sync
-        self.addCleanup(lambda: setattr(A, "order_sync", self._order))
-        self.addCleanup(lambda: setattr(A, "order_by_reference_sync",
-                                        self._by_ref))
-
-    def arrange(self, order_answer, lookup_answer):
-        def order_sync(creds, denomination_id, quantity=1, reference="",
-                       check_only=False):
-            self.sent.append({"denomination": denomination_id,
-                              "reference": reference, "check": check_only})
-            return order_answer
-
-        A.order_sync = order_sync
-        A.order_by_reference_sync = lambda creds, ref: lookup_answer
-
-    def test_the_probe_asks_for_a_dry_run(self):
-        self.arrange((True, {}), (True, {"items": []}))
-        A.dry_run_check_sync(CREDS, "gl-1000")
-        self.assertTrue(self.sent[0]["check"], "прогон ушёл не сухим")
-
-    def test_it_uses_its_own_reference_not_an_order_one(self):
-        """Чужой ссылкой проверять нельзя: она принадлежит покупателю."""
-        self.arrange((True, {}), (True, {"items": []}))
-        got = A.dry_run_check_sync(CREDS, "gl-1000")
-        self.assertTrue(got["reference"].startswith("probe-"))
-        self.assertEqual(self.sent[0]["reference"], got["reference"])
-
-    def test_an_order_found_afterwards_means_the_run_was_not_dry(self):
-        self.arrange((True, {}), (True, {"items": [{"id": "1"}]}))
-        got = A.dry_run_check_sync(CREDS, "gl-1000")
-        self.assertTrue(got["found"])
-        self.assertEqual(got["rows"], 1)
-
-    def test_nothing_found_leaves_found_false(self):
-        self.arrange((True, {}), (True, {"items": []}))
-        self.assertFalse(A.dry_run_check_sync(CREDS, "gl-1000")["found"])
-
-    def test_codes_in_the_answer_are_counted_because_they_cost_money(self):
-        """Коды выдаются только за деньги — их наличие само доказывает, что
-        прогон не сухой, даже если список заказов промолчал."""
-        self.arrange((True, {"result": {"vouchers": [{"pin": "AAA"}]}}),
-                     (True, {"items": []}))
-        self.assertEqual(A.dry_run_check_sync(CREDS, "gl-1000")["codes"], 1)
-
-    def test_a_failed_lookup_is_admitted_not_read_as_absence(self):
-        """«Не прочитали список» и «заказа нет» — разные ответы."""
-        self.arrange((True, {}), (False, "не достучались"))
-        got = A.dry_run_check_sync(CREDS, "gl-1000")
-        self.assertFalse(got["looked"])
-        self.assertFalse(got["found"])
-
-    def test_a_refused_run_keeps_the_reason(self):
-        self.arrange((False, "нет такого номинала"), (True, {"items": []}))
-        got = A.dry_run_check_sync(CREDS, "gl-1000")
-        self.assertFalse(got["sent_ok"])
-        self.assertIn("номинала", got["sent_why"])
-
-
-class TheCheckRefusesToSpendMoneyWithoutBeingTold(unittest.TestCase):
-    """Проверка потому и нужна, что мы не знаем, сухой ли прогон. При
-    ненулевом балансе она сама может оказаться той тратой, которую
-    проверяет, — поэтому спрашивает подтверждение."""
-
-    def report(self, balance, confirmed=False, checked=None):
-        real_balance, real_check = A.balance_sync, A.dry_run_check_sync
-        A.balance_sync = lambda creds: (True, balance)
-        A.dry_run_check_sync = lambda creds, d: (checked or {
-            "reference": "probe-1", "denomination": d, "sent_ok": True,
-            "sent_why": "", "looked": True, "found": False, "rows": 0,
-            "codes": 0})
-        try:
-            screen = Screen()
-            asyncio.run(H._dry_check_report(screen, CREDS, "gl-1000",
-                                            confirmed))
-            return screen.last
-        finally:
-            A.balance_sync, A.dry_run_check_sync = real_balance, real_check
-
-    ZERO = {"items": [{"currency": "USD", "balance": 0, "available": 0}]}
-    MONEY = {"items": [{"currency": "USD", "balance": 12.5, "available": 12.5}]}
-
-    def test_with_an_empty_balance_it_just_runs(self):
-        """Даже если прогон окажется покупкой, она упрётся в нехватку денег."""
-        said = self.report(self.ZERO)
-        self.assertIn("прогон", said.lower())
-        self.assertNotIn("повторите с подтверждением", said.lower())
-
-    def test_with_money_it_asks_first(self):
-        said = self.report(self.MONEY)
-        self.assertIn("деньги спишутся", said)
-        self.assertIn("точно", said)
-
-    def test_and_proceeds_once_told(self):
-        said = self.report(self.MONEY, confirmed=True)
-        self.assertNotIn("деньги спишутся", said)
-
-    def test_a_created_order_is_called_out_plainly(self):
-        said = self.report(self.ZERO, checked={
-            "reference": "probe-1", "denomination": "gl-1000",
-            "sent_ok": True, "sent_why": "", "looked": True, "found": True,
-            "rows": 1, "codes": 0})
-        self.assertIn("НЕ сухой", said)
-        self.assertIn("Выдачу включать нельзя", said)
-
-    def test_an_absent_order_is_not_sold_as_proof(self):
-        """Отсутствие в списке слабее, чем присутствие: заказ мог не успеть
-        в него попасть, и выдавать это за доказательство нельзя."""
-        said = self.report(self.ZERO)
-        self.assertIn("Похоже", said)
-
-    def test_an_unreadable_balance_stops_it(self):
-        real = A.balance_sync
-        A.balance_sync = lambda creds: (False, "ключ не принят")
-        try:
-            screen = Screen()
-            asyncio.run(H._dry_check_report(screen, CREDS, "gl-1000", False))
-            self.assertIn("не прочитан", screen.last)
-        finally:
-            A.balance_sync = real
-
 
 if __name__ == "__main__":
     unittest.main()

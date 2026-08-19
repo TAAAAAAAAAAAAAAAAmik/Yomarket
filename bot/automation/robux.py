@@ -181,20 +181,59 @@ def order_reference(order_id: str, robux: int) -> str:
     return f"yoo-{str(order_id or '').strip()}-{int(robux or 0)}"
 
 
+def is_masked_code(code: str) -> bool:
+    """`****9012` — это замазанный код, а не код.
+
+    `GET /orders` без `unhide=true` отдаёт коды скрытыми: звёздочки и
+    последние четыре символа. Отправить такое покупателю значит отчитаться
+    о выдаче, которой не было, — притом ответ приходит успешный, поле на
+    месте, и заметить это со стороны нечем. Проверка стоит здесь не потому,
+    что мы забудем `unhide`, а потому что забыть его — единственный способ
+    ошибиться незаметно.
+    """
+    return str(code or "").lstrip().startswith("*")
+
+
 def codes_from_result(data) -> list[str]:
     """Коды из ответа поставщика. `pin` — это и есть код гифт-карты.
 
-    Пустой список означает «кода нет», а не «выдача прошла»: доложить об
-    успехе, не получив кода, — худшее, что может сделать этот модуль.
+    Форм ответа две, и они разные:
+
+    * покупка — `data.result.vouchers[].pin`;
+    * список заказов (`GET /orders`) — `data.page.items[].vouchers[].pin`.
+
+    Второй путь появился после того, как выяснилось, что после обрыва связи
+    мы не нашли бы код даже там, где он есть: искали не по тому пути.
+
+    Замазанные коды отбрасываются. Если после этого не осталось ни одного —
+    это «кода нет», а не «выдали»: пустой список означает отказ, и доложить
+    об успехе, не получив кода, — худшее, что может сделать этот модуль.
     """
     out: list[str] = []
     if not isinstance(data, dict):
         return out
+
+    def take(vouchers) -> None:
+        for voucher in (vouchers or []):
+            if not isinstance(voucher, dict):
+                continue
+            pin = voucher.get("pin")
+            if pin and not is_masked_code(pin):
+                out.append(str(pin))
+
     result = data.get("result")
     if isinstance(result, dict):
-        for voucher in (result.get("vouchers") or []):
-            if isinstance(voucher, dict) and voucher.get("pin"):
-                out.append(str(voucher["pin"]))
+        take(result.get("vouchers"))
+    take(data.get("vouchers"))
+
+    page = data.get("page")
+    if isinstance(page, dict):
+        for row in (page.get("items") or []):
+            if isinstance(row, dict):
+                out.extend(codes_from_result(row))
+    for row in (data.get("items") or []):
+        if isinstance(row, dict) and row.get("vouchers"):
+            take(row.get("vouchers"))
     for order in (data.get("orders") or []):
         if isinstance(order, dict):
             out.extend(codes_from_result(order))

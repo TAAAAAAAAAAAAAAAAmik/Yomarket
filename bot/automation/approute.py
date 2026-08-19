@@ -59,6 +59,36 @@ TIMEOUT = 30
 # отдаю прежний результат», то есть успех, а не отказ.
 SUCCESS_CODES = ("OK", "ACCEPTED", "IDEMPOTENCY_REPLAY")
 
+# Числовой enum конверта — из документации поставщика (19.08,
+# `docs/approute_api_reference.md`). Не путать с HTTP: снаружи ответ почти
+# всегда двухсотый, а получилось ли — сказано здесь. Семёрки в enum нет;
+# неизвестный код считается отказом.
+AR_STATUS_CODES = {
+    0: "OK", 1: "ACCEPTED", 2: "IDEMPOTENCY_REPLAY", 3: "VALIDATION_ERROR",
+    4: "UNAUTHORIZED", 5: "FORBIDDEN", 6: "NOT_FOUND", 8: "LIMIT_REACHED",
+    9: "OUT_OF_STOCK", 10: "INSUFFICIENT_FUNDS", 11: "UPSTREAM_ERROR",
+}
+# Успех — три кода, а не один. `ACCEPTED` это «заказ принят, код будет
+# позже», `IDEMPOTENCY_REPLAY` — «такой заказ уже был, отдаю прежний
+# результат». Принять любой из них за отказ значит потерять оплаченный
+# заказ или купить второй раз.
+AR_SUCCESS_CODES = (0, 1, 2)
+
+
+def _status_code(body: dict):
+    """Числовой код конверта или None, если его нет вовсе.
+
+    `True`/`False` отсекаются нарочно: в Python это целые, и булев `status`
+    из чужого ответа притворился бы кодом 0, то есть успехом.
+    """
+    raw = (body or {}).get("statusCode")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
 # Поставщик сам разделил отказы по видам — это то, чего не хватало у
 # ns.gifts. Переводим: английский код на экране продавца здесь считается
 # отпиской.
@@ -204,29 +234,49 @@ class ARClient:
         trace = str(body.get("traceId") or "")
         errors = body.get("errors") or []
 
-        # Конверт из SDK: успех решает `code`.
+        # Решает `statusCode` — числовой код ВНУТРИ тела. Документация
+        # поставщика прямо предупреждает, что он не совпадает с HTTP:
+        # снаружи почти всегда 200. Раньше здесь стояла догадка, выведенная
+        # из имён полей, и она читала как отказ два успеха сразу:
+        # `1` ACCEPTED («заказ принят, код будет позже») и `2`
+        # IDEMPOTENCY_REPLAY («такой referenceId уже был, отдаю прежний
+        # результат»). Второе — это вторая покупка за свои деньги, ровно то,
+        # от чего строилась вся защита от обрыва связи.
+        status_code = _status_code(body)
+        if status_code is not None:
+            # Сверх плана: успешный код вместе с жалобами — `errors` или
+            # непустым `errorCode` — это ответ, противоречащий сам себе.
+            # Таких мы не видели, и противоречие решается в сторону «денег
+            # не потратили»: ошибиться в эту сторону дешевле, а выдача всё
+            # равно проверит, есть ли код.
+            complained = str(body.get("errorCode") or "").strip()
+            if status_code in AR_SUCCESS_CODES and (errors or complained):
+                said = str(body.get("statusMessage") or "").strip()
+                raise ARError(complained or AR_STATUS_CODES.get(status_code, ""),
+                              explain_code(complained, said) if complained else
+                              "поставщик ответил успехом, но с жалобами по "
+                              "полям — считаем это отказом",
+                              r.status_code, trace, errors)
+            if status_code in AR_SUCCESS_CODES:
+                # `data` при успехе бывает пустым: у ACCEPTED внутри `result`
+                # ещё ничего нет. Требовать непустоту здесь значит объявить
+                # отказом принятый заказ; есть ли код — решает выдача.
+                return body.get("data")
+            name = AR_STATUS_CODES.get(status_code, "")
+            said = str(body.get("statusMessage") or "").strip()
+            raise ARError(name or str(status_code),
+                          explain_code(name, said) if name else
+                          (said or f"поставщик отказал (код {status_code})"),
+                          r.status_code, trace, errors)
+
+        # Конверт из SDK. Проверяется ПОСЛЕ живого: SDK местами устарел, и
+        # при расхождении верх берёт то, что приходит на самом деле.
         code = str(body.get("code") or "")
         if code:
             if code in SUCCESS_CODES:
                 return body.get("data")
             raise ARError(code, explain_code(code, body.get("message")),
                           r.status_code, trace, errors)
-
-        # Живой конверт, снятый 17.08 пробой `/apr_debug`: полей `code` и
-        # `message` в нём нет вовсе, зато есть `errorCode`, `statusCode` и
-        # `statusMessage`. Форма разошлась с их же SDK, и разбираем мы её
-        # по тому, что видели, а не по тому, что было написано.
-        if _looks_like_live_envelope(body):
-            problem = str(body.get("errorCode") or "").strip()
-            said = str(body.get("statusMessage") or "").strip()
-            status_code = body.get("statusCode")
-            if _live_envelope_is_ok(body):
-                return body.get("data")
-            why = explain_code(problem, said) if problem else (
-                said or "поставщик отказал, не назвав причины")
-            if status_code and str(status_code) not in ("200", "0"):
-                why += f" (код {status_code})"
-            raise ARError(problem, why, r.status_code, trace, errors)
 
         # Ни того конверта, ни другого — значит отвечали не они.
         raise ARError("", _no_envelope(body, r.status_code),
@@ -424,8 +474,22 @@ def whoami_sync(creds: dict) -> tuple[bool, object]:
     return _guarded(lambda: (_client(creds).call("GET", "/whoami") or {}))
 
 
+REFERENCE_MAX = 40
+
+
+def cut_reference(reference: str) -> str:
+    """Ссылка в том виде, в каком её увидит поставщик.
+
+    Требование схемы — 1..40 символов. Обрезать надо **одинаково** при
+    покупке и при поиске: разойдутся на один символ — заказ не найдётся, и
+    после обрыва связи мы решим, что покупки не было. Поэтому обрезание
+    живёт в одной функции, а не в двух местах по памяти.
+    """
+    return str(reference or "")[:REFERENCE_MAX]
+
+
 def live_order_body(denomination_id: str, quantity: int = 1,
-                    reference: str = "", check_only: bool = False) -> dict:
+                    reference: str = "") -> dict:
     """Тело заказа в той форме, которую поставщик принимает на самом деле.
 
     Выяснена сухим прогоном 18.08: ни SDK (`itemId` наверху), ни
@@ -450,9 +514,12 @@ def live_order_body(denomination_id: str, quantity: int = 1,
     Ссылка не на своём месте — значит он её не видел, значит повтор был бы
     **второй покупкой**, а не повтором.
 
-    Из двух имён берётся `reference`: именно оно возвращается в строке заказа
-    (`TransactionListItem.reference`), то есть его поставщик и хранит.
-    `referenceId` — имя фильтра в `GET /orders`, им мы заказ ищем.
+    **Имя поля — `referenceId`.** Прежняя запись «берётся `reference`,
+    потому что оно возвращается в строке заказа» перепутала запрос с
+    ответом: `reference` есть только в *ответе* `GET /orders`, как эхо
+    нашего значения, а в схеме запроса такого поля нет вовсе. Поставщик
+    нашего `reference` не видел — значит идемпотентности не было, и повтор
+    после обрыва связи был бы **второй покупкой**, а не повтором.
 
     Что схема примет на самом деле, проверяется `/apr_order_probe`: он
     спрашивает поставщика тремя телами с заведомо несуществующим номиналом —
@@ -464,18 +531,14 @@ def live_order_body(denomination_id: str, quantity: int = 1,
                     "quantity": int(quantity or 1)}],
     }
     if reference:
-        body["reference"] = str(reference)
-    if check_only:
-        # Поле общего запроса, а не DTU-шное: в модели оно стоит рядом с
-        # `orders_type` и по умолчанию `False`. На странице документации
-        # «Проверка DTU» — это отдельный метод SDK, а не ограничение поля.
-        body["checkOnly"] = True
+        # 1..40 символов, уникален в пределах кабинета. Повтор с тем же
+        # значением возвращает первый результат и statusCode=2.
+        body["referenceId"] = cut_reference(reference)
     return body
 
 
 def order_sync(creds: dict, denomination_id: str, quantity: int = 1,
-               reference: str = "", check_only: bool = False
-               ) -> tuple[bool, object]:
+               reference: str = "") -> tuple[bool, object]:
     """Купить номинал → (успех, `data` поставщика или причина по-русски).
 
     **Единственное место в проекте, которое тратит чужие деньги.** Отсюда
@@ -486,58 +549,36 @@ def order_sync(creds: dict, denomination_id: str, quantity: int = 1,
       ссылку поставщик отвечает `IDEMPOTENCY_REPLAY` — «такой заказ уже
       был, отдаю прежний результат», то есть успехом. Принять этот ответ за
       отказ значит купить второй раз.
-    * `check_only=True` — сухой прогон: тело то же, заказ не создаётся.
-      Им проверяется форма перед настоящей покупкой.
+    * **Сухого прогона здесь нет и быть не может.** `checkOnly` разрешён
+      только при `ordersType=dtu`, а Robux — `voucher`, то есть shop. Что
+      сервер сделает с этим полем в теле магазинного заказа, не сказано
+      нигде, и оба исхода плохи: либо отказ по схеме на каждой покупке,
+      либо поле игнорируется — и тогда «сухой прогон» и есть покупка, то
+      есть мы покупаем дважды подряд. Замена — `item_sync` перед вызовом.
 
     Успех здесь означает ровно «поставщик не отказал». Есть ли в ответе
     код — решает вызывающий: пустой `vouchers` при HTTP 200 это отказ, а не
     выдача.
     """
-    body = live_order_body(denomination_id, quantity, reference, check_only)
+    body = live_order_body(denomination_id, quantity, reference)
     return _guarded(lambda: _client(creds).call("POST", "/orders",
                                                 json_body=body))
 
 
-def dry_run_check_sync(creds: dict, denomination_id: str) -> dict:
-    """Сухой ли на самом деле наш сухой прогон. Читает результат обратно.
+def item_sync(creds: dict, service_id: str, item_id: str) -> tuple[bool, object]:
+    """Свежие цена и остаток одного номинала — замена сухому прогону.
 
-    Повод: в документации поставщика (approute.ru → «Документация и SDK»)
-    `POST /orders` перечислен четырежды — Shop, DTU, eSIM и отдельной
-    строкой **«Проверка DTU»**. То есть проверка описана только для
-    пополнений, а мы шлём `checkOnly` вместе с `ordersType: "shop"`. Что
-    сервер делает с ним в этом случае — не сказано нигде.
+    Прогон для магазина не разрешён, а покупать вслепую нельзя: остаток
+    мог кончиться с прошлого чтения каталога, а цена — измениться. Этот
+    запрос отвечает на оба вопроса и стоит дёшево: 120 в минуту против 2 у
+    полного `/services`.
 
-    Разница денежная. Если `checkOnly` для shop игнорируется, то «сухой
-    прогон» перед каждой покупкой — это сама покупка, и защиты, о которой
-    написано в `docs/robux_delivery.md`, попросту нет.
-
-    Выясняется единственным честным способом: сделать прогон со **своей**
-    ссылкой и тут же спросить `GET /orders?referenceId=…`. Появился заказ —
-    прогон не сухой. Это то же правило, что и везде здесь: сделали —
-    перечитайте и сравните, ответ «HTTP 200» сам по себе ничего не значит.
-
-    Возвращает факты dict-ом, а не готовый текст: разбирать собственную
-    прозу вместо структурных данных в этом проекте уже приводило к ошибкам.
+    Ответ совпадает с элементом `items[]` каталога: `id`, `price`,
+    `currency`, `inStock`, `isLongOrder`, `minQtyToLongOrder`.
     """
-    reference = f"probe-{int(time.time())}"
-    out = {"reference": reference, "denomination": str(denomination_id or ""),
-           "sent_ok": False, "sent_why": "", "looked": False,
-           "found": False, "rows": 0, "codes": 0}
-
-    ok, data = order_sync(creds, denomination_id, 1, reference, True)
-    out["sent_ok"] = bool(ok)
-    out["sent_why"] = "" if ok else str(data)[:300]
-    if ok:
-        out["codes"] = len(codes_of(data))
-
-    found_ok, rows = order_by_reference_sync(creds, reference)
-    out["looked"] = bool(found_ok)
-    if found_ok:
-        items = rows.get("items") if isinstance(rows, dict) else rows
-        items = [r for r in (items or []) if isinstance(r, dict)]
-        out["rows"] = len(items)
-        out["found"] = bool(items)
-    return out
+    return _guarded(lambda: _client(creds).call(
+        "GET", f"/services/{str(service_id or '')}/items/{str(item_id or '')}")
+        or {})
 
 
 def codes_of(data) -> list[str]:
@@ -556,9 +597,72 @@ def order_by_reference_sync(creds: dict, reference: str) -> tuple[bool, object]:
     Ссылку мы придумали до вызова, поэтому спросить о судьбе покупки можно
     и тогда, когда ответа на неё не пришло вовсе. Без этого единственным
     выходом был бы повтор вслепую.
+
+    **`unhide=true` обязателен.** Без него коды приходят замазанными —
+    `****9012`, — и отправка такого «кода» покупателю была бы отчётом о
+    выдаче, которой не было. Фильтр при этом тоже обязателен: `unhide` без
+    `referenceId` отвергается с HTTP 422.
+
+    У запроса есть побочное действие: поставщик помечает коды полученными и
+    запоминает время первой выдачи. Поэтому звать его «просто посмотреть»
+    из диагностики нельзя — только на пути настоящей выдачи.
     """
     return _guarded(lambda: _client(creds).call(
-        "GET", "/orders", params={"referenceId": str(reference or "")}))
+        "GET", "/orders",
+        params={"referenceId": cut_reference(reference), "unhide": "true"}))
+
+
+TERMINAL_STATUSES = ("SUCCESS", "PARTIALLY_COMPLETED", "CANCELLED")
+
+
+def _facts(data, ok: bool, why: str = "") -> dict:
+    """Общий разбор ответа про заказ — фактами, а не прозой.
+
+    Разбирать собственный текст вместо структурных данных в этом проекте
+    уже приводило к ошибкам, поэтому наружу отсюда идёт dict.
+    """
+    from automation.robux import codes_from_result
+    out = {"ok": bool(ok), "why": str(why or ""), "status": "",
+           "order_id": "", "codes": [], "trace_id": ""}
+    if isinstance(data, dict):
+        out["status"] = str(data.get("status") or "").upper()
+        out["order_id"] = str(data.get("orderId") or data.get("id") or "")
+        out["codes"] = codes_from_result(data)
+    return out
+
+
+def order_place_sync(creds: dict, denomination_id: str, quantity: int = 1,
+                     reference: str = "") -> dict:
+    """Купить. Возвращает факты, а не текст.
+
+    `{"ok", "why", "status", "order_id", "codes", "trace_id"}`.
+
+    Пустые `codes` при `ok` — не поломка: покупка законно отвечает
+    `IN_PROGRESS` (заказ принят, код будет позже), и тогда его надо
+    дождаться опросом, а не объявлять выдачу несостоявшейся.
+    """
+    ok, data = order_sync(creds, denomination_id, quantity, reference)
+    return _facts(data if ok else None, ok, "" if ok else str(data))
+
+
+def order_codes_sync(creds: dict, reference: str) -> dict:
+    """Чем кончился заказ с этой ссылкой — и коды, если они уже есть.
+
+    `{"ok", "why", "found", "status", "codes"}`. Ходит с `unhide=true`,
+    иначе коды приходят замазанными (см. `order_by_reference_sync`).
+    """
+    ok, data = order_by_reference_sync(creds, reference)
+    out = _facts(data if ok else None, ok, "" if ok else str(data))
+    rows = []
+    if isinstance(data, dict):
+        page = data.get("page")
+        rows = (page.get("items") if isinstance(page, dict) else None) \
+            or data.get("items") or []
+    out["found"] = bool(rows)
+    if rows and not out["status"]:
+        first = rows[0] if isinstance(rows[0], dict) else {}
+        out["status"] = str(first.get("status") or "").upper()
+    return out
 
 
 def probe_sync(creds: dict) -> list[dict]:

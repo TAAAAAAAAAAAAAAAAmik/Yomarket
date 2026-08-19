@@ -51,16 +51,25 @@ class Harness:
     """Поставщик, чат и хранилище — на подставках; считаем вызовы."""
 
     def __init__(self, test, *, settings, catalog=CATALOG,
-                 dry=(True, {}), buy=None, send=(True, "")):
+                 dry=None, buy=None, send=(True, "")):
         self.test = test
         self.uid = 4242
         self.settings = settings
         self.catalog = catalog
-        self.dry_result = dry
-        self.buy_result = buy if buy is not None else (
-            True, {"result": {"vouchers": [{"pin": "AAAA-1111"}]}})
+        # Сухого прогона больше нет: `checkOnly` разрешён только для DTU, а
+        # Robux это `voucher`. Его место занял `item_sync` — перечитывание
+        # одного номинала перед покупкой.
+        self.item_result = dry if dry is not None else (
+            True, {"id": "gl-1000", "price": 11.22, "currency": "USD",
+                   "inStock": 994})
+        self.buy_result = buy if buy is not None else {
+            "ok": True, "why": "", "status": "SUCCESS", "order_id": "o1",
+            "codes": ["AAAA-1111"]}
+        self.lookup_results: list = []   # ответы `order_codes_sync` по порядку
         self.send_result = send
-        self.orders: list = []          # (denomination, qty, ref, check_only)
+        self.orders: list = []          # (denomination, qty, ref)
+        self.items: list = []           # (service_id, item_id)
+        self.lookups: list = []         # ссылки, по которым спрашивали код
         self.chat_sent: list = []
         self.notified: list = []
         self.saves: list = []           # снимок состояния на каждом save
@@ -78,13 +87,28 @@ class Harness:
             return (True, self.catalog) if self.catalog is not None else (
                 False, "каталог не прочитан")
 
-        def order_sync(creds, denomination_id, quantity=1, reference="",
-                       check_only=False):
-            self.orders.append((denomination_id, quantity, reference, check_only))
-            return self.dry_result if check_only else self.buy_result
+        def order_place_sync(creds, denomination_id, quantity=1, reference=""):
+            self.orders.append((denomination_id, quantity, reference))
+            return dict(self.buy_result)
+
+        def item_sync(creds, service_id, item_id):
+            self.items.append((service_id, item_id))
+            return self.item_result
+
+        def order_codes_sync(creds, reference):
+            self.lookups.append(reference)
+            if self.lookup_results:
+                return dict(self.lookup_results.pop(0))
+            return {"ok": True, "why": "", "found": False, "status": "",
+                    "codes": []}
 
         self._patch(approute, "services_sync", services_sync)
-        self._patch(approute, "order_sync", order_sync)
+        self._patch(approute, "order_place_sync", order_place_sync)
+        self._patch(approute, "item_sync", item_sync)
+        self._patch(approute, "order_codes_sync", order_codes_sync)
+        # Опрос «принятого» заказа ждёт десятками секунд — в тестах ждать
+        # нечего, важен порядок вызовов, а не их темп.
+        self._patch(M.TaskManager, "_ROBUX_POLL_STEPS", (0, 0, 0))
         self._patch(storage, "get_ar_creds", lambda uid: {"api_key": "k"})
         self._patch(M, "get_ar_creds", lambda uid: {"api_key": "k"})
 
@@ -158,19 +182,27 @@ class APaidOrderIsDeliveredWithoutAskingTheBuyerAnything(unittest.TestCase):
     def test_the_right_denomination_is_bought_once(self):
         with Harness(self, settings=settings_with()) as h:
             h.run(title="1000 Robux")
-            real = [o for o in h.orders if not o[3]]
+            real = list(h.orders)
             self.assertEqual(len(real), 1, "покупок должно быть ровно одна")
             self.assertEqual(real[0][0], "gl-1000")
 
-    def test_a_dry_run_goes_first_with_the_same_body(self):
-        """Форма тела подтверждена ответами сервера, но не живой покупкой.
-        Ошибись мы в ней — отказ придёт на сухом прогоне, а не на деньгах."""
+    def test_the_nominal_is_reread_before_the_purchase(self):
+        """Сухого прогона для магазина не существует — `checkOnly` разрешён
+        только для DTU. Его место занял дешёвый вопрос про один номинал:
+        остаток мог кончиться, а цена измениться с прошлого чтения каталога.
+        """
         with Harness(self, settings=settings_with()) as h:
             h.run()
-            self.assertTrue(h.orders[0][3], "первым должен идти сухой прогон")
-            self.assertFalse(h.orders[1][3])
-            self.assertEqual(h.orders[0][0], h.orders[1][0])
-            self.assertEqual(h.orders[0][2], h.orders[1][2])   # та же ссылка
+            self.assertEqual(h.items, [("svc-GL", "gl-1000")])
+
+    def test_a_purchase_is_not_attempted_when_the_nominal_is_out_of_stock(self):
+        """Остаток кончился между чтением каталога и покупкой — обычное
+        дело. Честный отказ дешевле покупки того, чего нет."""
+        with Harness(self, settings=settings_with(),
+                     dry=(True, {"inStock": 0, "price": 11.22})) as h:
+            h.run()
+            self.assertEqual(h.orders, [], "покупать было нечего")
+            self.assertTrue(h.notified)
 
     def test_the_code_reaches_the_buyer(self):
         with Harness(self, settings=settings_with()) as h:
@@ -187,7 +219,7 @@ class APaidOrderIsDeliveredWithoutAskingTheBuyerAnything(unittest.TestCase):
         with Harness(self, settings=settings_with()) as h:
             h.run()
             h.run()
-            self.assertEqual(len([o for o in h.orders if not o[3]]), 1)
+            self.assertEqual(len(list(h.orders)), 1)
 
 
 class NothingHappensQuietly(unittest.TestCase):
@@ -216,16 +248,19 @@ class NothingHappensQuietly(unittest.TestCase):
             self.assertEqual(h.orders, [])
             self.assertIn("ключ", h.notified[0].lower())
 
-    def test_a_failed_dry_run_stops_before_the_money(self):
+    def test_an_unreadable_nominal_stops_before_the_money(self):
+        """Не смогли перечитать номинал — покупать вслепую нельзя: остаток
+        и цену подтвердить нечем."""
         with Harness(self, settings=settings_with(),
-                     dry=(False, "Validation error")) as h:
+                     dry=(False, "ключ не принят")) as h:
             h.run()
-            self.assertEqual([o for o in h.orders if not o[3]], [])
+            self.assertEqual(list(h.orders), [])
             self.assertTrue(h.notified)
 
     def test_a_refused_purchase_is_reported(self):
         with Harness(self, settings=settings_with(),
-                     buy=(False, "нет в наличии")) as h:
+                     buy={"ok": False, "why": "нет в наличии", "status": "",
+                          "codes": []}) as h:
             h.run()
             self.assertNotIn("777", h.delivered)
             self.assertTrue(h.notified)
@@ -238,7 +273,8 @@ class MoneyIsNeverLostSilently(unittest.TestCase):
         """Двухсотый без vouchers — отказ. Деньги при этом могли уйти, и
         продавец обязан узнать об этом, а не увидеть тишину."""
         with Harness(self, settings=settings_with(),
-                     buy=(True, {"result": {"vouchers": []}})) as h:
+                     buy={"ok": True, "why": "", "status": "SUCCESS",
+                          "order_id": "o1", "codes": []}) as h:
             h.run()
             self.assertNotIn("777", h.delivered)
             self.assertEqual(h.chat_sent, [])
@@ -275,9 +311,13 @@ class MoneyIsNeverLostSilently(unittest.TestCase):
                      if s["log"] and s["log"][0].get("codes")]
             self.assertTrue(saved, "код не попал в журнал до отправки")
 
-    def test_a_repeat_after_a_break_reuses_the_same_reference(self):
-        """На ту же ссылку поставщик отвечает IDEMPOTENCY_REPLAY — прежним
-        результатом. Другая ссылка означала бы вторую покупку."""
+    def test_a_repeat_after_a_closed_chat_does_not_buy_again(self):
+        """Код уже куплен и лежит в записи — покупать нечего, надо доотправить.
+
+        Ссылка при этом остаётся прежней: понадобись повтор покупки, на неё
+        поставщик ответит `IDEMPOTENCY_REPLAY`, то есть прежним результатом,
+        а не вторым списанием.
+        """
         with Harness(self, settings=settings_with(),
                      send=(False, "закрыт")) as h:
             h.run()
@@ -285,7 +325,83 @@ class MoneyIsNeverLostSilently(unittest.TestCase):
             h.orders.clear()
             h.send_result = (True, "")
             h.run()
-            self.assertEqual(h.orders[0][2], first_ref)
+            self.assertEqual(h.orders, [], "второй покупки быть не должно")
+            self.assertEqual(h.log[0]["reference"], first_ref)
+            self.assertIn("777", h.delivered)
+            self.assertIn("AAAA-1111", h.chat_sent[-1][1])
+
+
+class AnAcceptedOrderIsFollowedUpNotWrittenOff(unittest.TestCase):
+    """`IN_PROGRESS` — законный ответ, а не отказ.
+
+    Заказ принят, код будет позже; для «долгих» номиналов это обычное дело.
+    Объявить такой ответ выдачей без кода значит потерять оплаченный заказ,
+    который на самом деле уже куплен.
+    """
+
+    accepted = {"ok": True, "why": "", "status": "IN_PROGRESS",
+                "order_id": "o1", "codes": []}
+
+    def test_an_order_accepted_for_processing_is_polled_until_the_code_comes(self):
+        with Harness(self, settings=settings_with(), buy=dict(self.accepted)) as h:
+            h.lookup_results = [
+                {"ok": True, "found": True, "status": "IN_PROGRESS", "codes": []},
+                {"ok": True, "found": True, "status": "SUCCESS",
+                 "codes": ["CCCC-3333"]},
+            ]
+            h.run()
+            self.assertEqual(len(list(h.orders)), 1, "покупка должна быть одна")
+            self.assertIn("CCCC-3333", h.chat_sent[-1][1])
+            self.assertIn("777", h.delivered)
+
+    def test_polling_stops_on_a_terminal_status_without_codes(self):
+        """`CANCELLED` и `PARTIALLY_COMPLETED` — конец, а не «ещё подождём»."""
+        with Harness(self, settings=settings_with(), buy=dict(self.accepted)) as h:
+            h.lookup_results = [
+                {"ok": True, "found": True, "status": "CANCELLED", "codes": []},
+            ]
+            h.run()
+            self.assertEqual(len(list(h.orders)), 1, "повторов покупки быть не должно")
+            self.assertEqual(h.chat_sent, [])
+            self.assertTrue(h.notified)
+
+    def test_a_timeout_leaves_the_record_for_the_next_pass(self):
+        """Поток занимать дольше нельзя — на нём стоит опрос заказов
+        продавца. Запись остаётся, её доведёт возобновление."""
+        with Harness(self, settings=settings_with(), buy=dict(self.accepted)) as h:
+            h.run()
+            self.assertEqual(h.chat_sent, [])
+            self.assertNotIn("777", h.delivered)
+            self.assertEqual(h.log[0]["state"], "куплен, ждём код")
+
+    def test_and_the_next_pass_does_not_buy_it_again(self):
+        with Harness(self, settings=settings_with(), buy=dict(self.accepted)) as h:
+            h.run()
+            h.orders.clear()
+            h.lookup_results = [
+                {"ok": True, "found": True, "status": "SUCCESS",
+                 "codes": ["DDDD-4444"]}]
+            h.resume()
+            self.assertEqual(h.orders, [], "заказ уже принят — покупать нечего")
+            self.assertIn("DDDD-4444", h.chat_sent[-1][1])
+
+
+class AMaskedCodeIsNeverSentToTheBuyer(unittest.TestCase):
+    """`****9012` — это замазанный код, а не код.
+
+    `GET /orders` без `unhide=true` отдаёт их скрытыми. Отправить такое
+    покупателю значит отчитаться о выдаче, которой не было, — притом ответ
+    приходит успешный, поле на месте, и заметить нечем.
+    """
+
+    def test_a_masked_code_does_not_count_as_a_delivery(self):
+        with Harness(self, settings=settings_with(),
+                     buy={"ok": True, "why": "", "status": "SUCCESS",
+                          "order_id": "o1", "codes": []}) as h:
+            h.run()
+            self.assertEqual(h.chat_sent, [], "покупателю ушла бы маска")
+            self.assertNotIn("777", h.delivered)
+            self.assertTrue(h.notified)
 
 
 class TheDeliveredMarkSurvivesTheTwoHundredthOrder(unittest.TestCase):
@@ -469,7 +585,7 @@ class AnInterruptedDeliveryIsFinishedNotForgotten(unittest.TestCase):
         """Той же ссылкой — иначе это не повтор, а вторая покупка."""
         with Harness(self, settings=self.stuck("покупаем")) as h:
             h.resume()
-            real = [o for o in h.orders if not o[3]]
+            real = list(h.orders)
             self.assertEqual(len(real), 1)
             self.assertEqual(real[0][2], "yoo-777-1000")
 
@@ -485,16 +601,18 @@ class AnInterruptedDeliveryIsFinishedNotForgotten(unittest.TestCase):
         with Harness(self, settings=self.stuck("куплен, отправляем",
                                                codes=["BBBB-2222"])) as h:
             h.resume()
-            self.assertEqual([o for o in h.orders if not o[3]], [])
+            self.assertEqual(list(h.orders), [])
             self.assertIn("BBBB-2222", h.chat_sent[-1][1])
             self.assertIn("777", h.delivered)
 
-    def test_an_unstarted_purchase_still_gets_its_dry_run(self):
-        """«Собираемся покупать» значит, что прогон не успел пройти. Он
-        единственное, что стоит между неверной формой тела и деньгами."""
+    def test_an_unstarted_purchase_rereads_the_nominal_first(self):
+        """«Собираемся покупать» значит, что до покупки в тот раз не дошло.
+        Значит и номинал перечитать не успели — а он решает, есть ли что
+        покупать."""
         with Harness(self, settings=self.stuck("собираемся покупать")) as h:
             h.resume()
-            self.assertTrue([o for o in h.orders if o[3]], "прогона не было")
+            self.assertTrue(h.items, "номинал не перечитан")
+            self.assertEqual(len(list(h.orders)), 1)
 
     def test_a_finished_delivery_is_left_alone(self):
         with Harness(self, settings=self.stuck("выдан", codes=["X"])) as h:
@@ -615,7 +733,7 @@ class TheCatalogueIsNotRereadForEveryOrder(unittest.TestCase):
                     h.uid, object(), h.settings, oid, "1000 Robux",
                     "chat-1", "work"))
             self.assertEqual(len(reads), 1, "каталог прочитан дважды")
-            self.assertEqual(len([o for o in h.orders if not o[3]]), 2)
+            self.assertEqual(len(list(h.orders)), 2)
 
     def test_a_stale_cache_does_not_outlive_two_minutes(self):
         from tasks.manager import TaskManager
