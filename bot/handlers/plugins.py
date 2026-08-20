@@ -142,6 +142,8 @@ class PluginState(StatesGroup):
     roblox_set_keyword = State()
     roblox_set_note = State()
     roblox_manual_order = State()
+    roblox_set_ad_title = State()
+    roblox_set_ad_text = State()
     roblox_ads_rate = State()
     # AutoGifts
     gifts_manual_buyer = State()
@@ -1641,7 +1643,8 @@ def _roblox_keyboard(settings: dict) -> InlineKeyboardMarkup:
     # неоткуда, а без него в этом разделе не работает ничего.
     builder.button(text="🔑 Поставщик AppRoute", callback_data="apr:creds")
     builder.button(text="📦 Номиналы и остатки", callback_data="apr:stock")
-    builder.button(text="💰 Баланс у поставщика", callback_data="apr:balance")
+    builder.button(text="💰 Баланс у поставщика",
+                   callback_data="plugins:roblox:balance")
     # Товары по номиналам поставщика. Витрина, где продаётся 500 Robux,
     # автовыдаче недоступна: такого номинала у поставщика нет, а подменять
     # бот не станет. Поэтому объявления удобнее заводить прямо отсюда — из
@@ -1691,6 +1694,16 @@ def _roblox_settings_text(settings: dict) -> str:
         lines.append("   ⚠️ Если у вас есть товары вида «Roblox аккаунт», "
                      "задайте слово: иначе они тоже попадут в выдачу Robux.")
     lines.append(f"📝 Заметка: <i>{html.escape(note)}</i>")
+
+    from automation.robux import DEFAULT_AD_TEXT, DEFAULT_AD_TITLE
+    title = p.get("ad_title") or ""
+    text = p.get("ad_text") or ""
+    lines += ["", "🏷 <b>Заготовки для новых товаров</b>"]
+    lines.append(f"   Название: <code>{html.escape(title or DEFAULT_AD_TITLE)}</code>"
+                 + ("" if title else " <i>(наша)</i>"))
+    short = (text or DEFAULT_AD_TEXT).split("\n")[0][:60]
+    lines.append(f"   Описание: <code>{html.escape(short)}…</code>"
+                 + ("" if text else " <i>(наше)</i>"))
     return "\n".join(lines)
 
 
@@ -1704,8 +1717,12 @@ def _roblox_settings_keyboard(settings: dict | None = None) -> InlineKeyboardMar
     builder.button(text="🔤 Слово-опознаватель",
                    callback_data="plugins:roblox:set_keyword")
     builder.button(text="📝 Заметка", callback_data="plugins:roblox:set_note")
+    builder.button(text="🏷 Название товара",
+                   callback_data="plugins:roblox:set_ad_title")
+    builder.button(text="📄 Описание товара",
+                   callback_data="plugins:roblox:set_ad_text")
     builder.button(text="⬅️ Назад", callback_data="plugins:auto_roblox")
-    builder.adjust(1, 2, 1)
+    builder.adjust(1, 2, 2, 1)
     return builder.as_markup()
 
 
@@ -1866,6 +1883,85 @@ async def roblox_manual_order_input(message: Message, state: FSMContext) -> None
         reply_markup=_roblox_keyboard(settings))
 
 
+@router.callback_query(F.data == "plugins:roblox:balance")
+async def roblox_balance(callback: CallbackQuery) -> None:
+    """Баланс кабинета и что на него можно выдать.
+
+    Отдельный экран, а не общий `/apr_balance`, ради последней строки: «не
+    ноль» и «хватит» — разные вещи. При 1.43 $ на счету и самом дешёвом
+    номинале в 2.74 $ прежний экран молчал, а первая же выдача отвалилась бы
+    с «не хватает средств», причём по каждому оплаченному заказу отдельно.
+    """
+    from automation.approute import balance_sync, services_sync
+    from automation.robux import affordable
+    from handlers.approute import _accounts, _balance_text
+    from storage import get_ar_creds
+
+    uid = callback.from_user.id
+    settings = get_settings(uid)
+    creds = get_ar_creds(uid)
+    if not creds or not creds.get("api_key"):
+        await callback.answer("Ключ AppRoute не задан", show_alert=True)
+        return
+    await callback.answer("⏳ Спрашиваю кабинет…")
+    await callback.message.edit_text("⏳ Спрашиваю баланс у поставщика…")
+    ok, text = await _balance_text(creds)
+
+    lines = [text]
+    if ok:
+        loop = asyncio.get_event_loop()
+        # Сумма берётся из данных, а не вычитывается из собственного отчёта:
+        # разбор своей же прозы вместо структуры в этом проекте уже отвечал
+        # «есть ли деньги» наугад.
+        try:
+            money_ok, money = await asyncio.wait_for(
+                loop.run_in_executor(None, balance_sync, creds), timeout=60)
+        except Exception:
+            money_ok, money = False, None
+        usd = 0.0
+        if money_ok:
+            for acc in _accounts(money):
+                if str(acc.get("currency") or "").upper() == "USD":
+                    usd = float(acc.get("amount") or 0)
+                    break
+        try:
+            got, catalog = await asyncio.wait_for(
+                loop.run_in_executor(None, services_sync, creds), timeout=90)
+        except Exception:
+            got, catalog = False, None
+        if got:
+            can = affordable(catalog, usd)
+            lines.append("")
+            if can["cheapest"] <= 0:
+                lines.append("У поставщика не нашлось ни одного номинала в "
+                             "наличии — считать не на чем.")
+            elif can["count"] <= 0:
+                lines.append(
+                    f"⚠️ <b>Выдать нельзя ни одного кода.</b> Самый дешёвый "
+                    f"сейчас — {html.escape(can['cheapest_name'])} "
+                    f"({can['cheapest_region']}) за ${can['cheapest']:.2f}, а "
+                    f"на счету меньше. Первый же оплаченный заказ отвалится "
+                    f"с «не хватает средств».")
+            else:
+                lines.append(
+                    f"Хватит на <b>{can['count']}</b> шт. самого дешёвого — "
+                    f"{html.escape(can['cheapest_name'])} "
+                    f"({can['cheapest_region']}) по ${can['cheapest']:.2f}.")
+                lines.append(f"По карману номиналов: <b>{can['total']}</b> "
+                             f"из тех, что в наличии.")
+        else:
+            lines.append("")
+            lines.append("<i>Каталог сейчас не прочитан — сколько это кодов, "
+                         "сказать не могу. У поставщика лимит: два таких "
+                         "запроса в минуту.</i>")
+    b = InlineKeyboardBuilder()
+    b.button(text="🔑 Доступ к поставщику", callback_data="apr:creds")
+    b.button(text="⬅️ Назад", callback_data="plugins:auto_roblox")
+    b.adjust(1)
+    await callback.message.edit_text("\n".join(lines)[:4000],
+                                     reply_markup=b.as_markup())
+
+
 @router.callback_query(F.data == "plugins:roblox:log")
 async def roblox_log(callback: CallbackQuery) -> None:
     """Журнал выдач — здесь же лежат коды, не ушедшие в закрытый чат."""
@@ -1905,7 +2001,7 @@ async def roblox_make_ads_prompt(callback: CallbackQuery, state: FSMContext) -> 
     подменять ближайшим бот не станет.
     """
     from automation.approute import services_sync
-    from automation.robux import denominations
+    from automation.robux import catalog_regions
     from storage import get_ar_creds
 
     await state.clear()  # Cancel с шага цены ведёт сюда — закрываем форму
@@ -1931,26 +2027,94 @@ async def roblox_make_ads_prompt(callback: CallbackQuery, state: FSMContext) -> 
             reply_markup=_roblox_keyboard(settings))
         return
 
-    region = str(settings["plugins"]["auto_roblox"].get("region") or "GL").upper()
-    rows = [r for r in denominations(catalog, region) if r["in_stock"] > 0]
-    if not rows:
+    # Регион спрашивается ПЕРВЫМ, а не берётся из настройки: у Юмаркета
+    # выбора региона нет вовсе, и единственное место, где он переживёт
+    # создание товара, — описание. Значит знать его надо до того, как
+    # описание собрано.
+    regions = [r for r in catalog_regions(catalog) if r["in_stock"] > 0]
+    if not regions:
         await callback.message.edit_text(
-            f"❌ В регионе {region} нет номиналов Robux с ненулевым остатком.",
+            "❌ У поставщика не нашлось ни одного региона Roblox с ненулевым "
+            "остатком.", reply_markup=_roblox_keyboard(settings))
+        return
+    await state.update_data(ar_catalog_at=time.time())
+
+    b = InlineKeyboardBuilder()
+    for r in regions:
+        mark = "💠" if r["kind"] == "wallet" else "💳"
+        b.button(text=f"{mark} {r['region']} · {r['in_stock']}",
+                 callback_data=f"plugins:roblox:reg:{r['region']}")
+    b.button(text="⬅️ Назад", callback_data="plugins:auto_roblox")
+    b.adjust(3)
+    wallet = [r["region"] for r in regions if r["kind"] == "wallet"]
+    lines = [
+        "🌐 <b>Регион кода</b>", "",
+        "У поставщика их несколько, и это <b>два разных товара</b>:", "",
+        f"💠 <b>{', '.join(wallet) or '—'}</b> — кошельковые коды, номинал "
+        f"прямо в Robux.",
+        "💳 <b>остальные</b> — подарочные карты страны, номинал в её валюте "
+        "($10, EUR 25). Сколько Robux даст такая карта, решает курс самого "
+        "Roblox — бот его не знает и выдавать по нему не станет.",
+        "",
+        "Рядом с регионом — сколько номиналов в наличии.",
+        "",
+        "<i>Регион уйдёт в описание товара отдельной строкой: у Юмаркета "
+        "поля под него нет, а выдаче он нужен, чтобы купить тот самый код.</i>",
+    ]
+    await callback.message.edit_text("\n".join(lines)[:4000],
+                                     reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("plugins:roblox:reg:"))
+async def roblox_region_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    """Регион выбран — показываем номиналы именно этого региона."""
+    from automation.approute import services_sync
+    from automation.robux import denominations, is_wallet_region
+    from storage import get_ar_creds
+
+    region = callback.data.split(":")[-1].strip().upper()
+    uid = callback.from_user.id
+    settings = get_settings(uid)
+    creds = get_ar_creds(uid)
+    await callback.answer("⏳ Читаю номиналы…")
+    loop = asyncio.get_event_loop()
+    try:
+        ok, catalog = await asyncio.wait_for(
+            loop.run_in_executor(None, services_sync, creds), timeout=90)
+    except Exception as e:
+        ok, catalog = False, str(e)[:200]
+    if not ok:
+        await callback.message.edit_text(
+            f"❌ Каталог не прочитан: {html.escape(str(catalog))}",
             reply_markup=_roblox_keyboard(settings))
         return
 
+    rows = [r for r in denominations(catalog, region) if r["in_stock"] > 0]
+    if not rows:
+        await callback.message.edit_text(
+            f"❌ В регионе {region} нет номиналов с ненулевым остатком.",
+            reply_markup=_roblox_keyboard(settings))
+        return
+    wallet = is_wallet_region(region)
+    await state.update_data(ar_region=region, ar_rows=[
+        {"id": r["denomination_id"], "robux": r["robux"], "face": r["face"],
+         "cur": r["face_currency"], "name": r["name"], "price": r["price"]}
+        for r in rows])
+
     b = InlineKeyboardBuilder()
     for r in rows:
-        # В callback_data только номинал: он короткий и однозначный, а
-        # denominationId — UUID, и вместе с префиксом упирается в лимит.
-        b.button(text=f"{r['robux']} Robux · ${r['price']:.2f}",
-                 callback_data=f"plugins:roblox:den:{r['robux']}")
-    b.button(text="⬅️ Назад", callback_data="plugins:auto_roblox")
+        # `denominationId` — UUID в 36 символов, вместе с префиксом это 55
+        # байт из 64 разрешённых. Влезает, и выбор получается однозначным:
+        # у карт одинаковый номинал бывает в разных валютах.
+        title = (f"{r['robux']} Robux" if wallet
+                 else f"{r['face']:g} {r['face_currency']}")
+        b.button(text=f"{title} · ${r['price']:.2f}",
+                 callback_data=f"plugins:roblox:den:{r['denomination_id']}")
+    b.button(text="⬅️ Другой регион", callback_data="plugins:roblox:make_ads")
     b.adjust(2)
-    lines = [f"🏷 <b>Создать товар по номиналу</b> · регион {region}", "",
-             "Это те номиналы, которые бот умеет выдать. Выберите один — "
-             "дальше пойдёт обычное создание объявления, название и описание "
-             "уже подставлю.", "",
+    what = ("кошельковые коды — номинал в Robux" if wallet
+            else "подарочные карты — номинал в валюте страны")
+    lines = [f"🏷 <b>Номиналы · регион {region}</b>", "", f"Это {what}.", "",
              "Цены рядом — <b>закупочные, в долларах</b>. Свою цену в рублях "
              "назначите на следующем шаге: курс боту брать неоткуда, и "
              "выдумывать его он не станет."]
@@ -1960,17 +2124,28 @@ async def roblox_make_ads_prompt(callback: CallbackQuery, state: FSMContext) -> 
 
 @router.callback_query(F.data.startswith("plugins:roblox:den:"))
 async def roblox_den_pick(callback: CallbackQuery, state: FSMContext) -> None:
-    robux = "".join(ch for ch in callback.data.split(":")[-1] if ch.isdigit())
-    if not robux:
-        await callback.answer("Номинал не разобран", show_alert=True)
+    den_id = callback.data.split(":", 3)[-1].strip()
+    data = await state.get_data()
+    rows = data.get("ar_rows") or []
+    row = next((r for r in rows if r.get("id") == den_id), None)
+    if not row:
+        # Список номиналов живёт в состоянии формы, и оно теряется при
+        # перезапуске бота. Молча промолчать нельзя: продавец нажал кнопку и
+        # ждёт ответа.
+        await callback.answer("Список устарел — откройте регионы заново",
+                              show_alert=True)
         return
     await state.set_state(PluginState.roblox_ads_rate)
-    await state.update_data(robux=int(robux))
+    await state.update_data(ar_den=row)
+    title = (f"{row['robux']} Robux" if row.get("robux")
+             else f"{row['face']:g} {row['cur']}")
     await callback.message.edit_text(
-        f"🏷 <b>{robux} Robux</b>\n\n"
+        f"🏷 <b>{html.escape(title)}</b> · регион "
+        f"{html.escape(str(data.get('ar_region') or ''))}\n\n"
+        f"Закупка: ${row['price']:.2f}\n\n"
         f"Назовите цену в рублях, за которую продаёте — одним числом.\n\n"
-        f"Дальше откроется обычное создание объявления с этого же места: "
-        f"название и описание уже подставлены, а количество, фото и категорию "
+        f"Дальше откроется обычное создание объявления: название и описание "
+        f"подставлю по вашим заготовкам, а количество, фото и категорию "
         f"мастер спросит сам.",
         reply_markup=_cancel_kb("plugins:roblox:make_ads"))
     await callback.answer()
@@ -1990,18 +2165,37 @@ async def roblox_den_price(message: Message, state: FSMContext) -> None:
     картинки объявление может не принять.
     """
     data = await state.get_data()
-    robux = int(data.get("robux") or 0)
+    den = data.get("ar_den") or {}
+    region = str(data.get("ar_region") or "").upper()
     digits = "".join(ch for ch in (message.text or "") if ch.isdigit())
-    if not digits or not robux:
+    if not digits or not den:
         await message.answer("❌ Нужно одно число — цена в рублях.")
         return
     price = int(digits)
     await state.clear()
 
+    # Заготовки продавца. Пустые — берутся наши; регион дописывается
+    # отдельной строкой в любом случае, потому что читать его потом будет
+    # выдача, а у Юмаркета поля под регион нет.
+    from automation.robux import (DEFAULT_AD_TEXT, DEFAULT_AD_TITLE,
+                                  fill_template, with_region)
+    # Через `.get`, а не по ключу: у продавца, чьи настройки записаны до
+    # появления заготовок, раздела может не быть вовсе, и создание товара
+    # упало бы на ровном месте — с непонятным ему KeyError.
+    p = ((get_settings(message.from_user.id) or {}).get("plugins") or {}
+         ).get("auto_roblox") or {}
+    nominal = (f"{den['robux']} Robux" if den.get("robux")
+               else f"{den['face']:g} {den['cur']}")
+    filled = functools.partial(
+        fill_template, robux=int(den.get("robux") or 0), nominal=nominal,
+        region=region, price=price)
+    ad_title = filled(p.get("ad_title") or DEFAULT_AD_TITLE)[:100]
+    ad_text = with_region(filled(p.get("ad_text") or DEFAULT_AD_TEXT), region)
+
     from handlers.create_ad import CreateAdState
     await state.set_state(CreateAdState.quantity)
     await state.update_data(
-        title=f"{robux} Robux",
+        title=ad_title,
         price=price,
         # Раздел витрины здесь известен заранее — товар заводится из плагина
         # Robux, и выбирать «Roblox» руками по каждому номиналу продавцу
@@ -2026,19 +2220,103 @@ async def roblox_den_price(message: Message, state: FSMContext) -> None:
         # белого списка, и «roblox.com» роняло создание товара отказом 422 на
         # последнем шаге — когда продавец уже всё ввёл. Проверено живьём
         # 19.08. Куда идти, покупатель прочитает в самом коде выдачи.
-        description=("Код на пополнение Robux. Активируется в самом Roblox: "
-                     "Пополнить → Использовать код.\n"
-                     "Выдача сразу после оплаты."),
+        description=ad_text,
     )
     b = InlineKeyboardBuilder()
     b.button(text="1️⃣ Пропустить (кол-во = 1)", callback_data="create_ad:qty:1")
     b.button(text="❌ Отмена", callback_data="menu:ads")
     b.adjust(1)
     await message.answer(
-        f"✅ Цена: <b>{price} ₽</b> за <b>{robux} Robux</b>\n\n"
+        f"✅ Цена: <b>{price} ₽</b> за <b>{html.escape(nominal)}</b> "
+        f"({html.escape(region)})\n\n"
+        f"Название: <code>{html.escape(ad_title)}</code>\n"
+        f"Регион уйдёт в описание отдельной строкой — оттуда его потом "
+        f"читает выдача.\n\n"
         f"Сколько таких кодов выставляем? Введите число или пропустите — "
         f"но тогда объявление продастся один раз и уйдёт с витрины.",
         reply_markup=b.as_markup())
+
+
+def _template_help(what: str, now: str, default: str) -> str:
+    """Экран заготовки. Подстановки перечислены те, что и правда работают."""
+    from automation.robux import TEMPLATE_FIELDS
+    lines = [f"🏷 <b>{what} для новых товаров</b>", ""]
+    if now:
+        lines.append(f"Сейчас: <code>{html.escape(now)}</code>")
+    else:
+        lines.append(f"Сейчас наша: <code>{html.escape(default)}</code>")
+    lines += ["", "Можно подставить:"]
+    for mark, about in TEMPLATE_FIELDS.items():
+        lines.append(f"   <code>{html.escape(mark)}</code> — {about}")
+    lines += ["",
+              "Пришлите свой вариант одним сообщением. Точка «.» вернёт наш.",
+              "",
+              "<i>Регион бот допишет отдельной строкой сам — у Юмаркета "
+              "выбора региона нет, и из описания его потом читает выдача.</i>"]
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data == "plugins:roblox:set_ad_title")
+async def roblox_set_ad_title_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    from automation.robux import DEFAULT_AD_TITLE
+    await state.set_state(PluginState.roblox_set_ad_title)
+    p = get_settings(callback.from_user.id)["plugins"]["auto_roblox"]
+    await callback.message.edit_text(
+        _template_help("Название", p.get("ad_title") or "", DEFAULT_AD_TITLE),
+        reply_markup=_cancel_kb("plugins:roblox:settings"))
+    await callback.answer()
+
+
+@router.message(PluginState.roblox_set_ad_title)
+async def roblox_set_ad_title_input(message: Message, state: FSMContext) -> None:
+    value = (message.text or "").strip()
+    if value == ".":
+        value = ""
+    uid = message.from_user.id
+    settings = get_settings(uid)
+    settings["plugins"]["auto_roblox"]["ad_title"] = value[:100]
+    save_settings(uid, settings)
+    await state.clear()
+    said = (f"✅ Название: <code>{html.escape(value[:100])}</code>" if value
+            else "✅ Вернул нашу заготовку названия.")
+    await message.answer(said, reply_markup=_roblox_settings_keyboard(settings))
+
+
+@router.callback_query(F.data == "plugins:roblox:set_ad_text")
+async def roblox_set_ad_text_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    from automation.robux import DEFAULT_AD_TEXT
+    await state.set_state(PluginState.roblox_set_ad_text)
+    p = get_settings(callback.from_user.id)["plugins"]["auto_roblox"]
+    await callback.message.edit_text(
+        _template_help("Описание", p.get("ad_text") or "", DEFAULT_AD_TEXT),
+        reply_markup=_cancel_kb("plugins:roblox:settings"))
+    await callback.answer()
+
+
+@router.message(PluginState.roblox_set_ad_text)
+async def roblox_set_ad_text_input(message: Message, state: FSMContext) -> None:
+    value = (message.text or "").strip()
+    if value == ".":
+        value = ""
+    uid = message.from_user.id
+    settings = get_settings(uid)
+    # Ссылки панель не принимает, и отказ приходит 422 на последнем шаге
+    # мастера — когда введено уже всё. Сказать здесь дешевле.
+    if value:
+        from automation.panel import link_trouble
+        found = link_trouble(value)
+        if found:
+            await message.answer(
+                f"❌ Панель не примет описание со ссылкой: "
+                f"<code>{html.escape(found)}</code>\n\n"
+                f"Уберите ссылку и пришлите заготовку ещё раз.")
+            return
+    settings["plugins"]["auto_roblox"]["ad_text"] = value
+    save_settings(uid, settings)
+    await state.clear()
+    said = ("✅ Описание сохранено." if value
+            else "✅ Вернул наше описание.")
+    await message.answer(said, reply_markup=_roblox_settings_keyboard(settings))
 
 
 @router.callback_query(F.data == "plugins:roblox:set_note")

@@ -301,6 +301,69 @@ def match_denomination(catalog, robux: int, region: str = "") -> tuple[dict | No
     return in_stock[0], ""
 
 
+# Что можно подставить в заготовку названия и описания. Список короткий
+# нарочно: обещать в подсказке больше, чем подставляется, хуже, чем не
+# обещать вовсе.
+TEMPLATE_FIELDS = {
+    "{robux}": "количество Robux (у карт — 0)",
+    "{номинал}": "номинал как он называется у поставщика",
+    "{регион}": "регион кода: GL, RU, US…",
+    "{цена}": "ваша цена в рублях",
+}
+
+# Заготовки по умолчанию — то, чем бот пользуется, пока продавец не задал
+# своих. Без ссылок: панель их не принимает, кроме своего белого списка, и
+# «roblox.com» роняло создание отказом 422 на последнем шаге.
+DEFAULT_AD_TITLE = "Roblox {номинал} ({регион})"
+DEFAULT_AD_TEXT = ("Код на пополнение. Активируется в самом Roblox: "
+                   "Пополнить → Использовать код.\n"
+                   "Выдача сразу после оплаты.")
+
+
+def fill_template(template: str, *, robux: int = 0, nominal: str = "",
+                  region: str = "", price: int = 0) -> str:
+    """Подставить значения в заготовку продавца.
+
+    Неизвестные подстановки не трогаются: продавец увидит `{чтото}` в
+    предпросмотре и поймёт, что опечатался. Молча стереть их значило бы
+    выпустить товар с дырой в названии, и заметил бы он это на витрине.
+    """
+    out = str(template or "")
+    for mark, value in (("{robux}", robux), ("{номинал}", nominal),
+                        ("{регион}", str(region or "").upper()),
+                        ("{цена}", price)):
+        out = out.replace(mark, str(value))
+    return out.strip()
+
+
+def affordable(catalog, balance_usd: float, region: str = "") -> dict:
+    """Что можно купить на этот баланс — фактами, а не прозой.
+
+    «Не ноль» и «хватит» — разные вещи, и разница стоит оплаченного заказа:
+    при 1.43 $ на счету и самом дешёвом номинале в 2.74 $ экран молчал, а
+    первая же выдача отвалилась бы с «не хватает средств» — по каждому
+    покупателю отдельно.
+
+    Возвращает `{cheapest, cheapest_name, cheapest_region, count, total}`:
+    цена самого дешёвого номинала в наличии, сколько таких можно взять и
+    сколько всего номиналов по карману.
+    """
+    rows = [r for r in denominations(catalog, region) if r["in_stock"] > 0]
+    out = {"cheapest": 0.0, "cheapest_name": "", "cheapest_region": "",
+           "count": 0, "total": 0}
+    if not rows:
+        return out
+    cheap = min(rows, key=lambda r: r["price"])
+    out["cheapest"] = float(cheap["price"])
+    out["cheapest_name"] = cheap["name"]
+    out["cheapest_region"] = cheap["region"]
+    money = float(balance_usd or 0)
+    if out["cheapest"] > 0:
+        out["count"] = int(money // out["cheapest"])
+    out["total"] = sum(1 for r in rows if r["price"] <= money)
+    return out
+
+
 def region_line(region: str) -> str:
     """Строка региона для описания товара — та, которую бот потом и читает."""
     return f"{REGION_PREFIX} {str(region or '').strip().upper()}"

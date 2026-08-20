@@ -122,6 +122,43 @@ class TheMatchUsesTheRightYardstick(unittest.TestCase):
         self.assertIn("10000", why)
 
 
+class NotZeroIsNotTheSameAsEnough(unittest.TestCase):
+    """Живой случай 19.08: на счету 1.43 $, самый дешёвый номинал 2.74 $.
+
+    Баланс не ноль, поэтому предупреждение о пустом счёте молчало — а выдать
+    нельзя было ни одного кода, и первый же оплаченный заказ отвалился бы с
+    «не хватает средств», причём по каждому покупателю отдельно.
+    """
+
+    def test_money_that_buys_nothing_is_counted_as_nothing(self):
+        can = R.affordable(CATALOG, 1.43)
+        self.assertEqual(can["count"], 0)
+        self.assertEqual(can["total"], 0)
+        self.assertGreater(can["cheapest"], 1.43)
+
+    def test_the_cheapest_in_stock_is_named(self):
+        can = R.affordable(CATALOG, 100)
+        self.assertEqual(can["cheapest"], 3.57)
+        self.assertEqual(can["cheapest_name"], "200 Robux")
+        self.assertEqual(can["cheapest_region"], "GL")
+
+    def test_a_sold_out_denomination_does_not_count_as_affordable(self):
+        """У $25 US остаток ноль — купить его нельзя ни за какие деньги."""
+        can = R.affordable(CATALOG, 1000)
+        self.assertNotIn(23.5, [23.5] if can["total"] == 0 else [])
+        rows = [r for r in R.denominations(CATALOG) if r["in_stock"] > 0]
+        self.assertEqual(can["total"], len(rows))
+
+    def test_how_many_of_the_cheapest_fit(self):
+        can = R.affordable(CATALOG, 8.0)      # 2 × 3.57 = 7.14
+        self.assertEqual(can["count"], 2)
+
+    def test_an_empty_catalogue_answers_zero_not_a_crash(self):
+        can = R.affordable({"items": []}, 100)
+        self.assertEqual(can["cheapest"], 0.0)
+        self.assertEqual(can["count"], 0)
+
+
 class TheRegionLivesInTheDescriptionBecauseItHasNowhereElse(unittest.TestCase):
     """У Юмаркета выбора региона нет: категория отдаёт ноль фильтров, а в
     заказе от объявления приходит только `ad_id`."""

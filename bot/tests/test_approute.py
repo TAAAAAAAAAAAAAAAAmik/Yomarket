@@ -1685,9 +1685,14 @@ class TheBalanceIsVisibleFromTheRobuxScreen(unittest.TestCase):
         return cb
 
     def test_the_robux_screen_has_a_way_to_see_it(self):
-        """Проводка: экран может быть хорош, а попасть в него неоткуда."""
+        """Проводка: экран может быть хорош, а попасть в него неоткуда.
+
+        Кнопка ведёт теперь в свой экран раздела, а не в общий
+        `apr:balance`: там к сумме добавлена последняя строка — сколько
+        кодов на неё выйдет. «Не ноль» и «хватит» это разные вещи.
+        """
         from handlers import plugins as P
-        self.assertIn("apr:balance",
+        self.assertIn("plugins:roblox:balance",
                       callbacks(P._roblox_keyboard({"plugins": {"auto_roblox": {}}})))
 
     def test_the_number_the_supplier_gave_is_the_one_shown(self):

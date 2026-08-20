@@ -209,11 +209,22 @@ class TheScreenDoesNotPromiseWhatItCannotDo(unittest.TestCase):
         return [b.callback_data for row in kb.inline_keyboard for b in row]
 
     def test_the_stub_buttons_are_gone(self):
+        """`plugins:roblox:balance` из этого списка ушёл — не потому, что
+        кнопку вернули, а потому что за ней теперь есть экран: баланс
+        кабинета и сколько кодов на него выйдет. Заглушкой она быть
+        перестала."""
         cbs = self.keyboard()
         for dead in ("plugins:roblox:accumulated", "plugins:roblox:profit",
-                     "plugins:roblox:balance", "plugins:roblox:notifs",
-                     "plugins:roblox:replies"):
+                     "plugins:roblox:notifs", "plugins:roblox:replies"):
             self.assertNotIn(dead, cbs)
+
+    def test_and_the_balance_button_is_no_longer_a_stub(self):
+        import inspect
+        from handlers import plugins as P
+        self.assertIn("plugins:roblox:balance", self.keyboard())
+        self.assertTrue(hasattr(P, "roblox_balance"),
+                        "кнопка есть, обработчика нет — это заглушка")
+        self.assertIn("хватит", inspect.getsource(P.roblox_balance).lower())
 
     def test_manual_delivery_asks_for_an_order_not_for_a_buyer(self):
         """Кнопка вернулась, но означает другое. Прежняя спрашивала
@@ -345,11 +356,14 @@ class MakingAnAdHandsOverToTheWizardWhereTheWizardStillAsks(unittest.TestCase):
         from handlers import plugins as P
         from handlers.create_ad import CreateAdState
 
-        msg, fsm = self.Msg("990"), self.FSM(robux=1000)
+        msg, fsm = self.Msg("990"), self.FSM(ar_region="GL", ar_den={"id": "gl-1000", "robux": 1000,
+                                        "face": 0, "cur": "",
+                                        "name": "1000 Robux",
+                                        "price": 11.22})
         asyncio.run(P.roblox_den_price(msg, fsm))
 
         self.assertEqual(fsm.state, CreateAdState.quantity)
-        self.assertEqual(fsm.data.get("title"), "1000 Robux")
+        self.assertEqual(fsm.data.get("title"), "Roblox 1000 Robux (GL)")
         self.assertEqual(fsm.data.get("price"), 990)
 
     def test_the_quantity_is_not_pinned_behind_the_sellers_back(self):
@@ -357,7 +371,10 @@ class MakingAnAdHandsOverToTheWizardWhereTheWizardStillAsks(unittest.TestCase):
         import asyncio
         from handlers import plugins as P
 
-        msg, fsm = self.Msg("990"), self.FSM(robux=1000)
+        msg, fsm = self.Msg("990"), self.FSM(ar_region="GL", ar_den={"id": "gl-1000", "robux": 1000,
+                                        "face": 0, "cur": "",
+                                        "name": "1000 Robux",
+                                        "price": 11.22})
         asyncio.run(P.roblox_den_price(msg, fsm))
 
         self.assertNotIn("quantity", fsm.data)
@@ -376,7 +393,10 @@ class MakingAnAdHandsOverToTheWizardWhereTheWizardStillAsks(unittest.TestCase):
             "message": None,
             "answer": lambda self, *a, **kw: _done(),
         })()
-        fsm = self.FSM(robux=1000)
+        fsm = self.FSM(ar_region="GL", ar_den={"id": "gl-1000", "robux": 1000,
+                                        "face": 0, "cur": "",
+                                        "name": "1000 Robux",
+                                        "price": 11.22})
         asyncio.run(P.roblox_make_ads_prompt(cb, fsm))
 
         self.assertEqual(fsm.state, None)

@@ -67,12 +67,16 @@ class OurOwnDescriptionPassesThePanel(unittest.TestCase):
     описание и исправить его не может."""
 
     def description(self) -> str:
-        import inspect
+        """Наша заготовка описания.
 
-        from handlers import plugins as PL
-        src = inspect.getsource(PL)
-        start = src.index('description=("Код на пополнение Robux')
-        return src[start:src.index("),", start)]
+        Раньше вытаскивалась из исходника плагина по куску текста. Текст
+        переехал в `automation.robux` — стал заготовкой, которую продавец
+        может заменить своей, — и вырезка из исходника перестала его
+        находить. Берём значение, а не строку кода: так проверка переживёт
+        следующий переезд.
+        """
+        from automation.robux import DEFAULT_AD_TEXT
+        return DEFAULT_AD_TEXT
 
     def test_it_has_no_link_at_all(self):
         self.assertEqual(P.link_trouble(self.description()), "")

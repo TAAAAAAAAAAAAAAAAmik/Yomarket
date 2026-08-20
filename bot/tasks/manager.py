@@ -2318,7 +2318,23 @@ class TaskManager:
             save_settings(user_id, settings)
 
         qty = robux_quantity(title)
-        region = str(p.get("region") or "GL").upper()
+        # Регион берётся из описания самого товара, а не из общей настройки.
+        # Причина не в удобстве: у Юмаркета выбора региона нет вовсе —
+        # категория отдаёт ноль фильтров, — а продавец держит на витрине и
+        # глобальные коды, и российские, и карты стран. Одна настройка на
+        # всех означала бы покупать не тот код, и покупатель не смог бы его
+        # активировать.
+        region, how = await self._robux_region_of(api, order_id, entry_hint=already)
+        if not region:
+            region = str(p.get("region") or "").upper()
+            how = "настройка плагина" if region else ""
+        if not region:
+            await self._robux_stop(
+                user_id, settings, order_id, qty,
+                "в описании товара не сказано, какой это регион, и запасной "
+                "не задан. Допишите в описание строку вида «Регион кода: GL» "
+                "— выдача читает её оттуда", record=False)
+            return
 
         creds = get_ar_creds(user_id)
         if not creds or not creds.get("api_key"):
@@ -2411,6 +2427,43 @@ class TaskManager:
     # вместо кода, который уже куплен.
     _ROBUX_POLL_STEPS = (12, 12, 15, 20, 30, 30, 30, 45, 60, 60)
     _ROBUX_POLL_CEILING = 600.0        # десять минут, дальше — на следующий проход
+
+    async def _robux_region_of(self, api: YooMarketAPI, order_id: str,
+                               entry_hint: dict | None = None) -> tuple[str, str]:
+        """Регион кода по описанию заказанного товара → (регион, чем узнали).
+
+        В заказе от объявления приходит только `ad_id`, поэтому описание
+        дочитывается отдельным запросом `GET /ads/{id}` — там оно лежит в
+        поле `content` (проверено живьём 19.08).
+
+        Записанный регион главнее: у оборванной выдачи он уже в журнале, и
+        перечитывать его значит рисковать другим ответом, если продавец
+        успел поправить описание.
+        """
+        from automation.robux import region_from_description
+
+        saved = str((entry_hint or {}).get("region") or "").upper()
+        if saved:
+            return saved, "запись в журнале"
+        try:
+            order = await asyncio.wait_for(api.get_order(order_id), timeout=30)
+        except Exception as e:
+            logger.info("AutoRoblox: заказ %s не дочитан — %s", order_id, e)
+            return "", ""
+        node = (order.get("data") if isinstance(order, dict) and "data" in order
+                else order) or {}
+        ad_id = node.get("ad_id") if isinstance(node, dict) else None
+        if not ad_id:
+            return "", ""
+        try:
+            ad = await asyncio.wait_for(api.get_ad(ad_id), timeout=30)
+        except Exception as e:
+            logger.info("AutoRoblox: объявление %s не прочитано — %s", ad_id, e)
+            return "", ""
+        card = (ad.get("data") if isinstance(ad, dict) and "data" in ad
+                else ad) or {}
+        text = str(card.get("content") or "") if isinstance(card, dict) else ""
+        return region_from_description(text)
 
     async def _robux_recheck(self, creds: dict, entry: dict) -> tuple[bool, dict]:
         """Свежие цена и остаток номинала — замена сухому прогону.
