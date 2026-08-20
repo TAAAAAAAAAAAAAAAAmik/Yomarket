@@ -206,3 +206,56 @@ class TheCardScreenTellsTheTruth(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnEnabledCardGetsItsOwnButton(unittest.TestCase):
+    """Карта, которой торгуют каждый день, должна открываться в одно
+    нажатие, а не через общий список из восьми.
+
+    Кнопки берутся из реестра по признаку «включена». Перечислять их руками
+    значило бы завести восемь строчек вида «если это Apple — покажи Apple»,
+    и девятая однажды не появилась бы вовсе — ровно то, от чего уходили,
+    когда сводили плагины в один движок.
+    """
+
+    def buttons(self, settings):
+        from handlers.plugins import _plugins_menu_keyboard
+        kb = _plugins_menu_keyboard(settings)
+        return [(b.text, b.callback_data)
+                for row in kb.inline_keyboard for b in row]
+
+    def test_nothing_enabled_shows_only_the_general_entry(self):
+        cbs = [c for _, c in self.buttons({})]
+        self.assertIn("plugins:gifts", cbs)
+        self.assertFalse([c for c in cbs if c.startswith("plugins:gc:")])
+
+    def test_an_enabled_card_is_pinned_to_the_menu(self):
+        got = self.buttons({"plugins": {"gift_cards": {"apple": {"enabled": True}}}})
+        self.assertIn("plugins:gc:apple", [c for _, c in got])
+        self.assertTrue([t for t, _ in got if "Apple" in t])
+
+    def test_a_disabled_card_is_not(self):
+        got = self.buttons({"plugins": {"gift_cards": {"apple": {"enabled": False}}}})
+        self.assertNotIn("plugins:gc:apple", [c for _, c in got])
+
+    def test_several_enabled_cards_all_appear(self):
+        got = [c for _, c in self.buttons({"plugins": {"gift_cards": {
+            "apple": {"enabled": True}, "xbox": {"enabled": True},
+            "steam": {"enabled": True}}}})]
+        for slug in ("apple", "xbox", "steam"):
+            self.assertIn(f"plugins:gc:{slug}", got)
+
+    def test_the_general_list_never_disappears(self):
+        """Через него включают карту в первый раз. Без него выключенная
+        карта была бы недостижима вовсе."""
+        got = [c for _, c in self.buttons(
+            {"plugins": {"gift_cards": {"apple": {"enabled": True}}}})]
+        self.assertIn("plugins:gifts", got)
+
+    def test_no_card_is_named_in_the_menu_code(self):
+        """Признак того, что кнопки штампуются, а не перечисляются."""
+        import inspect
+        from handlers import plugins as P
+        src = inspect.getsource(P._plugins_menu_keyboard)
+        for slug in ("apple", "xbox", "steam", "amazon", "razer"):
+            self.assertNotIn(f'"{slug}"', src)

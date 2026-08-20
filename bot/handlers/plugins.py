@@ -162,14 +162,34 @@ def _cancel_kb(back: str) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def _plugins_menu_keyboard() -> InlineKeyboardMarkup:
+def _plugins_menu_keyboard(settings: dict | None = None) -> InlineKeyboardMarkup:
+    """Меню плагинов.
+
+    Включённые карты выносятся сюда своими кнопками: та, которой продавец
+    торгует каждый день, должна открываться в одно нажатие, а не через
+    общий список из восьми.
+
+    Кнопки берутся из реестра по признаку «включена», а не перечисляются
+    руками. Строчка вида «если это Apple — покажи Apple» вернула бы нас к
+    тому, от чего ушли: восемь карт означали бы восемь таких строк, и
+    девятая однажды не появилась бы вовсе.
+    """
+    from automation.giftcards import enabled_cards
+
     builder = InlineKeyboardBuilder()
     builder.button(text="⭐ AutoStars", callback_data="plugins:auto_stars")
+    pinned = enabled_cards(settings or {})
     # Robux переехал под гифт-карты: это такая же карта, просто номинал у
     # неё в игровой единице. Отдельная кнопка вела бы во второй экран того
     # же самого — продавец видел бы два раздела про одно, с раздельными
     # тумблерами и журналами, и не понимал бы, какой из них работает.
-    builder.button(text="🎁 Гифт-карты", callback_data="plugins:gifts")
+    for gift in pinned:
+        builder.button(text=f"{gift.emoji} {gift.title}",
+                       callback_data=f"plugins:gc:{gift.slug}")
+    # Общий список остаётся всегда: через него включают карту в первый раз,
+    # и через него же видно те, что выключены. Без него карта, которую ещё
+    # не включали, была бы недостижима.
+    builder.button(text="🎁 Все гифт-карты", callback_data="plugins:gifts")
     # Прежний поставщик переехал сюда из раздела Robux: там он был не к
     # месту — поставщик выбран, и сравнение закупочной цены не то, ради чего
     # открывают экран выдачи. Но убрать его совсем значило бы оставить экран
@@ -177,7 +197,8 @@ def _plugins_menu_keyboard() -> InlineKeyboardMarkup:
     # командой, а про команду продавцу неоткуда узнать.
     builder.button(text="🔑 ns.gifts (сравнить цену)", callback_data="ns:creds")
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
-    builder.adjust(2, 1, 1)
+    # Включённые карты — по две в ряд, остальное по одной.
+    builder.adjust(1, *([2] * ((len(pinned) + 1) // 2)), 1, 1, 1)
     return builder.as_markup()
 
 
@@ -2840,6 +2861,6 @@ async def plugins_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         "🧩 <b>Плагины</b>\n\n"
         "Автоматическая доставка цифровых товаров при новых заказах.",
-        reply_markup=_plugins_menu_keyboard(),
+        reply_markup=_plugins_menu_keyboard(get_settings(callback.from_user.id)),
     )
     await callback.answer()
