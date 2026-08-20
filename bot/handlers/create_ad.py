@@ -584,6 +584,37 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
     await callback.answer()
 
 
+def _autopick_match(options: list, words) -> dict | None:
+    """Единственный подходящий вариант селекта или None.
+
+    Нужно для создания товаров из плагина: раздел витрины там известен
+    заранее, и заставлять продавца выбирать «Roblox» вручную по каждому
+    номиналу — работа, которую бот может сделать сам.
+
+    Слова пробуются по порядку, от узкого к широкому: «robux» отличает
+    валюту от аккаунтов и подарочных карт, а «roblox» подойдёт и им. Точное
+    совпадение имени сильнее вхождения.
+
+    **Несколько совпадений — не повод взять первое.** Раздел решает, где
+    покупатель увидит товар; ошибиться здесь молча значит выставить код
+    Robux среди аккаунтов и узнать об этом по отсутствию продаж. Ни одного
+    совпадения — то же самое. В обоих случаях возвращается None, и продавца
+    спрашивают, как раньше.
+    """
+    for word in words or []:
+        w = str(word or "").strip().lower()
+        if not w:
+            continue
+        pairs = [(o, str(o.get("label", "")).strip().lower()) for o in options]
+        exact = [o for o, label in pairs if label == w]
+        if len(exact) == 1:
+            return exact[0]
+        near = [o for o, label in pairs if w in label]
+        if len(near) == 1:
+            return near[0]
+    return None
+
+
 async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
     """Ask the user to pick the next required select option, or create the product."""
     from storage import get_panel_creds
@@ -596,8 +627,10 @@ async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
 
     if not queue:
         values = data.get("pending") or {}
+        picked = list(data.get("autopicked") or [])
         await state.clear()
-        await _panel_create_and_report(msg, uid, values, extra=chosen)
+        await _panel_create_and_report(msg, uid, values, extra=chosen,
+                                       picked=picked)
         return
 
     attr = queue[0]
@@ -645,6 +678,21 @@ async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
 
     options = options[:500]
     label = f.get("label") or attr
+
+    # Раздел, известный заранее, выбирается сам — но только когда подходит
+    # ровно один вариант. Выбранное записывается и показывается продавцу:
+    # молча решить за него, где будет лежать товар, значит поставить его
+    # перед фактом на витрине.
+    guess = _autopick_match(options, data.get("autopick") or [])
+    if guess is not None:
+        chosen[attr] = guess.get("value")
+        notes = list(data.get("autopicked") or [])
+        notes.append(f"{label}: {guess.get('label')}")
+        await state.update_data(chosen=chosen, autopicked=notes,
+                                select_queue=queue[1:])
+        await _ask_next_select(msg, state, uid)
+        return
+
     await state.update_data(
         current_attr=attr, current_label=label,
         current_options=options, current_view=options, current_page=0,
@@ -818,8 +866,23 @@ async def choose_select_option(callback: CallbackQuery, state: FSMContext) -> No
     await _ask_next_select(callback.message, state, callback.from_user.id)
 
 
-async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | None) -> None:
-    """Run panel_create_product_sync in a thread with live progress, then report."""
+def _picked_note(picked: list | None) -> str:
+    """Строка о разделах, выбранных ботом. Пусто — если выбирал продавец."""
+    if not picked:
+        return ""
+    rows = "; ".join(html.escape(str(p)) for p in picked)
+    return f"\n🏷 <i>Раздел выбран автоматически — {rows}</i>"
+
+
+async def _panel_create_and_report(msg, uid: int, values: dict,
+                                   extra: dict | None,
+                                   picked: list | None = None) -> None:
+    """Run panel_create_product_sync in a thread with live progress, then report.
+
+    `picked` — разделы, выбранные ботом без спроса (создание из плагина).
+    Печатаются в отчёте: продавец должен видеть, где оказался товар, а не
+    обнаруживать это на витрине.
+    """
     from storage import get_panel_creds
     from automation.panel import panel_create_product_sync
 
@@ -925,6 +988,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
             f"✅ <b>Товар создан через панель!</b>\n\n"
             f"📝 {html.escape(str(values['title']))}\n"            f"💰 {values['price']} ₽"
             f"{chr(10) + '🆔 ' + item_id if item_id else ''}"
+            f"{_picked_note(picked)}"
             f"{pub_note}",
             reply_markup=b.as_markup(),
         )
@@ -962,7 +1026,10 @@ async def _panel_create_and_report(msg, uid: int, values: dict, extra: dict | No
     body = f"<b>Панель не приняла:</b>\n{html.escape(why)}\n\n{said}" \
         if why else said
 
-    await _edit_safely(msg, f"{header}\n\n{body}", b.as_markup())
+    # Раздел печатается и в отказе: «панель не приняла» бывает как раз из-за
+    # него, и тогда важно видеть, что именно бот выбрал.
+    await _edit_safely(msg, f"{header}{_picked_note(picked)}\n\n{body}",
+                       b.as_markup())
 
 
 @router.callback_query(F.data.startswith("cadpub:"))
