@@ -77,6 +77,22 @@ def UNITS(name: str) -> Unit:
 # ---------------------------------------------------------------------------
 
 _SIGNS = {"$": "USD", "€": "EUR", "£": "GBP", "₽": "RUB"}
+
+# Запятая перед ровно тремя цифрами — разделитель тысяч, а не десятичная
+# точка. Проверено на живом каталоге 20.08: таких названий 92, а запятой в
+# роли десятичной там **ноль**. Без этого «Roblox: 4,500 Robux for Xbox»
+# читалось как 4.5 Robux, «IDR 500,000» как 500 идр, а «$1,000 Amazon» как
+# один доллар: номинал уменьшался в тысячу раз и переставал находиться.
+_THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+
+
+def _as_number(raw: str) -> float:
+    """Число из названия поставщика. Пустое или непонятное — ноль."""
+    text = _THOUSANDS.sub("", str(raw or "").strip())
+    try:
+        return float(text.replace(",", "."))
+    except ValueError:
+        return 0.0
 # Срок подписки приводится к единственному числу: «3 months» и «3 Month» —
 # одно и то же, а сравнивать их как разные значило бы не найти номинал,
 # который есть.
@@ -99,17 +115,16 @@ def face_value(name: str) -> tuple[float, str]:
     деньгами не меряется, и притворяться, что меряется, здесь нельзя.
     """
     text = str(name or "")
-    m = re.search(r"(\b[A-Za-z]{3}\b|[$€£₽])\s*([\d]+(?:[.,]\d+)?)", text)
+    m = re.search(r"(\b[A-Za-z]{3}\b|[$€£₽])\s*([\d]+(?:[.,]\d+)*)", text)
     if not m:
-        m2 = re.search(r"([\d]+(?:[.,]\d+)?)\s*(\b[A-Za-z]{3}\b|[$€£₽])", text)
+        m2 = re.search(r"([\d]+(?:[.,]\d+)*)\s*(\b[A-Za-z]{3}\b|[$€£₽])", text)
         if not m2:
             return 0.0, ""
         amount, sign = m2.group(1), m2.group(2)
     else:
         sign, amount = m.group(1), m.group(2)
-    try:
-        value = float(str(amount).replace(",", "."))
-    except ValueError:
+    value = _as_number(amount)
+    if value <= 0:
         return 0.0, ""
     return value, _SIGNS.get(sign, str(sign).upper())
 
@@ -132,14 +147,12 @@ def units_value(name: str, unit_name: str) -> tuple[float, str]:
         return 0.0, ""
     u = re.escape(unit)
     # Единица перед числом («VP 240») или после него («2800 FC Points»).
-    m = (re.search(rf"\b{u}\b\s*:?\s*([\d]+(?:[.,]\d+)?)", text, re.I)
-         or re.search(rf"([\d]+(?:[.,]\d+)?)\s*\+?\s*[\d]*\s*\b{u}\b", text, re.I))
+    m = (re.search(rf"\b{u}\b\s*:?\s*([\d]+(?:[.,]\d+)*)", text, re.I)
+         or re.search(rf"([\d]+(?:[.,]\d+)*)\s*\+?\s*[\d]*\s*\b{u}\b", text, re.I))
     if not m:
         return 0.0, ""
-    try:
-        return float(m.group(1).replace(",", ".")), unit
-    except ValueError:                              # pragma: no cover
-        return 0.0, ""
+    value = _as_number(m.group(1))
+    return (value, unit) if value > 0 else (0.0, "")
 
 
 def period_value(name: str) -> tuple[float, str]:
@@ -458,18 +471,33 @@ def services(catalog, gift: GiftCard) -> list[dict]:
     return [s for s in _catalog_items(catalog) if gift.matches_service(s)]
 
 
-def region_of(service: dict) -> str:
-    """Регион услуги.
+# Суффикс «| XX» из названия услуги. Короткий и без пробелов — иначе это
+# не регион, а часть имени товара.
+_SUFFIX = re.compile(r"^[A-Z0-9]{2,5}$")
 
-    Берётся из `countryCode`, а не из названия: на живом каталоге поле
-    совпало с суффиксом «| XX» во **всех 90 услугах** трёх семейств,
-    расхождений ноль, — а поле надёжнее разбора текста.
+
+def region_of(service: dict) -> str:
+    """Регион услуги. Сначала суффикс «| XX» из названия, потом `countryCode`.
+
+    Прежде здесь стоял `countryCode` — «совпал с суффиксом во всех 90
+    услугах трёх семейств». Для Apple, PlayStation и подарочных карт Roblox
+    это правда, а для кошельковых кодов Roblox — нет, и цена ошибки та
+    самая: `Roblox Wallet Code | XBox` и `| GL` оба помечены `GLOB`, то
+    есть сливаются в один регион. Номинал 4500 есть в обоих, и покупатель
+    с ПК мог получить код, который работает только на Xbox.
+
+    По всему каталогу 20.08 суффикс и `countryCode` расходятся у 242 услуг
+    из 849. Из объявленных карт слив был ровно один — тот самый Robux.
+
+    Суффикс главнее ещё и потому, что его пишет поставщик именно чтобы
+    различать товары, а `countryCode` у него — грубая пометка «глобальный».
     """
-    code = str((service or {}).get("countryCode") or "").strip().upper()
-    if code:
-        return code
     name = str((service or {}).get("name") or "")
-    return name.split("|")[-1].strip().upper() if "|" in name else ""
+    if "|" in name:
+        suffix = name.split("|")[-1].strip().upper()
+        if _SUFFIX.match(suffix):
+            return suffix
+    return str((service or {}).get("countryCode") or "").strip().upper()
 
 
 def denominations(catalog, gift: GiftCard, region: str = "") -> list[dict]:

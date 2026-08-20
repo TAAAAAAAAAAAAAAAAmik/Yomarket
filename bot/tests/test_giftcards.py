@@ -345,3 +345,76 @@ class WhereTheRegionLives(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ATousandsSeparatorIsNotADecimalPoint(unittest.TestCase):
+    """Запятая в названии уменьшала номинал в тысячу раз.
+
+    Живой каталог 20.08: `Roblox: 4,500 Robux for Xbox` читался как **4.5
+    Robux**, `IDR 500,000` как пятьсот, `$1,000 Amazon` как один доллар.
+    Такой номинал не находится вовсе — товар молча становится
+    непродаваемым, и продавец видит «номинала нет» там, где он есть.
+
+    Проверено там же: названий с запятой-разделителем 92, а запятой в роли
+    десятичной — **ни одного**. Поэтому правило однозначное: запятая перед
+    ровно тремя цифрами — разделитель тысяч.
+    """
+
+    def test_a_grouped_unit_value_keeps_its_size(self):
+        self.assertEqual(gc.units_value("Roblox: 4,500 Robux for Xbox", "Robux"),
+                         (4500.0, "Robux"))
+        self.assertEqual(gc.units_value("1,000 Robux", "Robux"), (1000.0, "Robux"))
+
+    def test_a_grouped_money_value_keeps_its_size(self):
+        self.assertEqual(gc.face_value("IDR 500,000 gift card"), (500000.0, "IDR"))
+        self.assertEqual(gc.face_value("$1,000 Amazon"), (1000.0, "USD"))
+
+    def test_a_real_decimal_point_still_works(self):
+        """`AUD 10.37` в каталоге есть — округлить его было бы подменой."""
+        self.assertEqual(gc.face_value("AUD 10.37 Roblox gift card"),
+                         (10.37, "AUD"))
+
+    def test_an_ungrouped_number_is_unchanged(self):
+        self.assertEqual(gc.units_value("4500 Robux", "Robux"), (4500.0, "Robux"))
+        self.assertEqual(gc.face_value("$10 Apple Gift Card"), (10.0, "USD"))
+
+
+class TwoProductsMustNotShareOneRegion(unittest.TestCase):
+    """`Roblox Wallet Code | XBox` и `| GL` оба помечены `countryCode: GLOB`.
+
+    Регион брался из этого поля, и обе услуги попадали в один. Номинал 4500
+    есть в обеих, а выдача берёт первую подошедшую — покупатель с ПК мог
+    получить код, который работает только на Xbox. Отказа при этом никакого:
+    товар выдан, деньги списаны, узнаёт продавец от покупателя.
+
+    Суффикс «| XX» надёжнее: его поставщик пишет именно чтобы различать
+    товары. По каталогу 20.08 он расходится с `countryCode` у 242 услуг из
+    849.
+    """
+
+    def rows(self):
+        return ({"name": "Roblox Wallet Code | XBox", "countryCode": "GLOB"},
+                {"name": "Roblox Wallet Code | GL", "countryCode": "GLOB"})
+
+    def test_the_suffix_tells_them_apart(self):
+        xbox, gl = self.rows()
+        self.assertEqual(gc.region_of(xbox), "XBOX")
+        self.assertEqual(gc.region_of(gl), "GL")
+        self.assertNotEqual(gc.region_of(xbox), gc.region_of(gl))
+
+    def test_the_country_code_is_still_used_when_there_is_no_suffix(self):
+        self.assertEqual(
+            gc.region_of({"name": "Apple Gift Card", "countryCode": "US"}), "US")
+
+    def test_a_long_tail_is_not_mistaken_for_a_region(self):
+        """«Что-то | Deluxe Pack» — это часть имени, а не регион."""
+        self.assertEqual(
+            gc.region_of({"name": "Some Game | Deluxe Pack",
+                          "countryCode": "GLOB"}), "GLOB")
+
+    def test_the_families_already_shipped_are_unaffected(self):
+        """У Apple и PlayStation суффикс и код совпадают — правка их не
+        трогает, и товары, заведённые раньше, не переезжают."""
+        self.assertEqual(
+            gc.region_of({"name": "Apple Gift Card | TR", "countryCode": "TR"}),
+            "TR")
