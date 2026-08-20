@@ -386,9 +386,52 @@ PSN = GiftCard(
 )
 
 
+# Roblox — та же гифт-карта, просто с двумя семействами номиналов, и обе
+# лежат в одной подкатегории поставщика. Проверено живьём 20.08: все 26
+# услуг Roblox имеют `subcategoryName = "Roblox Gift Cards"`, а кошельковые
+# коды отличаются словом «Wallet Code» в названии. Ровно для такого случая
+# в декларации и заведены `name_must_have` / `name_must_not_have`.
+ROBUX = GiftCard(
+    slug="robux", title="Roblox — Robux", emoji="🎮",
+    subcategory="Roblox Gift Cards", unit=UNITS("Robux"),
+    name_must_have="Wallet Code",
+    # Слова узкие нарочно, и порядок в реестре тоже: «roblox» подходит и
+    # картам, поэтому здесь его нет. Заказ «Roblox Gift Card $10» пройдёт
+    # мимо этой карты и достанется следующей — а «1000 Robux» заберётся
+    # здесь, потому что слово «Robux» стоит в названии всякого такого
+    # товара. Продавцу, у которого товар назван одним словом «Роблокс»,
+    # экран советует задать своё слово-опознаватель.
+    words=("robux", "робукс", "робуксы", "робуксов"),
+    activation="Активировать: в самом Roblox → Пополнить → Использовать код. "
+               "Robux зачислятся сразу на ваш аккаунт.",
+    ad_title="Roblox {номинал} ({регион})",
+    ad_text="Код на пополнение Robux. Выдача сразу после оплаты.",
+)
+
+ROBLOX_CARD = GiftCard(
+    slug="roblox_card", title="Roblox — подарочные карты", emoji="🎁",
+    subcategory="Roblox Gift Cards", unit=MONEY,
+    name_must_not_have="Wallet Code",
+    words=("roblox", "роблокс", "робл"),
+    # Про регион сказано покупателю нарочно: карта номинирована в валюте
+    # своей страны и кладёт деньги в кошелёк, а не Robux напрямую. Аккаунт
+    # другого региона её не примет, и разбираться покупатель будет с
+    # продавцом.
+    activation="Активировать: в самом Roblox → Пополнить → Использовать код. "
+               "Карта пополняет кошелёк в валюте своего региона — аккаунт "
+               "должен быть того же региона.",
+    ad_title="Roblox Gift Card {номинал} ({регион})",
+    ad_text="Подарочная карта Roblox. Выдача сразу после оплаты.",
+)
+
+
 # Реестр. Из него строится меню, по нему же идут общие тесты — один тест на
 # все карты сразу, и это главный выигрыш шаблона.
-CARDS: tuple[GiftCard, ...] = (APPLE, PSN)
+#
+# **Порядок значим.** Заказ забирает первая признавшая карта, поэтому узкие
+# объявления стоят раньше широких: `ROBUX` со словом «robux» — до
+# `ROBLOX_CARD` со словом «roblox», иначе карты забирали бы заказы на Robux.
+CARDS: tuple[GiftCard, ...] = (ROBUX, ROBLOX_CARD, APPLE, PSN)
 
 
 def cards() -> tuple[GiftCard, ...]:
@@ -700,6 +743,33 @@ DEFAULT_CARD_CONF: dict = {
 }
 
 
+def _take_over_robux(plugins: dict, holder: dict) -> None:
+    """Забрать настройки старого раздела AutoRoblox под карту `robux`.
+
+    Robux переехал на общий движок, и у продавца всё нажитое лежит в
+    `plugins["auto_roblox"]`. Самое важное там — **`delivered`**: это
+    список заказов, по которым код уже куплен и отправлен. Потерять его
+    значит выдать их заново, то есть купить второй код за деньги продавца
+    по каждому. `log` и `force` теряются дешевле, но и они переносятся:
+    в журнале лежат коды, не ушедшие в закрытый чат.
+
+    Старый раздел не удаляется. Он остаётся как есть — на случай, если
+    переезд надо будет разобрать: стереть чужие настройки, не спросив,
+    здесь не принято.
+
+    Вызывается лениво и ровно один раз: признак — что карты `robux` в
+    новом хранилище ещё нет.
+    """
+    old = plugins.get("auto_roblox")
+    if not isinstance(old, dict):
+        return
+    fresh = copy.deepcopy(DEFAULT_CARD_CONF)
+    for key in fresh:
+        if key in old:
+            fresh[key] = copy.deepcopy(old[key])
+    holder[ROBUX.slug] = fresh
+
+
 def card_conf(settings: dict, slug: str) -> dict:
     """Настройки одной карты, заводятся лениво.
 
@@ -711,6 +781,8 @@ def card_conf(settings: dict, slug: str) -> dict:
     if not isinstance(holder, dict):                # pragma: no cover
         holder = {}
         plugins["gift_cards"] = holder
+    if str(slug) == ROBUX.slug and ROBUX.slug not in holder:
+        _take_over_robux(plugins, holder)
     conf = holder.setdefault(str(slug), {})
     for key, value in DEFAULT_CARD_CONF.items():
         if key not in conf:

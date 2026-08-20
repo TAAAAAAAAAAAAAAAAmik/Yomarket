@@ -165,7 +165,10 @@ def _cancel_kb(back: str) -> InlineKeyboardMarkup:
 def _plugins_menu_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="⭐ AutoStars", callback_data="plugins:auto_stars")
-    builder.button(text="🎮 AutoRoblox", callback_data="plugins:auto_roblox")
+    # Robux переехал под гифт-карты: это такая же карта, просто номинал у
+    # неё в игровой единице. Отдельная кнопка вела бы во второй экран того
+    # же самого — продавец видел бы два раздела про одно, с раздельными
+    # тумблерами и журналами, и не понимал бы, какой из них работает.
     builder.button(text="🎁 Гифт-карты", callback_data="plugins:gifts")
     # Прежний поставщик переехал сюда из раздела Robux: там он был не к
     # месту — поставщик выбран, и сравнение закупочной цены не то, ради чего
@@ -174,7 +177,7 @@ def _plugins_menu_keyboard() -> InlineKeyboardMarkup:
     # командой, а про команду продавцу неоткуда узнать.
     builder.button(text="🔑 ns.gifts (сравнить цену)", callback_data="ns:creds")
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
-    builder.adjust(2, 1, 1, 1)
+    builder.adjust(2, 1, 1)
     return builder.as_markup()
 
 
@@ -1729,10 +1732,20 @@ def _roblox_settings_keyboard(settings: dict | None = None) -> InlineKeyboardMar
 
 @router.callback_query(F.data == "plugins:auto_roblox")
 async def roblox_screen(callback: CallbackQuery, state: FSMContext) -> None:
+    """Старый вход в раздел Robux — ведёт на его же экран среди гифт-карт.
+
+    Кнопка осталась в сообщениях, отправленных до переезда, и нажимать её
+    будут ещё долго. Прежний экран правил раздел `auto_roblox`, который
+    выдачей больше не управляет: тумблер там включался бы, а выдача его не
+    читала — то самое молчаливое враньё, ради которого написан CLAUDE.md.
+    Поэтому вход не удалён, а перенаправлен.
+    """
+    from automation.giftcards import ROBUX
+
     await state.clear()
-    uid = callback.from_user.id
-    settings = get_settings(uid)
-    await callback.message.edit_text(_roblox_text(settings, get_shop_name(uid)), reply_markup=_roblox_keyboard(settings))
+    settings = get_settings(callback.from_user.id)
+    await callback.message.edit_text(_gift_card_text(settings, ROBUX),
+                                     reply_markup=_gift_card_keyboard(settings, ROBUX))
     await callback.answer()
 
 

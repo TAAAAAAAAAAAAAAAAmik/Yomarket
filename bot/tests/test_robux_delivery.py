@@ -31,6 +31,10 @@ logging.getLogger("tasks.manager").setLevel(logging.CRITICAL)
 
 CATALOG = {"items": [{
     "id": "svc-GL", "name": "Roblox Wallet Code | GL", "type": "voucher",
+    # Движок выбирает услуги по точному имени подкатегории. Живьём 20.08:
+    # все 26 услуг Roblox лежат в «Roblox Gift Cards», а кошельковые коды
+    # отличаются словом «Wallet Code» в названии.
+    "subcategoryName": "Roblox Gift Cards",
     "fields": None,
     "items": [
         {"id": "gl-1000", "name": "1000 Robux", "price": 11.22,
@@ -41,10 +45,16 @@ CATALOG = {"items": [{
 
 
 def settings_with(**over):
-    plugin = {"enabled": True, "region": "GL", "keyword": "", "note": "",
-              "delivered": [], "log": []}
-    plugin.update(over)
-    return {"plugins": {"auto_roblox": plugin}}
+    """Настройки продавца с включённой картой `robux`.
+
+    Раздел переехал в общее хранилище карт: Robux — такая же гифт-карта,
+    просто с номиналом в игровой единице. Путь к деньгам у всех карт один.
+    """
+    conf = {"enabled": True, "region": "GL", "keyword": "", "note": "",
+            "ad_title": "", "ad_text": "",
+            "delivered": [], "log": [], "force": []}
+    conf.update(over)
+    return {"plugins": {"gift_cards": {"robux": conf}}}
 
 
 class Harness:
@@ -65,6 +75,7 @@ class Harness:
         self.buy_result = buy if buy is not None else {
             "ok": True, "why": "", "status": "SUCCESS", "order_id": "o1",
             "codes": ["AAAA-1111"]}
+        self.region = "GL"
         self.lookup_results: list = []   # ответы `order_codes_sync` по порядку
         self.send_result = send
         self.orders: list = []          # (denomination, qty, ref)
@@ -108,12 +119,13 @@ class Harness:
         self._patch(approute, "order_codes_sync", order_codes_sync)
         # Опрос «принятого» заказа ждёт десятками секунд — в тестах ждать
         # нечего, важен порядок вызовов, а не их темп.
-        self._patch(M.TaskManager, "_ROBUX_POLL_STEPS", (0, 0, 0))
+        self._patch(M.TaskManager, "_GIFT_POLL_STEPS", (0, 0, 0))
         self._patch(storage, "get_ar_creds", lambda uid: {"api_key": "k"})
         self._patch(M, "get_ar_creds", lambda uid: {"api_key": "k"})
 
         def save_settings(uid, s):
-            p = s["plugins"]["auto_roblox"]
+            p = ((s.get("plugins") or {}).get("gift_cards") or {}
+                 ).get("robux") or {}
             self.saves.append({
                 "delivered": list(p.get("delivered") or []),
                 "force": list(p.get("force") or []),
@@ -128,7 +140,7 @@ class Harness:
         for module, name, old in reversed(self._undo):
             setattr(module, name, old)
 
-    def run(self, title="1000 Robux", status="work", order_id="777"):
+    def _manager(self):
         from tasks.manager import TaskManager
         mgr = TaskManager.__new__(TaskManager)
 
@@ -141,38 +153,45 @@ class Harness:
 
         mgr._send_chat = send_chat
         mgr._notify = notify
-        asyncio.run(mgr._maybe_deliver_robux(
-            self.uid, object(), self.settings, order_id, title, "chat-1", status))
+        return mgr
+
+    def _api(self):
+        """Заказ и объявление. Регион выдача читает из описания товара: у
+        Юмаркета поля под него нет вовсе."""
+        region = self.region
+
+        class Api:
+            async def get_order(_self, oid):
+                return {"data": {"id": oid, "ad_id": "ad-1"}}
+
+            async def get_ad(_self, ad_id):
+                return {"data": {"content": f"Код.\n\nРегион кода: {region}"}}
+
+        return Api()
+
+    def run(self, title="1000 Robux", status="work", order_id="777"):
+        asyncio.run(self._manager()._maybe_deliver_gifts(
+            self.uid, self._api(), self.settings, order_id, title,
+            "chat-1", status))
         return self
 
     def resume(self, order=None):
         """Проход возобновления — тот, что доводит оборванные выдачи."""
-        from tasks.manager import TaskManager
-        mgr = TaskManager.__new__(TaskManager)
-
-        async def send_chat(api, chat_id, text, settings=None):
-            self.chat_sent.append((chat_id, text))
-            return self.send_result
-
-        async def notify(uid, text):
-            self.notified.append(text)
-
-        class Api:
-            async def get_order(_self, oid):
-                return {"data": {"id": oid}}
-
-        mgr._send_chat = send_chat
-        mgr._notify = notify
-        asyncio.run(mgr._robux_resume(self.uid, Api(), self.settings, set()))
+        asyncio.run(self._manager()._gift_resume(
+            self.uid, self._api(), self.settings, set()))
         return self
+
+    def _conf(self) -> dict:
+        from automation.giftcards import card_conf
+        return card_conf(self.settings, "robux")
 
     @property
     def log(self):
-        return self.settings["plugins"]["auto_roblox"]["log"]
+        return self._conf()["log"]
 
     @property
     def delivered(self):
-        return self.settings["plugins"]["auto_roblox"]["delivered"]
+        return self._conf()["delivered"]
 
 
 class APaidOrderIsDeliveredWithoutAskingTheBuyerAnything(unittest.TestCase):
@@ -461,7 +480,7 @@ class TheManualQueueIsFreedAndTheFreeingIsWrittenDown(unittest.TestCase):
         with Harness(self, settings=settings_with(delivered=["777"],
                                                   force=["777"])) as h:
             h.run()
-            self.assertEqual(h.settings["plugins"]["auto_roblox"]["force"], [])
+            self.assertEqual(h.settings["plugins"]["gift_cards"]["robux"]["force"], [])
             self.assertEqual(h.orders, [])
 
     def test_and_the_seller_hears_about_it(self):
@@ -487,23 +506,25 @@ class TheManualQueueIsWalkedEvenWhenNothingChanged(unittest.TestCase):
         seen: list = []
         stops: list = []
 
-        async def deliver(uid, api_, s, oid, title, chat_id, status=""):
+        # Сигнатуры общего пути: в них добавлена карта — движок один на
+        # все, и знать, чью выдачу он ведёт, ему обязательно.
+        async def deliver(uid, api_, s, gift, oid, title, chat_id, status=""):
             seen.append((oid, title, chat_id, status))
 
-        async def stop(uid, s, oid, qty, why, record=True):
+        async def stop(uid, s, gift, oid, nominal, why, record=True):
             stops.append((oid, why))
 
-        mgr._maybe_deliver_robux = deliver
-        mgr._robux_stop = stop
+        mgr._maybe_deliver_gift = deliver
+        mgr._gift_stop = stop
         # Хранилище тоже на подставке: тест, пишущий в настоящее, оставляет
         # следы соседям — из-за такого здесь уже падали чужие тесты.
         from tasks import manager as M
         real_save, self.saved = M.save_settings, []
         M.save_settings = lambda uid, s: self.saved.append(
-            list((s.get("plugins", {}).get("auto_roblox", {})
-                  .get("force") or [])))
+            list(((s.get("plugins", {}).get("gift_cards", {}) or {})
+                  .get("robux", {}).get("force") or [])))
         try:
-            asyncio.run(mgr._robux_forced_sweep(4242, api, settings, set(tried)))
+            asyncio.run(mgr._gift_forced_sweep(4242, api, settings, set(tried)))
         finally:
             M.save_settings = real_save
         return seen, stops
@@ -551,7 +572,7 @@ class TheManualQueueIsWalkedEvenWhenNothingChanged(unittest.TestCase):
         api = self.api_with({})
         settings = settings_with(force=["999"])
         self.sweep(api, settings)
-        self.assertEqual(settings["plugins"]["auto_roblox"]["force"], [])
+        self.assertEqual(settings["plugins"]["gift_cards"]["robux"]["force"], [])
 
     def test_and_the_freeing_is_written_down(self):
         """Иначе запись вернётся следующим проходом — настройки читаются
@@ -629,7 +650,7 @@ class AnInterruptedDeliveryIsFinishedNotForgotten(unittest.TestCase):
 
     def test_an_order_already_marked_delivered_is_not_touched(self):
         s = self.stuck("покупаем")
-        s["plugins"]["auto_roblox"]["delivered"] = ["777"]
+        s["plugins"]["gift_cards"]["robux"]["delivered"] = ["777"]
         with Harness(self, settings=s) as h:
             h.resume()
             self.assertEqual(h.orders, [])
@@ -649,7 +670,7 @@ class AnInterruptedDeliveryIsFinishedNotForgotten(unittest.TestCase):
                 h.notified.append(text)
 
             mgr._send_chat, mgr._notify = send_chat, notify
-            asyncio.run(mgr._robux_resume(h.uid, object(), h.settings, {"777"}))
+            asyncio.run(mgr._gift_resume(h.uid, h._api(), h.settings, {"777"}))
             self.assertEqual(h.orders, [])
 
     def test_without_a_key_a_bought_code_is_still_not_left_lying(self):
@@ -729,8 +750,8 @@ class TheCatalogueIsNotRereadForEveryOrder(unittest.TestCase):
 
             mgr._send_chat, mgr._notify = send_chat, notify
             for oid in ("801", "802"):
-                asyncio.run(mgr._maybe_deliver_robux(
-                    h.uid, object(), h.settings, oid, "1000 Robux",
+                asyncio.run(mgr._maybe_deliver_gifts(
+                    h.uid, h._api(), h.settings, oid, "1000 Robux",
                     "chat-1", "work"))
             self.assertEqual(len(reads), 1, "каталог прочитан дважды")
             self.assertEqual(len(list(h.orders)), 2)
@@ -740,7 +761,7 @@ class TheCatalogueIsNotRereadForEveryOrder(unittest.TestCase):
         mgr = TaskManager.__new__(TaskManager)
         mgr._ar_catalog = {1: (time.time() - 121, {"items": []})}
         with Harness(self, settings=settings_with()) as h:
-            got = asyncio.run(mgr._robux_catalog(1, {"api_key": "k"}))
+            got = asyncio.run(mgr._supplier_catalog(1, {"api_key": "k"}))
             self.assertEqual(got[1], CATALOG, "отдан просроченный каталог")
 
     def test_a_failed_read_is_not_cached(self):
@@ -748,7 +769,7 @@ class TheCatalogueIsNotRereadForEveryOrder(unittest.TestCase):
         from tasks.manager import TaskManager
         mgr = TaskManager.__new__(TaskManager)
         with Harness(self, settings=settings_with(), catalog=None) as h:
-            ok, _ = asyncio.run(mgr._robux_catalog(1, {"api_key": "k"}))
+            ok, _ = asyncio.run(mgr._supplier_catalog(1, {"api_key": "k"}))
             self.assertFalse(ok)
             self.assertEqual(getattr(mgr, "_ar_catalog", {}), {})
 
