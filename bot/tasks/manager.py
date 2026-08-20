@@ -955,6 +955,12 @@ def _match_panel_id(title, by_title: dict) -> str:
 _ROBUX_UNFINISHED = ("собираемся покупать", "покупаем", "куплен, ждём код",
                      "куплен, отправляем")
 
+# Те же состояния для гифт-карт. Кортеж отдельный намеренно: состояния
+# двух плагинов не обязаны совпадать вечно, а общий связал бы их молча —
+# и переименование у одного сломало бы возобновление у другого.
+_GIFT_UNFINISHED = ("собираемся покупать", "покупаем", "куплен, ждём код",
+                    "куплен, отправляем")
+
 
 class TaskManager:
     def __init__(self, bot: Bot) -> None:
@@ -1359,6 +1365,10 @@ class TaskManager:
                     robux_tried.add(oid)
                     await self._maybe_deliver_robux(
                         user_id, api, settings, oid, title, chat_id, status)
+                    # Гифт-карты: тот же случай — спрашивать нечего, код
+                    # уходит сразу по факту оплаты.
+                    await self._maybe_deliver_gifts(
+                        user_id, api, settings, oid, title, chat_id, status)
 
                 elif prev_status != status and status in _DONE_STATUSES:
                     ev = ae.get("on_confirmed", {})
@@ -1427,6 +1437,8 @@ class TaskManager:
                         robux_tried.add(oid)
                         await self._maybe_deliver_robux(
                             user_id, api, settings, oid, title, chat_id, status)
+                        await self._maybe_deliver_gifts(
+                            user_id, api, settings, oid, title, chat_id, status)
 
                 # Заказ лежит оплаченным, а в работу не взят. Автопринятие
                 # знало ровно два момента: заказ увиден впервые и пришла
@@ -1459,6 +1471,11 @@ class TaskManager:
             # После ручной очереди: сначала то, о чём продавец попросил
             # явно, потом то, что оборвалось само.
             await self._robux_resume(user_id, api, settings, robux_tried)
+
+            # Гифт-карты — тем же порядком: сначала то, о чём продавец
+            # попросил явно, потом то, что оборвалось само.
+            await self._gift_forced_sweep(user_id, api, settings, robux_tried)
+            await self._gift_resume(user_id, api, settings, robux_tried)
 
             await self._check_messages(user_id, api, settings)
             await self._check_watched_chats(user_id, api, settings)
@@ -2388,7 +2405,18 @@ class TaskManager:
                                  chat_id)
 
     async def _robux_catalog(self, user_id: int, creds: dict) -> tuple[bool, object]:
-        """Каталог поставщика — свой на продавца, живёт две минуты.
+        """Каталог поставщика для Robux. Обёртка над общим чтением.
+
+        Имя оставлено прежним: на него ссылаются тесты, и оно называет
+        место, откуда каталог берёт выдача Robux. Само чтение теперь общее
+        (`_supplier_catalog`) — иначе два плагина с раздельными кешами
+        душили бы друг друга: у `GET /services` лимит **2 запроса в минуту
+        на кабинет**.
+        """
+        return await self._supplier_catalog(user_id, creds)
+
+    async def _supplier_catalog(self, user_id: int, creds: dict) -> tuple[bool, object]:
+        """Каталог поставщика — один на продавца, живёт две минуты.
 
         Читался он под каждый заказ заново, а это один ответ на 1263 услуги:
         три оплаченных заказа в одном проходе — три таких чтения подряд, и
@@ -2427,6 +2455,12 @@ class TaskManager:
     # вместо кода, который уже куплен.
     _ROBUX_POLL_STEPS = (12, 12, 15, 20, 30, 30, 30, 45, 60, 60)
     _ROBUX_POLL_CEILING = 600.0        # десять минут, дальше — на следующий проход
+
+    # То же для гифт-карт. Значения совпадают, но константы свои: лимит
+    # `GET /orders?unhide=true` общий на кабинет, а вот менять темп одному
+    # плагину, не трогая другой, должно быть можно.
+    _GIFT_POLL_STEPS = (12, 12, 15, 20, 30, 30, 30, 45, 60, 60)
+    _GIFT_POLL_CEILING = 600.0
 
     async def _robux_region_of(self, api: YooMarketAPI, order_id: str,
                                entry_hint: dict | None = None) -> tuple[str, str]:
@@ -2864,6 +2898,572 @@ class TaskManager:
         await self._notify(user_id, _card(
             "🎮 <b>ROBUX НЕ ВЫДАНЫ</b>",
             [f"Заказ #{_esc(order_id)}" + (f", {qty} Robux" if qty else "") + ".",
+             f"Причина: {_esc(str(why))}.",
+             "",
+             "Покупатель ждёт оплаченный заказ — выдайте вручную."]))
+
+    # -----------------------------------------------------------------
+    # Гифт-карты: один путь к деньгам на все карты реестра
+    #
+    # Замысел продавца: «одинаковые менюшки и т.д, просто ид покупки
+    # меняется». Поэтому здесь нет ни одной ветки «если это Apple, то
+    # иначе»: карта приходит параметром, а всё остальное общее.
+    #
+    # Порядок записей тот же, что у Robux, и он не переставляется:
+    # намерение до вызова поставщика → код до отправки покупателю →
+    # отметка «выдано» только после подтверждённой отправки. Каждая из трёх
+    # закрывает свой способ потерять деньги.
+    # -----------------------------------------------------------------
+
+    async def _ad_description(self, api: YooMarketAPI, order_id: str) -> str:
+        """Описание товара, по которому сделан заказ.
+
+        В заказе от объявления приходит только `ad_id`, поэтому описание
+        дочитывается отдельным запросом `GET /ads/{id}` — там оно лежит в
+        поле `content` (проверено живьём 19.08).
+        """
+        try:
+            order = await asyncio.wait_for(api.get_order(order_id), timeout=30)
+        except Exception as e:
+            logger.info("Гифт-карты: заказ %s не дочитан — %s", order_id, e)
+            return ""
+        node = (order.get("data") if isinstance(order, dict) and "data" in order
+                else order) or {}
+        ad_id = node.get("ad_id") if isinstance(node, dict) else None
+        if not ad_id:
+            return ""
+        try:
+            ad = await asyncio.wait_for(api.get_ad(ad_id), timeout=30)
+        except Exception as e:
+            logger.info("Гифт-карты: объявление %s не прочитано — %s", ad_id, e)
+            return ""
+        card = (ad.get("data") if isinstance(ad, dict) and "data" in ad
+                else ad) or {}
+        return str(card.get("content") or "") if isinstance(card, dict) else ""
+
+    async def _gift_region_of(self, api: YooMarketAPI, order_id: str,
+                              entry_hint: dict | None = None) -> tuple[str, str]:
+        """Регион кода → (регион, чем узнали).
+
+        Записанный регион главнее: у оборванной выдачи он уже в журнале, и
+        перечитывать его значит рисковать другим ответом, если продавец
+        успел поправить описание.
+        """
+        from automation.giftcards import region_from_description
+
+        saved = str((entry_hint or {}).get("region") or "").upper()
+        if saved:
+            return saved, "запись в журнале"
+        return region_from_description(await self._ad_description(api, order_id))
+
+    async def _maybe_deliver_gifts(
+        self, user_id: int, api: YooMarketAPI, settings: dict,
+        order_id: str, title: str, chat_id: str, status: str = "",
+    ) -> None:
+        """Раздать заказ той карте, которая его признала.
+
+        **Первая признавшая забирает заказ.** Название вида «Apple или Xbox»
+        признали бы обе, и без остановки бот купил бы два кода на один
+        оплаченный заказ.
+        """
+        from automation.giftcards import card_conf, cards, is_card_order
+
+        for gift in cards():
+            conf = card_conf(settings, gift.slug)
+            forced = conf.get("force") or []
+            if order_id in forced:
+                await self._maybe_deliver_gift(user_id, api, settings, gift,
+                                               order_id, title, chat_id, status)
+                return
+            if not conf.get("enabled"):
+                continue
+            if not is_card_order(gift, title, conf.get("keyword") or ""):
+                continue
+            await self._maybe_deliver_gift(user_id, api, settings, gift,
+                                           order_id, title, chat_id, status)
+            return
+
+    async def _maybe_deliver_gift(
+        self, user_id: int, api: YooMarketAPI, settings: dict, gift,
+        order_id: str, title: str, chat_id: str, status: str = "",
+    ) -> None:
+        """Выдать код гифт-карты по оплаченному заказу."""
+        from automation.giftcards import (card_conf, match_denomination,
+                                          nominal_from_title, order_reference)
+        from orderfields import is_paid
+        from storage import get_ar_creds
+
+        conf = card_conf(settings, gift.slug)
+        # Ручная выдача идёт этим же путём, а не своим. Второй путь к деньгам
+        # пришлось бы снабдить тем же порядком записей, и однажды он бы с
+        # ним разъехался.
+        forced: list = conf.setdefault("force", [])
+        by_hand = order_id in forced
+
+        # «Создан» деньгами не является: маркетплейс на таком заказе прямо
+        # предупреждает «не выдавайте товар».
+        if not is_paid(status):
+            if by_hand:
+                forced.remove(order_id)
+                # Без записи снятие живёт до конца прохода: настройки
+                # читаются заново каждую минуту, и продавец получал бы одно
+                # и то же уведомление, пока покупатель не заплатит.
+                save_settings(user_id, settings)
+                await self._gift_stop(
+                    user_id, settings, gift, order_id, "",
+                    f"заказ не оплачен (статус «{status}»). Выдавать по "
+                    f"неоплаченному нельзя — маркетплейс сам об этом "
+                    f"предупреждает", record=False)
+            return
+
+        delivered: list = conf.setdefault("delivered", [])
+        if order_id in delivered:
+            if by_hand:
+                forced.remove(order_id)
+                save_settings(user_id, settings)
+                await self._notify(user_id, _card(
+                    f"{gift.emoji} <b>{_esc(gift.title.upper())}: УЖЕ ВЫДАНО</b>",
+                    [f"Заказ #{_esc(order_id)} выдан раньше — "
+                     f"второй раз бот покупать не станет.",
+                     "Код лежит в журнале выдач."]))
+            return
+
+        log: list = conf.setdefault("log", [])
+        # Заказ уже в журнале — значит вызов поставщика мог уйти. Повторять
+        # его можно только той же ссылкой, а заводить вторую запись нельзя:
+        # по ней потом не понять, что покупали.
+        already = next((e for e in log if e.get("order") == order_id), None)
+
+        if by_hand:
+            # Снимаем метку сразу: что бы дальше ни случилось, второй раз по
+            # ней заходить нельзя.
+            forced.remove(order_id)
+            save_settings(user_id, settings)
+
+        region, how = await self._gift_region_of(api, order_id, entry_hint=already)
+        if not region:
+            region = str(conf.get("region") or "").upper()
+            how = "настройка плагина" if region else ""
+        if not region:
+            await self._gift_stop(
+                user_id, settings, gift, order_id, "",
+                "в описании товара не сказано, какой это регион, и запасной "
+                "не задан. Допишите в описание строку вида «Регион кода: US» "
+                "— выдача читает её оттуда", record=False)
+            return
+
+        creds = get_ar_creds(user_id)
+        if not creds or not creds.get("api_key"):
+            await self._gift_stop(user_id, settings, gift, order_id, "",
+                                  "ключ AppRoute не задан — Плагины → "
+                                  "🎁 Гифт-карты → 🔑 Поставщик")
+            return
+
+        ok, catalog = await self._supplier_catalog(user_id, creds)
+        if not ok:
+            await self._gift_stop(user_id, settings, gift, order_id, "",
+                                  f"каталог поставщика не прочитан: {catalog}")
+            return
+
+        value, measure = nominal_from_title(gift, title)
+        row, why, _how = match_denomination(catalog, gift, region, value, measure)
+        if not row:
+            await self._gift_stop(user_id, settings, gift, order_id, "", why)
+            return
+
+        # Ссылка при повторе берётся из записи, а не считается заново: она
+        # и есть вся защита от второго списания.
+        reference = str((already or {}).get("reference") or "") \
+            or order_reference(gift.slug, order_id)
+        entry = already or {
+            "order": order_id, "card": gift.slug,
+            "nominal": row["nominal"], "value": row["value"],
+            "measure": row["measure"],
+            "denomination": row["denomination_id"],
+            "service_id": row.get("service_id") or "",
+            "reference": reference, "region": region,
+            "price": row.get("price"), "at": time.time(),
+            # Чат запоминается: возобновление оборванной выдачи идёт из
+            # журнала, а карточки заказа под рукой у него нет.
+            "chat": str(chat_id or ""),
+            "codes": [], "state": "собираемся покупать",
+        }
+        if entry not in log:
+            log.insert(0, entry)
+            del log[40:]
+        save_settings(user_id, settings)          # намерение — до вызова
+
+        await self._gift_finish(user_id, api, settings, gift, entry, creds,
+                                chat_id)
+
+    async def _gift_recheck(self, creds: dict, entry: dict) -> tuple[bool, object]:
+        """Свежие цена и остаток номинала — замена сухому прогону.
+
+        Сухого прогона для магазина не существует: `checkOnly` разрешён
+        только при `ordersType=dtu`, а гифт-карты это `voucher`. Чтение
+        одного номинала стоит 120 запросов в минуту против 2 у каталога,
+        поэтому зовётся под каждую покупку.
+        """
+        from automation.approute import item_sync
+
+        loop = asyncio.get_event_loop()
+        service_id = str(entry.get("service_id") or "")
+        denomination = str(entry.get("denomination") or "")
+        try:
+            ok, data = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: item_sync(creds, service_id, denomination)),
+                timeout=60)
+        except Exception as e:
+            return False, str(e)[:200]
+        if not ok:
+            return False, str(data)[:300]
+        return True, (data if isinstance(data, dict) else {})
+
+    async def _gift_wait_codes(self, user_id: int, settings: dict, gift,
+                               entry: dict, creds: dict, reference: str):
+        """Дождаться кода по принятому заказу.
+
+        Возвращает коды, пустой список (терминальный статус без кодов — это
+        отказ) или `None`: «время вышло, доведём следующим проходом».
+
+        Поток здесь занят, а на нём стоит опрос заказов этого продавца,
+        поэтому ожидание ограничено сверху жёстко. Незаконченная запись не
+        теряется: `_gift_resume` подберёт её по состоянию.
+        """
+        from automation.approute import TERMINAL_STATUSES, order_codes_sync
+
+        loop = asyncio.get_event_loop()
+        waited = 0.0
+        for step in self._GIFT_POLL_STEPS:
+            if waited >= self._GIFT_POLL_CEILING:
+                break
+            await asyncio.sleep(step)
+            waited += step
+            try:
+                got = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, lambda: order_codes_sync(creds, reference)),
+                    timeout=60)
+            except Exception as e:
+                logger.info("Гифт-карты: опрос %s — %s", reference, e)
+                continue
+            if not got.get("ok"):
+                continue
+            codes = list(got.get("codes") or [])
+            if codes:
+                return codes
+            status = str(got.get("status") or "")
+            if status in TERMINAL_STATUSES:
+                # `PARTIALLY_COMPLETED` — тоже конец, а не «ещё подождём».
+                entry["state"] = "ответ без кода"
+                entry["why"] = f"поставщик закончил заказ статусом {status}"
+                save_settings(user_id, settings)
+                return []
+        return None
+
+    async def _gift_finish(self, user_id: int, api: YooMarketAPI,
+                           settings: dict, gift, entry: dict, creds: dict,
+                           chat_id: str) -> None:
+        """Купить (если ещё не купили), отправить код, отметить выданным.
+
+        **Единственный путь к деньгам для всех карт сразу.** Сюда приходят
+        все три входа: новый оплаченный заказ, ручная очередь и
+        возобновление оборванной выдачи.
+        """
+        from automation.approute import order_place_sync
+        from automation.giftcards import card_conf
+
+        order_id = str(entry.get("order") or "")
+        nominal = str(entry.get("nominal") or "")
+        region = str(entry.get("region") or "")
+        denomination = str(entry.get("denomination") or "")
+        reference = str(entry.get("reference") or "")
+        conf = card_conf(settings, gift.slug)
+        loop = asyncio.get_event_loop()
+
+        codes = [str(c) for c in (entry.get("codes") or []) if c]
+        if not codes and str(entry.get("state")) == "куплен, ждём код":
+            # Заказ уже принят поставщиком — повторять покупку незачем.
+            waited = await self._gift_wait_codes(user_id, settings, gift,
+                                                 entry, creds, reference)
+            if waited is None:
+                return
+            if not waited:
+                # Терминальный статус без кодов — это отказ. Провалиться
+                # отсюда в покупку значит купить ещё раз то, что поставщик
+                # уже закончил.
+                await self._gift_stop(
+                    user_id, settings, gift, order_id, nominal,
+                    str(entry.get("why") or "поставщик закончил заказ, кода "
+                                            "в нём нет"), record=False)
+                return
+            codes = waited
+
+        if not codes:
+            fresh_ok, fresh = await self._gift_recheck(creds, entry)
+            if not fresh_ok:
+                entry["state"] = "номинал не перечитан"
+                entry["why"] = str(fresh)[:300]
+                save_settings(user_id, settings)
+                await self._gift_stop(
+                    user_id, settings, gift, order_id, nominal,
+                    f"номинал не перечитан перед покупкой: {fresh}",
+                    record=False)
+                return
+            if int((fresh or {}).get("inStock") or 0) <= 0:
+                entry["state"] = "нет в наличии"
+                save_settings(user_id, settings)
+                await self._gift_stop(
+                    user_id, settings, gift, order_id, nominal,
+                    "к моменту покупки номинал кончился у поставщика — "
+                    "денег не потрачено", record=False)
+                return
+            # Цена запоминается ДО покупки: иначе «почему списалось столько»
+            # объяснить будет нечем.
+            if fresh.get("price") is not None:
+                entry["price"] = fresh.get("price")
+
+            entry["state"] = "покупаем"
+            save_settings(user_id, settings)
+            try:
+                got = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, lambda: order_place_sync(creds, denomination, 1,
+                                                       reference)),
+                    timeout=120)
+            except Exception as e:
+                got = {"ok": False, "why": str(e)[:200], "status": "",
+                       "codes": []}
+            if not got.get("ok"):
+                entry["state"] = "поставщик отказал"
+                entry["why"] = str(got.get("why"))[:300]
+                save_settings(user_id, settings)
+                await self._gift_stop(user_id, settings, gift, order_id,
+                                      nominal,
+                                      f"поставщик отказал: {got.get('why')}",
+                                      record=False)
+                return
+
+            codes = list(got.get("codes") or [])
+            # `IN_PROGRESS` — законный ответ: заказ принят, код будет позже.
+            # Для «долгих» номиналов это обычное дело, а их у гифт-карт
+            # заметно больше, чем у Robux.
+            if not codes and str(got.get("status") or "") == "IN_PROGRESS":
+                entry["state"] = "куплен, ждём код"
+                save_settings(user_id, settings)
+                codes = await self._gift_wait_codes(user_id, settings, gift,
+                                                    entry, creds, reference)
+                if codes is None:
+                    # Потолок ожидания. Запись осталась в «ждём код», её
+                    # доведёт `_gift_resume` следующим проходом.
+                    return
+            if not codes:
+                # Причину, если поставщик её назвал, обязательно повторить:
+                # `_gift_wait_codes` записывает её в журнал, и молчащее
+                # уведомление оставляло бы продавца с «кода нет» без ответа
+                # на «почему». Именно за это в `CLAUDE.md` заведено правило
+                # «каждое „ничего не произошло“ объясняется».
+                said = str(entry.get("why") or "").strip()
+                entry["state"] = "ответ без кода"
+                save_settings(user_id, settings)
+                await self._notify(user_id, _card(
+                    f"{gift.emoji} <b>{_esc(gift.title.upper())}: "
+                    f"ОТВЕТ БЕЗ КОДА</b>",
+                    [f"Заказ #{_esc(order_id)}, {_esc(nominal)}.",
+                     (f"Причина: {_esc(said)}." if said
+                      else "Поставщик не отказал, но кода не прислал."),
+                     f"Ссылка покупки: <code>{_esc(reference)}</code>.",
+                     "",
+                     "Деньги могли списаться. Посмотрите кабинет по этой "
+                     "ссылке и выдайте код вручную, если он там есть."]))
+                return
+
+            # Код записывается ДО отправки: чат может быть закрыт, и тогда
+            # купленный код не должен остаться никому.
+            entry["codes"] = codes
+            entry["state"] = "куплен, отправляем"
+            save_settings(user_id, settings)
+
+        note = str(conf.get("note") or "").strip()
+        text = "\n".join(
+            [f"Ваш код {gift.title} {nominal}:"]
+            + list(codes)
+            + ["", gift.activation]
+            + ([f"Регион кода: {region}."] if region else [])
+            + ([note] if note else []))
+        sent, err = await self._send_chat(api, chat_id, text, settings)
+        if not sent:
+            entry["state"] = "куплен, отправить не смогли"
+            entry["why"] = str(err)[:200]
+            save_settings(user_id, settings)
+            await self._notify(user_id, _card(
+                f"{gift.emoji} <b>{_esc(gift.title.upper())}: КУПЛЕН, "
+                f"НО НЕ ОТПРАВЛЕН</b>",
+                [f"Заказ #{_esc(order_id)}, {_esc(nominal)}.",
+                 f"Причина: {_esc(str(err))}.",
+                 "",
+                 "Код: " + ", ".join(_esc(c) for c in codes),
+                 "",
+                 "Передайте его покупателю сами — второй раз бот покупать "
+                 "не станет."]))
+            return
+
+        # Только теперь. Отметка по факту покупки однажды доложила бы о
+        # выдаче, которой покупатель не видел.
+        entry["state"] = "выдан"
+        delivered: list = conf.setdefault("delivered", [])
+        if order_id not in delivered:
+            delivered.append(order_id)
+        # Новые записи в конце, значит лишнее режется с начала.
+        del delivered[:-200]
+        save_settings(user_id, settings)
+        logger.info("Гифт-карты (%s): заказ %s выдан (%s)",
+                    gift.slug, order_id, nominal)
+
+    async def _gift_forced_sweep(self, user_id: int, api: YooMarketAPI,
+                                 settings: dict, tried: set) -> None:
+        """Ручная очередь: заказы, до которых обычный проход не доходит.
+
+        Выдача срабатывает на **перемену** — заказ увиден впервые или пришла
+        оплата. А в очередь продавец ставит обычно давно оплаченный заказ, с
+        которым ничего не происходит.
+        """
+        from automation.giftcards import card_conf, cards
+        from orderfields import describe as _describe
+        from orderfields import order_chat_id as _chat_of
+
+        for gift in cards():
+            conf = card_conf(settings, gift.slug)
+            waiting = [o for o in list(conf.get("force") or [])
+                       if o not in tried]
+            for oid in waiting:
+                tried.add(oid)
+                raw, err = {}, ""
+                try:
+                    raw = await api.get_order(oid)
+                except Exception as e:
+                    raw, err = {}, str(e)[:200]
+                node = (raw.get("data") if isinstance(raw, dict)
+                        and isinstance(raw.get("data"), dict) else raw)
+                node = node if isinstance(node, dict) else {}
+                if not node:
+                    queue: list = conf.setdefault("force", [])
+                    if oid in queue:
+                        queue.remove(oid)
+                    save_settings(user_id, settings)
+                    # Заказ снимается с очереди и когда номер неверен, и
+                    # когда оборвалась связь: различить их здесь нечем, а
+                    # оставлять запись значит молчать о ней каждый проход.
+                    await self._gift_stop(
+                        user_id, settings, gift, oid, "",
+                        "маркетплейс не отдал заказ с таким номером"
+                        + (f" ({err})" if err else "")
+                        + ". Проверьте номер; если это был сбой связи — "
+                        "поставьте заказ в очередь снова", record=False)
+                    continue
+                d = _describe(node)
+                chat_id = _chat_of(node) or oid
+                await self._maybe_deliver_gift(
+                    user_id, api, settings, gift, oid,
+                    d.get("title") or "—", chat_id, d.get("status") or "")
+
+    async def _gift_resume(self, user_id: int, api: YooMarketAPI,
+                           settings: dict, tried: set) -> None:
+        """Довести до конца выдачи, оборванные посередине.
+
+        Обрыв случается чаще всего не от сбоя, а от обычного выката:
+        контейнер перезапускается, задача умирает между «покупаем» и
+        «выдан». После этого статус заказа больше не меняется никогда,
+        значит по нему уже ничего не сработает: деньги потрачены,
+        покупатель без кода, продавец без единого слова.
+
+        Повтор безопасен ровно потому, что ссылка та же.
+        """
+        from automation.giftcards import card_conf, cards
+        from orderfields import order_chat_id as _chat_of
+        from storage import get_ar_creds
+
+        creds = None
+        for gift in cards():
+            conf = card_conf(settings, gift.slug)
+            delivered = conf.get("delivered") or []
+            stuck = [e for e in list(conf.get("log") or [])
+                     if isinstance(e, dict)
+                     and str(e.get("state") or "") in _GIFT_UNFINISHED
+                     and str(e.get("order") or "")
+                     and str(e.get("order")) not in tried
+                     and str(e.get("order")) not in delivered]
+            if not stuck:
+                continue
+            if creds is None:
+                creds = get_ar_creds(user_id) or {}
+            if not creds.get("api_key"):
+                # Ключ нужен, только чтобы **купить**. Записи с уже
+                # купленным кодом его не требуют вовсе: покупать нечего,
+                # осталось отправить.
+                ready = [e for e in stuck if e.get("codes")]
+                for entry in [e for e in stuck if not e.get("codes")]:
+                    # Сказать хватит одного раза на запись: настройки
+                    # читаются заново каждую минуту, и без отметки это
+                    # уведомление раз в минуту.
+                    if entry.get("said_no_key"):
+                        continue
+                    entry["said_no_key"] = True
+                    save_settings(user_id, settings)
+                    await self._gift_stop(
+                        user_id, settings, gift, str(entry.get("order")),
+                        str(entry.get("nominal") or ""),
+                        "выдача осталась незаконченной, а ключ AppRoute не "
+                        "задан — довести её нечем", record=False)
+                if not ready:
+                    continue
+                stuck = ready
+
+            for entry in stuck:
+                oid = str(entry.get("order"))
+                tried.add(oid)
+                chat_id = str(entry.get("chat") or "")
+                if not chat_id:
+                    # Записи, сделанные до того, как чат стал запоминаться.
+                    try:
+                        raw = await api.get_order(oid)
+                    except Exception:
+                        raw = {}
+                    node = (raw.get("data") if isinstance(raw, dict)
+                            and isinstance(raw.get("data"), dict) else raw)
+                    chat_id = _chat_of(node if isinstance(node, dict)
+                                       else {}) or oid
+                    entry["chat"] = chat_id
+                logger.info("Гифт-карты (%s): доводим оборванную выдачу по "
+                            "заказу %s (состояние «%s»)",
+                            gift.slug, oid, entry.get("state"))
+                await self._gift_finish(user_id, api, settings, gift, entry,
+                                        creds, chat_id)
+
+    async def _gift_stop(self, user_id: int, settings: dict, gift,
+                         order_id: str, nominal: str, why: str,
+                         record: bool = True) -> None:
+        """Сказать продавцу, почему выдачи не будет.
+
+        «Ничего не произошло» без причины — самая частая поломка этого
+        проекта. Здесь она стоила бы покупателю ожидания оплаченного заказа.
+        """
+        from automation.giftcards import card_conf
+
+        if record:
+            conf = card_conf(settings, gift.slug)
+            log: list = conf.setdefault("log", [])
+            log.insert(0, {"order": order_id, "card": gift.slug,
+                           "nominal": nominal, "at": time.time(),
+                           "state": "не выдан", "why": str(why)[:300],
+                           "codes": []})
+            del log[40:]
+            save_settings(user_id, settings)
+        await self._notify(user_id, _card(
+            f"{gift.emoji} <b>{_esc(gift.title.upper())}: НЕ ВЫДАНО</b>",
+            [f"Заказ #{_esc(order_id)}"
+             + (f", {_esc(nominal)}" if nominal else "") + ".",
              f"Причина: {_esc(str(why))}.",
              "",
              "Покупатель ждёт оплаченный заказ — выдайте вручную."]))

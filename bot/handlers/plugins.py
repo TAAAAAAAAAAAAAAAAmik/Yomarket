@@ -145,10 +145,11 @@ class PluginState(StatesGroup):
     roblox_set_ad_title = State()
     roblox_set_ad_text = State()
     roblox_ads_rate = State()
-    # AutoGifts
-    gifts_manual_buyer = State()
-    gifts_set_type = State()
-    gifts_set_note = State()
+    # Гифт-карты. Состояния общие на все карты реестра: `slug` лежит в
+    # данных состояния, а не в его имени. Иначе двадцать пять карт по
+    # четыре поля добавили бы сотню состояний к нынешним девяноста трём.
+    gc_field = State()
+    gc_manual = State()
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +166,7 @@ def _plugins_menu_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="⭐ AutoStars", callback_data="plugins:auto_stars")
     builder.button(text="🎮 AutoRoblox", callback_data="plugins:auto_roblox")
-    builder.button(text="🎁 AutoGifts", callback_data="plugins:auto_gifts")
+    builder.button(text="🎁 Гифт-карты", callback_data="plugins:gifts")
     # Прежний поставщик переехал сюда из раздела Robux: там он был не к
     # месту — поставщик выбран, и сравнение закупочной цены не то, ради чего
     # открывают экран выдачи. Но убрать его совсем значило бы оставить экран
@@ -2339,154 +2340,481 @@ async def roblox_set_note_input(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AutoGifts
+# Гифт-карты: один набор экранов на все карты реестра
+#
+# «Одинаковые менюшки и т.д, просто ид покупки меняется» — поэтому здесь нет
+# ни одного экрана, написанного под конкретную карту. Всё, что отличает Apple
+# от Xbox, лежит в декларации (`automation/giftcards.py`), а экран собирается
+# из неё.
+#
+# `callback_data` — `plugins:gc:<slug>:<действие>`, и это не случайная форма:
+# у Telegram на неё **64 байта**, а карт может быть двадцать пять. Регион в
+# callback не кладётся вовсе — их бывает 63 у одной карты, для них отдельный
+# ввод.
+#
+# Раньше на этом месте была заглушка **другого товара** — «Telegram —
+# Подарки», с полями «Тип подарка» и «Заметка» и пятью кнопками, честно
+# отвечавшими «функция появится в следующем обновлении». Обещание, которого
+# бот не сдержит, убрано вместе с ними: понадобятся телеграм-подарки — это
+# отдельный плагин с другим поставщиком, у них с картами общего ничего.
 # ---------------------------------------------------------------------------
 
-def _gifts_text(settings: dict, shop_name: str = "") -> str:
-    p = settings["plugins"]["auto_gifts"]
-    enabled = p.get("enabled", False)
-    note = p.get("note") or "—"
-    name_part = f" • {shop_name}" if shop_name else ""
-    status = ("🟢 Настройки сохранены" if enabled
-              else "🔴 Настройки не сохранены")
-    return (
-        f"🎁 <b>Telegram — Подарки{name_part}</b>\n\n"
-        f"🚧 <b>Раздел готовится.</b> Отправка подарков появится в следующем "
-        f"обновлении — сейчас можно только сохранить настройки.\n\n"
-        f"{status}\n"
-        f"{note}"
-    )
+
+def _gift_cards_text(settings: dict, shop_name: str = "") -> str:
+    from automation.giftcards import card_conf, cards
+
+    name_part = f" • {html.escape(shop_name)}" if shop_name else ""
+    lines = [f"🎁 <b>Гифт-карты{name_part}</b>", ""]
+    on = [c for c in cards() if card_conf(settings, c.slug).get("enabled")]
+    if on:
+        lines.append("<b>Включены:</b>")
+        for gift in on:
+            conf = card_conf(settings, gift.slug)
+            region = str(conf.get("region") or "").upper() or "из описания"
+            lines.append(f"{gift.emoji} {html.escape(gift.title)} — регион: "
+                         f"{html.escape(region)}")
+    else:
+        lines.append("Пока не включена ни одна карта.")
+    lines += [
+        "",
+        "<b>Что здесь выдаётся.</b> Код, который покупатель активирует сам. "
+        "Ник и логин не нужны — выдача идёт сразу по факту оплаты.",
+        "",
+        "⚠️ <b>На живом заказе выдача ещё не проверялась.</b> Первые покупки "
+        "посмотрите глазами: бот пишет о каждой — и об удачной, и о "
+        "несостоявшейся.",
+    ]
+    return "\n".join(lines)
 
 
-def _gifts_keyboard(settings: dict) -> InlineKeyboardMarkup:
-    enabled = settings["plugins"]["auto_gifts"].get("enabled", False)
+def _gift_cards_keyboard(settings: dict) -> InlineKeyboardMarkup:
+    from automation.giftcards import card_conf, cards
+
     builder = InlineKeyboardBuilder()
-    builder.button(text="🚀 Ручная выдача", callback_data="plugins:gifts:manual")
-    builder.button(text="📦 Выдать накопленные", callback_data="plugins:gifts:accumulated")
-    builder.button(text="💎 Прибыль", callback_data="plugins:gifts:profit")
-    builder.button(text="💰 Баланс", callback_data="plugins:gifts:balance")
-    builder.button(text="🔔 Уведомления", callback_data="plugins:gifts:notifs")
-    builder.button(text="💬 Ответы", callback_data="plugins:gifts:replies")
-    builder.button(text="▶️ Включить" if not enabled else "⏸ Выключить", callback_data="plugins:gifts:toggle")
-    builder.button(text="⚙️ Настройки", callback_data="plugins:gifts:settings")
+    on = [c for c in cards() if card_conf(settings, c.slug).get("enabled")]
+    for gift in on:
+        builder.button(text=f"{gift.emoji} {gift.title}",
+                       callback_data=f"plugins:gc:{gift.slug}")
+    if len(on) < len(cards()):
+        builder.button(text="➕ Добавить карту", callback_data="plugins:gifts:add")
+    builder.button(text="🔑 Поставщик AppRoute", callback_data="apr:creds")
     builder.button(text="⬅️ Назад", callback_data="plugins:menu")
-    builder.adjust(2, 2, 2, 1, 2)
+    builder.adjust(1)
     return builder.as_markup()
 
 
-def _gifts_settings_text(settings: dict) -> str:
-    p = settings["plugins"]["auto_gifts"]
-    gift_type = p.get("gift_type") or "—"
-    note = p.get("note") or "—"
-    return (
-        f"⚙️ <b>Настройки AutoGifts</b>\n\n"
-        f"🎁 Тип подарка: <b>{gift_type}</b>\n"
-        f"📝 Заметка: <i>{note}</i>"
-    )
+def _gift_card_text(settings: dict, gift) -> str:
+    from automation.giftcards import card_conf
+
+    conf = card_conf(settings, gift.slug)
+    enabled = conf.get("enabled")
+    region = str(conf.get("region") or "").upper()
+    keyword = str(conf.get("keyword") or "")
+    note = str(conf.get("note") or "")
+    log = conf.get("log") or []
+    delivered = conf.get("delivered") or []
+    lines = [
+        f"{gift.emoji} <b>{html.escape(gift.title)}</b>",
+        "",
+        ("🟢 <b>Автовыдача включена</b> — бот сам купит код по оплаченному "
+         "заказу" if enabled
+         else "🔴 Автовыдача выключена — заказы выдаёте вручную"),
+        "",
+        f"🌐 Регион: <b>{html.escape(region) if region else 'из описания товара'}</b>",
+    ]
+    if not region:
+        lines.append("   Бот читает строку «Регион кода: XX» из описания "
+                     "товара. У Юмаркета своего поля региона нет.")
+    if keyword:
+        lines.append(f"🔤 Слово-опознаватель: <code>{html.escape(keyword)}</code>"
+                     f" — в работу пойдут только заказы с ним")
+    else:
+        words = ", ".join(gift.words[:4])
+        lines.append(f"🔤 Слово-опознаватель: <i>не задано</i> — узнаём заказ "
+                     f"по словам: {html.escape(words)}")
+        lines.append("   ⚠️ Если у вас есть товары вида «аккаунт» с тем же "
+                     "словом, задайте своё: иначе они тоже попадут в выдачу.")
+    if note:
+        lines.append(f"📝 Заметка покупателю: <i>{html.escape(note)}</i>")
+    lines += ["", f"📜 Выдач в журнале: <b>{len(log)}</b>, "
+                  f"выдано заказов: <b>{len(delivered)}</b>"]
+    return "\n".join(lines)
 
 
-def _gifts_settings_keyboard() -> InlineKeyboardMarkup:
+def _gift_card_keyboard(settings: dict, gift) -> InlineKeyboardMarkup:
+    from automation.giftcards import card_conf
+
+    enabled = card_conf(settings, gift.slug).get("enabled")
+    slug = gift.slug
     builder = InlineKeyboardBuilder()
-    builder.button(text="✏️ Тип подарка", callback_data="plugins:gifts:set_type")
-    builder.button(text="📝 Заметка", callback_data="plugins:gifts:set_note")
-    builder.button(text="⬅️ Назад", callback_data="plugins:auto_gifts")
-    builder.adjust(2, 1)
+    builder.button(text="⏸ Выключить" if enabled else "▶️ Включить",
+                   callback_data=f"plugins:gc:{slug}:toggle")
+    builder.button(text="⚙️ Настройки", callback_data=f"plugins:gc:{slug}:cfg")
+    builder.button(text="🚀 Выдать вручную",
+                   callback_data=f"plugins:gc:{slug}:manual")
+    builder.button(text="📜 Журнал выдач", callback_data=f"plugins:gc:{slug}:log")
+    builder.button(text="📦 Наличие и баланс",
+                   callback_data=f"plugins:gc:{slug}:stock")
+    builder.button(text="⬅️ Гифт-карты", callback_data="plugins:gifts")
+    builder.adjust(2, 2, 1, 1)
     return builder.as_markup()
 
 
-@router.callback_query(F.data == "plugins:auto_gifts")
+def _gift_cfg_keyboard(gift) -> InlineKeyboardMarkup:
+    slug = gift.slug
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🌐 Регион", callback_data=f"plugins:gc:{slug}:region")
+    builder.button(text="🔤 Слово-опознаватель",
+                   callback_data=f"plugins:gc:{slug}:kw")
+    builder.button(text="📝 Заметка", callback_data=f"plugins:gc:{slug}:note")
+    builder.button(text="🏷 Название товара",
+                   callback_data=f"plugins:gc:{slug}:adtitle")
+    builder.button(text="📄 Описание товара",
+                   callback_data=f"plugins:gc:{slug}:adtext")
+    builder.button(text="⬅️ Назад", callback_data=f"plugins:gc:{slug}")
+    builder.adjust(2, 1, 2, 1)
+    return builder.as_markup()
+
+
+def _gift_cfg_text(settings: dict, gift) -> str:
+    from automation.giftcards import card_conf
+
+    conf = card_conf(settings, gift.slug)
+    title = str(conf.get("ad_title") or "") or gift.ad_title
+    text = str(conf.get("ad_text") or "") or gift.ad_text
+    own_title = " <i>(наша)</i>" if not conf.get("ad_title") else ""
+    own_text = " <i>(наше)</i>" if not conf.get("ad_text") else ""
+    return "\n".join([
+        f"⚙️ <b>Настройки — {html.escape(gift.title)}</b>",
+        "",
+        f"🌐 Регион: <b>{html.escape(str(conf.get('region') or '') or '—')}</b>",
+        f"🔤 Слово: <code>{html.escape(str(conf.get('keyword') or '—'))}</code>",
+        f"📝 Заметка: <i>{html.escape(str(conf.get('note') or '—'))}</i>",
+        "",
+        "🏷 <b>Заготовки для новых товаров</b>",
+        f"   Название: <code>{html.escape(title)}</code>{own_title}",
+        f"   Описание: <code>{html.escape(text.split(chr(10))[0][:60])}…</code>"
+        f"{own_text}",
+    ])
+
+
+def _gift_or_none(data: str):
+    """Карта из `callback_data` вида `plugins:gc:<slug>[:действие]`."""
+    from automation.giftcards import card
+
+    parts = str(data or "").split(":")
+    return card(parts[2]) if len(parts) > 2 else None
+
+
+@router.callback_query(F.data == "plugins:gifts")
 async def gifts_screen(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     uid = callback.from_user.id
     settings = get_settings(uid)
-    await callback.message.edit_text(_gifts_text(settings, get_shop_name(uid)), reply_markup=_gifts_keyboard(settings))
+    await callback.message.edit_text(
+        _gift_cards_text(settings, get_shop_name(uid)),
+        reply_markup=_gift_cards_keyboard(settings))
     await callback.answer()
 
 
-@router.callback_query(F.data == "plugins:gifts:toggle")
-async def gifts_toggle(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id
-    settings = get_settings(uid)
-    settings["plugins"]["auto_gifts"]["enabled"] = not settings["plugins"]["auto_gifts"].get("enabled", False)
-    save_settings(uid, settings)
-    await callback.message.edit_text(_gifts_text(settings, get_shop_name(uid)), reply_markup=_gifts_keyboard(settings))
-    await callback.answer()
+@router.callback_query(F.data == "plugins:gifts:add")
+async def gifts_add(callback: CallbackQuery, state: FSMContext) -> None:
+    """Карты, которые продавец ещё не включил."""
+    from automation.giftcards import card_conf, cards
 
-
-@router.callback_query(F.data == "plugins:gifts:settings")
-async def gifts_settings(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     settings = get_settings(callback.from_user.id)
-    await callback.message.edit_text(_gifts_settings_text(settings), reply_markup=_gifts_settings_keyboard())
+    builder = InlineKeyboardBuilder()
+    for gift in cards():
+        if not card_conf(settings, gift.slug).get("enabled"):
+            builder.button(text=f"{gift.emoji} {gift.title}",
+                           callback_data=f"plugins:gc:{gift.slug}")
+    builder.button(text="⬅️ Назад", callback_data="plugins:gifts")
+    builder.adjust(1)
+    await callback.message.edit_text(
+        "➕ <b>Добавить карту</b>\n\nВыберите товар — откроется его экран, "
+        "там же включается автовыдача.",
+        reply_markup=builder.as_markup())
     await callback.answer()
 
 
-@router.callback_query(F.data == "plugins:gifts:set_type")
-async def gifts_set_type_prompt(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(PluginState.gifts_set_type)
-    await callback.message.edit_text("🎁 Введите тип подарка:", reply_markup=_cancel_kb("plugins:gifts:settings"))
+@router.callback_query(F.data.regexp(r"^plugins:gc:[a-z0-9_]+$"))
+async def gift_card_screen(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    gift = _gift_or_none(callback.data)
+    if not gift:
+        await callback.answer("Карта не найдена", show_alert=True)
+        return
+    settings = get_settings(callback.from_user.id)
+    await callback.message.edit_text(_gift_card_text(settings, gift),
+                                     reply_markup=_gift_card_keyboard(settings, gift))
     await callback.answer()
 
 
-@router.message(PluginState.gifts_set_type)
-async def gifts_set_type_input(message: Message, state: FSMContext) -> None:
-    gift_type = (message.text or "").strip()
-    if not gift_type:
-        await message.answer("❌ Тип не может быть пустым:")
+@router.callback_query(F.data.regexp(r"^plugins:gc:[a-z0-9_]+:toggle$"))
+async def gift_toggle(callback: CallbackQuery) -> None:
+    """Включение автовыдачи. Без ключа поставщика она не включается.
+
+    Тумблер, обещающий выдачу без ключа, — обещание, которого бот не
+    сдержит: первый же оплаченный заказ отвалился бы молча.
+    """
+    from automation.giftcards import card_conf
+    from storage import get_ar_creds
+
+    gift = _gift_or_none(callback.data)
+    if not gift:
+        await callback.answer("Карта не найдена", show_alert=True)
+        return
+    uid = callback.from_user.id
+    settings = get_settings(uid)
+    conf = card_conf(settings, gift.slug)
+    if not conf.get("enabled"):
+        creds = get_ar_creds(uid) or {}
+        if not creds.get("api_key"):
+            await callback.answer(
+                "Сначала задайте ключ AppRoute: 🔑 Поставщик AppRoute. "
+                "Без него покупать не на что.", show_alert=True)
+            return
+    conf["enabled"] = not conf.get("enabled")
+    save_settings(uid, settings)
+    await callback.message.edit_text(_gift_card_text(settings, gift),
+                                     reply_markup=_gift_card_keyboard(settings, gift))
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^plugins:gc:[a-z0-9_]+:cfg$"))
+async def gift_cfg(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    gift = _gift_or_none(callback.data)
+    if not gift:
+        await callback.answer("Карта не найдена", show_alert=True)
+        return
+    settings = get_settings(callback.from_user.id)
+    await callback.message.edit_text(_gift_cfg_text(settings, gift),
+                                     reply_markup=_gift_cfg_keyboard(gift))
+    await callback.answer()
+
+
+# Что спрашивается у продавца и куда кладётся. Одно состояние на все поля и
+# все карты: состояний в этом боте уже девяносто три, и заводить по четыре
+# на каждую из двадцати пяти карт значит утроить их число на ровном месте.
+_GIFT_FIELDS = {
+    "region": ("🌐 Введите регион кода — две буквы, как у поставщика "
+               "(US, TR, AE…).\n\nМожно оставить пустым: тогда бот возьмёт "
+               "регион из описания товара, где сам его и пишет.", "region"),
+    "kw": ("🔤 Введите слово, по которому узнавать заказы этой карты.\n\n"
+           "Заданное, оно становится требованием: заказы без него в выдачу "
+           "не пойдут.", "keyword"),
+    "note": ("📝 Введите заметку — она уйдёт покупателю вместе с кодом.",
+             "note"),
+    "adtitle": ("🏷 Введите заготовку названия товара.\n\nПодстановки: "
+                "{номинал}, {регион}, {цена}, {карта}", "ad_title"),
+    "adtext": ("📄 Введите заготовку описания товара.\n\nПодстановки: "
+               "{номинал}, {регион}, {цена}, {карта}\n\n⚠️ Ссылки панель не "
+               "принимает — отказ придёт на последнем шаге мастера.",
+               "ad_text"),
+}
+
+
+@router.callback_query(F.data.regexp(
+    r"^plugins:gc:[a-z0-9_]+:(region|kw|note|adtitle|adtext)$"))
+async def gift_field_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    gift = _gift_or_none(callback.data)
+    action = str(callback.data).split(":")[3]
+    if not gift or action not in _GIFT_FIELDS:
+        await callback.answer("Карта не найдена", show_alert=True)
+        return
+    prompt, field = _GIFT_FIELDS[action]
+    await state.set_state(PluginState.gc_field)
+    await state.update_data(gc_slug=gift.slug, gc_field=field)
+    await callback.message.edit_text(
+        prompt, reply_markup=_cancel_kb(f"plugins:gc:{gift.slug}:cfg"))
+    await callback.answer()
+
+
+@router.message(PluginState.gc_field)
+async def gift_field_input(message: Message, state: FSMContext) -> None:
+    from automation.giftcards import card, card_conf
+
+    data = await state.get_data()
+    gift = card(data.get("gc_slug") or "")
+    field = str(data.get("gc_field") or "")
+    await state.clear()
+    allowed = {name for _prompt, name in _GIFT_FIELDS.values()}
+    if not gift or field not in allowed:
+        await message.answer("Экран устарел — откройте карту заново.")
+        return
+    value = (message.text or "").strip()
+    if field == "region":
+        value = value.upper()
+    uid = message.from_user.id
+    settings = get_settings(uid)
+    card_conf(settings, gift.slug)[field] = value[:200]
+    save_settings(uid, settings)
+    await message.answer(_gift_cfg_text(settings, gift),
+                         reply_markup=_gift_cfg_keyboard(gift))
+
+
+@router.callback_query(F.data.regexp(r"^plugins:gc:[a-z0-9_]+:log$"))
+async def gift_log(callback: CallbackQuery) -> None:
+    """Журнал выдач: что купили, почём, чем кончилось.
+
+    Печатается состояние каждой записи, а не только удачные: «ничего не
+    произошло» без причины — самая частая поломка этого проекта.
+    """
+    from automation.giftcards import card_conf
+
+    gift = _gift_or_none(callback.data)
+    if not gift:
+        await callback.answer("Карта не найдена", show_alert=True)
+        return
+    conf = card_conf(get_settings(callback.from_user.id), gift.slug)
+    log = conf.get("log") or []
+    lines = [f"📜 <b>Журнал — {html.escape(gift.title)}</b>", ""]
+    if not log:
+        lines.append("Пока пусто.")
+    for entry in log[:15]:
+        state_ = html.escape(str(entry.get("state") or "—"))
+        nominal = html.escape(str(entry.get("nominal") or ""))
+        line = (f"#{html.escape(str(entry.get('order') or '—'))} · "
+                f"{nominal} · <b>{state_}</b>")
+        if entry.get("price"):
+            line += f" · {entry['price']} $"
+        lines.append(line)
+        if entry.get("codes"):
+            lines.append("   код: " + ", ".join(
+                f"<code>{html.escape(str(c))}</code>" for c in entry["codes"]))
+        if entry.get("why"):
+            lines.append(f"   причина: {html.escape(str(entry['why'])[:200])}")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Назад", callback_data=f"plugins:gc:{gift.slug}")
+    await callback.message.edit_text("\n".join(lines)[:4000],
+                                     reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^plugins:gc:[a-z0-9_]+:manual$"))
+async def gift_manual_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    """Ручная выдача спрашивает номер заказа, а не покупателя.
+
+    Код уходит в чат заказа — аккаунт покупателя тут ни при чём. Заказ
+    ставится в очередь, а покупает по-прежнему фоновый цикл: второй путь к
+    деньгам пришлось бы снабдить тем же порядком записей, и однажды он бы
+    с ним разъехался.
+    """
+    gift = _gift_or_none(callback.data)
+    if not gift:
+        await callback.answer("Карта не найдена", show_alert=True)
+        return
+    await state.set_state(PluginState.gc_manual)
+    await state.update_data(gc_slug=gift.slug)
+    await callback.message.edit_text(
+        f"🚀 <b>Выдать вручную — {html.escape(gift.title)}</b>\n\n"
+        f"Введите номер заказа. Бот проверит оплату, подберёт номинал и "
+        f"купит код на ближайшем проходе — и отчитается в любом случае, "
+        f"и если получится, и если нет.",
+        reply_markup=_cancel_kb(f"plugins:gc:{gift.slug}"))
+    await callback.answer()
+
+
+@router.message(PluginState.gc_manual)
+async def gift_manual_input(message: Message, state: FSMContext) -> None:
+    from automation.giftcards import card, card_conf
+
+    data = await state.get_data()
+    gift = card(data.get("gc_slug") or "")
+    await state.clear()
+    if not gift:
+        await message.answer("Экран устарел — откройте карту заново.")
+        return
+    order_id = (message.text or "").strip()
+    if not order_id:
+        await message.answer("Номер заказа пустой.")
         return
     uid = message.from_user.id
     settings = get_settings(uid)
-    settings["plugins"]["auto_gifts"]["gift_type"] = gift_type
+    conf = card_conf(settings, gift.slug)
+    queue = conf.setdefault("force", [])
+    if order_id not in queue:
+        queue.append(order_id)
     save_settings(uid, settings)
-    await state.clear()
-    await message.answer(f"✅ Тип подарка: <b>{gift_type}</b>", reply_markup=_gifts_settings_keyboard())
-
-
-@router.callback_query(F.data == "plugins:gifts:set_note")
-async def gifts_set_note_prompt(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(PluginState.gifts_set_note)
-    await callback.message.edit_text("📝 Введите заметку для покупателя:", reply_markup=_cancel_kb("plugins:gifts:settings"))
-    await callback.answer()
-
-
-@router.message(PluginState.gifts_set_note)
-async def gifts_set_note_input(message: Message, state: FSMContext) -> None:
-    note = (message.text or "").strip()
-    uid = message.from_user.id
-    settings = get_settings(uid)
-    settings["plugins"]["auto_gifts"]["note"] = note
-    save_settings(uid, settings)
-    await state.clear()
-    await message.answer(f"✅ Заметка: <i>{note or '—'}</i>", reply_markup=_gifts_settings_keyboard())
-
-
-@router.callback_query(F.data == "plugins:gifts:manual")
-async def gifts_manual_prompt(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(PluginState.gifts_manual_buyer)
-    await callback.message.edit_text(
-        "🚀 <b>Ручная выдача подарка</b>\n\nВведите @username или Telegram ID покупателя:",
-        reply_markup=_cancel_kb("plugins:auto_gifts"),
-    )
-    await callback.answer()
-
-
-@router.message(PluginState.gifts_manual_buyer)
-async def gifts_manual_buyer_input(message: Message, state: FSMContext) -> None:
-    buyer = (message.text or "").strip()
-    await state.clear()
-    gift_type = get_settings(message.from_user.id)["plugins"]["auto_gifts"].get("gift_type") or "—"
     await message.answer(
-        f"🎁 <b>Выдача подарка</b>\n\n"
-        f"👤 Покупатель: <b>{buyer}</b>\n"
-        f"🎁 Тип: <b>{gift_type}</b>\n\n"
-        f"⚠️ Функция отправки подарков будет доступна в следующем обновлении."
-    )
+        f"✅ Заказ #{html.escape(order_id)} поставлен в очередь "
+        f"{html.escape(gift.title)}.\n\nВыдача идёт фоновым проходом — он "
+        f"бывает раз в минуту. Отчёт придёт в любом случае.",
+        reply_markup=_gift_card_keyboard(settings, gift))
 
 
-@router.callback_query(F.data.in_({"plugins:gifts:accumulated", "plugins:gifts:profit",
-                                    "plugins:gifts:balance", "plugins:gifts:notifs", "plugins:gifts:replies"}))
-async def gifts_stub(callback: CallbackQuery) -> None:
-    await callback.answer("⚠️ Функция появится в следующем обновлении", show_alert=True)
+@router.callback_query(F.data.regexp(r"^plugins:gc:[a-z0-9_]+:stock$"))
+async def gift_stock(callback: CallbackQuery) -> None:
+    """Наличие и баланс: хватит ли денег на эту карту.
+
+    «Не ноль» и «хватит» — разные вещи, и разница стоит оплаченного заказа.
+
+    Каталог читается **по кнопке, а не при открытии экрана**: у
+    `GET /services` лимит два запроса в минуту на кабинет, и читать его на
+    каждом открытии значило бы отнимать лимит у выдачи.
+    """
+    from automation.approute import balance_sync, services_sync
+    from automation.giftcards import affordable, card_conf, regions
+    from storage import get_ar_creds
+
+    gift = _gift_or_none(callback.data)
+    if not gift:
+        await callback.answer("Карта не найдена", show_alert=True)
+        return
+    uid = callback.from_user.id
+    creds = get_ar_creds(uid) or {}
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Назад", callback_data=f"plugins:gc:{gift.slug}")
+    if not creds.get("api_key"):
+        await callback.message.edit_text(
+            "🔑 Ключ AppRoute не задан — читать каталог нечем.",
+            reply_markup=builder.as_markup())
+        await callback.answer()
+        return
+    await callback.message.edit_text("⏳ Читаю каталог поставщика…")
+    loop = asyncio.get_event_loop()
+    ok, catalog = await loop.run_in_executor(None, services_sync, creds)
+    if not ok:
+        await callback.message.edit_text(
+            f"❌ {html.escape(str(catalog)[:400])}",
+            reply_markup=builder.as_markup())
+        await callback.answer()
+        return
+    money = 0.0
+    bal_ok, accounts = await loop.run_in_executor(None, balance_sync, creds)
+    if bal_ok:
+        for row in ((accounts or {}).get("items") or []):
+            if str(row.get("currency")) == "USD":
+                money = float(row.get("available") or row.get("balance") or 0)
+    conf = card_conf(get_settings(uid), gift.slug)
+    region = str(conf.get("region") or "").upper()
+    facts = affordable(catalog, gift, money, region)
+    regs = regions(catalog, gift)
+    lines = [f"📦 <b>{html.escape(gift.title)} у поставщика</b>", "",
+             f"Регионов: <b>{len(regs)}</b>"]
+    if region:
+        lines.append(f"Смотрим регион: <b>{html.escape(region)}</b>")
+    if facts["cheapest"]:
+        lines += [
+            f"Самый дешёвый в наличии: {html.escape(facts['cheapest_name'])} "
+            f"({html.escape(facts['cheapest_region'])}) — "
+            f"<b>{facts['cheapest']:.2f} $</b>",
+            "",
+            f"💰 Баланс: <b>{money:.2f} $</b>",
+            f"Хватит примерно на <b>{facts['count']}</b> таких кодов; "
+            f"по карману номиналов: <b>{facts['total']}</b>",
+        ]
+        if not facts["count"]:
+            lines.append("⚠️ На самый дешёвый номинал денег уже не хватает — "
+                         "первая же выдача отвалится «не хватает средств».")
+    else:
+        lines.append("⚠️ Ни одного номинала в наличии"
+                     + (f" в регионе {html.escape(region)}" if region else ""))
+    await callback.message.edit_text("\n".join(lines)[:4000],
+                                     reply_markup=builder.as_markup())
+    await callback.answer()
 
 
 # ---------------------------------------------------------------------------
