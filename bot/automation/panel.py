@@ -2858,6 +2858,49 @@ _PANEL_FIELDS = {
 }
 
 
+def _first_json_object(text: str) -> dict | None:
+    """Первый полный объект JSON в тексте отчёта.
+
+    Берём именно первый, а не «от первой скобки до последней»: в отчёте их
+    два — отказ панели и наше «Отправлено: {…}», — и жадный захват давал
+    невалидный JSON, то есть молчание вместо объяснения.
+    """
+    decoder = _json.JSONDecoder()
+    at = str(text or "").find("{")
+    while at >= 0:
+        try:
+            body, _end = decoder.raw_decode(text[at:])
+            if isinstance(body, dict):
+                return body
+        except ValueError:
+            pass
+        at = text.find("{", at + 1)
+    return None
+
+
+def validation_fields(raw: str) -> list[str]:
+    """Какие поля панель назвала в отказе — их имена, а не объяснение.
+
+    Отдельно от `explain_validation`, потому что ответы на этом разные:
+    продавцу нужен текст, мастеру — список полей, которые надо спросить и
+    отправить заново. Отказ 422 называет недостающее поле прямым текстом
+    (`{"filter__8": ["Поле Регион обязательно для заполнения."]}`), и не
+    спросить после этого — значит оставить продавца в тупике, зная выход.
+    """
+    body = _first_json_object(raw)
+    if not body:
+        return []
+    out: list[str] = []
+    for field, complaints in body.items():
+        name = str(field)
+        # Значения отказа — список жалоб или строка. Всё прочее (наше
+        # «Отправлено», где по ключам лежат значения товара) — не отказ.
+        if isinstance(complaints, list) and complaints and all(
+                isinstance(c, str) for c in complaints):
+            out.append(name)
+    return out
+
+
 def explain_validation(raw: str) -> str:
     """Отказ панели по полям — по-русски и по делу. Пусто, если не разобрали.
 
@@ -2865,20 +2908,8 @@ def explain_validation(raw: str) -> str:
     это как есть, внутри отладочной простыни: сообщение на экране было, а
     прочитать в нём, что делать, было нельзя.
     """
-    text = str(raw or "")
-    # Берём ПЕРВЫЙ полный объект, а не «от первой скобки до последней»: в
-    # отчёте их два — отказ панели и наше «Отправлено: {…}», — и жадный
-    # захват давал невалидный JSON, то есть молчание вместо объяснения.
-    body = None
-    decoder = _json.JSONDecoder()
-    at = text.find("{")
-    while at >= 0:
-        try:
-            body, _end = decoder.raw_decode(text[at:])
-            break
-        except ValueError:
-            at = text.find("{", at + 1)
-    if not isinstance(body, dict):
+    body = _first_json_object(str(raw or ""))
+    if not body:
         return ""
     out: list[str] = []
     for field, complaints in body.items():

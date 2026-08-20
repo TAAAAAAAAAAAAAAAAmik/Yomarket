@@ -578,9 +578,12 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
             await callback.answer()
             return
 
-    # Форму не получили — пробуем создать напрямую (сервер сам скажет, чего не хватает)
-    await state.clear()
-    await _panel_create_and_report(callback.message, uid, values, extra=None)
+    # Форму не получили — пробуем создать напрямую (сервер сам скажет, чего
+    # не хватает). Состояние не чистим: панель называет недостающее поле, и
+    # с живой формой мастера этот отказ становится вопросом, а не тупиком.
+    await state.update_data(pending=values, chosen={})
+    await _panel_create_and_report(callback.message, uid, values, extra=None,
+                                   state=state)
     await callback.answer()
 
 
@@ -628,9 +631,8 @@ async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
     if not queue:
         values = data.get("pending") or {}
         picked = list(data.get("autopicked") or [])
-        await state.clear()
         await _panel_create_and_report(msg, uid, values, extra=chosen,
-                                       picked=picked)
+                                       picked=picked, state=state)
         return
 
     attr = queue[0]
@@ -874,14 +876,91 @@ def _picked_note(picked: list | None) -> str:
     return f"\n🏷 <i>Раздел выбран автоматически — {rows}</i>"
 
 
+async def _ask_for_refused_fields(msg, uid: int, values: dict,
+                                  extra: dict | None, picked: list | None,
+                                  state: FSMContext, result_msg: str) -> bool:
+    """Отказ панели по полю → вопрос продавцу. True, если спросили.
+
+    Обязательность полей у панели зависит от раздела: в форме создания
+    `filter__8` приходит без метки required, а после выбора категории
+    «Игровая валюта» отказ 422 называет его обязательным. Заранее об этом
+    узнать неоткуда — зато отказ называет поле сам, и это ровно то, что
+    нужно спросить.
+
+    Спрашиваем один раз за создание: если и с заполненным полем панель
+    откажет снова, продавец увидит отчёт, а не круг вопросов.
+    """
+    from automation.panel import panel_get_item_form_sync, validation_fields
+    from storage import get_panel_creds
+
+    data = await state.get_data()
+    if data.get("refused_asked"):
+        return False
+    refused = [a for a in validation_fields(result_msg)
+               if a not in (extra or {})]
+    if not refused:
+        return False
+
+    fields = data.get("form_fields") or []
+    resource = data.get("form_resource") or "items"
+    if not fields:
+        # Создание из плагина идёт мимо мастера, формы в состоянии нет —
+        # читаем её сейчас, иначе спрашивать нечем: у поля нет ни названия,
+        # ни вариантов, а `filter__8` продавцу ничего не говорит.
+        creds = get_panel_creds(uid)
+        if not creds or not creds.get("cookies"):
+            return False
+        loop = asyncio.get_event_loop()
+        try:
+            ok, form = await asyncio.wait_for(
+                loop.run_in_executor(None, panel_get_item_form_sync,
+                                     creds["cookies"]),
+                timeout=30)
+        except Exception:
+            return False
+        if not ok or not isinstance(form, dict):
+            return False
+        fields, resource = form["fields"], form["resource"]
+
+    known = {f["attribute"] for f in fields}
+    queue = [a for a in refused if a in known]
+    if not queue:
+        return False
+
+    await state.set_state(CreateAdState.panel_select)
+    await state.update_data(
+        pending=values, form_resource=resource, form_fields=fields,
+        chosen=dict(extra or {}), autopicked=list(picked or []),
+        select_queue=queue, refused_asked=True,
+    )
+    names = ", ".join(
+        str(next((f.get("label") for f in fields if f["attribute"] == a), a))
+        for a in queue)
+    try:
+        await msg.edit_text(
+            f"⚠️ <b>Панель просит заполнить: {html.escape(names)}</b>\n\n"
+            f"Это поле зависит от раздела, и до его выбора панель о нём "
+            f"молчит. Спрошу — и отправлю товар заново.")
+    except Exception:
+        pass
+    await _ask_next_select(msg, state, uid)
+    return True
+
+
 async def _panel_create_and_report(msg, uid: int, values: dict,
                                    extra: dict | None,
-                                   picked: list | None = None) -> None:
+                                   picked: list | None = None,
+                                   state: FSMContext | None = None) -> None:
     """Run panel_create_product_sync in a thread with live progress, then report.
 
     `picked` — разделы, выбранные ботом без спроса (создание из плагина).
     Печатаются в отчёте: продавец должен видеть, где оказался товар, а не
     обнаруживать это на витрине.
+
+    `state` — форма мастера, если она ещё жива. С ней отказ по недостающему
+    полю становится вопросом: панель назвала поле прямым текстом, спросить
+    его и отправить заново дешевле, чем отправить продавца заводить товар
+    руками. Без состояния (создание из плагина) поведение прежнее — отчёт.
     """
     from storage import get_panel_creds
     from automation.panel import panel_create_product_sync
@@ -934,6 +1013,11 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
         )
 
     if ok:
+        # Форма отработала — закрываем её. Брошенный экран ловит любое
+        # следующее сообщение, включая команду: так молча не работали
+        # `/chat_debug` и `/withdraw_debug`.
+        if state is not None:
+            await state.clear()
         item_id = result_msg if str(result_msg).isdigit() else ""
         pub_note = ""
         if item_id:
@@ -993,6 +1077,19 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
             reply_markup=b.as_markup(),
         )
         return
+
+    # ── Отказ по недостающему полю — спрашиваем его, а не сдаёмся ──────────
+    # Панель называет поле прямым текстом: «filter__8: Поле Регион
+    # обязательно для заполнения». Обязательность у неё зависит от раздела и
+    # в форме заранее не объявлена (`Обязательные: []`), поэтому узнать про
+    # такое поле можно только отсюда. Один раз: если и со спрошенным полем
+    # отказ повторится, продавец получит отчёт, а не круг вопросов.
+    if state is not None:
+        asked = await _ask_for_refused_fields(msg, uid, values, extra, picked,
+                                              state, result_msg)
+        if asked:
+            return
+        await state.clear()
 
     # ── Ошибка — строим правильный набор кнопок ─────────────────────────────
     is_expired = any(w in result_msg for w in ("истекла", "Сессия", "войдите снова", "Войдите"))

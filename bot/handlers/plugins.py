@@ -2097,7 +2097,8 @@ async def roblox_make_ads_prompt(callback: CallbackQuery, state: FSMContext) -> 
         "Рядом с регионом — сколько номиналов в наличии.",
         "",
         "<i>Регион уйдёт в описание товара отдельной строкой: у Юмаркета "
-        "поля под него нет, а выдаче он нужен, чтобы купить тот самый код.</i>",
+        "оттуда его читает выдача. Своё поле «Регион» у панели тоже есть, "
+        "и мастер спросит его, если сам не подберёт.</i>",
     ]
     await callback.message.edit_text("\n".join(lines)[:4000],
                                      reply_markup=b.as_markup())
@@ -2209,7 +2210,9 @@ async def roblox_den_price(message: Message, state: FSMContext) -> None:
 
     # Заготовки продавца. Пустые — берутся наши; регион дописывается
     # отдельной строкой в любом случае, потому что читать его потом будет
-    # выдача, а у Юмаркета поля под регион нет.
+    # выдача — она смотрит в описание, а не в панель. Своё поле «Регион»
+    # (`filter__8`) у панели есть и обязательно, но это её собственное
+    # требование к карточке, а не источник для выдачи.
     from automation.robux import (DEFAULT_AD_TEXT, DEFAULT_AD_TITLE,
                                   fill_template, with_region)
     # Через `.get`, а не по ключу: у продавца, чьи настройки записаны до
@@ -2891,8 +2894,13 @@ async def gift_make_regions(callback: CallbackQuery, state: FSMContext) -> None:
     """Регион спрашивается первым — раньше номинала.
 
     От него зависит и какие номиналы показывать, и что уйдёт в описание
-    товара: у Юмаркета своего поля под регион нет, и выдача читает его
-    оттуда. Значит знать регион надо до того, как описание собрано.
+    товара: выдача читает регион оттуда. Значит знать его надо до того, как
+    описание собрано.
+
+    20.08 выяснилось, что своё поле «Регион» у панели всё-таки есть —
+    `filter__8`, и оно обязательное. Описание оно не отменяет: выдача читает
+    описание, а не панель. Но регион теперь уходит и подсказкой в мастер,
+    чтобы не спрашивать продавца дважды об одном и том же.
     """
     from automation.giftcards import regions
     from storage import get_ar_creds
@@ -2937,9 +2945,10 @@ async def gift_make_regions(callback: CallbackQuery, state: FSMContext) -> None:
         f"🌐 <b>Регион — {html.escape(gift.title)}</b>"
         + (f" · <i>{age}</i>" if age else "") + "\n\n"
         f"Рядом с регионом — сколько номиналов в наличии.\n\n"
-        f"<i>Регион уйдёт в описание товара отдельной строкой: у Юмаркета "
-        f"поля под него нет, а выдаче он нужен, чтобы купить тот самый "
-        f"код.</i>", reply_markup=b.as_markup())
+        f"<i>Регион уйдёт в описание товара отдельной строкой — оттуда его "
+        f"читает выдача. У панели есть и своё поле «Регион»; оно "
+        f"обязательное, и мастер спросит его, если сам не подберёт.</i>",
+        reply_markup=b.as_markup())
 
 
 @router.callback_query(F.data.regexp(r"^plugins:gc:[a-z0-9_]+:reg:[A-Za-z0-9]+$"))
@@ -3050,8 +3059,13 @@ async def gift_make_handoff(message: Message, state: FSMContext) -> None:
 
     from handlers.create_ad import CreateAdState
     await state.set_state(CreateAdState.quantity)
+    # Регион идёт подсказкой вместе с разделами: у панели есть своё поле
+    # «Регион», и оно обязательное — но узнаётся это только из отказа, потому
+    # что обязательность зависит от раздела. Подсказка сработает, только если
+    # ровно один вариант подойдёт; иначе мастер спросит, а не решит за
+    # продавца, в каком регионе его товар.
     await state.update_data(title=ad_title, price=price, description=ad_text,
-                            autopick=list(gift.autopick))
+                            autopick=list(gift.autopick) + [region.lower()])
     b = InlineKeyboardBuilder()
     b.button(text="1️⃣ Пропустить (кол-во = 1)", callback_data="create_ad:qty:1")
     b.button(text="❌ Отмена", callback_data="menu:ads")

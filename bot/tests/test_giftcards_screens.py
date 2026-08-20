@@ -291,7 +291,9 @@ class MakingAProductLivesInTheTemplateToo(unittest.TestCase):
         self.assertNotIn("panel_create_product_sync", src)
 
     def test_the_region_goes_into_the_description(self):
-        """У Юмаркета поля под регион нет — выдача читает его из описания."""
+        """Выдача читает регион из описания, а не из панели. Своё поле
+        «Регион» у панели есть (`filter__8`, обязательное), но оно её
+        собственное требование к карточке и описания не заменяет."""
         import inspect
         from handlers import plugins as P
         self.assertIn("with_region", inspect.getsource(P.gift_make_handoff))
