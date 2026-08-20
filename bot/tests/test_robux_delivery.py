@@ -94,6 +94,12 @@ class Harness:
         from automation import approute
         from tasks import manager as M
 
+        # Каталог кешируется на две минуты и живёт в модуле, а не в
+        # менеджере: лимит `GET /services` считается на кабинет, и свой кеш
+        # у фона означал бы двойной расход. Подставного поставщика заводим с
+        # чистой памятью — иначе тест читает ответ соседнего.
+        approute._CATALOG.clear()
+
         def services_sync(creds):
             return (True, self.catalog) if self.catalog is not None else (
                 False, "каталог не прочитан")
@@ -137,6 +143,9 @@ class Harness:
         return self
 
     def __exit__(self, *exc):
+        from automation import approute
+
+        approute._CATALOG.clear()
         for module, name, old in reversed(self._undo):
             setattr(module, name, old)
 
@@ -758,10 +767,13 @@ class TheCatalogueIsNotRereadForEveryOrder(unittest.TestCase):
 
     def test_a_stale_cache_does_not_outlive_two_minutes(self):
         from tasks.manager import TaskManager
+        from automation import approute
         mgr = TaskManager.__new__(TaskManager)
-        mgr._ar_catalog = {1: (time.time() - 121, {"items": []})}
+        creds = {"api_key": "k"}
         with Harness(self, settings=settings_with()) as h:
-            got = asyncio.run(mgr._supplier_catalog(1, {"api_key": "k"}))
+            approute._CATALOG[approute.cabinet_key(creds)] = (
+                time.time() - 121, {"items": []})
+            got = asyncio.run(mgr._supplier_catalog(1, creds))
             self.assertEqual(got[1], CATALOG, "отдан просроченный каталог")
 
     def test_a_failed_read_is_not_cached(self):

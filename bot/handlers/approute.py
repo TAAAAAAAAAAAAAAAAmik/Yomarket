@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import html
 import logging
 import re
@@ -153,6 +154,11 @@ async def apr_login(message: Message) -> None:
 
 @router.message(Command("apr_forget"))
 async def apr_forget(message: Message) -> None:
+    # Каталог, прочитанный удалённым ключом, забываем вместе с ним: держать
+    # в памяти цены кабинета, от которого отказались, незачем.
+    from automation.approute import forget_catalog
+
+    forget_catalog(get_ar_creds(message.from_user.id))
     delete_ar_creds(message.from_user.id)
     await message.answer("🗑 Ключ AppRoute удалён.")
 
@@ -581,6 +587,36 @@ async def _balance_text(creds: dict) -> tuple[bool, str]:
     return True, body
 
 
+async def read_catalog(creds: dict, timeout: int = 90,
+                       force: bool = False) -> tuple[bool, object, str]:
+    """Каталог поставщика для экранов → (успех, каталог или причина, возраст).
+
+    Одна точка на все экраны, и не ради красоты: у `GET /services` лимит
+    **2 запроса в минуту на кабинет**, а один только выбор номинала для
+    нового товара проходит три экрана подряд. Каждый со своим запросом
+    выбирал лимит за полминуты, и продавец получал «Каталог не прочитан» на
+    ровном месте — при живом ключе и оплаченном кабинете.
+
+    Третьим значением возвращается приписка о возрасте («данные 40 с
+    назад») — её экран показывает рядом с остатками. Пустая, если ответ
+    свежий.
+    """
+    from automation.approute import catalog_age_note, services_cached_sync
+
+    loop = asyncio.get_event_loop()
+    try:
+        ok, data, age = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, functools.partial(services_cached_sync, creds,
+                                        force=force)),
+            timeout=timeout)
+    except asyncio.TimeoutError:
+        return False, f"поставщик не ответил за {timeout} с", ""
+    except Exception as e:
+        return False, str(e)[:200], ""
+    return ok, data, (catalog_age_note(age) if ok else "")
+
+
 async def _catalog_report(target, uid: int, needle: str) -> None:
     """Каталог: что есть, под каким id, почём и какие поля требует заказ.
 
@@ -588,7 +624,7 @@ async def _catalog_report(target, uid: int, needle: str) -> None:
     OpenAPI списка товаров нет, и на вопрос «есть ли у AppRoute Roblox и
     дешевле ли он, чем у ns.gifts» отвечает только он.
     """
-    from automation.approute import find_products, services_sync, truncated
+    from automation.approute import find_products, truncated
 
     say = target.edit_text if hasattr(target, "edit_text") else target.answer
     creds, hint = _creds_or_hint(uid)
@@ -598,20 +634,15 @@ async def _catalog_report(target, uid: int, needle: str) -> None:
     needle = str(needle or "").strip()
     await say("⏳ Читаю каталог поставщика"
               + (f" (ищу «{html.escape(needle)}»)…" if needle else "…"))
-    loop = asyncio.get_event_loop()
-    try:
-        ok, data = await asyncio.wait_for(
-            loop.run_in_executor(None, services_sync, creds), timeout=90)
-    except Exception as e:
-        await say(f"❌ {html.escape(str(e)[:200])}")
-        return
+    ok, data, age = await read_catalog(creds)
     if not ok:
         await say(f"❌ {html.escape(str(data)[:500])}")
         return
 
     total = len(find_products(data, ""))
     found = find_products(data, needle)
-    lines = ["📦 <b>Каталог AppRoute</b>", f"Товаров всего: <b>{total}</b>"]
+    lines = ["📦 <b>Каталог AppRoute</b>", f"Товаров всего: <b>{total}</b>"
+             + (f" · <i>{age}</i>" if age else "")]
     if truncated(data):
         # Промолчать нельзя: «Роблокса нет» и «нам прислали не весь список» —
         # разные ответы, а постраничного чтения у поставщика не описано.
@@ -1118,6 +1149,9 @@ async def apr_debug_button(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "apr:del")
 async def apr_delete(callback: CallbackQuery) -> None:
+    from automation.approute import forget_catalog
+
+    forget_catalog(get_ar_creds(callback.from_user.id))
     delete_ar_creds(callback.from_user.id)
     await _show_creds(callback, callback.from_user.id, "🗑 Ключ удалён.")
     await callback.answer()

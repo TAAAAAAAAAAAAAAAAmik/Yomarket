@@ -2263,26 +2263,23 @@ class TaskManager:
         он меняется; но решает не он, а сухой прогон прямо перед покупкой —
         устаревший остаток обернётся честным отказом, а не выдачей того,
         чего нет.
-        """
-        from automation.approute import services_sync
 
-        # Заводится лениво: менеджер создаётся и в обход `__init__` (так его
-        # строят тесты), и полагаться на атрибут из конструктора нельзя.
-        cache = getattr(self, "_ar_catalog", None)
-        if cache is None:
-            cache = {}
-            self._ar_catalog = cache
-        fresh = cache.get(user_id)
-        if fresh and (time.time() - fresh[0]) < 120:
-            return True, fresh[1]
+        Кеш общий с экранами бота, и это не мелочь: лимит `GET /services` —
+        два запроса в минуту **на кабинет**, а не на потребителя. Пока у
+        фона был свой кеш, а у экранов не было никакого, «🏷 Создать товар»
+        выбирал лимит за полминуты и получал «Каталог не прочитан» — при
+        живом ключе и оплаченном кабинете.
+        """
+        from automation.approute import services_cached_sync
+
         loop = asyncio.get_event_loop()
         try:
-            ok, catalog = await asyncio.wait_for(
-                loop.run_in_executor(None, services_sync, creds), timeout=90)
+            ok, catalog, _age = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, functools.partial(services_cached_sync, creds)),
+                timeout=90)
         except Exception as e:
             ok, catalog = False, str(e)[:200]
-        if ok:
-            cache[user_id] = (time.time(), catalog)
         return ok, catalog
 
     # Задержки опроса «принятого» заказа. Растут, потому что код обычно

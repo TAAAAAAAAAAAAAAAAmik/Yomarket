@@ -36,7 +36,9 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import threading
 import time
 
 import requests
@@ -127,6 +129,14 @@ _HTTP = {
 # Их же список повторяемых: транспорт SDK повторяет ровно эти.
 RETRYABLE = (429, 500, 502, 503, 504)
 
+# Дольше этого ждать внутри одного нажатия нельзя: продавец смотрит на
+# «⏳ Читаю каталог…» и решает, что бот завис. Паузу длиннее не пересиживают,
+# а сразу объявляют отказ — с названным сроком, чтобы он не был отпиской.
+RETRY_429_MAX_WAIT = 10.0
+# Сколько всего попыток допускается на 429, вместе с первой. Не `max_retries`:
+# у отказа по лимиту цена повтора особая — он тратит тот самый лимит.
+RETRY_429_TRIES = 2
+
 
 class ARError(Exception):
     """Отказ поставщика. `why` — по-русски, `trace_id` — для их поддержки."""
@@ -214,10 +224,33 @@ class ARClient:
             if r.status_code in RETRYABLE and attempt < self.max_retries:
                 # Поставщик сам говорит, сколько ждать. Своя оценка была бы
                 # догадкой поверх его же ответа.
-                delay = _retry_after(r) or (1.0 * (2 ** attempt))
-                time.sleep(min(delay, 10.0))
-                continue
-            return self._unwrap(r)
+                delay = _retry_after(r)
+                if r.status_code == 429:
+                    # Повтор на 429 стоит места в том же лимите, из-за
+                    # которого отказ и пришёл: у самых дорогих вызовов он
+                    # считается на минуту (`GET /services` и `GET /orders` —
+                    # по два запроса). Три попытки подряд укладывались в то
+                    # же окно, получали тот же отказ и **выедали остаток**,
+                    # который достался бы следующему экрану. Поэтому повтор
+                    # один, и только если названную паузу мы можем выдержать
+                    # целиком: спать 10 секунд из назначенных шестидесяти
+                    # значит гарантированно постучаться в ту же стену.
+                    if attempt >= RETRY_429_TRIES - 1 or delay > RETRY_429_MAX_WAIT:
+                        pass
+                    else:
+                        time.sleep(delay or 1.0)
+                        continue
+                else:
+                    time.sleep(min(delay or (1.0 * (2 ** attempt)), 10.0))
+                    continue
+            try:
+                return self._unwrap(r)
+            except ARError as e:
+                # «Слишком часто» без числа — отписка: продавец не знает,
+                # нажать ли ещё раз сейчас или пойти пить чай.
+                if r.status_code == 429:
+                    e.why += _wait_note(_retry_after(r))
+                raise
         # Сюда попасть нельзя: последняя попытка всегда возвращает разбор.
         raise ARError("", "поставщик не ответил после повторов")   # pragma: no cover
 
@@ -344,6 +377,18 @@ def _no_envelope(body: dict, http: int) -> str:
     return out
 
 
+def _wait_note(seconds: float) -> str:
+    """Приписка к отказу по лимиту — сколько ждать.
+
+    Секунды берутся из `Retry-After`, а если поставщик его не прислал —
+    называется само правило: у каталога и списка заказов лимит считается на
+    минуту. Догадкой это не является, лимиты сняты с `GET /rate-limits`.
+    """
+    if seconds and seconds > 0:
+        return f" — подождите {int(seconds) + 1} с"
+    return " — лимит считается на минуту, попробуйте через минуту"
+
+
 def _retry_after(r) -> float:
     try:
         return float((r.headers or {}).get("Retry-After") or 0)
@@ -460,6 +505,101 @@ def services_sync(creds: dict) -> tuple[bool, object]:
     живой ответ. В SDK и OpenAPI списка товаров нет.
     """
     return _guarded(lambda: (_client(creds).call("GET", "/services") or {}))
+
+
+# Каталог целиком — самый дорогой вызов у поставщика: 1263 услуги одним
+# ответом при лимите **2 запроса в минуту на кабинет**. Экраны читали его
+# каждый сам за себя: «🏷 Создать товар» → регионы (раз), выбор региона →
+# номиналы (два), «⬅️ Другой регион» (три) — и третий экран получал
+# «упёрлись в лимит кабинета» при том, что тот же каталог был прочитан
+# секунду назад. Кеш на две минуты в проекте был, но жил внутри фонового
+# опроса и экранам не доставался; в документации он при этом описан как
+# общий. Теперь он и правда общий — один на кабинет, и фон ходит сюда же.
+SERVICES_TTL = 120.0
+_CATALOG: dict[str, tuple[float, object]] = {}
+_CATALOG_LOCKS: dict[str, threading.Lock] = {}
+_CATALOG_GUARD = threading.Lock()
+
+
+def cabinet_key(creds: dict) -> str:
+    """Чем различаются кабинеты для кеша: ключ и адрес шлюза.
+
+    Ключ не кладётся в память как есть — только его хеш: кеш попадает в
+    диагностику, а ключ в диагностике не печатается никогда.
+    """
+    api_key = str((creds or {}).get("api_key") or "")
+    digest = hashlib.sha256(api_key.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"{digest}@{base_url_of(creds)}"
+
+
+def _catalog_lock(key: str) -> threading.Lock:
+    """Замок на кабинет: два экрана, нажатых подряд, не должны читать каталог
+    вдвоём — вторым чтением они сами себе и выберут лимит."""
+    with _CATALOG_GUARD:
+        lock = _CATALOG_LOCKS.get(key)
+        if lock is None:
+            lock = _CATALOG_LOCKS[key] = threading.Lock()
+        return lock
+
+
+def services_cached_sync(
+    creds: dict, max_age: float = SERVICES_TTL, force: bool = False,
+) -> tuple[bool, object, float]:
+    """Каталог поставщика → (успех, каталог или причина, возраст в секундах).
+
+    Возраст возвращается наружу намеренно: показать вчерашние остатки, не
+    сказав об этом, — ровно тот бодрый отчёт, от которого здесь уходят.
+    Свежий ответ имеет возраст 0.
+
+    При отказе отдаётся **просроченный** каталог, если он есть: список
+    номиналов двухминутной давности полезнее пустого экрана, а покупка
+    всё равно перечитывает свой номинал отдельным запросом перед выдачей.
+    Возраст при этом настоящий — пусть продавец решает сам.
+    """
+    key = cabinet_key(creds)
+    now = time.time()
+    if not force:
+        fresh = _CATALOG.get(key)
+        if fresh and (now - fresh[0]) < max_age:
+            return True, fresh[1], now - fresh[0]
+
+    with _catalog_lock(key):
+        # Пока ждали замок, каталог мог прочитать сосед — тогда своего
+        # запроса не нужно вовсе.
+        again = _CATALOG.get(key)
+        if again and not force and (time.time() - again[0]) < max_age:
+            return True, again[1], time.time() - again[0]
+
+        ok, answer = services_sync(creds)
+        if ok:
+            _CATALOG[key] = (time.time(), answer)
+            return True, answer, 0.0
+
+    stale = _CATALOG.get(key)
+    if stale:
+        return True, stale[1], time.time() - stale[0]
+    return False, answer, 0.0
+
+
+def forget_catalog(creds: dict | None = None) -> None:
+    """Забыть каталог — насовсем или по одному кабинету.
+
+    Нужно там, где ответ каталога перестал быть правдой: сменили ключ,
+    кабинет или прокси.
+    """
+    if creds is None:
+        _CATALOG.clear()
+        return
+    _CATALOG.pop(cabinet_key(creds), None)
+
+
+def catalog_age_note(age: float) -> str:
+    """Возраст каталога словами — для экрана. Пусто, если ответ свежий."""
+    if age < 1:
+        return ""
+    if age < 90:
+        return f"данные {int(age)} с назад"
+    return f"данные {int(age // 60)} мин назад"
 
 
 def whoami_sync(creds: dict) -> tuple[bool, object]:

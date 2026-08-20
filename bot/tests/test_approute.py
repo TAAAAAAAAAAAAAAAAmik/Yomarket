@@ -108,9 +108,16 @@ class FakeSession:
 
 
 def patch_session(case, answer):
-    """Подменить сессию на время теста и вернуть список созданных."""
+    """Подменить сессию на время теста и вернуть список созданных.
+
+    Заодно забывается кеш каталога: подменили поставщика — значит всё, что
+    он говорил раньше, к делу больше не относится. Без этого общий кеш
+    протекал между тестами, и отчёт о каталоге читал ответ соседнего теста.
+    """
     made: list[FakeSession] = []
     real = A._session
+    A._CATALOG.clear()
+    case.addCleanup(A._CATALOG.clear)
 
     def factory(proxy=""):
         s = FakeSession(answer, proxy)
@@ -1264,10 +1271,15 @@ class TheCatalogueReportShowsWhatAnOrderWillNeed(unittest.TestCase):
         self._get = H.get_ar_creds
         H.get_ar_creds = lambda uid: dict(CREDS)
         self._services = A.services_sync
+        # Каталог кешируется на две минуты и живёт в модуле. Подменяем
+        # поставщика — забываем, что говорил прежний: иначе следующий тест
+        # прочитает ответ предыдущего и пройдёт (или упадёт) не по делу.
+        A._CATALOG.clear()
 
     def tearDown(self):
         H.get_ar_creds = self._get
         A.services_sync = self._services
+        A._CATALOG.clear()
 
     def report(self, text="/apr_stock roblox", answer=None):
         A.services_sync = lambda creds: (answer or
@@ -1900,6 +1912,224 @@ class TheBalanceScreenSaysWhichDashboardAndWhen(unittest.TestCase):
     def test_the_time_of_reading_is_on_the_screen(self):
         import re as _re
         self.assertTrue(_re.search(r"\d{2}:\d{2}", self.press()))
+
+
+class TheCatalogIsReadOnceForAllScreens(unittest.TestCase):
+    """Каталог целиком стоит дорого: 1263 услуги одним ответом при лимите
+    **два запроса в минуту на кабинет**.
+
+    Экраны читали его каждый сам за себя. «🏷 Создать товар» → регионы (раз),
+    выбор региона → номиналы (два), «⬅️ Другой регион» (три) — и третий
+    экран отвечал «Каталог не прочитан: упёрлись в лимит кабинета» при живом
+    ключе и оплаченном кабинете. Кеш в проекте был, но жил внутри фонового
+    опроса и экранам не доставался, а в документации значился общим.
+    """
+
+    def setUp(self):
+        A._CATALOG.clear()
+        self.addCleanup(A._CATALOG.clear)
+
+    def serve(self, *replies):
+        """Поставщик, считающий запросы. Считает именно их, а не наши вызовы."""
+        box = {"count": 0}
+        queue = list(replies)
+
+        class Server:
+            proxies: dict = {}
+
+            def request(_self, method, url, headers=None, params=None,
+                        json=None, timeout=None):
+                box["count"] += 1
+                return queue.pop(0) if len(queue) > 1 else queue[0]
+
+        real = A._session
+        A._session = lambda proxy="": Server()
+        self.addCleanup(lambda: setattr(A, "_session", real))
+        return box
+
+    def test_three_screens_in_a_row_ask_the_supplier_once(self):
+        box = self.serve(Reply(envelope(data={"items": [{"id": "s1"}]})))
+        for _ in range(3):
+            ok, data, _age = A.services_cached_sync(CREDS)
+            self.assertTrue(ok)
+            self.assertEqual(data, {"items": [{"id": "s1"}]})
+        self.assertEqual(box["count"], 1,
+                         "каталог перечитывается на каждый экран — лимит "
+                         "кабинета выберется за полминуты")
+
+    def test_another_cabinet_is_not_served_the_first_ones_catalog(self):
+        box = self.serve(Reply(envelope(data={"items": [{"id": "s1"}]})))
+        A.services_cached_sync(CREDS)
+        A.services_cached_sync({"api_key": KEY + "-second", "region": "io"})
+        self.assertEqual(box["count"], 2, "чужой кабинет получил чужой каталог")
+
+    def test_the_same_key_in_the_other_cabinet_is_read_anew(self):
+        box = self.serve(Reply(envelope(data={"items": []})))
+        A.services_cached_sync({"api_key": KEY, "region": "io"})
+        A.services_cached_sync({"api_key": KEY, "region": "ru"})
+        self.assertEqual(box["count"], 2)
+
+    def test_an_expired_catalog_is_read_again(self):
+        box = self.serve(Reply(envelope(data={"items": []})))
+        A.services_cached_sync(CREDS)
+        A.services_cached_sync(CREDS, max_age=0)
+        self.assertEqual(box["count"], 2)
+
+    def test_the_key_itself_is_not_kept_in_the_cache_key(self):
+        """Кеш попадает в диагностику, ключ в диагностике не печатается."""
+        self.assertNotIn(KEY, A.cabinet_key(CREDS))
+
+
+class WhenTheCatalogFailsTheOldOneIsBetterThanAnEmptyScreen(unittest.TestCase):
+    """Отказ на экране выбора номинала — тупик: продавец не может завести
+    товар вовсе. Прочитанный минуту назад каталог отвечает на тот же вопрос,
+    и единственное условие — сказать, что он не свежий."""
+
+    def setUp(self):
+        A._CATALOG.clear()
+        self.addCleanup(A._CATALOG.clear)
+
+    def test_a_stale_catalog_is_offered_when_the_supplier_refuses(self):
+        replies = [Reply(envelope(data={"items": [{"id": "s1"}]})),
+                   Reply(envelope("LIMIT_REACHED", message="slow down"), 429)]
+        real = A._session
+
+        class Server:
+            proxies: dict = {}
+
+            def request(_self, *a, **kw):
+                return replies.pop(0) if len(replies) > 1 else replies[0]
+
+        A._session = lambda proxy="": Server()
+        self.addCleanup(lambda: setattr(A, "_session", real))
+
+        ok, data, _age = A.services_cached_sync(CREDS)
+        self.assertTrue(ok)
+        ok2, data2, age2 = A.services_cached_sync(CREDS, max_age=0)
+        self.assertTrue(ok2, "экран остался пустым, хотя каталог был прочитан")
+        self.assertEqual(data2, data)
+        self.assertGreaterEqual(age2, 0)
+
+    def test_without_any_catalog_the_refusal_is_told_as_it_is(self):
+        real = A._session
+
+        class Server:
+            proxies: dict = {}
+
+            def request(_self, *a, **kw):
+                return Reply(envelope("LIMIT_REACHED", message="slow down"), 429)
+
+        A._session = lambda proxy="": Server()
+        self.addCleanup(lambda: setattr(A, "_session", real))
+        ok, why, _age = A.services_cached_sync(CREDS)
+        self.assertFalse(ok)
+        self.assertIn("лимит", str(why).lower())
+
+    def test_the_age_is_named_not_hidden(self):
+        self.assertEqual(A.catalog_age_note(0), "")
+        self.assertIn("40", A.catalog_age_note(40))
+        self.assertIn("мин", A.catalog_age_note(200))
+
+
+class ARateLimitIsNotRetriedIntoTheSameWall(unittest.TestCase):
+    """Повтор на 429 не просто бесполезен — он вреден.
+
+    Лимит у дорогих вызовов считается **на минуту** (`GET /services` и
+    `GET /orders` — по два), а ждали мы не дольше десяти секунд: все три
+    попытки попадали в то же окно, получали тот же отказ и тратили остаток
+    лимита, который достался бы следующему экрану.
+    """
+
+    def serve(self, reply):
+        box = {"count": 0}
+
+        class Server:
+            proxies: dict = {}
+
+            def request(_self, *a, **kw):
+                box["count"] += 1
+                return reply
+
+        return box, Server()
+
+    def test_a_refusal_is_repeated_once_at_most(self):
+        """Повтор оставлен один: он и сам стоит места в том же лимите."""
+        box, server = self.serve(
+            Reply(envelope("LIMIT_REACHED", message="slow down"), 429))
+        c = A.ARClient(api_key=KEY)          # max_retries=2 — три попытки
+        c.session = server
+        with self.assertRaises(A.ARError):
+            c.call("GET", "/services")
+        self.assertEqual(box["count"], 2,
+                         "повторы съели остаток лимита кабинета")
+
+    def test_a_pause_longer_than_we_can_hold_is_not_sat_out(self):
+        """Проспать 10 секунд из назначенных 60 — постучаться в ту же стену,
+        потратив ещё один запрос из двух разрешённых в минуту."""
+        box, server = self.serve(
+            Reply(envelope("LIMIT_REACHED"), 429, {"Retry-After": "60"}))
+        c = A.ARClient(api_key=KEY)
+        c.session = server
+        with self.assertRaises(A.ARError):
+            c.call("GET", "/services")
+        self.assertEqual(box["count"], 1)
+
+    def test_a_server_error_is_still_retried(self):
+        """Чинили 429, а не повторы вообще: 500 повторить стоит."""
+        replies = [Reply(envelope("INTERNAL_ERROR"), 500),
+                   Reply(envelope(data={"items": []}))]
+        box = {"count": 0}
+
+        class Server:
+            proxies: dict = {}
+
+            def request(_self, *a, **kw):
+                box["count"] += 1
+                return replies.pop(0) if len(replies) > 1 else replies[0]
+
+        c = A.ARClient(api_key=KEY, max_retries=2)
+        c.session = Server()
+        self.assertEqual(c.call("GET", "/services"), {"items": []})
+        self.assertEqual(box["count"], 2)
+
+    def test_the_refusal_says_how_long_to_wait(self):
+        box, server = self.serve(
+            Reply(envelope("LIMIT_REACHED"), 429, {"Retry-After": "30"}))
+        c = A.ARClient(api_key=KEY)
+        c.session = server
+        with self.assertRaises(A.ARError) as e:
+            c.call("GET", "/services")
+        self.assertIn("31", e.exception.explain())
+
+    def test_without_the_header_the_rule_itself_is_named(self):
+        box, server = self.serve(Reply(envelope("LIMIT_REACHED"), 429))
+        c = A.ARClient(api_key=KEY)
+        c.session = server
+        with self.assertRaises(A.ARError) as e:
+            c.call("GET", "/services")
+        self.assertIn("минут", e.exception.explain())
+
+
+class TheScreensAndTheBackgroundShareOneCache(unittest.TestCase):
+    """Лимит считается на кабинет, а не на потребителя: свой кеш у фона и
+    никакого у экранов — это тот же перерасход, только незаметнее."""
+
+    def source(self, name):
+        import pathlib
+        here = pathlib.Path(__file__).resolve().parent.parent
+        return (here / name).read_text()
+
+    def test_the_background_loop_reads_through_the_shared_cache(self):
+        src = self.source("tasks/manager.py")
+        self.assertIn("services_cached_sync", src)
+        self.assertNotIn("services_sync, creds", src,
+                         "фон снова читает каталог мимо общего кеша")
+
+    def test_no_screen_reads_the_catalog_past_the_cache(self):
+        for name in ("handlers/plugins.py", "handlers/approute.py"):
+            src = self.source(name)
+            self.assertNotIn("None, services_sync", src,
+                             f"{name}: каталог читается мимо кеша")
 
 
 if __name__ == "__main__":

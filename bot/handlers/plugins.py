@@ -163,6 +163,18 @@ def _cancel_kb(back: str) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+async def _read_catalog(creds: dict) -> tuple[bool, object, str]:
+    """Каталог поставщика через общий кеш — одна дверь на все экраны.
+
+    Читать его каждым экраном заново нельзя: у `GET /services` лимит два
+    запроса в минуту на кабинет, а выбор номинала для нового товара проходит
+    три экрана подряд. Подробности и кеш — в `handlers.approute.read_catalog`.
+    """
+    from handlers.approute import read_catalog
+
+    return await read_catalog(creds)
+
+
 def _plugins_menu_keyboard(settings: dict | None = None) -> InlineKeyboardMarkup:
     """Меню плагинов.
 
@@ -1928,7 +1940,7 @@ async def roblox_balance(callback: CallbackQuery) -> None:
     номинале в 2.74 $ прежний экран молчал, а первая же выдача отвалилась бы
     с «не хватает средств», причём по каждому оплаченному заказу отдельно.
     """
-    from automation.approute import balance_sync, services_sync
+    from automation.approute import balance_sync
     from automation.robux import affordable
     from handlers.approute import _accounts, _balance_text
     from storage import get_ar_creds
@@ -1960,11 +1972,7 @@ async def roblox_balance(callback: CallbackQuery) -> None:
                 if str(acc.get("currency") or "").upper() == "USD":
                     usd = float(acc.get("amount") or 0)
                     break
-        try:
-            got, catalog = await asyncio.wait_for(
-                loop.run_in_executor(None, services_sync, creds), timeout=90)
-        except Exception:
-            got, catalog = False, None
+        got, catalog, _age = await _read_catalog(creds)
         if got:
             can = affordable(catalog, usd)
             lines.append("")
@@ -2036,7 +2044,6 @@ async def roblox_make_ads_prompt(callback: CallbackQuery, state: FSMContext) -> 
     500 Robux автовыдаче недоступно — такого номинала у поставщика нет, а
     подменять ближайшим бот не станет.
     """
-    from automation.approute import services_sync
     from automation.robux import catalog_regions
     from storage import get_ar_creds
 
@@ -2050,12 +2057,7 @@ async def roblox_make_ads_prompt(callback: CallbackQuery, state: FSMContext) -> 
     await callback.answer("⏳ Читаю каталог…")
     await callback.message.edit_text("⏳ Смотрю, какие номиналы есть у поставщика…")
 
-    loop = asyncio.get_event_loop()
-    try:
-        ok, catalog = await asyncio.wait_for(
-            loop.run_in_executor(None, services_sync, creds), timeout=90)
-    except Exception as e:
-        ok, catalog = False, str(e)[:200]
+    ok, catalog, age = await _read_catalog(creds)
     settings = get_settings(uid)
     if not ok:
         await callback.message.edit_text(
@@ -2084,7 +2086,7 @@ async def roblox_make_ads_prompt(callback: CallbackQuery, state: FSMContext) -> 
     b.adjust(3)
     wallet = [r["region"] for r in regions if r["kind"] == "wallet"]
     lines = [
-        "🌐 <b>Регион кода</b>", "",
+        "🌐 <b>Регион кода</b>" + (f" · <i>{age}</i>" if age else ""), "",
         "У поставщика их несколько, и это <b>два разных товара</b>:", "",
         f"💠 <b>{', '.join(wallet) or '—'}</b> — кошельковые коды, номинал "
         f"прямо в Robux.",
@@ -2104,7 +2106,6 @@ async def roblox_make_ads_prompt(callback: CallbackQuery, state: FSMContext) -> 
 @router.callback_query(F.data.startswith("plugins:roblox:reg:"))
 async def roblox_region_pick(callback: CallbackQuery, state: FSMContext) -> None:
     """Регион выбран — показываем номиналы именно этого региона."""
-    from automation.approute import services_sync
     from automation.robux import denominations, is_wallet_region
     from storage import get_ar_creds
 
@@ -2113,12 +2114,7 @@ async def roblox_region_pick(callback: CallbackQuery, state: FSMContext) -> None
     settings = get_settings(uid)
     creds = get_ar_creds(uid)
     await callback.answer("⏳ Читаю номиналы…")
-    loop = asyncio.get_event_loop()
-    try:
-        ok, catalog = await asyncio.wait_for(
-            loop.run_in_executor(None, services_sync, creds), timeout=90)
-    except Exception as e:
-        ok, catalog = False, str(e)[:200]
+    ok, catalog, age = await _read_catalog(creds)
     if not ok:
         await callback.message.edit_text(
             f"❌ Каталог не прочитан: {html.escape(str(catalog))}",
@@ -2150,7 +2146,8 @@ async def roblox_region_pick(callback: CallbackQuery, state: FSMContext) -> None
     b.adjust(2)
     what = ("кошельковые коды — номинал в Robux" if wallet
             else "подарочные карты — номинал в валюте страны")
-    lines = [f"🏷 <b>Номиналы · регион {region}</b>", "", f"Это {what}.", "",
+    lines = [f"🏷 <b>Номиналы · регион {region}</b>"
+             + (f" · <i>{age}</i>" if age else ""), "", f"Это {what}.", "",
              "Цены рядом — <b>закупочные, в долларах</b>. Свою цену в рублях "
              "назначите на следующем шаге: курс боту брать неоткуда, и "
              "выдумывать его он не станет."]
@@ -2822,7 +2819,7 @@ async def gift_stock(callback: CallbackQuery) -> None:
     `GET /services` лимит два запроса в минуту на кабинет, и читать его на
     каждом открытии значило бы отнимать лимит у выдачи.
     """
-    from automation.approute import balance_sync, services_sync
+    from automation.approute import balance_sync
     from automation.giftcards import affordable, card_conf, regions
     from storage import get_ar_creds
 
@@ -2842,7 +2839,7 @@ async def gift_stock(callback: CallbackQuery) -> None:
         return
     await callback.message.edit_text("⏳ Читаю каталог поставщика…")
     loop = asyncio.get_event_loop()
-    ok, catalog = await loop.run_in_executor(None, services_sync, creds)
+    ok, catalog, age = await _read_catalog(creds)
     if not ok:
         await callback.message.edit_text(
             f"❌ {html.escape(str(catalog)[:400])}",
@@ -2859,7 +2856,8 @@ async def gift_stock(callback: CallbackQuery) -> None:
     region = str(conf.get("region") or "").upper()
     facts = affordable(catalog, gift, money, region)
     regs = regions(catalog, gift)
-    lines = [f"📦 <b>{html.escape(gift.title)} у поставщика</b>", "",
+    lines = [f"📦 <b>{html.escape(gift.title)} у поставщика</b>"
+             + (f" · <i>{age}</i>" if age else ""), "",
              f"Регионов: <b>{len(regs)}</b>"]
     if region:
         lines.append(f"Смотрим регион: <b>{html.escape(region)}</b>")
@@ -2896,7 +2894,6 @@ async def gift_make_regions(callback: CallbackQuery, state: FSMContext) -> None:
     товара: у Юмаркета своего поля под регион нет, и выдача читает его
     оттуда. Значит знать регион надо до того, как описание собрано.
     """
-    from automation.approute import services_sync
     from automation.giftcards import regions
     from storage import get_ar_creds
 
@@ -2914,12 +2911,7 @@ async def gift_make_regions(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer("⏳ Читаю каталог…")
     await callback.message.edit_text("⏳ Смотрю, что есть у поставщика…")
 
-    loop = asyncio.get_event_loop()
-    try:
-        ok, catalog = await asyncio.wait_for(
-            loop.run_in_executor(None, services_sync, creds), timeout=90)
-    except Exception as e:
-        ok, catalog = False, str(e)[:200]
+    ok, catalog, age = await _read_catalog(creds)
     settings = get_settings(uid)
     if not ok:
         await callback.message.edit_text(
@@ -2942,7 +2934,8 @@ async def gift_make_regions(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="⬅️ Назад", callback_data=f"plugins:gc:{gift.slug}")
     b.adjust(4)
     await callback.message.edit_text(
-        f"🌐 <b>Регион — {html.escape(gift.title)}</b>\n\n"
+        f"🌐 <b>Регион — {html.escape(gift.title)}</b>"
+        + (f" · <i>{age}</i>" if age else "") + "\n\n"
         f"Рядом с регионом — сколько номиналов в наличии.\n\n"
         f"<i>Регион уйдёт в описание товара отдельной строкой: у Юмаркета "
         f"поля под него нет, а выдаче он нужен, чтобы купить тот самый "
@@ -2952,7 +2945,6 @@ async def gift_make_regions(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.regexp(r"^plugins:gc:[a-z0-9_]+:reg:[A-Za-z0-9]+$"))
 async def gift_make_nominals(callback: CallbackQuery, state: FSMContext) -> None:
     """Номиналы выбранного региона."""
-    from automation.approute import services_sync
     from automation.giftcards import denominations, nominal_text
     from storage import get_ar_creds
 
@@ -2964,13 +2956,7 @@ async def gift_make_nominals(callback: CallbackQuery, state: FSMContext) -> None
         await callback.answer("Карта не найдена", show_alert=True)
         return
     await callback.answer("⏳ Читаю номиналы…")
-    loop = asyncio.get_event_loop()
-    try:
-        ok, catalog = await asyncio.wait_for(
-            loop.run_in_executor(None, services_sync, get_ar_creds(uid)),
-            timeout=90)
-    except Exception as e:
-        ok, catalog = False, str(e)[:200]
+    ok, catalog, age = await _read_catalog(get_ar_creds(uid))
     if not ok:
         await callback.message.edit_text(
             f"❌ Каталог не прочитан: {html.escape(str(catalog))}",
@@ -2995,7 +2981,9 @@ async def gift_make_nominals(callback: CallbackQuery, state: FSMContext) -> None
     b.button(text="⬅️ Другой регион", callback_data=f"plugins:gc:{gift.slug}:make")
     b.adjust(2)
     await callback.message.edit_text(
-        f"🏷 <b>Номиналы · {html.escape(gift.title)} · {html.escape(region)}</b>\n\n"
+        f"🏷 <b>Номиналы · {html.escape(gift.title)} · "
+        f"{html.escape(region)}</b>" + (f" · <i>{age}</i>" if age else "")
+        + "\n\n"
         f"Цены рядом — <b>закупочные, в долларах</b>. Свою цену в рублях "
         f"назначите на следующем шаге: курс боту брать неоткуда, и "
         f"выдумывать его он не станет.", reply_markup=b.as_markup())
