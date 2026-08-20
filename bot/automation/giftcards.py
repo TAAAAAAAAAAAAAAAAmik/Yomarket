@@ -438,13 +438,58 @@ ROBLOX_CARD = GiftCard(
 )
 
 
+
+# Следующие четыре объявлены после замера на живом каталоге 20.08: у всех
+# номинал разбирается **на 100%**, все в наличии и все дешёвые. Семейства,
+# где разбор неполный, сюда не берутся — Tinder меряется сроком подписки
+# (0% денег из 796), Valorant смешан с VP (57%), и обоим нужна своя мера.
+XBOX = GiftCard(
+    slug="xbox", title="Xbox", emoji="🟩",
+    subcategory="Xbox Gift Cards", unit=MONEY,
+    words=("xbox", "иксбокс", "хбокс", "хбох", "иксбох"),
+    activation="Активировать: xbox.com/redeem либо на консоли → «Использовать код».",
+    ad_title="Xbox Gift Card {номинал} ({регион})",
+    ad_text="Код пополнения Xbox. Выдача сразу после оплаты.",
+)
+
+STEAM = GiftCard(
+    slug="steam", title="Steam", emoji="🎲",
+    subcategory="Steam Wallet Gift Cards", unit=MONEY,
+    words=("steam", "стим"),
+    activation="Активировать: Steam → «Добавить средства» → «Активировать код "
+               "пополнения кошелька».",
+    ad_title="Steam Wallet {номинал} ({регион})",
+    ad_text="Код пополнения кошелька Steam. Выдача сразу после оплаты.",
+)
+
+AMAZON = GiftCard(
+    slug="amazon", title="Amazon", emoji="📦",
+    subcategory="Amazon Gift Cards", unit=MONEY,
+    words=("amazon", "амазон"),
+    activation="Активировать: в аккаунте Amazon → «Подарочные карты» → "
+               "«Активировать код». Карта действует в магазине своей страны.",
+    ad_title="Amazon Gift Card {номинал} ({регион})",
+    ad_text="Подарочная карта Amazon. Выдача сразу после оплаты.",
+)
+
+RAZER = GiftCard(
+    slug="razer", title="Razer Gold", emoji="🐍",
+    subcategory="Razer Gold Gift Cards", unit=MONEY,
+    words=("razer", "рейзер", "разер", "razer gold"),
+    activation="Активировать: Razer Gold → «Пополнить» → ввести PIN.",
+    ad_title="Razer Gold {номинал} ({регион})",
+    ad_text="Код пополнения Razer Gold. Выдача сразу после оплаты.",
+)
+
+
 # Реестр. Из него строится меню, по нему же идут общие тесты — один тест на
 # все карты сразу, и это главный выигрыш шаблона.
 #
 # **Порядок значим.** Заказ забирает первая признавшая карта, поэтому узкие
 # объявления стоят раньше широких: `ROBUX` со словом «robux» — до
 # `ROBLOX_CARD` со словом «roblox», иначе карты забирали бы заказы на Robux.
-CARDS: tuple[GiftCard, ...] = (ROBUX, ROBLOX_CARD, APPLE, PSN)
+CARDS: tuple[GiftCard, ...] = (ROBUX, ROBLOX_CARD, APPLE, PSN,
+                               XBOX, STEAM, AMAZON, RAZER)
 
 
 def cards() -> tuple[GiftCard, ...]:
