@@ -1619,8 +1619,8 @@ def _roblox_keyboard(settings: dict) -> InlineKeyboardMarkup:
     """Кнопки раздела Robux.
 
     Шесть кнопок отсюда убраны, и это не упрощение. «📦 Выдать накопленные»,
-    «💎 Прибыль», «💰 Баланс», «🔔 Уведомления», «💬 Ответы» отвечали
-    всплывающим «функция появится в следующем обновлении», а «🚀 Ручная
+    «💎 Прибыль», «🔔 Уведомления», «💬 Ответы» отвечали всплывающим
+    «функция появится в следующем обновлении», а «🚀 Ручная
     выдача» спрашивала @username покупателя — понятие, взятое у звёзд, где
     выдача идёт на аккаунт. У Robux выдаётся код, и слать его некуда, кроме
     чата заказа. Кнопка, которая заведомо не сработает, — то же обещание
@@ -1629,6 +1629,11 @@ def _roblox_keyboard(settings: dict) -> InlineKeyboardMarkup:
     ns.gifts убран отсюда же: поставщик выбран, а сравнение цены — не то,
     ради чего продавец открывает раздел выдачи. Его каталог никуда не делся
     и открывается командой `/ns_stock`.
+
+    «💰 Баланс» вернулся — но уже не обещанием. Раньше он отвечал «функция
+    появится в следующем обновлении», теперь спрашивает кабинет AppRoute и
+    показывает, что тот ответил. Кнопка здесь потому, что на этих деньгах
+    держится вся выдача: кончатся — встанут разом все заказы.
     """
     enabled = settings["plugins"]["auto_roblox"].get("enabled", False)
     builder = InlineKeyboardBuilder()
@@ -1636,6 +1641,7 @@ def _roblox_keyboard(settings: dict) -> InlineKeyboardMarkup:
     # неоткуда, а без него в этом разделе не работает ничего.
     builder.button(text="🔑 Поставщик AppRoute", callback_data="apr:creds")
     builder.button(text="📦 Номиналы и остатки", callback_data="apr:stock")
+    builder.button(text="💰 Баланс у поставщика", callback_data="apr:balance")
     # Товары по номиналам поставщика. Витрина, где продаётся 500 Robux,
     # автовыдаче недоступна: такого номинала у поставщика нет, а подменять
     # бот не станет. Поэтому объявления удобнее заводить прямо отсюда — из
@@ -1648,7 +1654,7 @@ def _roblox_keyboard(settings: dict) -> InlineKeyboardMarkup:
                    callback_data="plugins:roblox:toggle")
     builder.button(text="⚙️ Настройки", callback_data="plugins:roblox:settings")
     builder.button(text="⬅️ Назад", callback_data="plugins:menu")
-    builder.adjust(2, 1, 2, 2, 1)
+    builder.adjust(2, 1, 1, 2, 2, 1)
     return builder.as_markup()
 
 

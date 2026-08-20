@@ -1652,5 +1652,117 @@ class TheReadingOfARefusalIsNotPassedOffAsAFact(unittest.TestCase):
         rows = A.order_shape_probe_sync(CREDS)
         self.assertNotIn(KEY, json.dumps(rows, ensure_ascii=False))
 
+class TheBalanceIsVisibleFromTheRobuxScreen(unittest.TestCase):
+    """Деньги, на которых держится выдача, продавец должен видеть до заказа.
+
+    Раньше кнопка «💰 Баланс» в этом разделе была, отвечала «функция
+    появится в следующем обновлении» и была снята как обещание невозможного.
+    Спросить баланс по-настоящему можно было только командой
+    `/apr_balance` — а про команду продавцу неоткуда узнать, раздел он
+    открывает кнопками.
+
+    Цена ошибки здесь не в неудобстве: кончившийся баланс останавливает
+    выдачу разом на всех заказах, и каждый покупатель получает свой отказ.
+    """
+
+    def setUp(self):
+        self._get = H.get_ar_creds
+        self._balance = A.balance_sync
+        self.creds = dict(CREDS)
+        self.answer = (True, {"items": [{"currency": "USD", "balance": 12.5,
+                                         "available": 12.5}]})
+        self.asked: list = []
+        H.get_ar_creds = lambda uid: dict(self.creds)
+        A.balance_sync = lambda creds: (self.asked.append(creds),
+                                        self.answer)[1]
+
+    def tearDown(self):
+        H.get_ar_creds, A.balance_sync = self._get, self._balance
+
+    def press(self):
+        cb = CB("apr:balance")
+        asyncio.run(H.apr_balance_button(cb))
+        return cb
+
+    def test_the_robux_screen_has_a_way_to_see_it(self):
+        """Проводка: экран может быть хорош, а попасть в него неоткуда."""
+        from handlers import plugins as P
+        self.assertIn("apr:balance",
+                      callbacks(P._roblox_keyboard({"plugins": {"auto_roblox": {}}})))
+
+    def test_the_number_the_supplier_gave_is_the_one_shown(self):
+        self.assertIn("12.5", self.press().message.last)
+
+    def test_it_says_whose_money_this_is(self):
+        """Рядом в боте живут деньги магазина на Юмаркете. Спутать их значит
+        решить, что выдавать есть на что, и узнать обратное на оплаченном
+        заказе."""
+        got = self.press().message.last
+        self.assertIn("AppRoute", got)
+        self.assertIn("Юмаркет", got)
+
+    def test_a_refusal_names_the_reason_instead_of_an_empty_balance(self):
+        """«Баланс: —» — это то же молчание, ради которого экран и делался."""
+        self.answer = (False, "ключ не принят")
+        got = self.press().message.last
+        self.assertIn("ключ не принят", got)
+        self.assertNotIn("12.5", got)
+
+    def test_a_refusal_points_at_the_diagnostics(self):
+        self.answer = (False, "ключ не принят")
+        self.assertIn("Наш IP у поставщика", self.press().message.last)
+
+    def test_without_a_key_it_says_so_rather_than_showing_zero(self):
+        """Ноль на экране означал бы «денег нет», а это «мы не спрашивали»."""
+        self.creds = {}
+        got = self.press()
+        self.assertIn("не задан", got.message.last)
+        self.assertEqual(self.asked, [])
+
+    def test_going_back_returns_to_robux_not_to_the_key_screen(self):
+        """Кнопка живёт в разделе Robux — уводить с неё на экран доступа
+        значит терять место, где продавец работал."""
+        self.assertIn("plugins:auto_roblox", callbacks(self.press().message.kbs[-1]))
+
+    def test_the_screen_can_be_refreshed_without_walking_back(self):
+        self.assertIn("apr:balance", callbacks(self.press().message.kbs[-1]))
+
+    def test_opening_the_robux_screen_does_not_ask_the_supplier(self):
+        """У AppRoute лимит запросов, а `GET /accounts` идёт по общему
+        счётчику. Баланс при каждой отрисовке раздела тратил бы его впустую
+        и подвешивал бы экран, когда поставщик молчит."""
+        from handlers import plugins as P
+        settings = {"plugins": {"auto_roblox": {"enabled": False}}}
+        P._roblox_text(settings, "Магазин")
+        P._roblox_keyboard(settings)
+        self.assertEqual(self.asked, [])
+
+    def test_the_key_never_reaches_the_screen(self):
+        self.answer = (False, f"ключ {KEY} не подошёл")
+        cb = self.press()
+        self.assertNotIn(KEY, "\n".join(cb.message.texts))
+
+
+class TheCurrencyIsTheOneThatCame(unittest.TestCase):
+    """«Баланс только в USDT» — запись, опровергнутая живым ответом 18.08:
+    кабинет отдал USD, RUB и EUR, а USDT среди них не было вовсе. Валюта,
+    назначенная кодом вместо прочитанной, превращает сравнение закупки с
+    ns.gifts в сравнение чисел разных денег."""
+
+    def test_every_account_keeps_its_own_currency(self):
+        lines = A.balance_lines({"items": [
+            {"currency": "USD", "balance": 1},
+            {"currency": "RUB", "balance": 2},
+            {"currency": "EUR", "balance": 3}]})
+        self.assertEqual(len(lines), 3)
+        for cur in ("USD", "RUB", "EUR"):
+            self.assertTrue(any(l.startswith(cur + ":") for l in lines),
+                            f"{cur} потерялась: {lines}")
+
+    def test_no_currency_is_replaced_by_a_guess(self):
+        self.assertNotIn("USDT", " ".join(A.balance_lines(
+            {"items": [{"currency": "USD", "balance": 1}]})))
+
+
 if __name__ == "__main__":
     unittest.main()

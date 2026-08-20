@@ -952,7 +952,13 @@ def _redact(text: str, key: str) -> str:
 
 
 def balance_lines(data) -> list[str]:
-    """Счета в вид «USDT: 12.5 (доступно 10.0)». Валюта только USDT."""
+    """Счета в вид «USD: 12.5 (доступно 10.0)».
+
+    Валюта берётся из ответа, а не назначается: запись «баланс только в
+    USDT» опровергнута живым `GET /accounts` 18.08 — кабинет отдал `USD`,
+    `RUB` и `EUR`, а USDT среди них не было вовсе. Сравнивать закупку с
+    ns.gifts надо по деньгам, а не по числам.
+    """
     out: list[str] = []
     for acc in (data or {}).get("items") or []:
         if not isinstance(acc, dict):

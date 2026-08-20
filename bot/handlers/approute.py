@@ -472,17 +472,24 @@ async def _probe_report(target, creds: dict) -> None:
 
 
 async def _balance_text(creds: dict) -> tuple[bool, str]:
-    """Баланс словами. Он же проверка ключа: чтение, денег не тратит."""
-    from automation.approute import balance_lines, balance_sync
+    """Баланс словами. Он же проверка ключа: чтение, денег не тратит.
 
+    Причина отказа приходит от поставщика, и он вполне может повторить в ней
+    наш ключ — так и делает при 400. Поэтому она проходит через `_redact`:
+    ключ один даёт право тратить баланс кабинета целиком, и попасть на экран
+    он не должен ни в чьём тексте, включая чужой.
+    """
+    from automation.approute import _redact, balance_lines, balance_sync
+
+    key = str((creds or {}).get("api_key") or "")
     loop = asyncio.get_event_loop()
     try:
         ok, data = await asyncio.wait_for(
             loop.run_in_executor(None, balance_sync, creds), timeout=60)
     except Exception as e:
-        return False, f"❌ {html.escape(str(e)[:200])}"
+        return False, f"❌ {html.escape(_redact(str(e)[:200], key))}"
     if not ok:
-        return False, f"❌ {html.escape(str(data)[:500])}"
+        return False, f"❌ {html.escape(_redact(str(data)[:500], key))}"
     lines = balance_lines(data)
     if not lines:
         # Пустой список счетов — это не ноль на балансе, а «поставщик не
@@ -940,6 +947,59 @@ async def apr_check(callback: CallbackQuery) -> None:
                   f"наш адрес в белом списке; «🔎 Что отвечает сервер» — что "
                   f"именно приходит из обоих кабинетов."))
     await _show_creds(callback, callback.from_user.id, note)
+
+
+@router.callback_query(F.data == "apr:balance")
+async def apr_balance_button(callback: CallbackQuery) -> None:
+    """Баланс кабинета поставщика — из раздела Robux, кнопкой.
+
+    Это те самые деньги, которыми покупаются коды: кончатся — выдача
+    остановится на всех заказах сразу, и каждый получит свой отказ «не
+    хватает средств». Узнать об этом заранее продавец мог только командой
+    `/apr_balance`, а про команду ему неоткуда узнать.
+
+    Спрашивается по нажатию, а не при отрисовке раздела: у AppRoute лимит
+    запросов, и читать баланс при каждом открытии экрана значит тратить его
+    впустую — да ещё и подвешивать раздел, когда поставщик молчит.
+
+    Отдельно оговаривается, **чей** это баланс. На соседних экранах бота
+    живут деньги магазина на Юмаркете; спутать их значит решить, что
+    выдавать есть на что, и узнать обратное на оплаченном заказе.
+    """
+    creds, hint = _creds_or_hint(callback.from_user.id)
+    if hint:
+        await callback.answer()
+        await callback.message.edit_text(hint, reply_markup=_back_to_robux())
+        return
+    await callback.answer("⏳ Спрашиваю…")
+    await callback.message.edit_text("⏳ Спрашиваю баланс у поставщика…")
+    ok, text = await _balance_text(creds)
+    if ok:
+        body = (f"{text}\n\n"
+                f"<i>Это деньги в кабинете AppRoute, которыми покупаются "
+                f"коды, — не баланс магазина на Юмаркете.</i>")
+    else:
+        # Причину показываем как есть: «баланс не получен» без неё — то же
+        # молчание, ради которого этот экран и делался.
+        body = (f"❌ <b>Баланс не получен.</b>\n{text}\n\n"
+                f"Что смотреть дальше: «🪪 Наш IP у поставщика» — стоит ли "
+                f"наш адрес в белом списке; «🔎 Что отвечает сервер» — что "
+                f"именно приходит из кабинета. Обе кнопки — в «🔑 Поставщик "
+                f"AppRoute».")
+    await callback.message.edit_text(body, reply_markup=_back_to_robux())
+
+
+def _back_to_robux() -> InlineKeyboardMarkup:
+    """Возврат туда, откуда пришли, а не на экран ключа.
+
+    Кнопка баланса живёт в разделе Robux; уводить с неё на экран доступа
+    значит терять место, где продавец работал.
+    """
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Обновить", callback_data="apr:balance")
+    b.button(text="⬅️ Назад", callback_data="plugins:auto_roblox")
+    b.adjust(1)
+    return b.as_markup()
 
 
 @router.callback_query(F.data == "apr:whoami")
