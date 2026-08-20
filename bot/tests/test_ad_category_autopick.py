@@ -213,15 +213,27 @@ class ThePluginTellsTheWizardWhichSectionToUse(unittest.TestCase):
         self.assertIn("roblox", src)
 
     def test_the_narrow_word_goes_first(self):
+        """Проверяется порядок, а не точный список.
+
+        Раньше здесь стояло `words[:2] == ["robux", "roblox"]`. Утверждение
+        класса — «узкое слово первым», а проверка запрещала вставить между
+        ними третье. Между ними и понадобилось: подкатегории «Робуксы» в
+        панели нет, и без «игровая валюта» подбор не срабатывал вовсе
+        (см. `test_robux_subcategory.py`).
+        """
         import inspect
         import re
 
         from handlers import plugins as P
         got = re.search(r"autopick=\[(.+?)\]",
-                        inspect.getsource(P.roblox_den_price))
+                        inspect.getsource(P.roblox_den_price), re.S)
         self.assertIsNotNone(got, "autopick передаётся не списком")
-        words = [w.strip().strip('"\'') for w in got.group(1).split(",")]
-        self.assertEqual(words[:2], ["robux", "roblox"])
+        words = [w.strip().strip('"\'') for w in got.group(1).split(",")
+                 if w.strip()]
+        self.assertEqual(words[0], "robux", "узкое слово должно идти первым")
+        self.assertIn("roblox", words)
+        self.assertLess(words.index("robux"), words.index("roblox"),
+                        "широкое слово перебило бы узкое")
 
 
 if __name__ == "__main__":
