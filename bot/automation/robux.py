@@ -30,6 +30,35 @@ ROBUX_WORDS = ("robux", "робукс", "roblox", "роблокс", "робл")
 # Услуги AppRoute, в которых лежат номиналы Robux. Название приходит вида
 # «Roblox Wallet Code | GL» — регион отделён вертикальной чертой.
 _WALLET_SERVICE = "roblox wallet code"
+# Второе семейство: подарочные карты по странам. Их 23 против трёх
+# кошельковых, и мерятся они **другим** — номинал у них в местной валюте
+# («$10 Roblox gift card», «EUR 25»), а не в Robux. Сколько Robux даст карта
+# на $10, решает курс самого Roblox: мы его не знаем и выдумывать не станем.
+# Поэтому подбор у семейств разный, и семейство определяется по региону.
+_CARD_SERVICE = "roblox gift card"
+
+# Регионы кошельковых кодов — там номинал в Robux. Всё остальное, что
+# встретится в каталоге, это страна подарочной карты.
+WALLET_REGIONS = ("GL", "RU", "XBOX")
+
+# Строка, которой регион записывается в описание товара. У Юмаркета выбора
+# региона нет вовсе — 19.08 проверено: категория 14 отдаёт ноль фильтров, —
+# поэтому единственное место, где регион переживёт создание объявления, это
+# само описание. Его же читает выдача, чтобы знать, какой код покупать.
+REGION_PREFIX = "Регион кода:"
+
+# Как регион может быть назван в чужом или старом описании. Читается только
+# если строки `REGION_PREFIX` нет: точная запись всегда главнее догадки.
+_REGION_WORDS = {
+    "GL": ("глобальн", "global", "worldwide", "любой регион"),
+    "RU": ("росси", "russia", " ru ", "рф"),
+    "XBOX": ("xbox", "хбокс"),
+    "US": ("сша", "usa", " us "),
+    "EU": ("европ", "europe", " eu "),
+    "UK": ("великобритан", "британ", " uk "),
+    "TR": ("турц", "turkey"),
+    "BR": ("бразил", "brazil"),
+}
 
 # Числа, которые в названии товара количеством не являются: год, «24/7»,
 # проценты и тому подобное соседство.
@@ -94,13 +123,85 @@ def region_of(service_name: str) -> str:
     return name.split("|")[-1].strip().upper() if "|" in name else ""
 
 
-def denominations(catalog, region: str = "") -> list[dict]:
-    """Номиналы Robux из живого ответа `GET /services`.
+def is_wallet_region(region: str) -> bool:
+    """Кошельковый код (номинал в Robux) или подарочная карта (в валюте).
 
-    Возвращает строки `{robux, denomination_id, price, currency, in_stock,
-    region, service_id}`. `denomination_id` — это `id` **номинала**, а не
-    услуги: именно он уходит в `orders[].denominationId`, и перепутать их
-    значит получить отказ по схеме.
+    Семейство определяется по региону, а не по названию заказа: у карт в
+    названии стоит номинал вроде «$10», и принять его за десять Robux —
+    ошибка в сто раз, притом молчаливая.
+    """
+    return str(region or "").strip().upper() in WALLET_REGIONS
+
+
+def face_value(name: str) -> tuple[float, str]:
+    """Номинал подарочной карты: «$10 Roblox gift card» → (10.0, «USD»).
+
+    У карт число само по себе ничего не значит без валюты: «10» бывает и
+    долларами, и евро, и реалами. Пара возвращается целиком, а не одно
+    число, чтобы сравнить их случайно было нельзя.
+    """
+    text = str(name or "")
+    # Код валюты — отдельное слово. Без границ слова `\b` три буквы брались
+    # из середины: «1000 Robux» читалось как тысяча валюты «ROB», то есть
+    # номинал в Robux притворялся номиналом карты.
+    m = re.search(r"(\b[A-Za-z]{3}\b|[$€£₽])\s*([\d]+(?:[.,]\d+)?)", text)
+    if not m:
+        m2 = re.search(r"([\d]+(?:[.,]\d+)?)\s*(\b[A-Za-z]{3}\b|[$€£₽])", text)
+        if not m2:
+            return 0.0, ""
+        amount, sign = m2.group(1), m2.group(2)
+    else:
+        sign, amount = m.group(1), m.group(2)
+    try:
+        value = float(str(amount).replace(",", "."))
+    except ValueError:
+        return 0.0, ""
+    signs = {"$": "USD", "€": "EUR", "£": "GBP", "₽": "RUB"}
+    return value, signs.get(sign, str(sign).upper())
+
+
+def catalog_regions(catalog) -> list[dict]:
+    """Регионы Roblox из живого каталога — как они есть, а не по памяти.
+
+    19.08 их 26: три кошельковых (GL, RU, XBOX) и 23 страны подарочных карт.
+    Список читается из ответа поставщика, потому что он меняется: зашитый
+    перечень однажды промолчит про новый регион или предложит исчезнувший.
+
+    Строки: `{region, kind, service_id, count, in_stock}`.
+    """
+    items = (catalog or {}).get("items") if isinstance(catalog, dict) else catalog
+    out: list[dict] = []
+    for service in (items or []):
+        if not isinstance(service, dict):
+            continue
+        low = str(service.get("name") or "").lower()
+        kind = ("wallet" if _WALLET_SERVICE in low else
+                "card" if _CARD_SERVICE in low else "")
+        if not kind:
+            continue
+        rows = [r for r in (service.get("items") or []) if isinstance(r, dict)]
+        out.append({
+            "region": region_of(service.get("name") or "") or "—",
+            "kind": kind,
+            "service_id": str(service.get("id") or ""),
+            "count": len(rows),
+            "in_stock": sum(1 for r in rows if int(r.get("inStock") or 0) > 0),
+        })
+    out.sort(key=lambda r: (r["kind"] != "wallet", r["region"]))
+    return out
+
+
+def denominations(catalog, region: str = "") -> list[dict]:
+    """Номиналы Roblox из живого ответа `GET /services`.
+
+    Оба семейства сразу. У кошельковых кодов заполнено `robux`, у
+    подарочных карт — `face` и `face_currency`, а `robux` там ноль: сколько
+    Robux даст карта на $10, решает курс самого Roblox, и подставлять сюда
+    догадку значит однажды выдать не то, что оплачено.
+
+    `denomination_id` — это `id` **номинала**, а не услуги: именно он уходит
+    в `orders[].denominationId`, и перепутать их значит получить отказ по
+    схеме.
     """
     items = (catalog or {}).get("items") if isinstance(catalog, dict) else catalog
     want = str(region or "").strip().upper()
@@ -109,7 +210,10 @@ def denominations(catalog, region: str = "") -> list[dict]:
         if not isinstance(service, dict):
             continue
         name = str(service.get("name") or "")
-        if _WALLET_SERVICE not in name.lower():
+        low = name.lower()
+        kind = ("wallet" if _WALLET_SERVICE in low else
+                "card" if _CARD_SERVICE in low else "")
+        if not kind:
             continue
         reg = region_of(name)
         if want and reg != want:
@@ -117,22 +221,32 @@ def denominations(catalog, region: str = "") -> list[dict]:
         for row in (service.get("items") or []):
             if not isinstance(row, dict):
                 continue
-            qty = robux_quantity(str(row.get("name") or ""))
-            if qty <= 0:
+            title = str(row.get("name") or "")
+            qty = robux_quantity(title) if kind == "wallet" else 0
+            face, face_cur = face_value(title) if kind == "card" else (0.0, "")
+            if kind == "wallet" and qty <= 0:
+                continue
+            if kind == "card" and face <= 0:
                 continue
             out.append({
                 "robux": qty,
+                "face": face,
+                "face_currency": face_cur,
+                "kind": kind,
                 "denomination_id": str(row.get("id") or ""),
                 "price": float(row.get("price") or 0),
                 "currency": str(row.get("currency") or ""),
                 "in_stock": int(row.get("inStock") or 0),
                 "region": reg,
                 "service_id": str(service.get("id") or ""),
-                "name": str(row.get("name") or ""),
+                "name": title,
             })
-    # Дешевле за Robux — выше. При равном номинале в разных регионах
+    # Дешевле за единицу — выше. При равном номинале в разных регионах
     # выбирать наугад нельзя, а по цене — можно объяснить.
-    out.sort(key=lambda r: (r["robux"], r["price"] / r["robux"]))
+    def _key(r):
+        unit = r["robux"] or r["face"] or 1
+        return (r["kind"] != "wallet", r["robux"], r["face"], r["price"] / unit)
+    out.sort(key=_key)
     return out
 
 
@@ -147,23 +261,94 @@ def match_denomination(catalog, robux: int, region: str = "") -> tuple[dict | No
     Складывать несколько кодов в один заказ (500 = 200 + 300) не умеем — и
     так и говорим, вместо того чтобы выдать один код на другую сумму.
     """
-    want = int(robux or 0)
-    if want <= 0:
-        return None, "в названии заказа не видно, сколько Robux нужно"
     rows = denominations(catalog, region)
     if not rows:
         where = f" в регионе {region}" if region else ""
-        return None, f"в каталоге поставщика нет номиналов Robux{where}"
-    exact = [r for r in rows if r["robux"] == want]
+        return None, f"в каталоге поставщика нет номиналов Roblox{where}"
+
+    wallet = is_wallet_region(region) if region else True
+    if wallet:
+        want = int(robux or 0)
+        if want <= 0:
+            return None, "в названии заказа не видно, сколько Robux нужно"
+        exact = [r for r in rows if r["kind"] == "wallet" and r["robux"] == want]
+        unit = f"{want} Robux"
+        have = ", ".join(str(q) for q in sorted(
+            {r["robux"] for r in rows if r["kind"] == "wallet"})) or "ничего"
+    else:
+        # Подарочная карта: сравнивается номинал в её валюте, а не Robux.
+        # Число из названия заказа здесь — это доллары или евро, и принять
+        # их за Robux значит ошибиться в сотню раз, притом молча.
+        want_face = float(robux or 0)
+        if want_face <= 0:
+            return None, ("в названии заказа не видно номинала карты — "
+                          "например «$10» или «EUR 25»")
+        exact = [r for r in rows
+                 if r["kind"] == "card" and abs(r["face"] - want_face) < 0.001]
+        unit = f"номинал {want_face:g}"
+        have = ", ".join(
+            f"{q:g}" for q in sorted({r["face"] for r in rows
+                                      if r["kind"] == "card"})) or "ничего"
+
     if not exact:
-        have = ", ".join(str(q) for q in sorted({r["robux"] for r in rows})) \
-            or "ничего"
-        return None, (f"номинала ровно на {want} Robux у поставщика нет. "
-                      f"Есть: {have}. Складывать несколько кодов бот не умеет")
+        return None, (f"{unit} у поставщика нет"
+                      + (f" в регионе {region}" if region else "")
+                      + f". Есть: {have}. Складывать несколько кодов бот "
+                        f"не умеет")
     in_stock = [r for r in exact if r["in_stock"] > 0]
     if not in_stock:
-        return None, f"номинал на {want} Robux есть, но остаток нулевой"
+        return None, f"{unit} есть, но остаток нулевой"
     return in_stock[0], ""
+
+
+def region_line(region: str) -> str:
+    """Строка региона для описания товара — та, которую бот потом и читает."""
+    return f"{REGION_PREFIX} {str(region or '').strip().upper()}"
+
+
+def with_region(description: str, region: str) -> str:
+    """Дописать регион в описание, не задвоив его при повторном создании."""
+    text = str(description or "").rstrip()
+    kept = [ln for ln in text.split("\n")
+            if not ln.strip().lower().startswith(REGION_PREFIX.lower())]
+    body = "\n".join(kept).rstrip()
+    line = region_line(region)
+    return f"{body}\n\n{line}" if body else line
+
+
+def region_from_description(description: str) -> tuple[str, str]:
+    """Регион товара из его описания → (регион, чем узнали).
+
+    Выбора региона у Юмаркета нет: 19.08 проверено — категория 14 отдаёт
+    ноль фильтров, а в заказе от объявления приходит только `ad_id`.
+    Описание остаётся единственным местом, где регион переживает создание
+    товара, поэтому туда его пишет бот и оттуда же читает.
+
+    Порядок: сначала своя строка, потом слова. Точная запись главнее
+    догадки — иначе описание «глобальный аккаунт не нужен, код RU» прочтётся
+    как глобальный код.
+
+    Вторым значением возвращается способ (`строка`/`слова`/пусто), чтобы
+    отчёт мог сказать, откуда взялся регион: догадка, поданная как факт,
+    в этом проекте уже стоила дней.
+    """
+    text = str(description or "")
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.lower().startswith(REGION_PREFIX.lower()):
+            value = stripped[len(REGION_PREFIX):].strip().upper()
+            # Берём первое слово: «GL (глобальный)» — это GL.
+            value = re.split(r"[\s,(/]+", value)[0] if value else ""
+            if value:
+                return value, "строка"
+    low = f" {text.lower()} "
+    hits = {code for code, words in _REGION_WORDS.items()
+            if any(w in low for w in words)}
+    if len(hits) == 1:
+        return hits.pop(), "слова"
+    # Ни одного или несколько — это «не знаем». Выбрать из двух наугад
+    # значит купить код не того региона: покупатель его не активирует.
+    return "", ""
 
 
 def order_reference(order_id: str, robux: int) -> str:

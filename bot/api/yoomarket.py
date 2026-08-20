@@ -584,9 +584,18 @@ class YooMarketAPI:
         return await self._post(f"/ads/{ad_id}/publish")
 
     async def get_category_filters(self, category_id: int | str) -> list[dict]:
-        """Product parameters a category expects (with `required` flags)."""
+        """Product parameters a category expects (with `required` flags).
+
+        Ответ приходит **списком**, а не конвертом: проверено живьём 19.08 на
+        категории 14, где он вернул пустой список. Разбор ждал словаря и
+        падал с `AttributeError` — то есть вызов не работал ни разу.
+        """
         data = await self._get(f"/categories/{category_id}/filters")
-        return data.get("data") or data.get("items") or []
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("data") or data.get("items") or []
+        return []
 
     async def categories_raw(self) -> dict:
         """First page of /categories untouched — for diagnosing its shape."""
