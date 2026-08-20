@@ -1239,7 +1239,7 @@ class TheAccessIsEnteredByButtons(unittest.TestCase):
             asyncio.run(H.apr_check(cb))
         finally:
             A.balance_sync = real
-        self.assertIn("42.0", cb.message.last)
+        self.assertIn("42,00", cb.message.last)
 
     def test_a_refused_check_says_why_and_does_not_claim_success(self):
         self.saved["api_key"] = KEY
@@ -1691,7 +1691,9 @@ class TheBalanceIsVisibleFromTheRobuxScreen(unittest.TestCase):
                       callbacks(P._roblox_keyboard({"plugins": {"auto_roblox": {}}})))
 
     def test_the_number_the_supplier_gave_is_the_one_shown(self):
-        self.assertIn("12.5", self.press().message.last)
+        got = self.press().message.last
+        self.assertIn("12,50", got)
+        self.assertIn("$", got)
 
     def test_it_says_whose_money_this_is(self):
         """Рядом в боте живут деньги магазина на Юмаркете. Спутать их значит
@@ -1762,6 +1764,137 @@ class TheCurrencyIsTheOneThatCame(unittest.TestCase):
     def test_no_currency_is_replaced_by_a_guess(self):
         self.assertNotIn("USDT", " ".join(A.balance_lines(
             {"items": [{"currency": "USD", "balance": 1}]})))
+
+
+class TheBalanceIsReadableAtAGlance(unittest.TestCase):
+    """«RUB: 1250.0» — это выгрузка, а не ответ на вопрос «есть ли на что
+    выдавать».
+
+    Здесь проверяется не красота, а то, что за неё можно потерять: подменённая
+    ноль-сумма, потерянная валюта и вывод «денег нет» из неразобранного ответа.
+    """
+
+    def body(self, items):
+        return H._balance_body({"items": items})
+
+    def test_thousands_are_split_and_kopecks_kept(self):
+        self.assertIn("1 250,40", self.body([{"currency": "USD",
+                                              "balance": 1250.4}]))
+
+    def test_the_currency_gets_its_sign(self):
+        for cur, sign in (("USD", "$"), ("RUB", "₽"), ("EUR", "€")):
+            self.assertIn(sign, self.body([{"currency": cur, "balance": 1}]))
+
+    def test_an_unknown_currency_keeps_its_code_instead_of_a_guessed_sign(self):
+        """Придуманный знак показал бы не те деньги."""
+        self.assertIn("XYZ", self.body([{"currency": "XYZ", "balance": 7}]))
+
+    def test_an_amount_that_is_not_a_number_is_printed_as_it_came(self):
+        """Подставить «0,00» значило бы сказать «денег нет» там, где на самом
+        деле «мы не разобрали ответ», — а это противоположные советы."""
+        got = self.body([{"currency": "USD", "balance": "недоступно"}])
+        self.assertIn("недоступно", got)
+        self.assertNotIn("0,00", got)
+
+    def test_money_comes_before_empty_accounts(self):
+        """Вопрос к экрану один — «есть ли на что выдавать». Ответ не должен
+        зависеть от того, каким по счёту кабинет вернул непустой счёт."""
+        got = self.body([{"currency": "RUB", "balance": 0},
+                         {"currency": "USD", "balance": 10}])
+        self.assertLess(got.index("10,00"), got.index("0,00"))
+
+    def test_an_unreadable_account_is_shown_first_of_all(self):
+        got = self.body([{"currency": "USD", "balance": 1},
+                         {"currency": "EUR", "balance": "?"}])
+        self.assertLess(got.index("EUR"), got.index("1,00"))
+
+    def test_only_money_is_emphasised_not_the_zeroes(self):
+        """Ноль, набранный жирным, выглядит суммой."""
+        self.assertIn("<b>10,00", self.body([{"currency": "USD",
+                                              "balance": 10}]))
+        self.assertNotIn("<b>0,00", self.body([{"currency": "USD",
+                                                "balance": 0}]))
+
+    def test_the_available_part_is_shown_when_it_differs(self):
+        got = self.body([{"currency": "USD", "balance": 10, "available": 8}])
+        self.assertIn("доступно 8,00", got)
+
+    def test_and_is_not_repeated_when_it_is_the_same(self):
+        got = self.body([{"currency": "USD", "balance": 10, "available": 10}])
+        self.assertNotIn("доступно", got)
+
+
+class EmptyAccountsAreCalledOutBeforeTheOrderIsPaid(unittest.TestCase):
+    """Ноль на счетах — не косметика: следующая покупка отвалится с «не
+    хватает средств», и каждый оплаченный заказ получит свой отказ. Продавцу
+    надо узнать об этом на экране, а не от покупателя."""
+
+    def test_all_zero_is_said_out_loud(self):
+        self.assertTrue(H._nothing_to_spend({"items": [
+            {"currency": "USD", "balance": 0}, {"currency": "RUB", "balance": 0}]}))
+
+    def test_one_account_with_money_is_enough_to_stay_quiet(self):
+        self.assertFalse(H._nothing_to_spend({"items": [
+            {"currency": "USD", "balance": 0}, {"currency": "RUB", "balance": 5}]}))
+
+    def test_an_unreadable_amount_cancels_the_claim(self):
+        """«Не поняли» — не повод объявлять, что денег нет: продавец пойдёт
+        пополнять кабинет, в котором деньги есть."""
+        self.assertFalse(H._nothing_to_spend({"items": [
+            {"currency": "USD", "balance": 0}, {"currency": "RUB", "balance": "?"}]}))
+
+    def test_no_accounts_at_all_is_not_the_same_as_zero(self):
+        """Пустой список — это «поставщик не назвал ни одного счёта»."""
+        self.assertFalse(H._nothing_to_spend({"items": []}))
+
+    def test_the_warning_names_what_will_break(self):
+        creds, saved = dict(CREDS), A.balance_sync
+        A.balance_sync = lambda c: (True, {"items": [{"currency": "USD",
+                                                      "balance": 0}]})
+        try:
+            ok, text = asyncio.run(H._balance_text(creds))
+        finally:
+            A.balance_sync = saved
+        self.assertTrue(ok)
+        self.assertIn("автовыдача остановится", text)
+
+    def test_the_logic_does_not_read_its_own_report(self):
+        """В этом файле жила `_positive_amount`: она искала числа регулярным
+        выражением в тексте, который сама же и составила. Стоило поменять
+        формат строки — и «есть ли деньги» начинало отвечать наугад."""
+        self.assertFalse(hasattr(H, "_positive_amount"))
+
+
+class TheBalanceScreenSaysWhichDashboardAndWhen(unittest.TestCase):
+    """Кабинета два, ключи у них разные, и «ноль» из чужого кабинета выглядит
+    точно так же, как настоящий. А экран остаётся в переписке — без времени
+    непонятно, свежий он или вчерашний."""
+
+    def setUp(self):
+        self._get, self._balance = H.get_ar_creds, A.balance_sync
+        self.creds = dict(CREDS)
+        H.get_ar_creds = lambda uid: dict(self.creds)
+        A.balance_sync = lambda c: (True, {"items": [{"currency": "USD",
+                                                      "balance": 1}]})
+
+    def tearDown(self):
+        H.get_ar_creds, A.balance_sync = self._get, self._balance
+
+    def press(self):
+        cb = CB("apr:balance")
+        asyncio.run(H.apr_balance_button(cb))
+        return cb.message.last
+
+    def test_the_international_dashboard_is_named(self):
+        self.assertIn("approute.io", self.press())
+
+    def test_the_russian_one_is_named_too(self):
+        self.creds["region"] = "ru"
+        self.assertIn("approute.ru", self.press())
+
+    def test_the_time_of_reading_is_on_the_screen(self):
+        import re as _re
+        self.assertTrue(_re.search(r"\d{2}:\d{2}", self.press()))
 
 
 if __name__ == "__main__":

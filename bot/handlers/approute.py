@@ -270,23 +270,6 @@ async def _item_text(creds: dict, service_id: str, item_id: str) -> str:
     return "\n".join(lines)
 
 
-def _positive_amount(line: str) -> bool:
-    """Есть ли в строке баланса число больше нуля.
-
-    Строки приходят вида «USD: 12.5 (доступно 10.0)». Разбирать текст здесь
-    приходится, потому что `balance_lines` отдаёт уже готовые строки; зато
-    решение принимается в сторону осторожности: не разобрали — считаем, что
-    деньги есть, и спросим подтверждение.
-    """
-    numbers = re.findall(r"\d+[.,]?\d*", str(line or ""))
-    if not numbers:
-        return True
-    try:
-        return any(float(n.replace(",", ".")) > 0 for n in numbers)
-    except ValueError:                                     # pragma: no cover
-        return True
-
-
 @router.message(Command("apr_order_probe"))
 async def apr_order_probe(message: Message) -> None:
     """Какую форму тела `POST /orders` принимает поставщик. Денег не тратит.
@@ -471,6 +454,97 @@ async def _probe_report(target, creds: dict) -> None:
 
 
 
+# Знак валюты вместо кода: «1 250,00 ₽» читается с одного взгляда, «RUB:
+# 1250.0» — нет. Незнакомая валюта остаётся своим кодом: придумывать ей знак
+# значит показать не те деньги.
+_CURRENCY_SIGNS = {"USD": "$", "EUR": "€", "RUB": "₽", "USDT": "₮",
+                   "GBP": "£", "KZT": "₸", "UAH": "₴"}
+
+
+def _money(value) -> str:
+    """Сумма деньгами: разряды пробелом, копейки запятой.
+
+    Нечисловое значение печатается как пришло. Подставить вместо него
+    «0,00» значило бы сказать «денег нет» там, где на самом деле «мы не
+    разобрали ответ» — а это противоположные советы продавцу.
+    """
+    try:
+        num = float(str(value).replace(",", ".").replace(" ", ""))
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+    whole, _, frac = f"{num:,.2f}".partition(".")
+    return f"{whole.replace(',', ' ')},{frac}"
+
+
+def _accounts(data) -> list[dict]:
+    """Счета структурно: валюта, сумма числом, доступно, овердрафт.
+
+    Отдельно от печати нарочно. Здесь когда-то жила `_positive_amount`,
+    которая искала числа регулярным выражением **в собственном же готовом
+    отчёте**, — тот самый разбор своей прозы вместо данных, из-за которого
+    в `CLAUDE.md` записано «факты собирайте в dict». Стоило поменять формат
+    строки, и «есть ли деньги» начало отвечать наугад.
+
+    `amount` равен `None`, когда сумму не разобрать: это «неизвестно», а не
+    ноль, и ни одно предупреждение на нём не строится.
+    """
+    out: list[dict] = []
+    for acc in (data or {}).get("items") or []:
+        if not isinstance(acc, dict):
+            continue
+        raw = acc.get("balance")
+        try:
+            amount = float(str(raw).replace(",", "."))
+        except (TypeError, ValueError):
+            amount = None
+        out.append({"currency": str(acc.get("currency") or "?").upper(),
+                    "raw": raw, "amount": amount,
+                    "available": acc.get("available"),
+                    "overdraft": acc.get("overdraftLimit")})
+    return out
+
+
+def _balance_body(data) -> str:
+    """Счета в вид, который читается с одного взгляда.
+
+    Порядок — не тот, в котором их прислал поставщик: сверху непонятые
+    суммы, потом деньги по убыванию, пустые счета вниз. Продавец открывает
+    этот экран с вопросом «есть ли на что выдавать», и ответ не должен
+    зависеть от того, каким по счёту кабинет вернул нужный счёт.
+    """
+    rows = _accounts(data)
+    rows.sort(key=lambda r: (r["amount"] is not None, -(r["amount"] or 0)))
+    lines: list[str] = []
+    for r in rows:
+        sign = _CURRENCY_SIGNS.get(r["currency"], r["currency"])
+        # Неразобранную сумму печатаем в виде «USD: недоступно»: приставлять
+        # знак валюты к слову получается «недоступно $» — вид числа у того,
+        # что числом не является.
+        money = (f"{_money(r['raw'])} {sign}" if r["amount"] is not None
+                 else f"{r['currency']}: {html.escape(str(r['raw']))}")
+        # Жирным — только то, чем можно платить. Ноль, набранный жирным,
+        # выглядит как сумма, и глаз спотыкается именно там, где не надо.
+        lines.append(f"<b>{money}</b>" if (r["amount"] or 0) > 0 else money)
+        extra = []
+        if r["available"] is not None and r["available"] != r["raw"]:
+            extra.append(f"доступно {_money(r['available'])}")
+        if r["overdraft"]:
+            extra.append(f"овердрафт {_money(r['overdraft'])}")
+        if extra:
+            lines.append(f"   <i>{' · '.join(extra)}</i>")
+    return "\n".join(lines)
+
+
+def _nothing_to_spend(data) -> bool:
+    """Все счета известны и все пусты.
+
+    Считается по числам, а не по тексту. Один неразобранный счёт снимает
+    утверждение целиком: «не поняли» — не повод объявлять, что денег нет.
+    """
+    rows = _accounts(data)
+    return bool(rows) and all(r["amount"] == 0 for r in rows)
+
+
 async def _balance_text(creds: dict) -> tuple[bool, str]:
     """Баланс словами. Он же проверка ключа: чтение, денег не тратит.
 
@@ -479,7 +553,7 @@ async def _balance_text(creds: dict) -> tuple[bool, str]:
     ключ один даёт право тратить баланс кабинета целиком, и попасть на экран
     он не должен ни в чьём тексте, включая чужой.
     """
-    from automation.approute import _redact, balance_lines, balance_sync
+    from automation.approute import _redact, balance_sync
 
     key = str((creds or {}).get("api_key") or "")
     loop = asyncio.get_event_loop()
@@ -490,14 +564,21 @@ async def _balance_text(creds: dict) -> tuple[bool, str]:
         return False, f"❌ {html.escape(_redact(str(e)[:200], key))}"
     if not ok:
         return False, f"❌ {html.escape(_redact(str(data)[:500], key))}"
-    lines = balance_lines(data)
-    if not lines:
+    if not _accounts(data):
         # Пустой список счетов — это не ноль на балансе, а «поставщик не
         # назвал ни одного счёта». Разница видна только если сказать прямо.
         return True, ("✅ Ключ принят, но ни одного счёта поставщик не вернул.\n"
                       "Возможно, кабинет ещё не пополняли.")
-    body = "\n".join(f"• {html.escape(l)}" for l in lines)
-    return True, f"💰 <b>Баланс у поставщика:</b>\n{body}"
+    body = f"💰 <b>Баланс у поставщика</b>\n\n{_balance_body(data)}"
+    if _nothing_to_spend(data):
+        # Ноль на счетах — не косметика: следующая же покупка отвалится с
+        # «не хватает средств», причём по каждому оплаченному заказу
+        # отдельно. Сказать это здесь дешевле, чем объясняться с
+        # покупателями потом.
+        body += ("\n\n⚠️ <b>Выдавать не на что.</b> Пока на счетах ноль, "
+                 "автовыдача остановится на первом же оплаченном заказе — "
+                 "пополните кабинет AppRoute.")
+    return True, body
 
 
 async def _catalog_report(target, uid: int, needle: str) -> None:
@@ -975,9 +1056,20 @@ async def apr_balance_button(callback: CallbackQuery) -> None:
     await callback.message.edit_text("⏳ Спрашиваю баланс у поставщика…")
     ok, text = await _balance_text(creds)
     if ok:
+        # Кабинет и время — не украшение. Кабинета два, ключи у них разные,
+        # и «баланс ноль» из не того кабинета выглядит точно так же, как
+        # настоящий ноль. Время отвечает на «это сейчас или я смотрю на
+        # вчерашний экран», который Telegram оставляет в переписке.
+        import localtime as _lt
+        from storage import get_settings
+        cabinet = _REGIONS.get(
+            str((creds or {}).get("region") or "io").strip().lower(),
+            _REGIONS["io"])[0]
+        when = _lt.now(get_settings(callback.from_user.id)).strftime("%H:%M")
         body = (f"{text}\n\n"
-                f"<i>Это деньги в кабинете AppRoute, которыми покупаются "
-                f"коды, — не баланс магазина на Юмаркете.</i>")
+                f"<i>Кабинет AppRoute {cabinet} · на {when}. Это деньги, "
+                f"которыми бот покупает коды, — не баланс магазина на "
+                f"Юмаркете.</i>")
     else:
         # Причину показываем как есть: «баланс не получен» без неё — то же
         # молчание, ради которого этот экран и делался.
