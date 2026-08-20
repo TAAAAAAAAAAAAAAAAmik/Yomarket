@@ -2490,6 +2490,22 @@ class TaskManager:
             del log[40:]
         save_settings(user_id, settings)          # намерение — до вызова
 
+        # Автоответ покупателю — до кода и только один раз за заказ.
+        # Отметка ставится в записи, а не в памяти: проход может оборваться
+        # между отправкой и покупкой, и тогда возобновление поздоровалось бы
+        # второй раз. Молчание при незаданном тексте — тоже решение: слать
+        # «принял заказ» и следом код через секунду это шум.
+        greeting = str(conf.get("greeting") or "").strip()
+        if greeting and not entry.get("greeted"):
+            entry["greeted"] = True
+            save_settings(user_id, settings)
+            sent, why = await self._send_chat(api, chat_id, greeting, settings)
+            if not sent:
+                # Не беда: код всё равно пойдёт своим путём, а закрытый чат
+                # он заметит сам. Но в журнале это видно.
+                entry["greet_error"] = str(why)[:150]
+                save_settings(user_id, settings)
+
         await self._gift_finish(user_id, api, settings, gift, entry, creds,
                                 chat_id)
 

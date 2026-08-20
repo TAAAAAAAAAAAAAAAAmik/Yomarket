@@ -259,3 +259,98 @@ class AnEnabledCardGetsItsOwnButton(unittest.TestCase):
         src = inspect.getsource(P._plugins_menu_keyboard)
         for slug in ("apple", "xbox", "steam", "amazon", "razer"):
             self.assertNotIn(f'"{slug}"', src)
+
+
+class MakingAProductLivesInTheTemplateToo(unittest.TestCase):
+    """Создание товара было только у Robux — того плагина, что писался с
+    нуля. У карт его не было вовсе, а завести руками 476 номиналов Apple по
+    31 региону невозможно.
+
+    Смысл не в удобстве: витрина и каталог обязаны сойтись. Объявление на
+    номинал, которого у поставщика нет, автовыдаче недоступно, и узнал бы
+    об этом продавец из отказа — когда покупатель уже заплатил.
+    """
+
+    def keyboard(self, gift):
+        from handlers.plugins import _gift_card_keyboard
+        kb = _gift_card_keyboard({}, gift)
+        return [b.callback_data for row in kb.inline_keyboard for b in row]
+
+    def test_every_card_can_start_a_product(self):
+        import automation.giftcards as G
+        for gift in G.cards():
+            self.assertIn(f"plugins:gc:{gift.slug}:make", self.keyboard(gift))
+
+    def test_the_flow_hands_over_to_the_usual_wizard(self):
+        """Своего создания товаров в шаблоне нет и не нужно: мастер умеет
+        разделы панели, обязательные поля, фото и публикацию."""
+        import inspect
+        from handlers import plugins as P
+        src = inspect.getsource(P.gift_make_handoff)
+        self.assertIn("CreateAdState.quantity", src)
+        self.assertNotIn("panel_create_product_sync", src)
+
+    def test_the_region_goes_into_the_description(self):
+        """У Юмаркета поля под регион нет — выдача читает его из описания."""
+        import inspect
+        from handlers import plugins as P
+        self.assertIn("with_region", inspect.getsource(P.gift_make_handoff))
+
+    def test_the_section_hint_comes_from_the_card(self):
+        """Подстановка раздела витрины — данные карты, а не ветка в коде."""
+        import inspect
+        from handlers import plugins as P
+        src = inspect.getsource(P.gift_make_handoff)
+        self.assertIn("gift.autopick", src)
+        for slug in ("apple", "xbox", "steam"):
+            self.assertNotIn(f'"{slug}"', src)
+
+
+class TheGreetingIsSentOnceAndOnlyIfAsked(unittest.TestCase):
+    """Автоответ уходит покупателю до кода.
+
+    Нужен не всегда: обычно код приходит через секунды. Но у долгих
+    номиналов поставщик отвечает «принято, код будет позже», и тогда
+    молчание похоже на поломку.
+    """
+
+    def test_silence_is_the_default(self):
+        import automation.giftcards as G
+        self.assertEqual(G.DEFAULT_CARD_CONF["greeting"], "")
+
+    def test_the_mark_lives_in_the_record_not_in_memory(self):
+        """Проход может оборваться между приветом и покупкой — тогда
+        возобновление поздоровалось бы второй раз."""
+        import inspect
+        from tasks import manager as M
+        src = inspect.getsource(M.TaskManager._maybe_deliver_gift)
+        self.assertIn('entry.get("greeted")', src)
+        self.assertIn('entry["greeted"] = True', src)
+
+    def test_it_goes_before_the_purchase(self):
+        import inspect
+        from tasks import manager as M
+        src = inspect.getsource(M.TaskManager._maybe_deliver_gift)
+        self.assertLess(src.index("greeting"), src.index("_gift_finish"))
+
+
+class TheKeywordIsExplainedWhereItIsMisread(unittest.TestCase):
+    """«Слово-опознаватель» понимают по-разному: одни думают, что это слово
+    для покупателя, другие — что бот ищет его в описании."""
+
+    def test_the_prompt_says_where_the_bot_looks(self):
+        from handlers.plugins import _GIFT_FIELDS
+        prompt = _GIFT_FIELDS["kw"][0]
+        self.assertIn("названи", prompt.lower())
+        self.assertIn("витрин", prompt.lower())
+
+    def test_and_shows_an_example_of_both_outcomes(self):
+        from handlers.plugins import _GIFT_FIELDS
+        prompt = _GIFT_FIELDS["kw"][0]
+        self.assertIn("✅", prompt)
+        self.assertIn("❌", prompt)
+
+    def test_and_says_when_not_to_set_it(self):
+        """Совет «задайте всегда» отправил бы продавца делать лишнее."""
+        from handlers.plugins import _GIFT_FIELDS
+        self.assertIn("только если", _GIFT_FIELDS["kw"][0].lower())

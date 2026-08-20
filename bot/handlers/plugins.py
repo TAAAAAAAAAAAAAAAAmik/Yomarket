@@ -150,6 +150,7 @@ class PluginState(StatesGroup):
     # четыре поля добавили бы сотню состояний к нынешним девяноста трём.
     gc_field = State()
     gc_manual = State()
+    gc_price = State()
 
 
 # ---------------------------------------------------------------------------
@@ -2489,8 +2490,14 @@ def _gift_card_keyboard(settings: dict, gift) -> InlineKeyboardMarkup:
     builder.button(text="📜 Журнал выдач", callback_data=f"plugins:gc:{slug}:log")
     builder.button(text="📦 Наличие и баланс",
                    callback_data=f"plugins:gc:{slug}:stock")
+    # Создание товара — здесь же. Витрина и каталог обязаны сойтись:
+    # объявление на номинал, которого у поставщика нет, автовыдаче
+    # недоступно, а узнал бы об этом продавец из отказа, когда покупатель
+    # уже заплатил.
+    builder.button(text="🏷 Создать товар",
+                   callback_data=f"plugins:gc:{slug}:make")
     builder.button(text="⬅️ Гифт-карты", callback_data="plugins:gifts")
-    builder.adjust(2, 2, 1, 1)
+    builder.adjust(2, 2, 2, 1)
     return builder.as_markup()
 
 
@@ -2500,13 +2507,14 @@ def _gift_cfg_keyboard(gift) -> InlineKeyboardMarkup:
     builder.button(text="🌐 Регион", callback_data=f"plugins:gc:{slug}:region")
     builder.button(text="🔤 Слово-опознаватель",
                    callback_data=f"plugins:gc:{slug}:kw")
+    builder.button(text="💬 Автоответ", callback_data=f"plugins:gc:{slug}:greet")
     builder.button(text="📝 Заметка", callback_data=f"plugins:gc:{slug}:note")
     builder.button(text="🏷 Название товара",
                    callback_data=f"plugins:gc:{slug}:adtitle")
     builder.button(text="📄 Описание товара",
                    callback_data=f"plugins:gc:{slug}:adtext")
     builder.button(text="⬅️ Назад", callback_data=f"plugins:gc:{slug}")
-    builder.adjust(2, 1, 2, 1)
+    builder.adjust(2, 2, 2, 1)
     return builder.as_markup()
 
 
@@ -2522,8 +2530,11 @@ def _gift_cfg_text(settings: dict, gift) -> str:
         f"⚙️ <b>Настройки — {html.escape(gift.title)}</b>",
         "",
         f"🌐 Регион: <b>{html.escape(str(conf.get('region') or '') or '—')}</b>",
-        f"🔤 Слово: <code>{html.escape(str(conf.get('keyword') or '—'))}</code>",
-        f"📝 Заметка: <i>{html.escape(str(conf.get('note') or '—'))}</i>",
+        f"🔤 Слово в названии: "
+        f"<code>{html.escape(str(conf.get('keyword') or '—'))}</code>",
+        f"💬 Автоответ до кода: "
+        f"<i>{html.escape(str(conf.get('greeting') or 'молчим'))}</i>",
+        f"📝 Заметка к коду: <i>{html.escape(str(conf.get('note') or '—'))}</i>",
         "",
         "🏷 <b>Заготовки для новых товаров</b>",
         f"   Название: <code>{html.escape(title)}</code>{own_title}",
@@ -2636,9 +2647,31 @@ _GIFT_FIELDS = {
     "region": ("🌐 Введите регион кода — две буквы, как у поставщика "
                "(US, TR, AE…).\n\nМожно оставить пустым: тогда бот возьмёт "
                "регион из описания товара, где сам его и пишет.", "region"),
-    "kw": ("🔤 Введите слово, по которому узнавать заказы этой карты.\n\n"
-           "Заданное, оно становится требованием: заказы без него в выдачу "
-           "не пойдут.", "keyword"),
+    # Название «слово-опознаватель» продавцы понимают по-разному: одни
+    # думают, что это слово для покупателя, другие — что бот будет искать
+    # его в описании. Поэтому объяснение начинается с того, ГДЕ бот смотрит,
+    # и показывает пример на их же товаре.
+    "kw": ("🔤 <b>Слово в названии товара</b>\n\n"
+           "Бот смотрит на <b>название объявления на витрине</b> и решает, "
+           "этой ли карте отдать заказ.\n\n"
+           "Например, слово <code>эпл</code>:\n"
+           "   ✅ «Эпл гифт карта 10$» — заберёт\n"
+           "   ❌ «Apple Gift Card 10$» — пропустит, слова нет\n\n"
+           "Пока слово не задано, бот узнаёт заказ по обычным написаниям "
+           "названия карты. Задавать своё стоит, только если у вас есть "
+           "другие товары с тем же словом — скажем, аккаунты, — и они "
+           "попадают в выдачу по ошибке.\n\n"
+           "Точка «.» очистит настройку.", "keyword"),
+    "greet": ("💬 <b>Автоответ покупателю</b>\n\n"
+              "Уходит в чат заказа сразу, как заказ взят в работу — "
+              "<b>до кода</b>.\n\n"
+              "Нужен не всегда: обычно код приходит через секунды, и "
+              "«принял заказ» следом за ним выглядит лишним. Но у долгих "
+              "номиналов поставщик отвечает «принято, код будет позже», и "
+              "ожидание тянется минутами — вот там молчание похоже на "
+              "поломку.\n\n"
+              "Точка «.» очистит — тогда бот молчит до самого кода.",
+              "greeting"),
     "note": ("📝 Введите заметку — она уйдёт покупателю вместе с кодом.",
              "note"),
     "adtitle": ("🏷 Введите заготовку названия товара.\n\nПодстановки: "
@@ -2651,7 +2684,7 @@ _GIFT_FIELDS = {
 
 
 @router.callback_query(F.data.regexp(
-    r"^plugins:gc:[a-z0-9_]+:(region|kw|note|adtitle|adtext)$"))
+    r"^plugins:gc:[a-z0-9_]+:(region|kw|greet|note|adtitle|adtext)$"))
 async def gift_field_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     gift = _gift_or_none(callback.data)
     action = str(callback.data).split(":")[3]
@@ -2849,6 +2882,201 @@ async def gift_stock(callback: CallbackQuery) -> None:
     await callback.message.edit_text("\n".join(lines)[:4000],
                                      reply_markup=builder.as_markup())
     await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Создание товара по номиналу — один экран на все карты
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.regexp(r"^plugins:gc:[a-z0-9_]+:make$"))
+async def gift_make_regions(callback: CallbackQuery, state: FSMContext) -> None:
+    """Регион спрашивается первым — раньше номинала.
+
+    От него зависит и какие номиналы показывать, и что уйдёт в описание
+    товара: у Юмаркета своего поля под регион нет, и выдача читает его
+    оттуда. Значит знать регион надо до того, как описание собрано.
+    """
+    from automation.approute import services_sync
+    from automation.giftcards import regions
+    from storage import get_ar_creds
+
+    await state.clear()
+    gift = _gift_or_none(callback.data)
+    if not gift:
+        await callback.answer("Карта не найдена", show_alert=True)
+        return
+    uid = callback.from_user.id
+    creds = get_ar_creds(uid)
+    if not creds or not creds.get("api_key"):
+        await callback.answer("Сначала ключ AppRoute — без него каталога нет",
+                              show_alert=True)
+        return
+    await callback.answer("⏳ Читаю каталог…")
+    await callback.message.edit_text("⏳ Смотрю, что есть у поставщика…")
+
+    loop = asyncio.get_event_loop()
+    try:
+        ok, catalog = await asyncio.wait_for(
+            loop.run_in_executor(None, services_sync, creds), timeout=90)
+    except Exception as e:
+        ok, catalog = False, str(e)[:200]
+    settings = get_settings(uid)
+    if not ok:
+        await callback.message.edit_text(
+            f"❌ Каталог не прочитан: {html.escape(str(catalog))}",
+            reply_markup=_gift_card_keyboard(settings, gift))
+        return
+
+    rows = [r for r in regions(catalog, gift) if r["in_stock"] > 0]
+    if not rows:
+        await callback.message.edit_text(
+            f"❌ У поставщика нет номиналов «{html.escape(gift.title)}» "
+            f"с ненулевым остатком.",
+            reply_markup=_gift_card_keyboard(settings, gift))
+        return
+
+    b = InlineKeyboardBuilder()
+    for r in rows:
+        b.button(text=f"{r['region']} · {r['in_stock']}",
+                 callback_data=f"plugins:gc:{gift.slug}:reg:{r['region']}")
+    b.button(text="⬅️ Назад", callback_data=f"plugins:gc:{gift.slug}")
+    b.adjust(4)
+    await callback.message.edit_text(
+        f"🌐 <b>Регион — {html.escape(gift.title)}</b>\n\n"
+        f"Рядом с регионом — сколько номиналов в наличии.\n\n"
+        f"<i>Регион уйдёт в описание товара отдельной строкой: у Юмаркета "
+        f"поля под него нет, а выдаче он нужен, чтобы купить тот самый "
+        f"код.</i>", reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.regexp(r"^plugins:gc:[a-z0-9_]+:reg:[A-Za-z0-9]+$"))
+async def gift_make_nominals(callback: CallbackQuery, state: FSMContext) -> None:
+    """Номиналы выбранного региона."""
+    from automation.approute import services_sync
+    from automation.giftcards import denominations, nominal_text
+    from storage import get_ar_creds
+
+    gift = _gift_or_none(callback.data)
+    region = callback.data.split(":")[-1].upper()
+    uid = callback.from_user.id
+    settings = get_settings(uid)
+    if not gift:
+        await callback.answer("Карта не найдена", show_alert=True)
+        return
+    await callback.answer("⏳ Читаю номиналы…")
+    loop = asyncio.get_event_loop()
+    try:
+        ok, catalog = await asyncio.wait_for(
+            loop.run_in_executor(None, services_sync, get_ar_creds(uid)),
+            timeout=90)
+    except Exception as e:
+        ok, catalog = False, str(e)[:200]
+    if not ok:
+        await callback.message.edit_text(
+            f"❌ Каталог не прочитан: {html.escape(str(catalog))}",
+            reply_markup=_gift_card_keyboard(settings, gift))
+        return
+
+    rows = [d for d in denominations(catalog, gift, region) if d["in_stock"] > 0]
+    if not rows:
+        await callback.message.edit_text(
+            f"❌ В регионе {html.escape(region)} нет номиналов в наличии.",
+            reply_markup=_gift_card_keyboard(settings, gift))
+        return
+    await state.update_data(gc_slug=gift.slug, gc_region=region, gc_rows=[
+        {"id": d["denomination_id"], "value": d["value"],
+         "measure": d["measure"], "name": d["name"], "price": d["price"]}
+        for d in rows])
+
+    b = InlineKeyboardBuilder()
+    for d in rows[:60]:
+        b.button(text=f"{nominal_text(d['value'], d['measure'])} · ${d['price']:.2f}",
+                 callback_data=f"plugins:gc:{gift.slug}:den:{d['denomination_id']}")
+    b.button(text="⬅️ Другой регион", callback_data=f"plugins:gc:{gift.slug}:make")
+    b.adjust(2)
+    await callback.message.edit_text(
+        f"🏷 <b>Номиналы · {html.escape(gift.title)} · {html.escape(region)}</b>\n\n"
+        f"Цены рядом — <b>закупочные, в долларах</b>. Свою цену в рублях "
+        f"назначите на следующем шаге: курс боту брать неоткуда, и "
+        f"выдумывать его он не станет.", reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.regexp(r"^plugins:gc:[a-z0-9_]+:den:[0-9a-f-]+$"))
+async def gift_make_price(callback: CallbackQuery, state: FSMContext) -> None:
+    from automation.giftcards import nominal_text
+
+    gift = _gift_or_none(callback.data)
+    den_id = callback.data.split(":")[-1]
+    data = await state.get_data()
+    row = next((r for r in (data.get("gc_rows") or [])
+                if r.get("id") == den_id), None)
+    if not gift or not row:
+        # Список живёт в состоянии формы, а оно теряется при перезапуске
+        # бота. Промолчать нельзя: продавец нажал и ждёт ответа.
+        await callback.answer("Список устарел — откройте регионы заново",
+                              show_alert=True)
+        return
+    await state.set_state(PluginState.gc_price)
+    await state.update_data(gc_den=row)
+    await callback.message.edit_text(
+        f"🏷 <b>{html.escape(nominal_text(row['value'], row['measure']))}</b> · "
+        f"{html.escape(gift.title)} · "
+        f"{html.escape(str(data.get('gc_region') or ''))}\n\n"
+        f"Закупка: ${row['price']:.2f}\n\n"
+        f"Назовите цену в рублях, за которую продаёте — одним числом.\n\n"
+        f"Дальше откроется обычное создание объявления: название и описание "
+        f"подставлю по вашим заготовкам, а количество, фото и раздел мастер "
+        f"спросит сам.",
+        reply_markup=_cancel_kb(f"plugins:gc:{gift.slug}:make"))
+    await callback.answer()
+
+
+@router.message(PluginState.gc_price)
+async def gift_make_handoff(message: Message, state: FSMContext) -> None:
+    """Цена принята — управление уходит обычному мастеру объявления.
+
+    Своего создания товаров здесь нет и не нужно: мастер уже умеет то, чего
+    каталог не знает — разделы панели, обязательные поля, фото, публикацию.
+    Плагин подставляет только то, что знает сам.
+    """
+    from automation.giftcards import (card, card_conf, fill_template,
+                                      nominal_text, with_region)
+
+    data = await state.get_data()
+    gift = card(data.get("gc_slug") or "")
+    den = data.get("gc_den") or {}
+    region = str(data.get("gc_region") or "").upper()
+    digits = "".join(ch for ch in (message.text or "") if ch.isdigit())
+    if not gift or not den or not digits:
+        await message.answer("❌ Нужно одно число — цена в рублях.")
+        return
+    price = int(digits)
+    await state.clear()
+
+    conf = card_conf(get_settings(message.from_user.id), gift.slug)
+    nominal = nominal_text(den["value"], den["measure"])
+    filled = functools.partial(fill_template, nominal=nominal, region=region,
+                               price=price)
+    ad_title = filled(conf.get("ad_title") or gift.ad_title)[:100]
+    ad_text = with_region(filled(conf.get("ad_text") or gift.ad_text), region)
+
+    from handlers.create_ad import CreateAdState
+    await state.set_state(CreateAdState.quantity)
+    await state.update_data(title=ad_title, price=price, description=ad_text,
+                            autopick=list(gift.autopick))
+    b = InlineKeyboardBuilder()
+    b.button(text="1️⃣ Пропустить (кол-во = 1)", callback_data="create_ad:qty:1")
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    b.adjust(1)
+    await message.answer(
+        f"✅ Цена: <b>{price} ₽</b> за <b>{html.escape(nominal)}</b> "
+        f"({html.escape(region)})\n\n"
+        f"Название: <code>{html.escape(ad_title)}</code>\n"
+        f"Регион уйдёт в описание отдельной строкой — оттуда его читает "
+        f"выдача.\n\n"
+        f"Сколько таких кодов выставляем? Введите число или пропустите — "
+        f"но тогда объявление продастся один раз и уйдёт с витрины.",
+        reply_markup=b.as_markup())
 
 
 # ---------------------------------------------------------------------------
