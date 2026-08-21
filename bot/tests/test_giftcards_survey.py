@@ -176,5 +176,104 @@ class TheReportTellsWhatToDoWithEachSection(unittest.TestCase):
         self.assertIn("Уже заведены", got)
 
 
+
+class TheDryRunAnswersWithoutSpendingAnything(unittest.TestCase):
+    """«Два плагина работают — значит и остальные тоже?» Движок общий и
+    правда проверен живой выдачей дважды. А `words` (по ним узнаётся заказ)
+    и разбор номинала у каждой карты свои, и ошибка в них видна **не
+    отказом, а тишиной**: заказ оплачен, выдача его не заметила.
+
+    Проверять это покупкой по каждой карте — по заказу на карту и деньги за
+    каждый. То же самое читается с витрины бесплатно, и здесь проверяется
+    именно оно.
+    """
+
+    CATALOG = {"items": [
+        {"name": "Xbox Gift Card 10 USD | US",
+         "subcategoryName": "Xbox Gift Cards", "countryCode": "US",
+         "items": [{"id": "d1", "name": "Xbox Gift Card 10 USD",
+                    "price": 8.0, "inStock": 5}]},
+        {"name": "Steam Wallet Code 5 USD | GL",
+         "subcategoryName": "Steam Wallet Gift Cards", "countryCode": "GLOB",
+         "items": [{"id": "d2", "name": "Steam Wallet Code 5 USD",
+                    "price": 4.5, "inStock": 3}]},
+    ]}
+
+    def run_it(self, *titles):
+        return G.dry_run(list(titles), self.CATALOG)
+
+    def test_a_listing_the_bot_knows_is_marked_with_its_regions(self):
+        row = self.run_it("Xbox Gift Card 10 USD (US)")[0]
+        self.assertEqual(row["card"], "Xbox")
+        self.assertEqual(row["regions"], ["US"])
+        self.assertEqual(row["why"], "")
+
+    def test_an_unknown_listing_is_named_as_such(self):
+        """Самый дорогой случай: заказ оплачен, а бот его не заметил."""
+        row = self.run_it("Аккаунт Minecraft навсегда")[0]
+        self.assertEqual(row["card"], "")
+        self.assertIn("не узнала", row["why"])
+
+    def test_a_listing_without_a_nominal_is_named_too(self):
+        row = self.run_it("Xbox подарочная карта")[0]
+        self.assertEqual(row["card"], "Xbox")
+        self.assertIn("не видно номинала", row["why"])
+
+    def test_a_nominal_the_supplier_does_not_have_is_named(self):
+        """Товар на витрине есть, купить его нечем — и узнать об этом надо
+        до покупателя, а не от него."""
+        row = self.run_it("Xbox Gift Card 999 USD (US)")[0]
+        self.assertEqual(row["card"], "Xbox")
+        self.assertIn("нет в наличии", row["why"])
+
+    def test_each_card_takes_its_own_listing(self):
+        rows = self.run_it("Xbox Gift Card 10 USD (US)",
+                           "Steam Wallet 5 USD (GL)")
+        self.assertEqual([r["card"] for r in rows], ["Xbox", "Steam"])
+
+    def test_the_sellers_own_keyword_is_honoured(self):
+        """Слово-опознаватель — требование: без него заказ в выдачу не идёт,
+        и сухой прогон обязан считать так же, иначе он врёт в утешительную
+        сторону."""
+        settings = {"plugins": {"gift_cards": {
+            "xbox": {"enabled": True, "keyword": "иксбокс"}}}}
+        rows = G.dry_run(["Xbox Gift Card 10 USD (US)"], self.CATALOG, settings)
+        self.assertEqual(rows[0]["card"], "")
+
+    def test_nothing_on_the_shelf_is_not_an_error(self):
+        self.assertEqual(G.dry_run([], self.CATALOG), [])
+
+
+class TheDryRunReportSaysWhatToDo(unittest.TestCase):
+    def lines(self, rows):
+        from handlers import plugins as P
+        return "\n".join(P._dry_run_lines(rows))
+
+    def test_the_count_is_stated_first(self):
+        got = self.lines([
+            {"title": "A", "card": "Xbox", "nominal": "10 USD",
+             "regions": ["US"], "why": ""},
+            {"title": "B", "card": "", "nominal": "", "regions": [],
+             "why": "ни одна карта не узнала товар по названию"},
+        ])
+        self.assertIn("<b>1</b> из <b>2</b>", got)
+
+    def test_the_unservable_ones_come_first(self):
+        """Их и надо чинить; список узнанных — утешение, а не работа."""
+        got = self.lines([
+            {"title": "Хороший", "card": "Xbox", "nominal": "10 USD",
+             "regions": ["US"], "why": ""},
+            {"title": "Плохой", "card": "", "nominal": "", "regions": [],
+             "why": "ни одна карта не узнала товар по названию"},
+        ])
+        self.assertLess(got.index("Плохой"), got.index("Хороший"))
+
+    def test_the_region_caveat_is_not_hidden(self):
+        """Проверка отвечает «узнаю», а не «выдам наверняка», и умолчать об
+        этом значит пообещать больше проверенного."""
+        got = self.lines([{"title": "A", "card": "Xbox", "nominal": "10 USD",
+                           "regions": ["US"], "why": ""}])
+        self.assertIn("Регион товара здесь не проверяется", got)
+
 if __name__ == "__main__":
     unittest.main()

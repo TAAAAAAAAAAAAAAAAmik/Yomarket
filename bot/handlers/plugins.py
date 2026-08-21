@@ -2432,6 +2432,8 @@ def _gift_cards_keyboard(settings: dict) -> InlineKeyboardMarkup:
                        callback_data=f"plugins:gc:{gift.slug}")
     if len(on) < len(cards()):
         builder.button(text="➕ Добавить карту", callback_data="plugins:gifts:add")
+    builder.button(text="🧪 Проверка на моих товарах",
+                   callback_data="plugins:gifts:dryrun")
     builder.button(text="🔬 Что ещё можно завести",
                    callback_data="plugins:gifts:survey")
     builder.button(text="🔑 Поставщик AppRoute", callback_data="apr:creds")
@@ -2599,6 +2601,97 @@ def _survey_lines(rows: list[dict]) -> list[str]:
                 f"«{html.escape(r['measure'] or 'не подобрана')}», услуг "
                 f"{r['services']}")
     return lines
+
+
+def _dry_run_lines(rows: list[dict]) -> list[str]:
+    """Сухой прогон словами. Отдельно от экрана — чтобы проверять текст."""
+    good = [r for r in rows if r["regions"]]
+    bad = [r for r in rows if not r["regions"]]
+    lines = ["🧪 <b>Проверка на ваших товарах</b>", ""]
+    lines.append(f"Узнаю и найду у поставщика: <b>{len(good)}</b> из "
+                 f"<b>{len(rows)}</b>")
+    lines.append("")
+    if bad:
+        lines.append("<b>Эти выдать не смогу:</b>")
+        for r in bad[:12]:
+            lines.append(f"❌ {html.escape(r['title'][:60])}\n"
+                         f"   {html.escape(r['why'])}"
+                         + (f" (карта: {html.escape(r['card'])})"
+                            if r["card"] else ""))
+        lines.append("")
+    if good:
+        lines.append("<b>Эти узнаю:</b>")
+        for r in good[:12]:
+            lines.append(
+                f"✅ {html.escape(r['title'][:60])}\n"
+                f"   {html.escape(r['card'])} · "
+                f"{html.escape(r['nominal'])} · регионы: "
+                f"{html.escape(', '.join(r['regions'][:6]))}")
+    lines.append("")
+    lines.append("<i>Регион товара здесь не проверяется: он лежит в описании "
+                 "и читается при выдаче. Проверка отвечает «узнаю, и номинал "
+                 "такой у поставщика есть» — не «выдам наверняка».</i>")
+    return lines
+
+
+@router.callback_query(F.data == "plugins:gifts:dryrun")
+async def gifts_dry_run(callback: CallbackQuery, state: FSMContext) -> None:
+    """Сухой прогон по витрине продавца: какие его товары бот узнаёт.
+
+    Движок общий и проверен живой выдачей, а `words` и разбор номинала у
+    каждой карты свои — и ошибка в них видна не отказом, а тишиной: заказ
+    оплачен, выдача его не заметила. Проверять это покупкой по каждой карте
+    дорого и долго; здесь то же самое читается с витрины, не потратив
+    ничего.
+    """
+    from automation.giftcards import dry_run
+    from automation.panel import panel_list_items_sync
+    from storage import get_ar_creds, get_panel_creds
+
+    await state.clear()
+    uid = callback.from_user.id
+    settings = get_settings(uid)
+    creds = get_ar_creds(uid)
+    panel = get_panel_creds(uid)
+    if not creds or not creds.get("api_key"):
+        await callback.answer("Сначала ключ AppRoute — без него каталога нет",
+                              show_alert=True)
+        return
+    if not panel or not panel.get("cookies"):
+        await callback.answer("Нужен вход в панель — оттуда берутся ваши товары",
+                              show_alert=True)
+        return
+
+    await callback.answer("⏳ Смотрю ваши товары…")
+    await callback.message.edit_text("⏳ Читаю витрину и каталог…")
+    loop = asyncio.get_event_loop()
+    try:
+        ok_items, items = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_list_items_sync, panel["cookies"]),
+            timeout=40)
+    except Exception as e:
+        ok_items, items = False, str(e)[:200]
+    if not ok_items:
+        await callback.message.edit_text(
+            f"❌ Товары не прочитаны: {html.escape(str(items)[:300])}",
+            reply_markup=_gift_cards_keyboard(settings))
+        return
+
+    ok, catalog, age = await _read_catalog(creds)
+    if not ok:
+        await callback.message.edit_text(
+            f"❌ Каталог не прочитан: {html.escape(str(catalog))}",
+            reply_markup=_gift_cards_keyboard(settings))
+        return
+
+    titles = [str(i.get("title") or "") for i in (items or [])
+              if isinstance(i, dict)]
+    rows = dry_run(titles, catalog, settings)
+    lines = _dry_run_lines(rows)
+    if age:
+        lines.append(f"<i>{html.escape(age)}</i>")
+    await callback.message.edit_text("\n".join(lines)[:4000],
+                                     reply_markup=_gift_cards_keyboard(settings))
 
 
 @router.callback_query(F.data == "plugins:gifts:survey")

@@ -852,6 +852,60 @@ def match_denomination(catalog, gift: GiftCard, region: str, value: float,
 # ---------------------------------------------------------------------------
 
 
+def dry_run(titles, catalog, settings: dict | None = None) -> list[dict]:
+    """Сухой прогон по названиям товаров продавца — без единой покупки.
+
+    Отвечает на вопрос, который иначе стоит денег: **узнает ли бот мои
+    товары**. Движок у карт общий и проверен живой выдачей, а вот `words`
+    (по ним узнаётся заказ) и разбор номинала у каждой карты свои — и
+    ошибка в них видна не отказом, а тишиной: заказ оплачен, а выдача его
+    просто не заметила.
+
+    Регион здесь **не проверяется**: он лежит в описании товара, а не в
+    названии, и читается при выдаче. Поэтому проверка отвечает «узнаю и
+    номинал такой у поставщика есть», а не «выдам наверняка».
+
+    По строке на товар: какая карта его забирает, что прочитано номиналом,
+    и есть ли такой номинал у поставщика хоть в одном регионе.
+    """
+    conf_of = {}
+    if isinstance(settings, dict):
+        conf_of = {c.slug: card_conf(settings, c.slug) for c in CARDS}
+
+    out: list[dict] = []
+    for title in titles or []:
+        text = str(title or "")
+        row = {"title": text, "card": "", "nominal": "", "regions": [],
+               "why": ""}
+        gift = next(
+            (c for c in CARDS
+             if is_card_order(c, text, (conf_of.get(c.slug) or {}).get("keyword") or "")),
+            None)
+        if gift is None:
+            row["why"] = "ни одна карта не узнала товар по названию"
+            out.append(row)
+            continue
+        row["card"] = gift.title
+
+        value, measure = nominal_from_title(gift, text)
+        if value <= 0:
+            row["why"] = "в названии не видно номинала"
+            out.append(row)
+            continue
+        row["nominal"] = nominal_text(value, measure) if measure else f"{value:g}"
+
+        rows = [d for d in denominations(catalog, gift)
+                if abs(d["value"] - value) < 0.001
+                and (not measure or d["measure"] == measure)
+                and d["in_stock"] > 0]
+        if not rows:
+            row["why"] = "такого номинала у поставщика нет в наличии"
+        else:
+            row["regions"] = sorted({d["region"] for d in rows})
+        out.append(row)
+    return out
+
+
 def order_reference(slug: str, order_id: str) -> str:
     """Ссылка покупки — придумывается ДО вызова поставщика.
 
