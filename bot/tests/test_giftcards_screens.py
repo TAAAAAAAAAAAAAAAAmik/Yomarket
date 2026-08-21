@@ -237,69 +237,40 @@ class TheScreensSellWithNumbersNotAdjectives(unittest.TestCase):
         from handlers import plugins as P
         return P._gift_cards_text(settings)
 
-    def test_the_menu_states_what_was_delivered(self):
+    def test_the_menu_is_a_short_pitch_not_a_report(self):
+        """Первый экран открывают, чтобы включить плагин, а не свериться с
+        цифрами. Счёт убран отсюда 21.08 по решению продавца — он остался
+        там, где по делу: на экране карт и в карточке каждой карты."""
         got = self.menu(self.settings(delivered=12))
-        self.assertIn("12", got)
-        self.assertIn("мин назад", got)
+        self.assertNotIn("Выдано кодов", got)
+        self.assertNotIn("Последняя выдача", got)
+        self.assertLess(len(got), 500, "экран снова разросся в простыню")
 
-    def test_a_failure_is_not_hidden_behind_the_successes(self):
-        got = self.menu(self.settings(delivered=12, failed=3))
-        self.assertIn("Не выдано", got)
-        self.assertIn("3", got)
-
-    def test_an_empty_shop_is_invited_not_scolded(self):
-        """Ноль выдач — это первый день, а не поломка."""
+    def test_the_menu_says_what_the_plugins_do(self):
         got = self.menu(self.settings(delivered=0, enabled=False))
-        self.assertIn("Пока не выдано", got)
-        self.assertNotIn("Не выдано:", got)
+        self.assertIn("не ждут вас", got)
+        self.assertIn("Карт много", got)
 
-    def test_the_shelf_counts_each_card(self):
-        got = self.shelf(self.settings(delivered=5))
-        self.assertIn("Apple", got)
-        self.assertIn("выдано 5", got)
-
-    def test_the_shelf_no_longer_claims_delivery_is_unproven(self):
-        """Эта строка была правдой ровно до первой выдачи, а потом
-        превратилась в неправду, которую продавец видел каждый день."""
-        got = self.shelf(self.settings(delivered=5))
-        self.assertNotIn("ещё не проверялась", got)
-
-    def test_the_shelf_says_how_many_cards_are_left_to_turn_on(self):
-        got = self.shelf(self.settings(delivered=0, enabled=False))
-        self.assertIn("Доступно ещё", got)
-
-    def test_the_screen_says_what_the_plugins_do_for_the_seller(self):
-        """Цифры доказывают, что работает; текст объясняет, зачем это нужно.
-        Одних цифр мало: «выдано 3» ничего не говорит тому, кто ещё думает,
-        включать ли плагин."""
-        got = self.menu(self.settings(delivered=3))
-        self.assertIn("Что делают плагины", got)
-        self.assertIn("пока вы спите", got)
-
-    def test_the_pitch_stays_when_there_is_nothing_to_show_yet(self):
-        got = self.menu(self.settings(delivered=0, enabled=False))
-        self.assertIn("Что делают плагины", got)
-
-    def test_the_numbers_come_before_the_pitch(self):
-        """Доказательство вперёд обещания: продавец видит свой счёт, а
-        потом уже читает, почему это хорошо."""
-        got = self.menu(self.settings(delivered=3))
-        self.assertLess(got.index("Выдано кодов"), got.index("Что делают"))
+    def test_the_menu_does_not_count_the_cards_out_loud(self):
+        """Число карт меняется каждую неделю, а цифра в тексте — нет:
+        разойдясь однажды, экран начинает врать по мелочи."""
+        got = self.menu(self.settings(delivered=1))
+        from automation.giftcards import cards
+        self.assertNotIn(f"{len(cards())} ", got)
 
     def test_nothing_is_promised_that_cannot_be_checked(self):
-        """«Продажи вырастут в разы» проверить нельзя, а «заказ в четыре утра
-        не ждёт до утра» продавец проверит в первую же ночь. Обещание,
-        которого нельзя сдержать, здесь дороже любой недосказанности."""
+        """«Продажи вырастут в разы» проверить нельзя, а «заказы не ждут вас
+        до утра» продавец проверит в первую же ночь. Обещание, которого
+        нельзя сдержать, здесь дороже любой недосказанности."""
         got = self.menu(self.settings(delivered=3)).lower()
         for promise in ("в разы", "гарантир", "вырастут", "заработаете",
                         "прибыль вырастет", "х2", "в два раза больше"):
             self.assertNotIn(promise, got)
 
-    def test_the_number_of_cards_is_counted_not_written_by_hand(self):
-        """Число в тексте — из реестра. Дописанное руками разошлось бы с ним
-        на первой же новой карте, и экран начал бы врать по мелочи."""
-        from automation.giftcards import cards
-        self.assertIn(str(len(cards())), self.menu(self.settings(delivered=1)))
+    def test_the_shelf_still_keeps_the_score(self):
+        """Убрали с первого экрана — не значит спрятали."""
+        got = self.shelf(self.settings(delivered=12))
+        self.assertIn("выдано 12", got)
 
     def test_a_failed_attempt_is_not_reported_as_a_delivery(self):
         """Самая дорогая мелочь на этом экране. Последняя запись журнала —
@@ -311,7 +282,7 @@ class TheScreensSellWithNumbersNotAdjectives(unittest.TestCase):
             "enabled": True, "delivered": ["1"],
             "log": [{"at": _t.time() - 7200, "state": "выдан"},
                     {"at": _t.time() - 60, "state": "не выдан"}]}}}}
-        got = self.menu(settings)
+        got = self.shelf(settings)
         self.assertIn("2 ч назад", got)
         self.assertNotIn("1 мин назад", got)
 
