@@ -876,6 +876,11 @@ def _picked_note(picked: list | None) -> str:
     return f"\n🏷 <i>Раздел выбран автоматически — {rows}</i>"
 
 
+# Сколько полей подряд готовы спросить по отказам панели. Три — это «панель
+# называет их по одному», а не «мастер ходит по кругу».
+_MAX_REFUSED_ROUNDS = 3
+
+
 async def _ask_for_refused_fields(msg, uid: int, values: dict,
                                   extra: dict | None, picked: list | None,
                                   state: FSMContext, result_msg: str) -> bool:
@@ -894,10 +899,16 @@ async def _ask_for_refused_fields(msg, uid: int, values: dict,
     from storage import get_panel_creds
 
     data = await state.get_data()
-    if data.get("refused_asked"):
+    # Спрошенное уже не спрашиваем: панель называет недостающие поля списком,
+    # и если после ответа отказ повторился тем же полем — вопрос не помог,
+    # второй такой же будет кругом. А вот НОВОЕ имя в отказе означает, что
+    # дело сдвинулось, и его спросить стоит. Потолок всё равно нужен: считать
+    # прогрессом бесконечную череду новых полей нельзя.
+    already = list(data.get("refused_asked") or [])
+    if len(already) >= _MAX_REFUSED_ROUNDS:
         return False
     refused = [a for a in validation_fields(result_msg)
-               if a not in (extra or {})]
+               if a not in (extra or {}) and a not in already]
     if not refused:
         return False
 
@@ -927,11 +938,19 @@ async def _ask_for_refused_fields(msg, uid: int, values: dict,
     if not queue:
         return False
 
+    # Панель только что назвала эти поля обязательными — это сильнее, чем
+    # `rules` в её же форме, где их обязательность не объявлена вовсе. Без
+    # этой отметки поле без готовых вариантов считалось бы необязательным и
+    # **молча пропускалось**: товар ушёл бы заново без него и получил тот же
+    # отказ, только двумя запросами позже.
+    fields = [{**f, "required": True} if f["attribute"] in queue else f
+              for f in fields]
+
     await state.set_state(CreateAdState.panel_select)
     await state.update_data(
         pending=values, form_resource=resource, form_fields=fields,
         chosen=dict(extra or {}), autopicked=list(picked or []),
-        select_queue=queue, refused_asked=True,
+        select_queue=queue, refused_asked=already + queue,
     )
     names = ", ".join(
         str(next((f.get("label") for f in fields if f["attribute"] == a), a))

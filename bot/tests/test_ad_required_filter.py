@@ -202,15 +202,46 @@ class ARefusedFieldIsAskedNotSurrenderedTo(unittest.TestCase):
         self.assertEqual(self.created[-1],
                          {"category": 4718, "filter__8": 7})
 
-    def test_it_asks_once_and_does_not_loop(self):
-        """Если и с ответом панель откажет, продавец получит отчёт, а не
-        второй круг вопросов."""
+    def test_the_same_field_is_not_asked_twice(self):
+        """Отказ тем же полем после ответа означает, что вопрос не помог.
+        Второй такой же — круг, а не помощь."""
         state = FSM({"form_fields": FIELDS, "form_resource": "items",
-                     "refused_asked": True})
+                     "refused_asked": ["filter__8"]})
         msg = self.run_create(state, extra={"category": 4718})
         self.assertEqual(self.asked, [])
         self.assertIn("Регион", msg.last)          # отчёт, с объяснением
         self.assertTrue(state.cleared)
+
+    def test_a_new_field_in_the_refusal_is_asked_too(self):
+        """Панель называет недостающие поля по мере того, как заполняются
+        предыдущие: новое имя — это движение вперёд, а не круг."""
+        state = FSM({"form_fields": FIELDS, "form_resource": "items",
+                     "refused_asked": ["filter__3"]})
+        self.run_create(state, extra={"category": 4718})
+        self.assertEqual(self.asked, ["filter__8"])
+
+    def test_the_rounds_are_capped(self):
+        """Бесконечная череда новых полей — это не прогресс."""
+        state = FSM({"form_fields": FIELDS, "form_resource": "items",
+                     "refused_asked": ["a", "b", "c"]})
+        msg = self.run_create(state, extra={"category": 4718})
+        self.assertEqual(self.asked, [])
+        self.assertTrue(state.cleared)
+
+    def test_the_refused_field_is_marked_required(self):
+        """Иначе поле без готовых вариантов считалось бы необязательным и
+        молча пропускалось: товар ушёл бы заново без него и получил тот же
+        отказ, только двумя запросами позже. Панель назвала его обязательным
+        — это сильнее, чем её же форма, где обязательность не объявлена."""
+        state = FSM({"form_fields": FIELDS, "form_resource": "items"})
+        self.run_create(state, extra={"category": 4718})
+        region = next(f for f in state.data["form_fields"]
+                      if f["attribute"] == "filter__8")
+        self.assertTrue(region["required"])
+        # Соседние поля не трогаем: обязательным его назвала панель, а не мы.
+        other = next(f for f in state.data["form_fields"]
+                     if f["attribute"] == "category")
+        self.assertFalse(other.get("required"))
 
     def test_a_field_the_form_does_not_know_is_not_asked(self):
         """Спросить поле, которого нет в форме, значит спросить пустоту."""
@@ -229,6 +260,67 @@ class ARefusedFieldIsAskedNotSurrenderedTo(unittest.TestCase):
         state = FSM({"form_fields": FIELDS, "form_resource": "items"})
         self.run_create(state, extra={"category": 4718, "filter__8": 7})
         self.assertTrue(state.cleared)
+
+
+class AFieldWithoutOptionsIsNotSilentlySkipped(unittest.TestCase):
+    """Самая дорогая версия этой поломки — не отказ, а тишина.
+
+    Варианты для `filter__8` панель отдаёт отдельным запросом, и он может
+    ничего не вернуть. Поле без вариантов мастер считал необязательным (в
+    форме у него и правда нет `required`) и **пропускал молча** — товар
+    уходил заново без региона и получал тот же отказ, только двумя
+    запросами позже. Продавец при этом видел бы ту же простыню и решил, что
+    правка не работает вовсе.
+    """
+
+    def setUp(self):
+        import storage
+        self.created: list = []
+        self._undo: list = []
+
+        def create(cookies, title, price, description, quantity=1,
+                   category="", uid=None, extra=None, photo_path=None):
+            self.created.append(dict(extra or {}))
+            return False, REFUSAL
+
+        for mod, name, val in (
+            (storage, "get_panel_creds", lambda uid: {"cookies": "c=1"}),
+            (P, "panel_create_product_sync", create),
+            (P, "panel_get_item_form_sync",
+             lambda cookies: (True, {"resource": "items", "fields": FIELDS})),
+            (P, "panel_sync_field_options_sync",
+             lambda *a, **kw: ([], "associatable/filter__8: 404")),
+        ):
+            self._undo.append((mod, name, getattr(mod, name, None)))
+            setattr(mod, name, val)
+
+    def tearDown(self):
+        for mod, name, old in reversed(self._undo):
+            setattr(mod, name, old)
+
+    def run_it(self):
+        # Поле без готовых вариантов — их придётся тянуть запросом.
+        fields = [dict(f, options=[]) for f in FIELDS]
+        state = FSM({"form_fields": fields, "form_resource": "items"})
+        msg = Msg()
+        asyncio.run(C._panel_create_and_report(
+            msg, 1, {"title": "Apple Gift Card TRY 10 (TR)", "price": 60,
+                     "description": "код", "quantity": 1, "category": "",
+                     "photo_path": None},
+            extra={"category": 4718}, state=state))
+        return msg
+
+    def test_the_item_is_not_sent_again_without_the_field(self):
+        self.run_it()
+        self.assertEqual(len(self.created), 1,
+                         "товар ушёл заново без региона — тот же отказ")
+
+    def test_the_seller_is_told_which_field_has_no_options(self):
+        self.assertIn("Регион", self.run_it().last)
+
+    def test_the_probe_is_printed_so_it_can_be_finished(self):
+        """Без трассы запросов доделывать это пришлось бы вслепую."""
+        self.assertIn("associatable/filter__8", self.run_it().last)
 
 
 class TheGiftCardTemplateHintsTheRegionItAlreadyKnows(unittest.TestCase):
