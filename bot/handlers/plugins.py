@@ -2396,28 +2396,43 @@ async def roblox_set_note_input(message: Message, state: FSMContext) -> None:
 
 
 def _gift_cards_text(settings: dict, shop_name: str = "") -> str:
-    from automation.giftcards import card_conf, cards
+    """Список карт как витрина: включённые с их счётом, остальные — числом.
 
-    name_part = f" • {html.escape(shop_name)}" if shop_name else ""
+    Прежний экран заканчивался строкой «на живом заказе выдача ещё не
+    проверялась». Она была правдой ровно до первой выдачи, а потом
+    превратилась в неправду, которую продавец видел каждый день. Теперь
+    сказано то, что есть в его журналах: сколько кодов ушло по каждой карте.
+    """
+    from automation.giftcards import ago, card_conf, cards, stats
+
+    facts = stats(settings)
+    name_part = f" · {html.escape(shop_name)}" if shop_name else ""
     lines = [f"🎁 <b>Гифт-карты{name_part}</b>", ""]
     on = [c for c in cards() if card_conf(settings, c.slug).get("enabled")]
     if on:
-        lines.append("<b>Включены:</b>")
         for gift in on:
             conf = card_conf(settings, gift.slug)
+            mine = facts["per_card"].get(gift.slug) or {}
             region = str(conf.get("region") or "").upper() or "из описания"
-            lines.append(f"{gift.emoji} {html.escape(gift.title)} — регион: "
-                         f"{html.escape(region)}")
+            done = mine.get("delivered") or 0
+            when = ago(mine.get("last_at") or 0)
+            tail = (f" · выдано {done}" + (f", {when}" if when else "")
+                    if done else " · выдач пока нет")
+            lines.append(f"{gift.emoji} <b>{html.escape(gift.title)}</b> — "
+                         f"{html.escape(region)}{tail}")
     else:
-        lines.append("Пока не включена ни одна карта.")
+        lines.append("Пока не включена ни одна карта — а включается она в "
+                     "одно нажатие.")
+    off = [c for c in cards() if c not in on]
+    if off:
+        names = ", ".join(html.escape(c.title) for c in off[:6])
+        more = " и другие" if len(off) > 6 else ""
+        lines += ["", f"Доступно ещё <b>{len(off)}</b>: {names}{more}."]
     lines += [
         "",
-        "<b>Что здесь выдаётся.</b> Код, который покупатель активирует сам. "
-        "Ник и логин не нужны — выдача идёт сразу по факту оплаты.",
-        "",
-        "⚠️ <b>На живом заказе выдача ещё не проверялась.</b> Первые покупки "
-        "посмотрите глазами: бот пишет о каждой — и об удачной, и о "
-        "несостоявшейся.",
+        "Покупатель платит — бот сам покупает код у поставщика и присылает "
+        "его в чат заказа. Ник и логин не нужны: код покупатель активирует "
+        "сам.",
     ]
     return "\n".join(lines)
 
@@ -2438,12 +2453,16 @@ def _gift_cards_keyboard(settings: dict) -> InlineKeyboardMarkup:
                    callback_data="plugins:gifts:survey")
     builder.button(text="🔑 Поставщик AppRoute", callback_data="apr:creds")
     builder.button(text="⬅️ Назад", callback_data="plugins:menu")
-    builder.adjust(1)
+    # Карты — по две в ряд: названия короткие, а тринадцать штук по одной
+    # превращали экран в два экрана. Всё, что ниже, — по одной: у этих
+    # кнопок подписи длинные, и вторая в ряд обрезалась бы многоточием.
+    cards_rows = [2] * ((len(on) + 1) // 2)
+    builder.adjust(*(cards_rows + [1, 1, 1, 1, 1]))
     return builder.as_markup()
 
 
 def _gift_card_text(settings: dict, gift) -> str:
-    from automation.giftcards import card_conf
+    from automation.giftcards import ago, card_conf
 
     conf = card_conf(settings, gift.slug)
     enabled = conf.get("enabled")
@@ -2458,8 +2477,24 @@ def _gift_card_text(settings: dict, gift) -> str:
         ("🟢 <b>Автовыдача включена</b> — бот сам купит код по оплаченному "
          "заказу" if enabled
          else "🔴 Автовыдача выключена — заказы выдаёте вручную"),
-        "",
     ]
+    # Счёт выдач стоял в самом низу, после всех настроек. Это главный ответ
+    # экрана — работает ли оно и когда сработало в последний раз, — и место
+    # ему рядом со статусом. Остальной текст продавец одобрил, и он не
+    # тронут.
+    if delivered:
+        when = ago(max((float(e.get("at") or 0) for e in log
+                        if isinstance(e, dict)), default=0.0))
+        lines.append(f"⚡ Выдано кодов: <b>{len(delivered)}</b>"
+                     + (f" · последний {when}" if when else ""))
+    failed = sum(1 for e in log
+                 if isinstance(e, dict) and str(e.get("state")) == "не выдан")
+    if failed:
+        # Рядом с «выдано 12» три несостоявшихся молчать не могут: это тот
+        # самый бодрый отчёт, от которого здесь уходят.
+        lines.append(f"⚠️ Не выдано: <b>{failed}</b> — причина у каждого "
+                     f"в журнале")
+    lines.append("")
     # Разница между «мерено» и «похоже, что разберётся» — это разница между
     # проверкой и надеждой, и продавец вправе её видеть. У меренных карт все
     # названия семейства разобрались на живом каталоге; у остальных
@@ -2489,8 +2524,9 @@ def _gift_card_text(settings: dict, gift) -> str:
                      "словом, задайте своё: иначе они тоже попадут в выдачу.")
     if note:
         lines.append(f"📝 Заметка покупателю: <i>{html.escape(note)}</i>")
-    lines += ["", f"📜 Выдач в журнале: <b>{len(log)}</b>, "
-                  f"выдано заказов: <b>{len(delivered)}</b>"]
+    if log:
+        lines += ["", f"📜 Записей в журнале: <b>{len(log)}</b> — там коды, "
+                      f"номиналы и причины отказов"]
     return "\n".join(lines)
 
 
@@ -3269,12 +3305,51 @@ async def gift_make_handoff(message: Message, state: FSMContext) -> None:
 # Plugins main menu
 # ---------------------------------------------------------------------------
 
+def _plugins_menu_text(settings: dict, shop_name: str = "") -> str:
+    """Экран плагинов — витрина, а не оглавление.
+
+    Продавец платит за подписку и вправе видеть, что она делает: не
+    «автоматическая доставка цифровых товаров», а сколько кодов ушло и когда
+    ушёл последний. Цифры берутся из его собственных журналов, поэтому это
+    не обещание, а отчёт — и проверить его он может там же.
+    """
+    from automation.giftcards import ago, stats
+
+    facts = stats(settings)
+    name_part = f" · {html.escape(shop_name)}" if shop_name else ""
+    lines = [f"🧩 <b>Плагины{name_part}</b>", ""]
+    if facts["delivered"]:
+        lines.append(
+            f"⚡ Выдано кодов: <b>{facts['delivered']}</b> · карт включено: "
+            f"<b>{facts['cards_on']}</b>")
+        last = ago(facts["last_at"])
+        if last:
+            lines.append(f"🕓 Последняя выдача: {html.escape(facts['last_card'])}"
+                         f", {last}")
+        if facts["failed"]:
+            # Молчать об этом нельзя: «12 выдано» рядом с тремя молча
+            # несостоявшимися — это тот самый бодрый отчёт, от которого
+            # здесь уходят. Журнал каждой карты называет причину.
+            lines.append(f"⚠️ Не выдано: <b>{facts['failed']}</b> — причина "
+                         f"у каждого в журнале карты")
+    else:
+        lines.append("Бот сам покупает код у поставщика и отправляет "
+                     "покупателю в чат заказа — от оплаты до кода проходит "
+                     "меньше минуты.")
+        lines.append("")
+        lines.append("Пока не выдано ни одного кода. Первые посмотрите "
+                     "глазами: бот пишет о каждой выдаче — и об удачной, и о "
+                     "несостоявшейся.")
+    return "\n".join(lines)
+
+
 @router.callback_query(F.data == "plugins:menu")
 async def plugins_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
+    uid = callback.from_user.id
+    settings = get_settings(uid)
     await callback.message.edit_text(
-        "🧩 <b>Плагины</b>\n\n"
-        "Автоматическая доставка цифровых товаров при новых заказах.",
-        reply_markup=_plugins_menu_keyboard(get_settings(callback.from_user.id)),
+        _plugins_menu_text(settings, get_shop_name(uid)),
+        reply_markup=_plugins_menu_keyboard(settings),
     )
     await callback.answer()

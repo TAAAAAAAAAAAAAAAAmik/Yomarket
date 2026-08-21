@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import copy
 import re
+import time
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
@@ -945,6 +946,72 @@ def match_denomination(catalog, gift: GiftCard, region: str, value: float,
 # ---------------------------------------------------------------------------
 # Ссылка покупки, заготовки, баланс
 # ---------------------------------------------------------------------------
+
+
+# Состояния записи журнала. Выдачей считается ровно одно — то, при котором
+# код ушёл покупателю; всё остальное либо ещё в пути, либо не состоялось.
+# Считать «последней выдачей» последнюю запись любого вида значит однажды
+# отчитаться о выдаче там, где был отказ.
+DELIVERED_STATE = "выдан"
+FAILED_STATES = frozenset((
+    "не выдан", "нет в наличии", "поставщик отказал", "ответ без кода",
+    "номинал не перечитан", "куплен, отправить не смогли",
+))
+
+
+def ago(when: float, now: float = 0.0) -> str:
+    """Сколько прошло — словами и без часовых поясов.
+
+    Абсолютное время («сегодня в 13:40») требует знать пояс продавца, а мы
+    его не знаем: бот живёт на сервере, продавец — где угодно. Соврать на
+    три часа в строке «последняя выдача» — мелочь, из которой складывается
+    недоверие ко всему остальному.
+    """
+    now = now or time.time()
+    gap = max(0.0, now - float(when or 0))
+    if not when:
+        return ""
+    if gap < 90:
+        return "только что"
+    if gap < 3600:
+        return f"{int(gap // 60)} мин назад"
+    if gap < 86400:
+        return f"{int(gap // 3600)} ч назад"
+    days = int(gap // 86400)
+    if days == 1:
+        return "вчера"
+    return f"{days} дн назад"
+
+
+def stats(settings: dict) -> dict:
+    """Что автовыдача уже сделала — по журналам карт.
+
+    Цифры, а не прилагательные. «Работает надёжно» продавец читает как
+    рекламу, «выдано 12 кодов, последний 20 минут назад» — как факт, и
+    второе он может проверить в журнале.
+    """
+    out = {"cards_on": 0, "delivered": 0, "failed": 0, "last_at": 0.0,
+           "last_card": "", "per_card": {}}
+    for card in CARDS:
+        conf = card_conf(settings, card.slug)
+        done = len(conf.get("delivered") or [])
+        log = [e for e in (conf.get("log") or []) if isinstance(e, dict)]
+        failed = sum(1 for e in log if str(e.get("state")) in FAILED_STATES)
+        # «Последняя выдача» — по записям о выдаче, а не по последней записи
+        # вообще. Иначе несостоявшаяся попытка, случившаяся минуту назад,
+        # отчитывалась бы как выдача: строка на экране бодрая, а кода
+        # покупатель не получил.
+        last = max((float(e.get("at") or 0) for e in log
+                    if str(e.get("state")) == DELIVERED_STATE), default=0.0)
+        if conf.get("enabled"):
+            out["cards_on"] += 1
+        out["delivered"] += done
+        out["failed"] += failed
+        out["per_card"][card.slug] = {"delivered": done, "last_at": last,
+                                      "failed": failed}
+        if last > out["last_at"]:
+            out["last_at"], out["last_card"] = last, card.title
+    return out
 
 
 def dry_run(titles, catalog, settings: dict | None = None) -> list[dict]:

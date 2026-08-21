@@ -204,6 +204,118 @@ class TheCardScreenTellsTheTruth(unittest.TestCase):
         self.assertIn("выключена", P._gift_card_text(settings, gift))
 
 
+
+class TheScreensSellWithNumbersNotAdjectives(unittest.TestCase):
+    """«Упакуй красиво и продажно» — 21.08.
+
+    Продажно здесь не значит «побольше прилагательных». Продавец платит за
+    подписку и вправе видеть, что она сделала: не «автоматическая доставка
+    цифровых товаров», а сколько кодов ушло и когда ушёл последний. Цифры
+    берутся из его собственных журналов — значит это отчёт, а не обещание,
+    и проверить он может там же.
+
+    Отдельно проверяется, что несостоявшиеся выдачи не спрятаны за
+    состоявшимися: «12 выдано» рядом с тремя молча не выданными — это тот
+    самый бодрый отчёт, от которого здесь уходят.
+    """
+
+    def settings(self, delivered=2, failed=0, enabled=True, when=None):
+        import time as _t
+        log = [{"at": when or (_t.time() - 600), "state": "выдан"}
+               for _ in range(delivered)]
+        log += [{"at": _t.time() - 60, "state": "не выдан", "why": "нет кода"}
+                for _ in range(failed)]
+        return {"plugins": {"gift_cards": {"apple": {
+            "enabled": enabled, "delivered": [str(i) for i in range(delivered)],
+            "log": log}}}}
+
+    def menu(self, settings):
+        from handlers import plugins as P
+        return P._plugins_menu_text(settings)
+
+    def shelf(self, settings):
+        from handlers import plugins as P
+        return P._gift_cards_text(settings)
+
+    def test_the_menu_states_what_was_delivered(self):
+        got = self.menu(self.settings(delivered=12))
+        self.assertIn("12", got)
+        self.assertIn("мин назад", got)
+
+    def test_a_failure_is_not_hidden_behind_the_successes(self):
+        got = self.menu(self.settings(delivered=12, failed=3))
+        self.assertIn("Не выдано", got)
+        self.assertIn("3", got)
+
+    def test_an_empty_shop_is_invited_not_scolded(self):
+        """Ноль выдач — это первый день, а не поломка."""
+        got = self.menu(self.settings(delivered=0, enabled=False))
+        self.assertIn("Пока не выдано", got)
+        self.assertNotIn("Не выдано:", got)
+
+    def test_the_shelf_counts_each_card(self):
+        got = self.shelf(self.settings(delivered=5))
+        self.assertIn("Apple", got)
+        self.assertIn("выдано 5", got)
+
+    def test_the_shelf_no_longer_claims_delivery_is_unproven(self):
+        """Эта строка была правдой ровно до первой выдачи, а потом
+        превратилась в неправду, которую продавец видел каждый день."""
+        got = self.shelf(self.settings(delivered=5))
+        self.assertNotIn("ещё не проверялась", got)
+
+    def test_the_shelf_says_how_many_cards_are_left_to_turn_on(self):
+        got = self.shelf(self.settings(delivered=0, enabled=False))
+        self.assertIn("Доступно ещё", got)
+
+    def test_a_failed_attempt_is_not_reported_as_a_delivery(self):
+        """Самая дорогая мелочь на этом экране. Последняя запись журнала —
+        не то же, что последняя выдача: несостоявшаяся попытка минуту назад
+        отчитывалась как выдача, и строка выходила бодрая, а кода покупатель
+        не получил."""
+        import time as _t
+        settings = {"plugins": {"gift_cards": {"apple": {
+            "enabled": True, "delivered": ["1"],
+            "log": [{"at": _t.time() - 7200, "state": "выдан"},
+                    {"at": _t.time() - 60, "state": "не выдан"}]}}}}
+        got = self.menu(settings)
+        self.assertIn("2 ч назад", got)
+        self.assertNotIn("1 мин назад", got)
+
+    def test_the_cards_offered_are_the_ones_still_off(self):
+        """Список «доступно ещё» перечислял включённые карты — предлагал
+        завести то, что уже заведено."""
+        got = self.shelf(self.settings(delivered=1))
+        tail = got.split("Доступно ещё")[1]
+        self.assertNotIn("Apple", tail)
+
+    def test_the_card_screen_puts_the_result_above_the_settings(self):
+        from automation.giftcards import card
+        from handlers import plugins as P
+        got = P._gift_card_text(self.settings(delivered=4), card("apple"))
+        self.assertIn("Выдано кодов", got)
+        self.assertLess(got.index("Выдано кодов"), got.index("Регион"))
+
+
+class TimeIsToldWithoutInventingATimezone(unittest.TestCase):
+    """Абсолютное время требует знать пояс продавца, а мы его не знаем: бот
+    живёт на сервере, продавец — где угодно. Соврать на три часа в строке
+    «последняя выдача» — мелочь, из которой складывается недоверие ко
+    всему остальному."""
+
+    def test_minutes_hours_and_days(self):
+        from automation.giftcards import ago
+        now = 1_000_000.0
+        self.assertEqual(ago(now - 30, now), "только что")
+        self.assertEqual(ago(now - 600, now), "10 мин назад")
+        self.assertEqual(ago(now - 7200, now), "2 ч назад")
+        self.assertEqual(ago(now - 86400 * 1.2, now), "вчера")
+        self.assertEqual(ago(now - 86400 * 5, now), "5 дн назад")
+
+    def test_nothing_is_said_when_nothing_happened(self):
+        from automation.giftcards import ago
+        self.assertEqual(ago(0), "")
+
 if __name__ == "__main__":
     unittest.main()
 
