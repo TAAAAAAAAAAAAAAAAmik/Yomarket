@@ -2432,6 +2432,8 @@ def _gift_cards_keyboard(settings: dict) -> InlineKeyboardMarkup:
                        callback_data=f"plugins:gc:{gift.slug}")
     if len(on) < len(cards()):
         builder.button(text="➕ Добавить карту", callback_data="plugins:gifts:add")
+    builder.button(text="🔬 Что ещё можно завести",
+                   callback_data="plugins:gifts:survey")
     builder.button(text="🔑 Поставщик AppRoute", callback_data="apr:creds")
     builder.button(text="⬅️ Назад", callback_data="plugins:menu")
     builder.adjust(1)
@@ -2560,6 +2562,81 @@ async def gifts_screen(callback: CallbackQuery, state: FSMContext) -> None:
         _gift_cards_text(settings, get_shop_name(uid)),
         reply_markup=_gift_cards_keyboard(settings))
     await callback.answer()
+
+
+def _survey_lines(rows: list[dict]) -> list[str]:
+    """Замер каталога словами. Отдельно от экрана — чтобы проверять текст,
+    а не разметку вокруг него."""
+    lines = ["🔬 <b>Разделы поставщика</b>", ""]
+    ready = [r for r in rows if r["ready"]]
+    if ready:
+        lines.append("<b>Готовы к заведению</b> — номинал разбирается у всех "
+                     "услуг до одной:")
+        for r in ready[:8]:
+            lines.append(
+                f"✅ <code>{html.escape(r['subcategory'])}</code>\n"
+                f"   мера: {html.escape(r['measure'])} · в наличии "
+                f"{r['in_stock']} из {r['nominals']} · от "
+                f"<b>{r['cheapest']:.2f} $</b>")
+        lines.append("")
+    else:
+        lines += ["Ни одного нового раздела с полным разбором номинала.", ""]
+
+    known = [r for r in rows if r["card"]]
+    if known:
+        lines.append("<b>Уже заведены:</b> " + ", ".join(
+            html.escape(r["card"]) for r in known[:12]))
+        lines.append("")
+
+    weak = [r for r in rows if not r["ready"] and not r["card"]][:6]
+    if weak:
+        lines.append("<b>Заводить нельзя</b> — номинал понят не везде, а "
+                     "непонятый номинал это оплаченный заказ без выдачи:")
+        for r in weak:
+            lines.append(
+                f"⚠️ <code>{html.escape(r['subcategory'])}</code> — "
+                f"{round(r['share'] * 100)} % по мере "
+                f"«{html.escape(r['measure'] or 'не подобрана')}», услуг "
+                f"{r['services']}")
+    return lines
+
+
+@router.callback_query(F.data == "plugins:gifts:survey")
+async def gifts_survey(callback: CallbackQuery, state: FSMContext) -> None:
+    """Замер каталога: какой раздел можно заводить картой, а какой нельзя.
+
+    Карта заводится одной декларацией, и соблазн «объявить и посмотреть»
+    велик. Цена ошибки не в коде: раздел, где номинал разбирается не у всех
+    услуг, даёт товар, который бот не выдаст — и узнает об этом продавец
+    после оплаты покупателем. Поэтому сначала замер, потом декларация.
+    """
+    from automation.giftcards import survey
+    from storage import get_ar_creds
+
+    await state.clear()
+    uid = callback.from_user.id
+    settings = get_settings(uid)
+    creds = get_ar_creds(uid)
+    if not creds or not creds.get("api_key"):
+        await callback.answer("Сначала ключ AppRoute — без него каталога нет",
+                              show_alert=True)
+        return
+    await callback.answer("⏳ Читаю каталог…")
+    await callback.message.edit_text("⏳ Меряю разделы поставщика…")
+    ok, catalog, age = await _read_catalog(creds)
+    if not ok:
+        await callback.message.edit_text(
+            f"❌ Каталог не прочитан: {html.escape(str(catalog))}",
+            reply_markup=_gift_cards_keyboard(settings))
+        return
+
+    rows = survey(catalog)
+    lines = _survey_lines(rows)
+    if age:
+        lines.append("")
+        lines.append(f"<i>{html.escape(age)}</i>")
+    await callback.message.edit_text("\n".join(lines)[:4000],
+                                     reply_markup=_gift_cards_keyboard(settings))
 
 
 @router.callback_query(F.data == "plugins:gifts:add")

@@ -637,6 +637,124 @@ def currencies_of(catalog, gift: GiftCard, region: str) -> list[str]:
 _NOT_A_NOMINAL = re.compile(r"(20\d\d|24/7|\d+\s*%)")
 
 
+# Слова, которые стоят рядом с числом, но единицей товара не являются.
+# Без этого «10 USD» дало бы единицу «USD», а «3 month» — «month», и замер
+# объявил бы готовым раздел, который на самом деле меряется деньгами или
+# сроком: обе меры у нас уже есть, и подменять их выдуманной третьей значит
+# завести товар, который выдача потом не поймёт.
+_NOT_A_UNIT = frozenset(
+    ("usd", "eur", "gbp", "rub", "try", "brl", "inr", "aud", "cad", "pln",
+     "sar", "aed", "jpy", "mxn", "ars", "clp", "cop", "idr", "myr", "php",
+     "sgd", "thb", "vnd", "zar", "chf", "nok", "sek", "dkk", "czk", "huf",
+     "ils", "nzd", "hkd", "twd", "krw", "cny", "kzt", "uah")
+    + tuple(_PERIODS) + ("gift", "card", "code", "key", "usdt", "for", "and"))
+
+# Слово вплотную к числу — с любой стороны. «2800 FC Points» пишет единицу
+# после числа, «VP 240 Valorant» — перед ним, и смотреть только в одну
+# сторону значит для половины разделов угадать не единицу, а название игры.
+_AFTER_NUMBER = re.compile(r"[\d][\d.,]*\s*\+?\s*[\d]*\s*([A-Za-z][A-Za-z-]{1,19})")
+_BEFORE_NUMBER = re.compile(r"([A-Za-z][A-Za-z-]{1,19})\s*:?\s*[\d][\d.,]*")
+
+
+def guess_unit(names) -> str:
+    """Чем, похоже, меряется номинал в этом разделе — по самому частому
+    слову вплотную к числу.
+
+    Это **догадка для замера**, а не для выдачи. Нужна она затем, что мера
+    задаётся в декларации карты, а декларацию ещё только предстоит написать:
+    померить раздел, не зная его меры, иначе нельзя. Валюты и сроки из
+    кандидатов выброшены — для них у нас свои меры.
+
+    При равной частоте побеждает короткое слово: в «VP 240 Valorant» и то и
+    другое стоит рядом с числом, но единица здесь `VP`, а `Valorant` —
+    название игры. Написание возвращается то, каким его пишет поставщик:
+    оно уйдёт в название товара, и «240 vp» там читается как небрежность.
+    """
+    counts: dict[str, int] = {}
+    spelling: dict[str, dict[str, int]] = {}
+    for name in names or []:
+        text = str(name or "")
+        for pattern in (_AFTER_NUMBER, _BEFORE_NUMBER):
+            for word in pattern.findall(text):
+                low = word.lower()
+                if low in _NOT_A_UNIT or len(low) < 2:
+                    continue
+                counts[low] = counts.get(low, 0) + 1
+                seen = spelling.setdefault(low, {})
+                seen[word] = seen.get(word, 0) + 1
+    if not counts:
+        return ""
+    best = max(counts.items(), key=lambda kv: (kv[1], -len(kv[0])))[0]
+    return max(spelling[best].items(), key=lambda kv: kv[1])[0]
+
+
+def survey(catalog) -> list[dict]:
+    """Замер каталога по разделам поставщика: чем меряется номинал и
+    разбирается ли он вообще.
+
+    Отвечает на единственный вопрос, с которого начинается новая карта:
+    **можно ли её заводить**. Раздел, у которого номинал разбирается не у
+    всех услуг, — это товар, который бот однажды не поймёт и не выдаст, уже
+    после оплаты покупателем. Прошлый заход по этому замеру взял четыре
+    карты и отверг Tinder (0 % деньгами из 796 названий) и Valorant (57 %,
+    смешан с VP) — и отверг правильно.
+
+    Меры перебираются все три: деньги, штуки (по угаданной единице) и срок.
+    Побеждает та, что разобрала больше. Ноль по всем трём — не «плохой
+    раздел», а «мера ещё не написана».
+
+    Возвращает по строке на раздел: имя (его же надо положить в
+    `subcategory` декларации), сколько услуг и номиналов, сколько в
+    наличии, лучшая мера с долей разбора, самая дешёвая цена в наличии и
+    заведена ли уже карта.
+    """
+    taken = {c.subcategory: c for c in CARDS}
+    groups: dict[str, list[dict]] = {}
+    for service in _catalog_items(catalog):
+        name = str(service.get("subcategoryName") or "").strip()
+        if not name:
+            continue
+        groups.setdefault(name, []).append(service)
+
+    out: list[dict] = []
+    for name, rows in groups.items():
+        titles = [str(s.get("name") or "") for s in rows]
+        nominals = [i for s in rows for i in (s.get("items") or [])
+                    if isinstance(i, dict)]
+        in_stock = [i for i in nominals if int(i.get("inStock") or 0) > 0]
+        prices = [float(i.get("price") or 0) for i in in_stock
+                  if float(i.get("price") or 0) > 0]
+
+        unit_name = guess_unit(titles)
+        candidates = [("деньги", MONEY), ("срок", PERIOD)]
+        if unit_name:
+            candidates.insert(1, (unit_name, UNITS(unit_name)))
+        best_measure, best_share = "", 0.0
+        for label, unit in candidates:
+            got = sum(1 for t in titles if nominal_of(t, unit)[1])
+            share = got / len(titles) if titles else 0.0
+            if share > best_share:
+                best_measure, best_share = label, share
+
+        out.append({
+            "subcategory": name,
+            "services": len(rows),
+            "nominals": len(nominals),
+            "in_stock": len(in_stock),
+            "measure": best_measure,
+            "share": best_share,
+            "cheapest": min(prices) if prices else 0.0,
+            "card": taken.get(name).title if name in taken else "",
+            # Готов — значит номинал разбирается у всех до одной услуги и
+            # есть что купить. «Почти всё» здесь не годится: неразобранная
+            # услуга это оплаченный заказ, который бот не выдаст.
+            "ready": best_share >= 1.0 and bool(in_stock) and name not in taken,
+        })
+    out.sort(key=lambda r: (not r["ready"], bool(r["card"]), -r["share"],
+                            -r["in_stock"]))
+    return out
+
+
 def is_card_order(gift: GiftCard, title: str, keyword: str = "") -> bool:
     """Заказ ли это на эту карту.
 
