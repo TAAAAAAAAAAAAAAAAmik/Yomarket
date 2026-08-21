@@ -881,6 +881,38 @@ def _picked_note(picked: list | None) -> str:
 _MAX_REFUSED_ROUNDS = 3
 
 
+def _what_to_do(values: dict, fields: list, is_expired: bool) -> str:
+    """Строка «что делать» — только там, где нам правда есть что сказать.
+
+    Совет наугад хуже молчания: «попробуйте ещё раз» на отказе по полю
+    отправляет продавца делать бессмысленное. Поэтому советы здесь ровно на
+    те случаи, где причина известна и поправима руками; на остальных
+    возвращается пустая строка, и экран честно ограничивается тем, что
+    сказала панель.
+    """
+    from automation.panel import link_trouble
+
+    if is_expired:
+        return ("<b>Что делать:</b> войти в панель заново — кнопка ниже. "
+                "Сессия панели живёт несколько дней.")
+    named = set(fields or [])
+    if "content" in named:
+        found = link_trouble(str(values.get("description") or ""))
+        if found:
+            return (f"<b>Что делать:</b> убрать ссылку "
+                    f"<code>{html.escape(found)}</code> из описания — панель "
+                    f"пускает только свой белый список.")
+        return ("<b>Что делать:</b> поправить описание — панель не приняла "
+                "именно его.")
+    if "images" in named:
+        return ("<b>Что делать:</b> добавить фото товара: без него панель "
+                "этот раздел не принимает.")
+    if "has_points" in named:
+        return ("<b>Что делать:</b> добавить остатки — пустой товар "
+                "маркетплейс не публикует.")
+    return ""
+
+
 async def _ask_for_refused_fields(msg, uid: int, values: dict,
                                   extra: dict | None, picked: list | None,
                                   state: FSMContext, result_msg: str) -> bool:
@@ -1126,26 +1158,36 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
     b.button(text="⬅️ Назад", callback_data="menu:ads")
     b.adjust(1)
 
-    header = "❌ <b>Не удалось создать товар</b>"
-    if is_found:
-        header = "⚠️ <b>Ресурс найден, но есть ошибка валидации</b>"
+    # Отчёт читается сверху вниз, и сверху должно стоять то, ради чего
+    # продавец его открыл: что не так и что теперь делать. Диагностика
+    # нужна тоже — но ей место под спойлером, а не поверх ответа.
+    #
+    # Прежний экран был устроен наоборот: две строки по делу и двадцать
+    # строк дампа, причём наша собственная разметка внутри дампа вылезала
+    # буквами — «Ресурс <b>items</b> найден» продавец видел именно так,
+    # угловыми скобками.
+    from automation.panel import as_plain, explain_validation, validation_fields
 
-    # Панель объясняет отказ по полям, но внутри JSON, а тот — внутри
-    # отладочной простыни: сообщение на экране было, а прочитать в нём, что
-    # делать, было нельзя. Ставим разбор первым, отчёт оставляем ниже.
-    from automation.panel import explain_validation
     why = explain_validation(result_msg)
-    # Ответ панели — чужой текст с чужой разметкой, и попадал он сюда
-    # сырым. Наши собственные заголовки внутри него станут видны буквами:
-    # это некрасиво, но читается, а непрошедшее сообщение не читается вовсе.
-    said = html.escape(str(result_msg))
-    body = f"<b>Панель не приняла:</b>\n{html.escape(why)}\n\n{said}" \
-        if why else said
+    header = ("⚠️ <b>Панель не приняла товар</b>" if why or is_found
+              else "❌ <b>Не удалось создать товар</b>")
 
-    # Раздел печатается и в отказе: «панель не приняла» бывает как раз из-за
-    # него, и тогда важно видеть, что именно бот выбрал.
-    await _edit_safely(msg, f"{header}{_picked_note(picked)}\n\n{body}",
-                       b.as_markup())
+    parts = [f"{header}{_picked_note(picked)}"]
+    if why:
+        parts.append("")
+        parts.append(html.escape(why))
+    advice = _what_to_do(values, validation_fields(result_msg), is_expired)
+    if advice:
+        parts.append("")
+        parts.append(advice)
+    # Подробности — под спойлером: они нужны раз в сто отказов, а место
+    # занимают всегда. Внутри чужой текст, поэтому экранируется.
+    details = html.escape(as_plain(result_msg, 1200))
+    if details:
+        parts.append("")
+        parts.append(f"<tg-spoiler>{details}</tg-spoiler>")
+
+    await _edit_safely(msg, "\n".join(parts), b.as_markup())
 
 
 @router.callback_query(F.data.startswith("cadpub:"))
@@ -1182,13 +1224,18 @@ async def publish_item(callback: CallbackQuery) -> None:
     b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
     b.button(text="📦 Мои товары", callback_data="menu:ads")
     b.adjust(1)
-    said = html.escape(str(msg_text)[:300])
-    result = (f"🕓 <b>Товар {item_id} отправлен на модерацию</b> ({said})"
-              f"\nПоявится в маркете после проверки." if ok
+    # Ответ панели — чужой текст с чужой разметкой. Раньше он вклеивался в
+    # заголовок скобками, обрезанный по счёту символов: заголовок из-за него
+    # переставал читаться, а обрывок тега ронял всё сообщение.
+    from automation.panel import as_plain
+
+    said = html.escape(as_plain(msg_text, 600))
+    tail = f"\n\n<tg-spoiler>{said}</tg-spoiler>" if said else ""
+    result = (f"🕓 <b>Товар {item_id} отправлен на модерацию</b>\n"
+              f"Появится в маркете после проверки.{tail}" if ok
               else (f"⚠️ <b>Товар {item_id} на модерацию не отправлен</b>\n\n"
                     f"Чаще всего причина одна: у товара нет остатков, а пустой "
-                    f"маркетплейс не публикует.\n\n"
-                    f"<i>Панель ответила: {said}</i>"))
+                    f"маркетплейс не публикует.{tail}"))
     await _edit_safely(callback.message, result, b.as_markup())
 
 

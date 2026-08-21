@@ -141,5 +141,127 @@ class ThePanelsOwnAnswerCannotBreakTheReport(unittest.TestCase):
         self.assertIn("&lt;1000&gt;", screen.last)
 
 
+
+# Отчёт панели в том виде, в каком он приходит: наша разметка вперемешку с
+# чужим текстом, и всё это одной строкой.
+REFUSED = (
+    "✅ Ресурс <b>items</b> найден!\n"
+    "Поля: <code>['title', 'category', 'filter__8']</code>\n"
+    "Обязательные: <code>[]</code>\n\n"
+    'Ошибка 422:\n<code>{"filter__8": '
+    '["Поле Регион обязательно для заполнения."]}</code>\n\n'
+    'Отправлено: <code>{"title": "Apple Gift Card TRY 10 (TR)", '
+    '"price": 60, "content": "Код пополнения", "category": 4718}</code>'
+)
+
+
+class TheRefusalReadsAsAnAnswerNotAsADump(unittest.TestCase):
+    """Продавец присылал этот экран дважды, и оба раза в нём было видно
+    одно: «Ресурс <b>items</b> найден» — угловыми скобками, буквами.
+
+    Всё сообщение экранировалось целиком, вместе с нашей собственной
+    разметкой. Плюс двадцать строк дампа поверх двух строк по делу: ответ на
+    вопрос «что не так» лежал в самом низу.
+    """
+
+    def setUp(self):
+        import storage
+        from automation import panel
+        self._undo = []
+        for mod, name, val in (
+            (storage, "get_panel_creds", lambda uid: {"cookies": "c=1"}),
+            (panel, "panel_create_product_sync",
+             lambda *a, **kw: (False, REFUSED)),
+        ):
+            self._undo.append((mod, name, getattr(mod, name, None)))
+            setattr(mod, name, val)
+
+    def tearDown(self):
+        for mod, name, old in reversed(self._undo):
+            setattr(mod, name, old)
+
+    def report(self, description="Код пополнения"):
+        screen = Screen()
+        values = {"title": "Apple Gift Card TRY 10 (TR)", "price": 60,
+                  "description": description, "quantity": 1, "category": "",
+                  "photo_path": None}
+        asyncio.run(C._panel_create_and_report(screen, 1, values, extra=None))
+        return screen.last
+
+    def test_our_own_tags_are_not_shown_as_letters(self):
+        got = self.report()
+        self.assertNotIn("&lt;b&gt;", got)
+        self.assertNotIn("&lt;code&gt;", got)
+
+    def test_the_reason_comes_before_the_diagnostics(self):
+        """Ради него экран и открывают."""
+        got = self.report()
+        self.assertIn("Регион", got)
+        self.assertLess(got.index("Регион"), got.index("tg-spoiler"))
+
+    def test_the_diagnostics_are_folded_away(self):
+        """Нужны они раз в сто отказов, а место занимали всегда."""
+        got = self.report()
+        self.assertIn("<tg-spoiler>", got)
+        self.assertIn("filter__8", got)          # не потеряны, просто свёрнуты
+
+    def test_the_field_name_is_not_said_twice(self):
+        """Панель уже назвала поле по-русски: «filter__8: Поле Регион
+        обязательно» читается как заикание. Различает случаи сама панель —
+        своё имя поля она пишет словом «Поле» в начале жалобы, и там, где
+        не пишет, техническое имя остаётся (`test_panel_links`)."""
+        got = self.report()
+        head = got.split("<tg-spoiler>")[0]
+        self.assertNotIn("filter__8", head)
+        self.assertIn("Поле Регион", head)
+
+    def test_no_advice_is_given_where_we_have_none(self):
+        """Совет наугад хуже молчания: он отправляет продавца делать
+        бессмысленное. Про регион мастер и так спросит сам."""
+        got = self.report()
+        self.assertNotIn("Что делать", got.split("<tg-spoiler>")[0])
+
+    def test_a_forbidden_link_is_named_where_it_is(self):
+        """Панель говорит «ссылки запрещены», а какая именно — знаем мы."""
+        from automation import panel
+        old = panel.panel_create_product_sync
+        panel.panel_create_product_sync = lambda *a, **kw: (
+            False, '{"content": ["Ссылки запрещены."]}')
+        try:
+            got = self.report(description="Купить тут: roblox.com/redeem")
+        finally:
+            panel.panel_create_product_sync = old
+        self.assertIn("Что делать", got)
+        self.assertIn("roblox.com", got)
+
+    def test_the_report_still_arrives_in_one_piece(self):
+        """Разметка своя, и Telegram обязан её принять с первой попытки."""
+        screen = Screen()
+        values = {"title": "Apple <10>", "price": 60, "description": "код",
+                  "quantity": 1, "category": "", "photo_path": None}
+        asyncio.run(C._panel_create_and_report(screen, 1, values, extra=None))
+        self.assertEqual([t[1] for t in screen.tries].count(None), 0)
+
+
+class ATruncatedReportBreaksOnAWord(unittest.TestCase):
+    """«…"subcategor» — так обрывался дамп в сообщении продавца. Пересылая
+    его в поддержку, он отправлял огрызок."""
+
+    def test_the_cut_lands_on_a_boundary(self):
+        from automation.panel import as_plain
+        got = as_plain("раз два три четыре пять шесть семь восемь", 25)
+        self.assertTrue(got.endswith("…"))
+        self.assertFalse(got[:-1].endswith(" "))
+        self.assertIn("раз два три", got)
+
+    def test_a_short_text_is_left_alone(self):
+        from automation.panel import as_plain
+        self.assertEqual(as_plain("коротко", 100), "коротко")
+
+    def test_our_markup_is_stripped_not_escaped(self):
+        from automation.panel import as_plain
+        self.assertEqual(as_plain("<b>Ресурс</b> <code>items</code>"),
+                         "Ресурс items")
+
 if __name__ == "__main__":
     unittest.main()

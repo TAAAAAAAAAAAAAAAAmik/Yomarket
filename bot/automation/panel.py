@@ -2858,6 +2858,30 @@ _PANEL_FIELDS = {
 }
 
 
+# Разметка, которой мы сами размечаем отчёты. Чужой текст внутри них
+# экранируется, а вместе с ним буквами вылезали и эти теги: продавец видел
+# «Ресурс <b>items</b> найден» — в его сообщении так и было написано,
+# угловыми скобками. Убираем их, а не экранируем: отчёт нужен читаемым, а не
+# точным до символа. Что осталось похожим на тег — уйдёт под `html.escape`.
+_OUR_TAGS = re.compile(r"</?(?:b|i|u|s|code|pre|tg-spoiler)>", re.I)
+
+
+def as_plain(raw: str, limit: int = 0) -> str:
+    """Отчёт как простой текст: без нашей разметки и без чужих тегов.
+
+    Обрезка — по границе слова, а не по счёту символов. Прежняя обрывала
+    посреди слова («…"subcategor»), и продавец, пересылая это в поддержку,
+    отправлял огрызок.
+    """
+    text = _OUR_TAGS.sub("", str(raw or ""))
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if limit and len(text) > limit:
+        cut = text[:limit]
+        space = max(cut.rfind(" "), cut.rfind("\n"))
+        text = (cut[:space] if space > limit * 0.6 else cut).rstrip() + "…"
+    return text
+
+
 def _first_json_object(text: str) -> dict | None:
     """Первый полный объект JSON в тексте отчёта.
 
@@ -2917,9 +2941,24 @@ def explain_validation(raw: str) -> str:
             complaints = [complaints]
         if not isinstance(complaints, list):
             continue
-        name = _PANEL_FIELDS.get(str(field), str(field))
+        known = _PANEL_FIELDS.get(str(field), str(field))
         for complaint in complaints[:2]:
-            out.append(f"• {name}: {str(complaint).strip()}")
+            said = str(complaint).strip()
+            # Имя поля впереди нужно не всегда. «filter__8: Поле Регион
+            # обязательно для заполнения» читается как заикание: панель уже
+            # назвала поле по-русски, и техническое имя только мешает —
+            # найти его можно в подробностях отчёта.
+            #
+            # А вот «filter__7: Обязательное» без имени не значит ничего, и
+            # такое поле лучше показать по-английски, чем промолчать.
+            # Различает их сама панель: своё имя поля она пишет словом
+            # «Поле» в начале жалобы.
+            names_itself = said.lower().startswith("поле ")
+            already = known.lower() in said.lower()
+            if names_itself or already:
+                out.append(f"• {said}")
+            else:
+                out.append(f"• {known}: {said}")
     return "\n".join(out)
 
 
