@@ -249,7 +249,25 @@ class TheScreensSellWithNumbersNotAdjectives(unittest.TestCase):
     def test_the_menu_says_what_the_plugins_do(self):
         got = self.menu(self.settings(delivered=0, enabled=False))
         self.assertIn("не ждут вас", got)
-        self.assertIn("Карт много", got)
+
+    def test_the_shop_is_not_only_about_codes(self):
+        """Гифт-карты — не весь товар: у бота есть и звёзды Telegram, и
+        список плагинов будет расти. Экран, говорящий только про коды,
+        продаёт меньше, чем есть."""
+        got = self.menu(self.settings(delivered=0, enabled=False))
+        self.assertIn("Stars", got)
+        self.assertIn("Гифт-карты", got)
+        self.assertIn("прибавляются", got)
+
+    def test_the_stars_are_not_promised_to_deliver_themselves(self):
+        """Плагин звёзд в боте есть, но выдача заблокирована снаружи:
+        Fragment отвечает `Access denied` (A1 в `CHECKLIST.md`). Написать
+        «звёзды летят покупателю сами» значит продать чужому продавцу то,
+        чего сегодня нет, — и получить возвраты вместо подписок."""
+        got = self.menu(self.settings(delivered=0, enabled=False)).lower()
+        for claim in ("звёзды уходят сам", "звёзды летят", "звёзды придут сам",
+                      "звёзды выдаются сам"):
+            self.assertNotIn(claim, got)
 
     def test_the_menu_does_not_count_the_cards_out_loud(self):
         """Число карт меняется каждую неделю, а цифра в тексте — нет:
