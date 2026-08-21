@@ -268,6 +268,39 @@ class TheScreensSellWithNumbersNotAdjectives(unittest.TestCase):
         got = self.shelf(self.settings(delivered=0, enabled=False))
         self.assertIn("Доступно ещё", got)
 
+    def test_the_screen_says_what_the_plugins_do_for_the_seller(self):
+        """Цифры доказывают, что работает; текст объясняет, зачем это нужно.
+        Одних цифр мало: «выдано 3» ничего не говорит тому, кто ещё думает,
+        включать ли плагин."""
+        got = self.menu(self.settings(delivered=3))
+        self.assertIn("Что делают плагины", got)
+        self.assertIn("пока вы спите", got)
+
+    def test_the_pitch_stays_when_there_is_nothing_to_show_yet(self):
+        got = self.menu(self.settings(delivered=0, enabled=False))
+        self.assertIn("Что делают плагины", got)
+
+    def test_the_numbers_come_before_the_pitch(self):
+        """Доказательство вперёд обещания: продавец видит свой счёт, а
+        потом уже читает, почему это хорошо."""
+        got = self.menu(self.settings(delivered=3))
+        self.assertLess(got.index("Выдано кодов"), got.index("Что делают"))
+
+    def test_nothing_is_promised_that_cannot_be_checked(self):
+        """«Продажи вырастут в разы» проверить нельзя, а «заказ в четыре утра
+        не ждёт до утра» продавец проверит в первую же ночь. Обещание,
+        которого нельзя сдержать, здесь дороже любой недосказанности."""
+        got = self.menu(self.settings(delivered=3)).lower()
+        for promise in ("в разы", "гарантир", "вырастут", "заработаете",
+                        "прибыль вырастет", "х2", "в два раза больше"):
+            self.assertNotIn(promise, got)
+
+    def test_the_number_of_cards_is_counted_not_written_by_hand(self):
+        """Число в тексте — из реестра. Дописанное руками разошлось бы с ним
+        на первой же новой карте, и экран начал бы врать по мелочи."""
+        from automation.giftcards import cards
+        self.assertIn(str(len(cards())), self.menu(self.settings(delivered=1)))
+
     def test_a_failed_attempt_is_not_reported_as_a_delivery(self):
         """Самая дорогая мелочь на этом экране. Последняя запись журнала —
         не то же, что последняя выдача: несостоявшаяся попытка минуту назад
