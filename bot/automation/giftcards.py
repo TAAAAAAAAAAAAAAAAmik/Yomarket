@@ -410,13 +410,19 @@ PSN = GiftCard(
 )
 
 
-# Roblox — та же гифт-карта, просто с двумя семействами номиналов, и обе
-# лежат в одной подкатегории поставщика. Проверено живьём 20.08: все 26
-# услуг Roblox имеют `subcategoryName = "Roblox Gift Cards"`, а кошельковые
-# коды отличаются словом «Wallet Code» в названии. Ровно для такого случая
-# в декларации и заведены `name_must_have` / `name_must_not_have`.
+# Roblox. Все 26 услуг лежат в одной подкатегории поставщика — проверено
+# живьём 20.08, — а кошельковые коды отличаются словом «Wallet Code» в
+# названии. Какое-то время под второе семейство, номинированное деньгами,
+# стояла отдельная карта `roblox_card`; **21.08 продавец её снял**: в его
+# магазине это один и тот же товар, и два плагина на него только путали.
+#
+# `name_must_have` при этом остался. Сняли карту, а не различение: если
+# денежные услуги в каталоге всё-таки есть, без фильтра они попали бы сюда
+# и **молча исчезли** из списка номиналов — мера у них другая, разобрать её
+# как Robux нельзя. Молча исчезнувший товар в этом проекте дороже лишнего
+# фильтра. Что там на самом деле, показывает «📦 Наличие и баланс».
 ROBUX = GiftCard(
-    slug="robux", title="Roblox — Robux", emoji="🎮",
+    slug="robux", title="Roblox Gift Cards", emoji="🎮",
     subcategory="Roblox Gift Cards", unit=UNITS("Robux"),
     name_must_have="Wallet Code",
     # Слова узкие нарочно, и порядок в реестре тоже: «roblox» подходит и
@@ -432,24 +438,6 @@ ROBUX = GiftCard(
     ad_title="Roblox {номинал} ({регион})",
     ad_text="Код на пополнение Robux. Выдача сразу после оплаты.",
 )
-
-ROBLOX_CARD = GiftCard(
-    slug="roblox_card", title="Roblox — подарочные карты", emoji="🎁",
-    subcategory="Roblox Gift Cards", unit=MONEY,
-    name_must_not_have="Wallet Code",
-    words=("roblox", "роблокс", "робл"),
-    autopick=("roblox", "игровая валюта"),
-    # Про регион сказано покупателю нарочно: карта номинирована в валюте
-    # своей страны и кладёт деньги в кошелёк, а не Robux напрямую. Аккаунт
-    # другого региона её не примет, и разбираться покупатель будет с
-    # продавцом.
-    activation="Активировать: в самом Roblox → Пополнить → Использовать код. "
-               "Карта пополняет кошелёк в валюте своего региона — аккаунт "
-               "должен быть того же региона.",
-    ad_title="Roblox Gift Card {номинал} ({регион})",
-    ad_text="Подарочная карта Roblox. Выдача сразу после оплаты.",
-)
-
 
 
 # Следующие четыре объявлены после замера на живом каталоге 20.08: у всех
@@ -501,9 +489,11 @@ RAZER = GiftCard(
 # все карты сразу, и это главный выигрыш шаблона.
 #
 # **Порядок значим.** Заказ забирает первая признавшая карта, поэтому узкие
-# объявления стоят раньше широких: `ROBUX` со словом «robux» — до
-# `ROBLOX_CARD` со словом «roblox», иначе карты забирали бы заказы на Robux.
-CARDS: tuple[GiftCard, ...] = (ROBUX, ROBLOX_CARD, APPLE, PSN,
+# объявления стоят раньше широких. Пока карт Roblox было две, `ROBUX` со
+# словом «robux» стоял перед картой со словом «roblox» — иначе вторая
+# забирала бы заказы на Robux. Карту сняли, правило осталось: оно понадобится
+# первой же паре, где одно слово входит в другое.
+CARDS: tuple[GiftCard, ...] = (ROBUX, APPLE, PSN,
                                XBOX, STEAM, AMAZON, RAZER)
 
 
@@ -982,6 +972,61 @@ def _take_over_robux(plugins: dict, holder: dict) -> None:
     holder[ROBUX.slug] = fresh
 
 
+# Слаг снятой карты. Само имя пережило её нарочно: в чужих настройках под
+# ним осталось нажитое, и разобрать его надо, а не забыть.
+RETIRED_ROBLOX_CARD = "roblox_card"
+
+
+def _take_over_roblox_card(holder: dict) -> None:
+    """Забрать под `robux` то, что осталось от снятой карты `roblox_card`.
+
+    Карту сняли 21.08 по решению продавца. Настройки её при этом остались в
+    хранилище — и остались бы **недостижимыми**: экрана нет, значит нет и
+    журнала. А в журнале лежат коды, которые не ушли в закрытый чат, и
+    список `delivered` — заказы, по которым код уже куплен.
+
+    Переносится ровно два списка:
+
+    * `delivered` — чтобы выданное не выдалось второй раз. Ошибка в эту
+      сторону стоит денег продавца по каждому заказу.
+    * `log` — журнал: в нём коды, за которые уже заплачено.
+
+    **`force` не переносится намеренно.** Это очередь ручной выдачи, и
+    заказ в ней — на *денежную* карту. Перенести его сюда значит купить по
+    нему код на Robux: не тот товар за настоящие деньги. Пусть лучше не
+    выдастся ничего — это чинится, а покупка не того чинится возвратом.
+
+    Старый ключ не стирается: убирать чужие настройки, не спросив, здесь не
+    принято.
+    """
+    old = holder.get(RETIRED_ROBLOX_CARD)
+    if not isinstance(old, dict):
+        return
+    fresh = holder.setdefault(ROBUX.slug, {})
+    for key in ("delivered", "log"):
+        moved = old.get(key)
+        if not isinstance(moved, list) or not moved:
+            continue
+        mine = fresh.setdefault(key, [])
+        if not isinstance(mine, list):              # pragma: no cover
+            continue
+        known = {_entry_order(e) for e in mine}
+        for entry in moved:
+            if _entry_order(entry) not in known:
+                mine.append(copy.deepcopy(entry))
+
+
+def _entry_order(entry) -> str:
+    """Номер заказа из записи журнала или из списка выданных.
+
+    В `delivered` лежат номера строками, в `log` — записи словарями. Одна
+    мерка на оба списка нужна затем, чтобы перенос не задваивал записи.
+    """
+    if isinstance(entry, dict):
+        return str(entry.get("order") or "")
+    return str(entry or "")
+
+
 def card_conf(settings: dict, slug: str) -> dict:
     """Настройки одной карты, заводятся лениво.
 
@@ -995,6 +1040,8 @@ def card_conf(settings: dict, slug: str) -> dict:
         plugins["gift_cards"] = holder
     if str(slug) == ROBUX.slug and ROBUX.slug not in holder:
         _take_over_robux(plugins, holder)
+    if str(slug) == ROBUX.slug:
+        _take_over_roblox_card(holder)
     conf = holder.setdefault(str(slug), {})
     for key, value in DEFAULT_CARD_CONF.items():
         if key not in conf:

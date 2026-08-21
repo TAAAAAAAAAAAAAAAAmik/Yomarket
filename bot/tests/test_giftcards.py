@@ -343,6 +343,77 @@ class WhereTheRegionLives(unittest.TestCase):
         self.assertEqual(gc.region_of(service), "AE")
 
 
+
+class TheRetiredRoblexCardLeavesNothingLocked(unittest.TestCase):
+    """21.08 продавец снял карту денежных подарочных карт Roblox: в его
+    магазине это тот же товар, что и Robux, и два плагина на одно только
+    путали.
+
+    Опасность снятия не в самой карте, а в том, что за ней остаётся.
+    Настройки лежат в хранилище по слагу, экрана больше нет — значит нет и
+    журнала, а в журнале коды, за которые уже заплачено, и список выданных
+    заказов. Потерять последний значит выдать их заново, купив второй код
+    за деньги продавца по каждому.
+    """
+
+    def conf(self, old: dict):
+        settings = {"plugins": {"gift_cards": {"roblox_card": old}}}
+        return settings, gc.card_conf(settings, "robux")
+
+    def test_the_card_is_gone_from_the_registry(self):
+        self.assertNotIn("roblox_card", [c.slug for c in gc.cards()])
+        self.assertIsNone(gc.card("roblox_card"))
+
+    def test_the_working_plugin_is_named_as_the_seller_asked(self):
+        self.assertEqual(gc.card("robux").title, "Roblox Gift Cards")
+
+    def test_the_delivered_orders_move_over(self):
+        """Иначе выданное выдастся второй раз — за деньги продавца."""
+        _s, conf = self.conf({"delivered": ["801", "802"]})
+        self.assertEqual(conf["delivered"], ["801", "802"])
+
+    def test_the_journal_moves_over_with_its_codes(self):
+        _s, conf = self.conf({"log": [{"order": "801", "code": "AAAA-1111"}]})
+        self.assertEqual(conf["log"][0]["code"], "AAAA-1111")
+
+    def test_the_manual_queue_does_not_move(self):
+        """`force` — очередь ручной выдачи, и заказ в ней был на денежную
+        карту. Перенести его сюда значит купить по нему код на Robux: не тот
+        товар за настоящие деньги. Пусть лучше не выдастся ничего."""
+        _s, conf = self.conf({"force": ["803"]})
+        self.assertEqual(conf["force"], [])
+
+    def test_the_old_settings_are_not_wiped(self):
+        """Стирать чужие настройки, не спросив, здесь не принято — и
+        разобрать переезд иначе было бы нечем."""
+        settings, _conf = self.conf({"delivered": ["801"]})
+        self.assertEqual(
+            settings["plugins"]["gift_cards"]["roblox_card"]["delivered"],
+            ["801"])
+
+    def test_nothing_is_doubled_on_the_second_read(self):
+        """Настройки читаются заново каждую минуту фоновым проходом."""
+        settings = {"plugins": {"gift_cards": {
+            "roblox_card": {"delivered": ["801"],
+                            "log": [{"order": "801"}]}}}}
+        for _ in range(3):
+            conf = gc.card_conf(settings, "robux")
+        self.assertEqual(conf["delivered"], ["801"])
+        self.assertEqual(len(conf["log"]), 1)
+
+    def test_what_the_working_card_already_had_is_kept(self):
+        settings = {"plugins": {"gift_cards": {
+            "robux": {"delivered": ["900"]},
+            "roblox_card": {"delivered": ["801"]}}}}
+        conf = gc.card_conf(settings, "robux")
+        self.assertEqual(conf["delivered"], ["900", "801"])
+
+    def test_a_seller_who_never_had_the_card_is_untouched(self):
+        settings: dict = {}
+        conf = gc.card_conf(settings, "robux")
+        self.assertEqual(conf["delivered"], [])
+        self.assertEqual(conf["log"], [])
+
 if __name__ == "__main__":
     unittest.main()
 
