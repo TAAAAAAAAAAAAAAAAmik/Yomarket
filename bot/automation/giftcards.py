@@ -379,6 +379,11 @@ class GiftCard:
     # на экране карты: «мерено» значит, что все названия семейства
     # разобрались, а не «похоже, что разберутся».
     measured: str = ""
+    # Одна строка о том, что это за товар — для экрана карты и для списка,
+    # где карту выбирают. Пишется про товар, а не про будущие доходы:
+    # «самый ходовой номинал» и «покупают чаще всего» проверить нельзя, а
+    # «код пополняет Apple ID» покупатель проверит сам.
+    pitch: str = ""
 
     def matches_service(self, service: dict) -> bool:
         """Эта ли услуга относится к карте."""
@@ -396,6 +401,8 @@ class GiftCard:
 
 APPLE = GiftCard(
     slug="apple", title="Apple", emoji="🍎",
+    pitch="Пополняет Apple ID: App Store, iCloud, подписки. Логин "
+          "покупателя не нужен — код он вводит сам.",
     subcategory="Apple Gift Cards", unit=MONEY, measured="20.08",
     words=("apple", "эпл", "эппл", "айтюнс", "itunes", "app store", "апстор"),
     activation="Активировать: appstore.com/redeem либо Настройки → ваш Apple ID "
@@ -406,6 +413,8 @@ APPLE = GiftCard(
 
 PSN = GiftCard(
     slug="psn", title="PlayStation Store", emoji="🎮",
+    pitch="Кошелёк PlayStation Store. Игры, подписки и внутриигровые "
+          "покупки покупатель берёт сам.",
     subcategory="PlayStation Gift Cards", unit=MONEY, measured="20.08",
     words=("playstation", "плейстейшен", "плейстешн", "плейстейшн", "psn",
            "пс стор", "ps store"),
@@ -429,6 +438,8 @@ PSN = GiftCard(
 # фильтра. Что там на самом деле, показывает «📦 Наличие и баланс».
 ROBUX = GiftCard(
     slug="robux", title="Roblox Gift Cards", emoji="🎮",
+    pitch="Robux на аккаунт по коду. Ник не нужен: покупатель "
+          "активирует код в самом Roblox.",
     subcategory="Roblox Gift Cards", unit=UNITS("Robux"), measured="20.08",
     name_must_have="Wallet Code",
     # Слова узкие нарочно, и порядок в реестре тоже: «roblox» подходит и
@@ -452,6 +463,8 @@ ROBUX = GiftCard(
 # (0% денег из 796), Valorant смешан с VP (57%), и обоим нужна своя мера.
 XBOX = GiftCard(
     slug="xbox", title="Xbox", emoji="🟩",
+    pitch="Кошелёк Xbox: игры, Game Pass, дополнения. Код работает в "
+          "своём регионе.",
     subcategory="Xbox Gift Cards", unit=MONEY, measured="20.08",
     words=("xbox", "иксбокс", "хбокс", "хбох", "иксбох"),
     autopick=("xbox", "пополнение баланса"),
@@ -462,6 +475,8 @@ XBOX = GiftCard(
 
 STEAM = GiftCard(
     slug="steam", title="Steam", emoji="🎲",
+    pitch="Пополнение кошелька Steam — деньги на игры и внутриигровые "
+          "покупки.",
     subcategory="Steam Wallet Gift Cards", unit=MONEY, measured="20.08",
     words=("steam", "стим"),
     autopick=("steam", "пополнение баланса"),
@@ -473,6 +488,8 @@ STEAM = GiftCard(
 
 AMAZON = GiftCard(
     slug="amazon", title="Amazon", emoji="📦",
+    pitch="Оплата покупок на Amazon. Номиналов много, начиная с совсем "
+          "мелких.",
     subcategory="Amazon Gift Cards", unit=MONEY, measured="20.08",
     words=("amazon", "амазон"),
     activation="Активировать: в аккаунте Amazon → «Подарочные карты» → "
@@ -483,6 +500,7 @@ AMAZON = GiftCard(
 
 RAZER = GiftCard(
     slug="razer", title="Razer Gold", emoji="🐍",
+    pitch="Razer Gold — единая валюта для оплаты игр без банковской карты.",
     subcategory="Razer Gold Gift Cards", unit=MONEY, measured="20.08",
     words=("razer", "рейзер", "разер", "razer gold"),
     activation="Активировать: Razer Gold → «Пополнить» → ввести PIN.",
@@ -518,6 +536,7 @@ RAZER = GiftCard(
 # который бот не поймёт.
 AIRBNB = GiftCard(
     slug="airbnb", title="Airbnb", emoji="🏠",
+    pitch="Сертификат Airbnb — оплата жилья и впечатлений.",
     subcategory="Airbnb Gift Card", unit=MONEY,
     words=("airbnb", "эйрбиэнби", "эйр би эн би", "аирбнб"),
     activation="Активировать: в аккаунте Airbnb — раздел подарочных карт. "
@@ -528,6 +547,7 @@ AIRBNB = GiftCard(
 
 ENEBA = GiftCard(
     slug="eneba", title="Eneba", emoji="🛒",
+    pitch="Баланс Eneba — площадки ключей, карт и подписок.",
     subcategory="Eneba Gift Card", unit=MONEY,
     words=("eneba", "энеба"),
     activation="Активировать: в аккаунте Eneba — пополнение баланса кодом.",
@@ -537,6 +557,7 @@ ENEBA = GiftCard(
 
 TWITCH = GiftCard(
     slug="twitch", title="Twitch", emoji="💜",
+    pitch="Кошелёк Twitch: подписки на стримеров и биты.",
     subcategory="Twitch Gift Card", unit=MONEY,
     words=("twitch", "твич"),
     activation="Активировать: в аккаунте Twitch — раздел кошелька или "
@@ -547,6 +568,7 @@ TWITCH = GiftCard(
 
 META_QUEST = GiftCard(
     slug="meta_quest", title="Meta Quest", emoji="🥽",
+    pitch="Оплата игр и приложений в Meta Quest Store.",
     # «Квест» одним словом не берём: так зовут и игры, и услуги прохождения,
     # и карта забирала бы чужие заказы. Первая признавшая забирает заказ —
     # ошибка здесь тихая.
@@ -560,6 +582,7 @@ META_QUEST = GiftCard(
 
 BATTLENET = GiftCard(
     slug="battlenet", title="Battle.net", emoji="⚔️",
+    pitch="Баланс Battle.net — игры Blizzard и внутриигровые покупки.",
     subcategory="Battle.net Gift Card", unit=MONEY,
     words=("battle.net", "battlenet", "battle net", "баттлнет", "батлнет",
            "близзард", "blizzard"),
@@ -571,6 +594,7 @@ BATTLENET = GiftCard(
 
 OZON = GiftCard(
     slug="ozon", title="OZON.ru", emoji="🔵",
+    pitch="Сертификат OZON — оплата любых покупок на маркетплейсе.",
     subcategory="OZON.ru Gift Card", unit=MONEY,
     words=("ozon", "озон"),
     activation="Активировать: на OZON — раздел сертификатов.",

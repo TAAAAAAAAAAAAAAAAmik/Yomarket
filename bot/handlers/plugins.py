@@ -225,11 +225,17 @@ def _stars_text(settings: dict, shop_name: str = "") -> str:
     note = p.get("note") or "—"
     name_part = f" • {shop_name}" if shop_name else ""
     status = "🟢 Автовыдача включена" if enabled else "🔴 Автовыдача выключена"
+    # Мини-описание в том же виде, что у карт: что за товар и что делает
+    # бот. Про покупку сказано «покупает через Fragment за TON» — это про
+    # устройство, и это правда; «звёзды уходят сами» правдой сегодня не
+    # является (пункт A1 в CHECKLIST.md: Fragment отвечает `Access denied`
+    # на `initBuyStarsRequest`). Строку усилить, когда выдача пойдёт живьём.
     return (
-        f"⭐ <b>Telegram — Звёзды{name_part}</b>\n\n"
+        f"⭐ <b>Telegram Stars{name_part}</b>\n"
+        "<i>Звёзды на ник покупателя. Бот покупает их через Fragment за "
+        "TON — свой кошелёк, свой баланс.</i>\n\n"
         f"{status}\n"
         f"{note}\n\n"
-        "Раздел управления плагином.\n"
         "Контроль, настройки, ручная выдача — всё здесь."
     )
 
@@ -2471,8 +2477,13 @@ def _gift_card_text(settings: dict, gift) -> str:
     note = str(conf.get("note") or "")
     log = conf.get("log") or []
     delivered = conf.get("delivered") or []
-    lines = [
-        f"{gift.emoji} <b>{html.escape(gift.title)}</b>",
+    lines = [f"{gift.emoji} <b>{html.escape(gift.title)}</b>"]
+    # Мини-описание — сразу под названием: продавец должен понимать, что это
+    # за товар, до того как читать настройки. Строка лежит в декларации, и
+    # у новой карты она появится вместе с ней.
+    if getattr(gift, "pitch", ""):
+        lines.append(f"<i>{html.escape(gift.pitch)}</i>")
+    lines += [
         "",
         ("🟢 <b>Автовыдача включена</b> — бот сам купит код по оплаченному "
          "заказу" if enabled
@@ -2790,16 +2801,25 @@ async def gifts_add(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     settings = get_settings(callback.from_user.id)
     builder = InlineKeyboardBuilder()
-    for gift in cards():
-        if not card_conf(settings, gift.slug).get("enabled"):
-            builder.button(text=f"{gift.emoji} {gift.title}",
-                           callback_data=f"plugins:gc:{gift.slug}")
+    off = [g for g in cards()
+           if not card_conf(settings, g.slug).get("enabled")]
+    for gift in off:
+        builder.button(text=f"{gift.emoji} {gift.title}",
+                       callback_data=f"plugins:gc:{gift.slug}")
     builder.button(text="⬅️ Назад", callback_data="plugins:gifts")
-    builder.adjust(1)
-    await callback.message.edit_text(
-        "➕ <b>Добавить карту</b>\n\nВыберите товар — откроется его экран, "
-        "там же включается автовыдача.",
-        reply_markup=builder.as_markup())
+    builder.adjust(*([2] * ((len(off) + 1) // 2) + [1]))
+    # Здесь карту выбирают — значит здесь описание и нужнее всего. Список
+    # из одних названий заставляет открывать каждую, чтобы понять, что это.
+    lines = ["➕ <b>Добавить карту</b>", ""]
+    for gift in off[:12]:
+        lines.append(f"{gift.emoji} <b>{html.escape(gift.title)}</b> — "
+                     f"{html.escape(gift.pitch)}"
+                     if gift.pitch else
+                     f"{gift.emoji} <b>{html.escape(gift.title)}</b>")
+    lines += ["", "Нажмите карту — откроется её экран, там же включается "
+                  "автовыдача."]
+    await callback.message.edit_text("\n".join(lines)[:4000],
+                                     reply_markup=builder.as_markup())
     await callback.answer()
 
 

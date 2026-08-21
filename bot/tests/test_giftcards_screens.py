@@ -338,6 +338,58 @@ class TimeIsToldWithoutInventingATimezone(unittest.TestCase):
         from automation.giftcards import ago
         self.assertEqual(ago(0), "")
 
+
+class EveryPluginIntroducesItself(unittest.TestCase):
+    """«К каждому плагину мини-описание» — 21.08.
+
+    Список из одних названий заставляет открывать каждую карту, чтобы
+    понять, что это. Описание лежит в декларации: у новой карты оно
+    появится вместе с ней, а не будет дописано отдельным списком, который
+    однажды отстанет от реестра.
+    """
+
+    def test_every_card_has_one(self):
+        from automation.giftcards import cards
+        for gift in cards():
+            self.assertTrue(gift.pitch.strip(), gift.slug)
+
+    def test_it_fits_one_line_on_a_phone(self):
+        """Мини-описание — значит мини: длинное превращает список в стену."""
+        from automation.giftcards import cards
+        for gift in cards():
+            self.assertLess(len(gift.pitch), 110, gift.slug)
+
+    def test_it_says_what_the_product_is_not_what_it_will_earn(self):
+        """«Самый ходовой номинал» и «покупают чаще всего» проверить нельзя,
+        а «код пополняет Apple ID» покупатель проверит сам."""
+        from automation.giftcards import cards
+        for gift in cards():
+            low = gift.pitch.lower()
+            for promise in ("ходов", "чаще всего", "выгодн", "прибыл",
+                            "заработ", "хит", "лидер продаж"):
+                self.assertNotIn(promise, low, gift.slug)
+
+    def test_the_card_screen_shows_it_under_the_title(self):
+        from automation.giftcards import card
+        from handlers import plugins as P
+        got = P._gift_card_text({}, card("apple"))
+        self.assertIn("Apple ID", got)
+        self.assertLess(got.index("Apple ID"), got.index("Автовыдача"))
+
+    def test_the_stars_plugin_introduces_itself_too(self):
+        """Плагинов у нас не только карты."""
+        from handlers import plugins as P
+        got = P._stars_text({"plugins": {"auto_stars": {}}})
+        self.assertIn("Звёзды на ник покупателя", got)
+
+    def test_the_stars_line_still_does_not_promise_delivery(self):
+        """A1 в CHECKLIST.md: Fragment отвечает `Access denied` на
+        `initBuyStarsRequest`. «Звёзды уходят сами» сегодня неправда."""
+        from handlers import plugins as P
+        got = P._stars_text({"plugins": {"auto_stars": {}}}).lower()
+        for claim in ("звёзды уходят сам", "звёзды летят", "придут сами"):
+            self.assertNotIn(claim, got)
+
 if __name__ == "__main__":
     unittest.main()
 
