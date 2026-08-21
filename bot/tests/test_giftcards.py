@@ -414,6 +414,107 @@ class TheRetiredRoblexCardLeavesNothingLocked(unittest.TestCase):
         self.assertEqual(conf["delivered"], [])
         self.assertEqual(conf["log"], [])
 
+
+class TheSixCardsAddedOnTheSellersWord(unittest.TestCase):
+    """«Пох делай те, что схожи с Xbox, Apple и Roblox» — 21.08.
+
+    Схожесть здесь значит одно: **номинал меряется деньгами**. Строки
+    подкатегорий взяты из живого каталога 20.08 с точностью до символа — у
+    этих шести слово «Card» в единственном числе, в отличие от `Apple Gift
+    Cards`, и пересказ по памяти стоил бы карты, которая не находит ни одной
+    услуги и молчит.
+
+    Слабое место названо вслух: разбор номинала у них **не мерян**. У прежних
+    семи мерян и дал 100 %; здесь основание другое — каталог показывает
+    номиналы деньгами. Ошибка в эту сторону не продаёт лишнего: номинал
+    подбирается точным совпадением, и непонятый оборачивается отказом.
+    """
+
+    NEW = ("airbnb", "eneba", "twitch", "meta_quest", "battlenet", "ozon")
+
+    def cards(self):
+        return {c.slug: c for c in gc.cards()}
+
+    def test_all_six_are_in_the_registry(self):
+        have = self.cards()
+        for slug in self.NEW:
+            self.assertIn(slug, have)
+
+    def test_the_subcategories_are_singular_as_the_catalogue_writes_them(self):
+        """`Airbnb Gift Card`, не `Airbnb Gift Cards`. Сверяется с точностью
+        до символа: лишняя буква — карта без единой услуги."""
+        have = self.cards()
+        for slug in self.NEW:
+            self.assertTrue(have[slug].subcategory.endswith("Gift Card"),
+                            f"{slug}: {have[slug].subcategory}")
+
+    def test_all_six_are_measured_in_money(self):
+        have = self.cards()
+        for slug in self.NEW:
+            self.assertEqual(have[slug].unit.kind, "money", slug)
+
+    def test_they_admit_they_are_not_measured_yet(self):
+        """Пустое `measured` — не забывчивость, а признак, по которому экран
+        карты предупреждает продавца."""
+        have = self.cards()
+        for slug in self.NEW:
+            self.assertEqual(have[slug].measured, "", slug)
+
+    def test_the_older_cards_keep_their_measurement(self):
+        have = self.cards()
+        for slug in ("apple", "xbox", "steam", "amazon", "razer", "psn",
+                     "robux"):
+            self.assertTrue(have[slug].measured, slug)
+
+    def test_no_two_cards_answer_to_the_same_word(self):
+        """Заказ забирает первая признавшая карта. Общее слово у двух карт —
+        это не спор, а тихая ошибка: вторая не получит ничего никогда."""
+        seen: dict = {}
+        for card in gc.cards():
+            for word in card.words:
+                self.assertNotIn(word, seen,
+                                 f"«{word}» у {card.slug} и {seen.get(word)}")
+                seen[word] = card.slug
+
+    def test_a_word_is_not_swallowed_by_another_cards_word(self):
+        """«квест» внутри «мета квест» — и карта Meta Quest забирала бы любой
+        заказ со словом «квест», включая прохождение игр."""
+        for card in gc.cards():
+            for word in card.words:
+                for other in gc.cards():
+                    if other.slug == card.slug:
+                        continue
+                    for their in other.words:
+                        self.assertNotEqual(
+                            word.strip(), their.strip(),
+                            f"{card.slug} и {other.slug} спорят за «{word}»")
+
+    def test_the_mixed_families_are_left_out(self):
+        """У Nintendo рядом с картами подписки, у EA — FC Points, у TikTok —
+        Coins, у Valorant и Riot — VP. Объявить их деньгами значит завести
+        товар, который бот не поймёт."""
+        taken = {c.subcategory for c in gc.cards()}
+        for family in ("Nintendo Gift Cards", "EA Gift Cards",
+                       "TikTok Gift Card", "Valorant Gift Card",
+                       "Riot Gift Cards", "Free Fire Gift Cards",
+                       "Tinder Gift Cards"):
+            self.assertNotIn(family, taken)
+
+    def test_every_new_card_can_make_an_ad_title(self):
+        """Заготовка без подстановок дала бы тринадцать одинаковых товаров."""
+        have = self.cards()
+        for slug in self.NEW:
+            title = gc.fill_template(have[slug].ad_title, nominal="10 USD",
+                                     region="US", price=900)
+            self.assertIn("10 USD", title)
+            self.assertIn("US", title)
+
+    def test_every_card_tells_the_buyer_how_to_use_the_code(self):
+        """Код без единого слова о том, что с ним делать, — это заявка в
+        поддержку продавца."""
+        for card in gc.cards():
+            self.assertTrue(card.activation.strip(), card.slug)
+
 if __name__ == "__main__":
     unittest.main()
 

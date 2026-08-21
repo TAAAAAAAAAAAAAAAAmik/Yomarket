@@ -373,6 +373,11 @@ class GiftCard:
     # пополнений называется «Пополнение баланса», у Robux — «Игровая
     # валюта»: подкатегории «Робуксы» в панели не существует.
     autopick: tuple[str, ...] = ()
+    # Дата замера на живом каталоге — или пусто, если семейство брали по
+    # записанной таблице, не померив разбор номинала. Разница видна продавцу
+    # на экране карты: «мерено» значит, что все названия семейства
+    # разобрались, а не «похоже, что разберутся».
+    measured: str = ""
 
     def matches_service(self, service: dict) -> bool:
         """Эта ли услуга относится к карте."""
@@ -390,7 +395,7 @@ class GiftCard:
 
 APPLE = GiftCard(
     slug="apple", title="Apple", emoji="🍎",
-    subcategory="Apple Gift Cards", unit=MONEY,
+    subcategory="Apple Gift Cards", unit=MONEY, measured="20.08",
     words=("apple", "эпл", "эппл", "айтюнс", "itunes", "app store", "апстор"),
     activation="Активировать: appstore.com/redeem либо Настройки → ваш Apple ID "
                "→ «Погасить подарочную карту».",
@@ -400,7 +405,7 @@ APPLE = GiftCard(
 
 PSN = GiftCard(
     slug="psn", title="PlayStation Store", emoji="🎮",
-    subcategory="PlayStation Gift Cards", unit=MONEY,
+    subcategory="PlayStation Gift Cards", unit=MONEY, measured="20.08",
     words=("playstation", "плейстейшен", "плейстешн", "плейстейшн", "psn",
            "пс стор", "ps store"),
     autopick=("playstation", "пополнение баланса"),
@@ -423,7 +428,7 @@ PSN = GiftCard(
 # фильтра. Что там на самом деле, показывает «📦 Наличие и баланс».
 ROBUX = GiftCard(
     slug="robux", title="Roblox Gift Cards", emoji="🎮",
-    subcategory="Roblox Gift Cards", unit=UNITS("Robux"),
+    subcategory="Roblox Gift Cards", unit=UNITS("Robux"), measured="20.08",
     name_must_have="Wallet Code",
     # Слова узкие нарочно, и порядок в реестре тоже: «roblox» подходит и
     # картам, поэтому здесь его нет. Заказ «Roblox Gift Card $10» пройдёт
@@ -446,7 +451,7 @@ ROBUX = GiftCard(
 # (0% денег из 796), Valorant смешан с VP (57%), и обоим нужна своя мера.
 XBOX = GiftCard(
     slug="xbox", title="Xbox", emoji="🟩",
-    subcategory="Xbox Gift Cards", unit=MONEY,
+    subcategory="Xbox Gift Cards", unit=MONEY, measured="20.08",
     words=("xbox", "иксбокс", "хбокс", "хбох", "иксбох"),
     autopick=("xbox", "пополнение баланса"),
     activation="Активировать: xbox.com/redeem либо на консоли → «Использовать код».",
@@ -456,7 +461,7 @@ XBOX = GiftCard(
 
 STEAM = GiftCard(
     slug="steam", title="Steam", emoji="🎲",
-    subcategory="Steam Wallet Gift Cards", unit=MONEY,
+    subcategory="Steam Wallet Gift Cards", unit=MONEY, measured="20.08",
     words=("steam", "стим"),
     autopick=("steam", "пополнение баланса"),
     activation="Активировать: Steam → «Добавить средства» → «Активировать код "
@@ -467,7 +472,7 @@ STEAM = GiftCard(
 
 AMAZON = GiftCard(
     slug="amazon", title="Amazon", emoji="📦",
-    subcategory="Amazon Gift Cards", unit=MONEY,
+    subcategory="Amazon Gift Cards", unit=MONEY, measured="20.08",
     words=("amazon", "амазон"),
     activation="Активировать: в аккаунте Amazon → «Подарочные карты» → "
                "«Активировать код». Карта действует в магазине своей страны.",
@@ -477,11 +482,99 @@ AMAZON = GiftCard(
 
 RAZER = GiftCard(
     slug="razer", title="Razer Gold", emoji="🐍",
-    subcategory="Razer Gold Gift Cards", unit=MONEY,
+    subcategory="Razer Gold Gift Cards", unit=MONEY, measured="20.08",
     words=("razer", "рейзер", "разер", "razer gold"),
     activation="Активировать: Razer Gold → «Пополнить» → ввести PIN.",
     ad_title="Razer Gold {номинал} ({регион})",
     ad_text="Код пополнения Razer Gold. Выдача сразу после оплаты.",
+)
+
+
+# Шесть карт по решению продавца 21.08: «делай те, что схожи с Xbox, Apple и
+# Roblox». Схожесть здесь означает одно — **номинал меряется деньгами**.
+#
+# Строки подкатегорий взяты из живого каталога, снятого 20.08
+# (`docs/plan_giftcards_template.md`, §2), с точностью до символа: у этих
+# шести слово «Card» стоит в единственном числе, в отличие от `Apple Gift
+# Cards`. Пересказ по памяти стоил бы карты, которая не находит ни одной
+# услуги и молчит.
+#
+# **Чего у них нет и о чём сказано вслух:** разбор номинала на живом
+# каталоге у этих шести не мерян — отсюда пустое `measured`. У прежних
+# семи он мерян и дал 100 %; здесь основание слабее: семейства выбраны по
+# тому, что каталог показывает их номиналы деньгами (`AED 50`, `$10`), а не
+# игровой единицей или сроком. Проверяется это кнопкой «🔬 Что ещё можно
+# завести» за один запрос.
+#
+# Ошибка в эту сторону не продаёт лишнего: номинал подбирается **точным**
+# совпадением значения и меры в своём регионе, и непонятый номинал
+# оборачивается отказом, а не выдачей не того.
+#
+# Смешанные семейства сюда не взяты намеренно. У Nintendo рядом с картами
+# лежат подписки, у EA — FC Points, у TikTok — Coins, у Valorant и Riot —
+# VP и Riot Cash, у Free Fire — Diamonds, у Tinder всё меряется сроком.
+# Каждому нужна своя мера, и объявить их деньгами значит завести товар,
+# который бот не поймёт.
+AIRBNB = GiftCard(
+    slug="airbnb", title="Airbnb", emoji="🏠",
+    subcategory="Airbnb Gift Card", unit=MONEY,
+    words=("airbnb", "эйрбиэнби", "эйр би эн би", "аирбнб"),
+    activation="Активировать: в аккаунте Airbnb — раздел подарочных карт. "
+               "Карта работает в валюте своего региона.",
+    ad_title="Airbnb Gift Card {номинал} ({регион})",
+    ad_text="Подарочная карта Airbnb. Выдача сразу после оплаты.",
+)
+
+ENEBA = GiftCard(
+    slug="eneba", title="Eneba", emoji="🛒",
+    subcategory="Eneba Gift Card", unit=MONEY,
+    words=("eneba", "энеба"),
+    activation="Активировать: в аккаунте Eneba — пополнение баланса кодом.",
+    ad_title="Eneba Gift Card {номинал} ({регион})",
+    ad_text="Подарочная карта Eneba. Выдача сразу после оплаты.",
+)
+
+TWITCH = GiftCard(
+    slug="twitch", title="Twitch", emoji="💜",
+    subcategory="Twitch Gift Card", unit=MONEY,
+    words=("twitch", "твич"),
+    activation="Активировать: в аккаунте Twitch — раздел кошелька или "
+               "подарочных карт. Карта в валюте своего региона.",
+    ad_title="Twitch Gift Card {номинал} ({регион})",
+    ad_text="Подарочная карта Twitch. Выдача сразу после оплаты.",
+)
+
+META_QUEST = GiftCard(
+    slug="meta_quest", title="Meta Quest", emoji="🥽",
+    # «Квест» одним словом не берём: так зовут и игры, и услуги прохождения,
+    # и карта забирала бы чужие заказы. Первая признавшая забирает заказ —
+    # ошибка здесь тихая.
+    subcategory="Meta Quest Gift Card", unit=MONEY,
+    words=("meta quest", "мета квест", "oculus", "окулус"),
+    activation="Активировать: в аккаунте Meta — раздел платежей или "
+               "подарочных карт. Карта в валюте своего региона.",
+    ad_title="Meta Quest Gift Card {номинал} ({регион})",
+    ad_text="Подарочная карта Meta Quest. Выдача сразу после оплаты.",
+)
+
+BATTLENET = GiftCard(
+    slug="battlenet", title="Battle.net", emoji="⚔️",
+    subcategory="Battle.net Gift Card", unit=MONEY,
+    words=("battle.net", "battlenet", "battle net", "баттлнет", "батлнет",
+           "близзард", "blizzard"),
+    activation="Активировать: в аккаунте Battle.net — пополнение баланса "
+               "кодом. Баланс в валюте своего региона.",
+    ad_title="Battle.net Gift Card {номинал} ({регион})",
+    ad_text="Подарочная карта Battle.net. Выдача сразу после оплаты.",
+)
+
+OZON = GiftCard(
+    slug="ozon", title="OZON.ru", emoji="🔵",
+    subcategory="OZON.ru Gift Card", unit=MONEY,
+    words=("ozon", "озон"),
+    activation="Активировать: на OZON — раздел сертификатов.",
+    ad_title="OZON.ru {номинал} ({регион})",
+    ad_text="Подарочный сертификат OZON. Выдача сразу после оплаты.",
 )
 
 
@@ -494,7 +587,9 @@ RAZER = GiftCard(
 # забирала бы заказы на Robux. Карту сняли, правило осталось: оно понадобится
 # первой же паре, где одно слово входит в другое.
 CARDS: tuple[GiftCard, ...] = (ROBUX, APPLE, PSN,
-                               XBOX, STEAM, AMAZON, RAZER)
+                               XBOX, STEAM, AMAZON, RAZER,
+                               AIRBNB, ENEBA, TWITCH, META_QUEST,
+                               BATTLENET, OZON)
 
 
 def cards() -> tuple[GiftCard, ...]:
