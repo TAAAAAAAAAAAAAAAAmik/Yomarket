@@ -35,14 +35,32 @@ class PaginationCallback(CallbackData, prefix="page"):
 
 
 def main_menu_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
-    from storage import MENU_BUTTONS, get_menu_labels
+    """Главное меню. Ширина ряда считается по надписям, а не берётся как «2».
+
+    Пункты меню продавец переименовывает сам, и жёсткая пара ломалась об
+    длинное название: «🛒 Заказы» и «🤖 Автопилот сделок» в одном ряду —
+    второе переносится на две строки, ряд становится вдвое выше соседнего.
+
+    Кнопка админа добавляется **до** раскладки. Раньше она шла после
+    `adjust(2)`, а `add()` дописывает кнопку в последний ряд, если там есть
+    место, — и при нечётном числе пунктов «👑 Админ-панель» вставала рядом
+    со случайным из них. Вёрстка зависела от того, сколько пунктов включено.
+    """
+    import storage
+    from storage import get_menu_labels
+    import ui
     labels = get_menu_labels()
     builder = InlineKeyboardBuilder()
-    for key, _default, cb in MENU_BUTTONS:
-        builder.button(text=labels.get(key, _default), callback_data=cb)
-    builder.adjust(2)
+    texts = []
+    for key, _default, cb in storage.MENU_BUTTONS:
+        text = labels.get(key, _default)
+        texts.append(text)
+        builder.button(text=text, callback_data=cb)
+    spec = ui.sizes(texts)
     if is_admin_user:
         builder.button(text="👑 Админ-панель", callback_data="admin:menu")
+        spec = spec + [1]
+    builder.adjust(*spec)
     return builder.as_markup()
 
 
@@ -77,16 +95,23 @@ def ads_list_keyboard(
         price = money(value) if value is not None else ""
         label = f"{title[:28]} — {price} ₽" if price else title[:35]
         builder.button(text=label, callback_data=AdCallback(ad_id=ad_id).pack())
-    builder.adjust(1)
+    # Товары — по одному в ряд, даже короткие: два названия рядом читаются
+    # как одно длинное. Подвал раскладывается по ширине надписей.
+    import ui
+    page = 0
     if next_cursor:
-        builder.button(
-            text="Ещё товары ▶️",
-            callback_data=PaginationCallback(entity="ads", cursor=next_cursor).pack(),
-        )
-    builder.button(text="➕ Добавить товар", callback_data="create_ad:start")
-    builder.button(text="🔄 Обновить", callback_data="ads_load")
-    builder.button(text="⬅️ Меню", callback_data="menu:main")
-    builder.adjust(1)
+        # Листалка отдельной строкой: рядом с действиями она читается как
+        # ещё одно действие.
+        builder.button(text="Ещё товары ▶️", callback_data=PaginationCallback(
+            entity="ads", cursor=next_cursor).pack())
+        page = 1
+    tail = [("➕ Добавить товар", "create_ad:start"),
+             ("🔄 Обновить", "ads_load"),
+             ("⬅️ Меню", "menu:main")]
+    for text, cb in tail:
+        builder.button(text=text, callback_data=cb)
+    builder.adjust(*([1] * (len(ads) + page)
+                     + ui.sizes([t for t, _ in tail])))
     return builder.as_markup()
 
 
@@ -113,18 +138,17 @@ def order_actions_keyboard(order_id: str, chat_id: str = "",
     # маркетплейсе, не подтверждено — на тестовом заказе покупатель сразу
     # увидел «магазин сообщил, что выполнил заказ». Автопринятие в Автопилоте
     # остаётся, там это осознанный выбор с показом настоящего статуса.
-    rows: list[int] = []
-    shown = 0
     if allowed("confirm"):
         builder.button(text="✅ Подтвердить", callback_data=OrderCallback(order_id=order_id, action="confirm").pack())
-        shown += 1
     if allowed("refund"):
         builder.button(text="↩️ Возврат", callback_data=OrderCallback(order_id=order_id, action="refund").pack())
-        shown += 1
     builder.button(text="💬 Чат по заказу", callback_data=ChatCallback(chat_id=chat_id or order_id).pack())
     builder.button(text="⬅️ Назад", callback_data="menu:orders")
-    rows = ([shown] if shown else []) + [1, 1]
-    builder.adjust(*rows)
+    # Столбиком, и это не «недоделанная раскладка». «✅ Подтвердить» и
+    # «↩️ Возврат» коротки обе и по ширине встали бы в один ряд — а промах
+    # пальцем на телефоне означает либо закрытую сделку вместо возврата,
+    # либо отданные покупателю деньги вместо закрытой сделки.
+    builder.adjust(1)
     return builder.as_markup()
 
 

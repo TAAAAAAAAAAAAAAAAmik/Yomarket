@@ -29,6 +29,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from storage import (ar_fields, delete_ar_creds, encryption_on, get_ar_creds,
                      save_ar_creds)
 
@@ -933,7 +935,7 @@ async def apr_proxy_prompt(callback: CallbackQuery, state: FSMContext) -> None:
         b.button(text="🧪 Годится ли он", callback_data="apr:proxy_test")
         b.button(text="🗑 Убрать прокси", callback_data="apr:proxy_off")
     b.button(text="⬅️ Отмена", callback_data="apr:creds")
-    b.adjust(1)
+    ui.lay(b)
     await callback.message.edit_text(
         "🌐 <b>Прокси для запросов к AppRoute</b>\n\n"
         "Нужен, если у поставщика включён белый список адресов: туда "
@@ -1121,7 +1123,7 @@ def _back_to_robux() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить", callback_data="apr:balance")
     b.button(text="⬅️ Назад", callback_data="plugins:auto_roblox")
-    b.adjust(1)
+    ui.lay(b)
     return b.as_markup()
 
 

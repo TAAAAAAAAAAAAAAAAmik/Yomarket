@@ -10,6 +10,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from automation.panel import YooMarketPanelHTTP, PanelSession, try_token_login
 from storage import get_panel_creds, save_panel_creds, delete_panel_creds, get_token
 
@@ -66,7 +68,7 @@ def _menu_kb(creds: dict | None, has_token: bool = False):
     else:
         b.button(text="📧 Войти по email", callback_data="panel:sms_start")
         b.button(text="⬅️ Настройки", callback_data="settings:menu")
-        b.adjust(1)
+        ui.lay(b)
     return b.as_markup()
 
 
@@ -285,7 +287,7 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
-        b.adjust(1)
+        ui.lay(b)
         await message.answer("Выберите действие:", reply_markup=b.as_markup())
         return
 
@@ -346,7 +348,7 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
         b = InlineKeyboardBuilder()
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
-        b.adjust(1)
+        ui.lay(b)
         await message.answer("Выберите действие:", reply_markup=b.as_markup())
         return
 

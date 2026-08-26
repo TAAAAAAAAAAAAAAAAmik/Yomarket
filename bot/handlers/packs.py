@@ -9,6 +9,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from api.yoomarket import YooMarketAPI
 from storage import get_settings, save_settings
 
@@ -56,7 +58,7 @@ async def _render_menu(msg, uid: int) -> None:
     b.adjust(1)
     b.button(text="➕ Новый пак", callback_data="pack:new")
     b.button(text="⬅️ Объявления", callback_data="menu:ads")
-    b.adjust(1)
+    ui.lay(b)
     await msg.edit_text("\n".join(lines), reply_markup=b.as_markup())
 
 
@@ -209,7 +211,7 @@ async def pack_schedule(callback: CallbackQuery) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="🕐 Часы и потолок трат", callback_data="sched:menu")
     b.button(text="📦 К паку", callback_data=f"pack:view:{idx}")
-    b.adjust(1)
+    ui.lay(b)
     await callback.message.edit_text("\n".join(head), reply_markup=b.as_markup())
     await callback.answer()
 
@@ -355,7 +357,7 @@ async def pack_bump_ask(callback: CallbackQuery) -> None:
         b = InlineKeyboardBuilder()
         b.button(text="⚙️ Выбрать тариф", callback_data="promo:setup")
         b.button(text="⬅️ К паку", callback_data=f"pack:view:{idx}")
-        b.adjust(1)
+        ui.lay(b)
         await callback.message.edit_text(
             "⚙️ <b>Сначала выберите тариф</b>\n\n"
             "«Премиум» требует услугу, срок и способ оплаты — сроки стоят "

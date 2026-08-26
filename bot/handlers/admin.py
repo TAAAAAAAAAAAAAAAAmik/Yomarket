@@ -11,6 +11,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from storage import (
     CUSTOM_TEXTS, MENU_BUTTONS, add_admin, block_user, clear_custom_text,
     clear_header_emoji, count_subscribers, count_users, get_all_users,
@@ -205,7 +207,7 @@ async def _do_grant(msg, state: FSMContext, days: int, admin_id: int, bot: Bot) 
     b = InlineKeyboardBuilder()
     b.button(text="🎫 Ещё подписку", callback_data="admin:sub")
     b.button(text="⬅️ Админ-панель", callback_data="admin:menu")
-    b.adjust(1)
+    ui.lay(b)
     text = (f"✅ Подписка выдана!\n\n"
             f"👤 <code>{target}</code>\n"
             f"➕ {days} дн.  →  всего <b>{left} дн.</b>")
@@ -800,7 +802,7 @@ async def text_edit_save(message: Message, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="👁 Посмотреть", callback_data=f"admin:txt:{key}")
     b.button(text="📝 К текстам", callback_data="admin:texts")
-    b.adjust(1)
+    ui.lay(b)
     await message.answer("✅ Текст сохранён!", reply_markup=b.as_markup())
     # show how it will actually look
     try:

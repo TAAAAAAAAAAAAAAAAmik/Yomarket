@@ -14,6 +14,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from storage import (
     get_settings, save_settings, get_shop_name,
     get_fragment_creds, save_fragment_creds, delete_fragment_creds,
@@ -1127,7 +1129,7 @@ async def stars_whois_input(message: Message, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="🔁 Ещё ник", callback_data="plugins:stars:whois")
     b.button(text="⬅️ AutoStars", callback_data="plugins:auto_stars")
-    b.adjust(1)
+    ui.lay(b)
     body = "\n".join(html.escape(str(x)) for x in lines)[:3500]
     await status.edit_text(f"🔎 <b>Проверка получателя</b>\n\n{body}",
                            reply_markup=b.as_markup())
@@ -1486,7 +1488,7 @@ def _notifs_kb(p: dict) -> InlineKeyboardMarkup:
         mark = "🟢" if n.get(key, True) else "🔴"
         b.button(text=f"{mark} {title}", callback_data=f"plugins:stars:ntog:{key}")
     b.button(text="⬅️ Назад", callback_data="plugins:auto_stars")
-    b.adjust(1)
+    ui.lay(b)
     return b.as_markup()
 
 
@@ -2009,7 +2011,7 @@ async def roblox_balance(callback: CallbackQuery) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="🔑 Доступ к поставщику", callback_data="apr:creds")
     b.button(text="⬅️ Назад", callback_data="plugins:auto_roblox")
-    b.adjust(1)
+    ui.lay(b)
     await callback.message.edit_text("\n".join(lines)[:4000],
                                      reply_markup=b.as_markup())
 

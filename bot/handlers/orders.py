@@ -9,6 +9,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from api.yoomarket import YooMarketAPI
 from keyboards.main import OrderCallback, PaginationCallback, back_keyboard, order_actions_keyboard
 from orderfields import (BACK, DONE, describe, money, status_icon,
@@ -120,18 +122,25 @@ def _build_orders_keyboard(orders: list[dict], next_cursor: str | None,
             text=label,
             callback_data=OrderCallback(order_id=d["id"], action="view").pack(),
         )
-    builder.adjust(1)
+    # Заказы — по одному в ряд: у каждого название и сумма, вдвоём в строку
+    # они не влезают. Подвал раскладывается по ширине: пять коротких кнопок
+    # в столбик отодвигали «⬅️ Главное меню» за нижний край экрана.
+    # Листалка стоит отдельной строкой: рядом с «🔍 Поиск» она читается как
+    # ещё один фильтр, хотя делает совсем другое.
+    page = 0
     if next_cursor:
-        builder.button(
-            text="Следующая →",
-            callback_data=PaginationCallback(entity="orders", cursor=next_cursor).pack(),
-        )
-    builder.button(text="🔍 Поиск", callback_data="orders:search")
-    builder.button(text="✅ Выполненные", callback_data="orders:filter:done")
-    builder.button(text="⏳ Активные", callback_data="orders:filter:active")
-    builder.button(text="↩️ Возвраты", callback_data="orders:filter:refunds")
-    builder.button(text="⬅️ Главное меню", callback_data="menu:main")
-    builder.adjust(1)
+        builder.button(text="Следующая →", callback_data=PaginationCallback(
+            entity="orders", cursor=next_cursor).pack())
+        page = 1
+    tail: list[tuple[str, str]] = [("🔍 Поиск", "orders:search"),
+             ("✅ Выполненные", "orders:filter:done"),
+             ("⏳ Активные", "orders:filter:active"),
+             ("↩️ Возвраты", "orders:filter:refunds"),
+             ("⬅️ Главное меню", "menu:main")]
+    for text, cb in tail:
+        builder.button(text=text, callback_data=cb)
+    builder.adjust(*([1] * (len(orders) + page)
+                     + ui.sizes([t for t, _ in tail])))
     return builder.as_markup()
 
 
@@ -303,6 +312,7 @@ async def ask_refund(
              callback_data=OrderCallback(order_id=oid, action="refund").pack())
     b.button(text="❌ Отмена",
              callback_data=OrderCallback(order_id=oid, action="view").pack())
+    # Столбиком: «Да» и «Отмена» рядом — это возврат чужих денег по промаху.
     b.adjust(1)
     await callback.message.edit_text(
         f"↩️ <b>Оформить возврат по заказу #{oid}?</b>\n\n"
@@ -479,7 +489,7 @@ async def _do_order_action(callback: CallbackQuery, oid: str, action: str,
     builder = InlineKeyboardBuilder()
     builder.button(text="🔍 Детали заказа", callback_data=OrderCallback(order_id=oid, action="view").pack())
     builder.button(text="⬅️ Заказы", callback_data="menu:orders")
-    builder.adjust(1)
+    ui.lay(builder)
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
@@ -539,7 +549,6 @@ async def orders_search_exec(message: Message, state: FSMContext) -> None:
             text=f"#{oid} {title}",
             callback_data=OrderCallback(order_id=str(oid), action="view").pack(),
         )
-    b.adjust(1)
     b.button(text="⬅️ Заказы", callback_data="menu:orders")
     b.adjust(1)
     await message.answer("\n".join(lines), reply_markup=b.as_markup())
@@ -587,7 +596,6 @@ async def filter_orders_done(callback: CallbackQuery) -> None:
             text=f"#{oid} {title}",
             callback_data=OrderCallback(order_id=str(oid), action="view").pack(),
         )
-    b.adjust(1)
     b.button(text="⬅️ Заказы", callback_data="menu:orders")
     b.adjust(1)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
@@ -635,7 +643,6 @@ async def filter_orders_active(callback: CallbackQuery) -> None:
             text=f"#{oid} {title}",
             callback_data=OrderCallback(order_id=str(oid), action="view").pack(),
         )
-    b.adjust(1)
     b.button(text="⬅️ Заказы", callback_data="menu:orders")
     b.adjust(1)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
@@ -680,7 +687,6 @@ async def filter_orders_refunds(callback: CallbackQuery) -> None:
             text=f"#{oid} {title}",
             callback_data=OrderCallback(order_id=str(oid), action="view").pack(),
         )
-    b.adjust(1)
     b.button(text="⬅️ Заказы", callback_data="menu:orders")
     b.adjust(1)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())

@@ -12,6 +12,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from api.yoomarket import YooMarketAPI
 from storage import get_settings, save_settings
 
@@ -724,7 +726,7 @@ async def pos_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="⚡ Добавить все сразу", callback_data="pos:addall")
     b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
     b.button(text="⬅️ Назад", callback_data="pos:menu")
-    b.adjust(1)
+    ui.lay(b)
     await _pos_edit(
         callback.message,
         "➕ <b>Добавить товар под наблюдение</b>\n\n"
@@ -929,7 +931,7 @@ async def pos_add_list(callback: CallbackQuery) -> None:
         mark = "✅ " if ad["id"] in known else ""
         b.button(text=f"{mark}{ad['title'][:36]}", callback_data=f"pos:addpick:{i}")
     b.button(text="⬅️ Назад", callback_data="pos:add")
-    b.adjust(1)
+    ui.lay(b)
     await _pos_edit(
         callback.message,
         f"📦 <b>За каким товаром следить</b>\n\n"
@@ -1098,7 +1100,7 @@ async def pos_add_pick(callback: CallbackQuery) -> None:
         b.button(text="📂 Выбрать раздел из каталога", callback_data="pos:cat:")
         b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
         b.button(text="⬅️ Назад", callback_data="pos:add")
-        b.adjust(1)
+        ui.lay(b)
         await _pos_edit(
             callback.message,
             f"❔ <b>{_esc(ad['title'][:40])}</b>\n\n{why}\n\n"
@@ -1210,7 +1212,7 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
                  callback_data=f"pos:cat:{parent}"[:64])
         b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
         b.button(text="⬅️ Назад", callback_data="pos:add")
-        b.adjust(1)
+        ui.lay(b)
         # Отказ обязан объяснять себя. «Каталог не читается» без причины и
         # без версии стоило круга: непонятно даже, доехал ли до бота код,
         # в котором подразделы вообще умеют спрашиваться.
@@ -1251,7 +1253,7 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
         b.button(text=f"{r['title'][:30]}{count}",
                  callback_data=f"pos:cat:{r['slug']}"[:64])
     b.button(text="⬅️ Назад", callback_data="pos:add")
-    b.adjust(1)
+    ui.lay(b)
     if parent:
         name = _esc(str(here.get("title") or parent))
         head = (f"Внутри «{name}»: {len(rows)} раздел(ов)." if rows
@@ -1306,7 +1308,7 @@ async def pos_category_chosen(callback: CallbackQuery) -> None:
         b = InlineKeyboardBuilder()
         b.button(text="📂 Выбрать раздел заново", callback_data="pos:cat:")
         b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
-        b.adjust(1)
+        ui.lay(b)
         # Раньше здесь молча получался адрес всего каталога, и дальше бот
         # искал товар в чужой категории.
         await _pos_edit(callback.message,
@@ -1336,7 +1338,7 @@ async def pos_category_chosen(callback: CallbackQuery) -> None:
         b = InlineKeyboardBuilder()
         b.button(text="📂 Выбрать другой раздел", callback_data="pos:cat:")
         b.button(text="🔗 Указать адрес вручную", callback_data="pos:addurl")
-        b.adjust(1)
+        ui.lay(b)
         seen = len(res["offers"]) if ok else 0
         # Раздел назван словом, а не только обрезанным адресом: продавец
         # выбрал Black Russia, увидел «…/tanks-bli…» и первым делом спросил,
@@ -1842,7 +1844,7 @@ async def pos_watch_item(callback: CallbackQuery) -> None:
     for j, it in enumerate(items[:40]):
         b.button(text=it["title"][:36], callback_data=f"pos:wis:{idx}:{j}")
     b.button(text="⬅️ Назад", callback_data=f"pos:w:{idx}")
-    b.adjust(1)
+    ui.lay(b)
     await _pos_edit(
         callback.message,
         "🔗 <b>Какой товар поднимать</b>\n\n"
@@ -2607,7 +2609,7 @@ async def run_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
         b = InlineKeyboardBuilder()
         b.button(text="⚙️ Выбрать тариф", callback_data="promo:setup")
         b.button(text="⬅️ Назад", callback_data="selenium:bump:menu")
-        b.adjust(1)
+        ui.lay(b)
         await callback.message.edit_text(
             "⚙️ <b>Сначала выберите тариф</b>\n\n"
             "«Премиум» требует услугу, срок и способ оплаты. Каждый срок стоит "
@@ -2870,7 +2872,7 @@ async def restore_held(callback: CallbackQuery) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="🔁 Снять отсрочку со всех", callback_data="restore:unhold")
     b.button(text="⬅️ Назад", callback_data="selenium:restore:menu")
-    b.adjust(1)
+    ui.lay(b)
 
     # A barred status quietly skips every ad in it, so it has to be visible —
     # otherwise a seller sees listings that never come back and no reason why.

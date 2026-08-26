@@ -5,6 +5,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from api.yoomarket import YooMarketAPI
 from keyboards.main import AdCallback, PaginationCallback, back_keyboard
 
@@ -271,7 +273,7 @@ async def bump_ad_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
         b = InlineKeyboardBuilder()
         b.button(text="⚙️ Выбрать тариф", callback_data="promo:setup")
         b.button(text="⬅️ Назад", callback_data=f"ad:{ad_id}")
-        b.adjust(1)
+        ui.lay(b)
         await callback.message.edit_text(
             "⚙️ <b>Сначала выберите тариф</b>\n\n"
             "«Премиум» требует услугу, срок и способ оплаты — сроки стоят "

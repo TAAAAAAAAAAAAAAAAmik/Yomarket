@@ -17,6 +17,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from api.yoomarket import YooMarketAPI
 
 router = Router()
@@ -133,7 +135,7 @@ async def _show_list(message, uid: int, api: YooMarketAPI, page: int = 0,
         b = InlineKeyboardBuilder()
         b.button(text="🔄 Повторить", callback_data="prices:reload")
         b.button(text="⬅️ Меню", callback_data="menu:main")
-        b.adjust(1)
+        ui.lay(b)
         await _edit(message, "❌ <b>Не удалось загрузить товары</b>\n\n"
                              f"<code>{html.escape(str(e)[:200])}</code>",
                     b.as_markup())

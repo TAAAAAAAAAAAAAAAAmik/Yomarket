@@ -6,6 +6,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from storage import get_settings, save_settings
 
 import autoreply as ar
@@ -190,7 +192,7 @@ async def show_categories(callback: CallbackQuery, api) -> None:
         text = (head + f"Объявлений: <b>{len(ads)}</b>. Выберите категорию:")
 
     builder.button(text="⬅️ Автоответы", callback_data="ar:menu")
-    builder.adjust(1)
+    ui.lay(builder)
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
@@ -272,7 +274,7 @@ async def show_game_responder(callback: CallbackQuery, api) -> None:
         text = header + "Ответа для этого товара пока нет."
         builder.button(text="➕ Добавить ответ", callback_data=f"resp:add:{title_key}")
         builder.button(text="⬅️ Назад", callback_data=back)
-        builder.adjust(1)
+        ui.lay(builder)
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
@@ -598,7 +600,7 @@ def _rules_kb(conf: dict) -> InlineKeyboardMarkup:
     b.button(text=f"{_sw(fb_on)} Запасной ответ", callback_data="ar:t:fb")
     b.button(text="✏️ Текст запасного", callback_data="ar:fbtx")
     b.button(text="⬅️ Автоответы", callback_data="ar:menu")
-    b.adjust(1)
+    ui.lay(b)
     return b.as_markup()
 
 
@@ -874,7 +876,7 @@ async def ar_templates(callback: CallbackQuery) -> None:
         lines.append(f"<b>{tpl['name']}</b> — {tpl['about']}")
         b.button(text=f"➕ {tpl['name']}", callback_data=f"ar:tpl:{key}")
     b.button(text="⬅️ Автоответы", callback_data="ar:menu")
-    b.adjust(1)
+    ui.lay(b)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
     await callback.answer()
 

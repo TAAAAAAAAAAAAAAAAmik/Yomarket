@@ -13,6 +13,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from api.yoomarket import YooMarketAPI
 from storage import get_panel_creds, get_settings, save_settings
 
@@ -64,7 +66,7 @@ def _no_session_kb():
     b = InlineKeyboardBuilder()
     b.button(text="🌐 Войти в панель", callback_data="panel:sms_start")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
-    b.adjust(1)
+    ui.lay(b)
     return b.as_markup()
 
 
@@ -111,7 +113,7 @@ async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
         b = InlineKeyboardBuilder()
         b.button(text="🔄 Повторить", callback_data="pitems:cats")
         b.button(text="⬅️ Назад", callback_data="menu:ads")
-        b.adjust(1)
+        ui.lay(b)
         await _safe_edit(callback.message, _load_error(e), b.as_markup())
         return
 
@@ -135,7 +137,7 @@ async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
     b = InlineKeyboardBuilder()
     for i, (name, cnt) in enumerate(ordered[:40]):
         b.button(text=f"📂 {name[:24]} ({cnt})", callback_data=f"pcat:{i}")
-    b.adjust(1)
+    ui.lay(b)
     b.button(text="📋 Все товары", callback_data="pitems:allads")
     b.button(text="🔄 Обновить", callback_data="pitems:cats")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
@@ -192,7 +194,7 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
         b = InlineKeyboardBuilder()
         b.button(text="🔄 Повторить", callback_data="pitems:cats")
         b.button(text="⬅️ Назад", callback_data="menu:ads")
-        b.adjust(1)
+        ui.lay(b)
         await _safe_edit(callback.message, _load_error(e), b.as_markup())
         return
 
@@ -439,7 +441,7 @@ async def _toggle(callback: CallbackQuery, public: bool,
             b.button(text="📦 Добавить остатки",
                      callback_data=f"pitem_stock:{item_id}")
             b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
-            b.adjust(1)
+            ui.lay(b)
             await callback.answer("Нет остатков", show_alert=True)
             await callback.message.edit_text(
                 f"📦 <b>Нельзя опубликовать — нет остатков</b>\n\n"
@@ -630,7 +632,7 @@ async def item_stock_save(message: Message, state: FSMContext,
         b.button(text="🚀 Отправить на модерацию",
                  callback_data=f"pitem_show:{item_id}")
         b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
-        b.adjust(1)
+        ui.lay(b)
         await status.edit_text(
             f"✅ <b>Готово</b> — {done}.\n\n"
             f"Теперь товар можно отправить на модерацию.",

@@ -14,6 +14,8 @@ from aiogram import F, Router
 from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 router = Router()
 logger = logging.getLogger(__name__)
 
@@ -30,7 +32,7 @@ async def unhandled_callback(callback: CallbackQuery) -> None:
     if data.startswith("chat:"):
         b.button(text="💬 Открыть чаты", callback_data="chats:list")
     b.button(text="🏠 Главное меню", callback_data="menu:main")
-    b.adjust(1)
+    ui.lay(b)
     try:
         await callback.message.answer(
             "🤷 <b>Эта кнопка ничего не делает</b>\n\n"

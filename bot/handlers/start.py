@@ -5,6 +5,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from api.yoomarket import YooMarketAPI
 from keyboards.main import main_menu_keyboard
 from storage import delete_token, get_token, save_token, get_settings, save_settings, get_shop_name, save_shop_name, _DATA_DIR
@@ -12,7 +14,7 @@ from storage import delete_token, get_token, save_token, get_settings, save_sett
 router = Router()
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-08-22-ui-frame"
+BOT_VERSION = "2026-08-26-button-layout"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -265,7 +267,7 @@ async def process_token(message: Message, state: FSMContext, **data) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="📧 Войти по email", callback_data="panel:sms_start")
     b.button(text="⏭ Позже", callback_data="menu:main")
-    b.adjust(1)
+    ui.lay(b)
     # The shop name comes from the marketplace and goes into an HTML message —
     # a '<' in it would make Telegram reject the whole send.
     import html as _html

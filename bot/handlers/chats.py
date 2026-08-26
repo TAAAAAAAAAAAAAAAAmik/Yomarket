@@ -8,6 +8,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from api.yoomarket import YooMarketAPI
 from keyboards.main import ChatCallback, PaginationCallback, back_keyboard
 from aiogram.filters import Command
@@ -306,7 +308,7 @@ def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None,
     # Раскладка задаётся в самом конце и на все кнопки сразу. Вызов adjust
     # посередине относился только к тем, что уже добавлены, а хвост слипался в
     # одну строку: «Заказ #102… | Поддержка | Чаты» с обрезанными подписями.
-    builder.adjust(1)
+    ui.lay(builder)
     return builder.as_markup()
 
 
@@ -416,7 +418,7 @@ async def chats_well_known(callback: CallbackQuery, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="📋 Другие чаты вне заказов", callback_data="wchats:list")
     b.button(text="❌ Отмена", callback_data="menu:chats")
-    b.adjust(1)
+    ui.lay(b)
     await callback.message.edit_text(
         f"{meta['icon']} <b>{meta['title']}</b>\n\n"
         "Такой чат ещё не добавлен. Пришлите его номер или ссылку — "
@@ -595,7 +597,7 @@ async def send_reply(message: Message, state: FSMContext, api: YooMarketAPI) -> 
     builder = InlineKeyboardBuilder()
     builder.button(text="💬 Вернуться в чат", callback_data=ChatCallback(chat_id=chat_id).pack())
     builder.button(text="⬅️ Чаты", callback_data="menu:chats")
-    builder.adjust(1)
+    ui.lay(builder)
     await message.answer(text, reply_markup=builder.as_markup())
 
 
@@ -791,7 +793,7 @@ async def support_reply_init(callback: CallbackQuery, state: FSMContext) -> None
         b = InlineKeyboardBuilder()
         b.button(text="🌐 Войти в панель", callback_data="panel:sms_start")
         b.button(text="⬅️ Назад", callback_data=f"wchat:{cid}")
-        b.adjust(1)
+        ui.lay(b)
         await callback.message.edit_text(
             "🔑 <b>Нужен вход в панель</b>\n\n"
             "Ответ в поддержку идёт через панель, а для этого боту нужен токен, "
@@ -845,7 +847,7 @@ async def support_reply_send(message: Message, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="💬 К чату", callback_data=f"wchat:{cid}")
     b.button(text="⬅️ Чаты", callback_data="menu:chats")
-    b.adjust(1)
+    ui.lay(b)
     await status.edit_text(
         (f"✅ {_esc(msg)}" if ok else f"❌ {_esc(msg)}"),
         reply_markup=b.as_markup())

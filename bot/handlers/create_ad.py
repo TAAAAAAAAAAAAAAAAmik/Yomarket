@@ -12,6 +12,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from api.yoomarket import YooMarketAPI
 from keyboards.main import back_keyboard
 from storage import get_settings, save_settings
@@ -76,7 +78,7 @@ def _step_kb(step: str, extra: list | None = None) -> InlineKeyboardMarkup:
     if step in _STEP_BACK:
         b.button(text="⬅️ Назад", callback_data=f"create_ad:back:{_STEP_BACK[step]}")
     b.button(text="❌ Отмена", callback_data="menu:ads")
-    b.adjust(1)
+    ui.lay(b)
     return b.as_markup()
 
 
@@ -124,11 +126,17 @@ def _confirm_kb(has_photo: bool = False) -> InlineKeyboardMarkup:
     else:
         b.button(text="📷 Добавить фото", callback_data="create_ad:edit:photo")
         b.button(text="💾 Сохранить как шаблон", callback_data="create_ad:save_template")
-    b.button(text="✏️ Изменить название", callback_data="create_ad:edit:title")
-    b.button(text="✏️ Изменить цену", callback_data="create_ad:edit:price")
-    b.button(text="✏️ Изменить описание", callback_data="create_ad:edit:description")
+    # Три правки — одной строкой, а не тремя. «Изменить» в каждой надписи
+    # съедало половину ширины и повторяло то, что и так понятно из экрана
+    # предпросмотра; без него все три помещаются в ряд, и видно, что это
+    # один набор, а не три разных действия.
+    b.button(text="✏️ Название", callback_data="create_ad:edit:title")
+    b.button(text="✏️ Цена", callback_data="create_ad:edit:price")
+    b.button(text="✏️ Описание", callback_data="create_ad:edit:description")
     b.button(text="❌ Отмена", callback_data="menu:ads")
-    b.adjust(1)
+    # «Отмена» отдельной строкой: она бросает набранное, и стоять под одним
+    # пальцем с правкой описания ей незачем.
+    b.adjust(*([1] * (3 if has_photo else 2) + [3, 1]))
     return b.as_markup()
 
 
@@ -146,7 +154,7 @@ async def create_ad_start(callback: CallbackQuery, state: FSMContext) -> None:
     if templates:
         b.button(text=f"📋 Использовать шаблон ({len(templates)})", callback_data="create_ad:templates_list")
     b.button(text="❌ Отмена", callback_data="menu:ads")
-    b.adjust(1)
+    ui.lay(b)
     await callback.message.edit_text(
         "➕ <b>Новый товар</b>\n\n"
         + _step_header("title")
@@ -512,7 +520,7 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
             b = InlineKeyboardBuilder()
             b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
             b.button(text="📦 Мои товары", callback_data="menu:ads")
-            b.adjust(1)
+            ui.lay(b)
             await callback.message.edit_text(
                 f"✅ <b>Товар создан!</b>\n\n"
                 f"📝 {title}\n💰 {price} ₽\n🆔 ID: {ad_id}",
@@ -532,7 +540,7 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
         b = InlineKeyboardBuilder()
         b.button(text="🌐 Войти в панель", callback_data="panel:sms_start")
         b.button(text="⬅️ Назад", callback_data="menu:ads")
-        b.adjust(1)
+        ui.lay(b)
         await callback.message.edit_text(
             "❌ <b>Не удалось создать товар</b>\n\n"
             "Integration API не поддерживает создание товаров.\n\n"
@@ -663,7 +671,7 @@ async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
             b.button(text="🌐 Создать вручную в панели",
                      url="https://panel.yoomarket.net/goods/create")
             b.button(text="⬅️ Назад", callback_data="menu:ads")
-            b.adjust(1)
+            ui.lay(b)
             await msg.edit_text(
                 f"❌ <b>Не удалось получить варианты поля «{f.get('label') or attr}»</b>\n\n"
                 f"component: <code>{f.get('component','?')}</code>\n"
@@ -1117,7 +1125,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
                      callback_data=f"cadpub:{item_id}")
         b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
         b.button(text="📦 Мои товары", callback_data="menu:ads")
-        b.adjust(1)
+        ui.lay(b)
         await _edit_safely(
             msg,
             f"✅ <b>Товар создан через панель!</b>\n\n"
@@ -1156,7 +1164,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
         )
         b.button(text="🔄 Обновить вход в панель", callback_data="panel:sms_start")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
-    b.adjust(1)
+    ui.lay(b)
 
     # Отчёт читается сверху вниз, и сверху должно стоять то, ради чего
     # продавец его открыл: что не так и что теперь делать. Диагностика
@@ -1223,7 +1231,7 @@ async def publish_item(callback: CallbackQuery) -> None:
         b.button(text="🚀 Попробовать снова", callback_data=f"cadpub:{item_id}")
     b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
     b.button(text="📦 Мои товары", callback_data="menu:ads")
-    b.adjust(1)
+    ui.lay(b)
     # Ответ панели — чужой текст с чужой разметкой. Раньше он вклеивался в
     # заголовок скобками, обрезанный по счёту символов: заголовок из-за него
     # переставал читаться, а обрывок тега ронял всё сообщение.
@@ -1275,7 +1283,7 @@ async def templates_list(callback: CallbackQuery) -> None:
         b.button(text=f"📋 {t.get('title','')[:30]} — {t.get('price',0)} ₽", callback_data=f"create_ad:use_template:{i}")
     b.button(text="➕ Новый товар", callback_data="create_ad:start")
     b.button(text="❌ Отмена", callback_data="menu:ads")
-    b.adjust(1)
+    ui.lay(b)
     await callback.message.edit_text(
         "📋 <b>Шаблоны товаров</b>\n\nВыберите шаблон:",
         reply_markup=b.as_markup(),

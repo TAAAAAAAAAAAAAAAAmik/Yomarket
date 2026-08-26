@@ -6,6 +6,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from storage import get_settings, save_settings
 
 router = Router()
@@ -164,7 +166,7 @@ def _auto_keyboard(s: dict) -> InlineKeyboardMarkup:
         builder.button(text=f"⛔ Потолок трат: {ceil_str}", callback_data="auto:set:bump_ceiling")
 
     builder.button(text="⬅️ Настройки", callback_data="settings:menu")
-    builder.adjust(1)
+    ui.lay(builder)
     return builder.as_markup()
 
 

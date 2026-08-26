@@ -13,6 +13,8 @@ from aiogram.types import (BufferedInputFile, CallbackQuery,
                            InlineKeyboardMarkup, Message)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from api.yoomarket import YooMarketAPI
 import localtime as _lt
 from storage import get_settings
@@ -289,7 +291,7 @@ async def show_bump_spend(callback: CallbackQuery) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="⚙️ Настроить поднятия", callback_data="auto:menu")
     b.button(text="⬅️ Статистика", callback_data="menu:stats")
-    b.adjust(1)
+    ui.lay(b)
     await callback.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
 
 

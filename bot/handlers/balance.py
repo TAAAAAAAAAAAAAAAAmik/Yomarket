@@ -9,6 +9,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from api.yoomarket import YooMarketAPI
 from keyboards.main import back_keyboard
 import localtime as _lt
@@ -451,7 +453,7 @@ def _setup_first_kb():
     b = InlineKeyboardBuilder()
     b.button(text="⚙️ Настроить вывод", callback_data="balance:auto")
     b.button(text="⬅️ Баланс", callback_data="menu:balance")
-    b.adjust(1)
+    ui.lay(b)
     return b.as_markup()
 
 
@@ -644,7 +646,7 @@ def _auto_kb(s: dict) -> InlineKeyboardMarkup:
     if ready:
         b.button(text="💸 Вывести сейчас", callback_data="wd:manual")
     b.button(text="⬅️ Баланс", callback_data="menu:balance")
-    b.adjust(1)
+    ui.lay(b)
     return b.as_markup()
 
 
@@ -867,7 +869,7 @@ async def _wd_ask_next(message, state: FSMContext) -> None:
         if not f["required"]:
             b.button(text="⏭ Пропустить", callback_data="wd:skip")
         b.button(text="❌ Отмена", callback_data="balance:auto")
-        b.adjust(1)
+        ui.lay(b)
         ph = f.get("placeholder")
         await message.edit_text(
             f"✍️ <b>{label}</b>{hint}\n\n"

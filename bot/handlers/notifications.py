@@ -6,6 +6,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from storage import get_settings, save_settings
 
 router = Router()
@@ -99,7 +101,7 @@ def _notif_kb(s: dict):
         callback_data="notif:toggle:reviews",
     )
     b.button(text="⬅️ Настройки", callback_data="settings:menu")
-    b.adjust(1)
+    ui.lay(b)
     return b.as_markup()
 
 
@@ -296,7 +298,10 @@ def _bl_kb(s: dict):
         b.button(text="🗑 Удалить последнего", callback_data="bl:del_last")
         b.button(text="🧹 Очистить всё", callback_data="bl:clear")
     b.button(text="⬅️ Уведомления", callback_data="notif:menu")
-    b.adjust(1)
+    # «Очистить всё» стирает список без вопроса, поэтому в паре с соседней
+    # кнопкой не ставится: промахнуться в «Назад» и стереть чужой список —
+    # не то, что чинится нажатием ещё раз.
+    ui.lay(b, solo={"bl:clear"})
     return b.as_markup()
 
 
