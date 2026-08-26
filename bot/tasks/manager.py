@@ -637,10 +637,11 @@ def _parse_star_qty(title: str, default: int) -> int:
     return default
 
 
-# Notifications share one layout: a title, a rule, the facts, a rule, context.
-# Scanning a phone screen is easier when every alert puts the same thing in the
-# same place.
-_RULE = "━━━━━━━━━━━━━━"
+# Каркас переехал в `ui.py` — он теперь общий с экранами меню, а не только
+# у уведомлений. Имена здесь оставлены прежними: на них завязаны тридцать
+# шесть вызовов и тесты, и переименовывать их заодно с переездом значит
+# смешать две правки в одну.
+from ui import RULE as _RULE  # noqa: E402
 
 
 def _esc(text) -> str:
@@ -674,12 +675,10 @@ def _promo_price(settings: dict) -> int:
 
 
 def _card(title: str, body: list[str], footer: str = "") -> str:
-    # Empty strings are deliberate spacing, so only None is dropped — filtering
-    # on truthiness collapsed the blank lines that separate the blocks.
-    parts = [title, _RULE, *[b for b in body if b is not None]]
-    if footer:
-        parts += [_RULE, footer]
-    return "\n".join(parts)
+    """Карточка уведомления — см. `ui.card`."""
+    from ui import card as _ui_card
+
+    return _ui_card(title, body, footer)
 
 
 # Сколько выдач помним. Журнал нужен для «Прибыли» и «Накопленных», но это

@@ -270,10 +270,17 @@ class TheDryRunReportSaysWhatToDo(unittest.TestCase):
 
     def test_the_region_caveat_is_not_hidden(self):
         """Проверка отвечает «узнаю», а не «выдам наверняка», и умолчать об
-        этом значит пообещать больше проверенного."""
-        got = self.lines([{"title": "A", "card": "Xbox", "nominal": "10 USD",
-                           "regions": ["US"], "why": ""}])
-        self.assertIn("Регион товара здесь не проверяется", got)
+        этом значит пообещать больше проверенного.
+
+        Оговорка живёт в подвале экрана, а не в теле отчёта, — поэтому и
+        проверяется на собранном экране. Тело важнее: там список товаров,
+        которые бот не узнал, и читают его каждый раз.
+        """
+        import inspect
+        from handlers import plugins as P
+        src = inspect.getsource(P.gifts_dry_run)
+        self.assertIn("Регион товара здесь не проверяется", src)
+        self.assertIn("footer=note", src)
 
 if __name__ == "__main__":
     unittest.main()

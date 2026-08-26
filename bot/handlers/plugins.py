@@ -230,14 +230,16 @@ def _stars_text(settings: dict, shop_name: str = "") -> str:
     # устройство, и это правда; «звёзды уходят сами» правдой сегодня не
     # является (пункт A1 в CHECKLIST.md: Fragment отвечает `Access denied`
     # на `initBuyStarsRequest`). Строку усилить, когда выдача пойдёт живьём.
-    return (
-        f"⭐ <b>Telegram Stars{name_part}</b>\n"
+    from ui import screen
+
+    return screen("⭐ <b>Telegram Stars</b>", [
         "<i>Звёзды на ник покупателя. Бот покупает их через Fragment за "
-        "TON — свой кошелёк, свой баланс.</i>\n\n"
-        f"{status}\n"
-        f"{note}\n\n"
-        "Контроль, настройки, ручная выдача — всё здесь."
-    )
+        "TON — свой кошелёк, свой баланс.</i>",
+        "",
+        status,
+        note,
+    ], subtitle=shop_name,
+        footer="Контроль, настройки, ручная выдача — всё здесь.")
 
 
 def _stars_keyboard(settings: dict) -> InlineKeyboardMarkup:
@@ -2411,9 +2413,10 @@ def _gift_cards_text(settings: dict, shop_name: str = "") -> str:
     """
     from automation.giftcards import ago, card_conf, cards, stats
 
+    from ui import screen
+
     facts = stats(settings)
-    name_part = f" · {html.escape(shop_name)}" if shop_name else ""
-    lines = [f"🎁 <b>Гифт-карты{name_part}</b>", ""]
+    lines = []
     on = [c for c in cards() if card_conf(settings, c.slug).get("enabled")]
     if on:
         for gift in on:
@@ -2434,13 +2437,11 @@ def _gift_cards_text(settings: dict, shop_name: str = "") -> str:
         names = ", ".join(html.escape(c.title) for c in off[:6])
         more = " и другие" if len(off) > 6 else ""
         lines += ["", f"Доступно ещё <b>{len(off)}</b>: {names}{more}."]
-    lines += [
-        "",
-        "Покупатель платит — бот сам покупает код у поставщика и присылает "
-        "его в чат заказа. Ник и логин не нужны: код покупатель активирует "
-        "сам.",
-    ]
-    return "\n".join(lines)
+    return screen(
+        "🎁 <b>Гифт-карты</b>", lines, subtitle=shop_name,
+        footer="Покупатель платит — бот сам покупает код у поставщика и "
+               "присылает его в чат заказа. Ник и логин не нужны: код "
+               "покупатель активирует сам.")
 
 
 def _gift_cards_keyboard(settings: dict) -> InlineKeyboardMarkup:
@@ -2477,18 +2478,18 @@ def _gift_card_text(settings: dict, gift) -> str:
     note = str(conf.get("note") or "")
     log = conf.get("log") or []
     delivered = conf.get("delivered") or []
-    lines = [f"{gift.emoji} <b>{html.escape(gift.title)}</b>"]
-    # Мини-описание — сразу под названием: продавец должен понимать, что это
-    # за товар, до того как читать настройки. Строка лежит в декларации, и
-    # у новой карты она появится вместе с ней.
+    from ui import screen
+
+    lines = []
+    # Мини-описание — первой строкой тела, под шапкой: продавец должен
+    # понимать, что это за товар, до того как читать настройки. Строка лежит
+    # в декларации, и у новой карты она появится вместе с ней.
     if getattr(gift, "pitch", ""):
-        lines.append(f"<i>{html.escape(gift.pitch)}</i>")
-    lines += [
-        "",
-        ("🟢 <b>Автовыдача включена</b> — бот сам купит код по оплаченному "
-         "заказу" if enabled
-         else "🔴 Автовыдача выключена — заказы выдаёте вручную"),
-    ]
+        lines += [f"<i>{html.escape(gift.pitch)}</i>", ""]
+    lines.append(
+        "🟢 <b>Автовыдача включена</b> — бот сам купит код по оплаченному "
+        "заказу" if enabled
+        else "🔴 Автовыдача выключена — заказы выдаёте вручную")
     # Счёт выдач стоял в самом низу, после всех настроек. Это главный ответ
     # экрана — работает ли оно и когда сработало в последний раз, — и место
     # ему рядом со статусом. Остальной текст продавец одобрил, и он не
@@ -2535,10 +2536,10 @@ def _gift_card_text(settings: dict, gift) -> str:
                      "словом, задайте своё: иначе они тоже попадут в выдачу.")
     if note:
         lines.append(f"📝 Заметка покупателю: <i>{html.escape(note)}</i>")
-    if log:
-        lines += ["", f"📜 Записей в журнале: <b>{len(log)}</b> — там коды, "
-                      f"номиналы и причины отказов"]
-    return "\n".join(lines)
+    return screen(
+        f"{gift.emoji} <b>{html.escape(gift.title)}</b>", lines,
+        footer=(f"📜 Записей в журнале: <b>{len(log)}</b> — там коды, "
+                f"номиналы и причины отказов") if log else "")
 
 
 def _gift_card_keyboard(settings: dict, gift) -> InlineKeyboardMarkup:
@@ -2630,7 +2631,7 @@ async def gifts_screen(callback: CallbackQuery, state: FSMContext) -> None:
 def _survey_lines(rows: list[dict]) -> list[str]:
     """Замер каталога словами. Отдельно от экрана — чтобы проверять текст,
     а не разметку вокруг него."""
-    lines = ["🔬 <b>Разделы поставщика</b>", ""]
+    lines = []
     ready = [r for r in rows if r["ready"]]
     if ready:
         lines.append("<b>Готовы к заведению</b> — номинал разбирается у всех "
@@ -2668,10 +2669,8 @@ def _dry_run_lines(rows: list[dict]) -> list[str]:
     """Сухой прогон словами. Отдельно от экрана — чтобы проверять текст."""
     good = [r for r in rows if r["regions"]]
     bad = [r for r in rows if not r["regions"]]
-    lines = ["🧪 <b>Проверка на ваших товарах</b>", ""]
-    lines.append(f"Узнаю и найду у поставщика: <b>{len(good)}</b> из "
-                 f"<b>{len(rows)}</b>")
-    lines.append("")
+    lines = [f"Узнаю и найду у поставщика: <b>{len(good)}</b> из "
+             f"<b>{len(rows)}</b>", ""]
     if bad:
         lines.append("<b>Эти выдать не смогу:</b>")
         for r in bad[:12]:
@@ -2688,10 +2687,6 @@ def _dry_run_lines(rows: list[dict]) -> list[str]:
                 f"   {html.escape(r['card'])} · "
                 f"{html.escape(r['nominal'])} · регионы: "
                 f"{html.escape(', '.join(r['regions'][:6]))}")
-    lines.append("")
-    lines.append("<i>Регион товара здесь не проверяется: он лежит в описании "
-                 "и читается при выдаче. Проверка отвечает «узнаю, и номинал "
-                 "такой у поставщика есть» — не «выдам наверняка».</i>")
     return lines
 
 
@@ -2747,12 +2742,18 @@ async def gifts_dry_run(callback: CallbackQuery, state: FSMContext) -> None:
 
     titles = [str(i.get("title") or "") for i in (items or [])
               if isinstance(i, dict)]
-    rows = dry_run(titles, catalog, settings)
-    lines = _dry_run_lines(rows)
-    if age:
-        lines.append(f"<i>{html.escape(age)}</i>")
-    await callback.message.edit_text("\n".join(lines)[:4000],
-                                     reply_markup=_gift_cards_keyboard(settings))
+    from ui import screen
+
+    # Оговорка про регион — в подвале: она важна, но читать её каждый раз не
+    # надо, а вот список непригодных товаров надо.
+    note = ("<i>Регион товара здесь не проверяется: он лежит в описании и "
+            "читается при выдаче. Проверка отвечает «узнаю, и номинал такой "
+            "у поставщика есть» — не «выдам наверняка».</i>")
+    await callback.message.edit_text(
+        screen("🧪 <b>Проверка на ваших товарах</b>",
+               _dry_run_lines(dry_run(titles, catalog, settings)),
+               footer=note + (f"\n<i>{html.escape(age)}</i>" if age else "")),
+        reply_markup=_gift_cards_keyboard(settings))
 
 
 @router.callback_query(F.data == "plugins:gifts:survey")
@@ -2784,13 +2785,12 @@ async def gifts_survey(callback: CallbackQuery, state: FSMContext) -> None:
             reply_markup=_gift_cards_keyboard(settings))
         return
 
-    rows = survey(catalog)
-    lines = _survey_lines(rows)
-    if age:
-        lines.append("")
-        lines.append(f"<i>{html.escape(age)}</i>")
-    await callback.message.edit_text("\n".join(lines)[:4000],
-                                     reply_markup=_gift_cards_keyboard(settings))
+    from ui import screen
+
+    await callback.message.edit_text(
+        screen("🔬 <b>Разделы поставщика</b>", _survey_lines(survey(catalog)),
+               footer=f"<i>{html.escape(age)}</i>" if age else ""),
+        reply_markup=_gift_cards_keyboard(settings))
 
 
 @router.callback_query(F.data == "plugins:gifts:add")
@@ -3349,10 +3349,9 @@ def _plugins_menu_text(settings: dict, shop_name: str = "") -> str:
     продавцу то, чего сегодня нет, — и получить возвраты вместо подписок.
     Когда выдача пойдёт живьём, строку надо усилить.
     """
-    name_part = f" · {html.escape(shop_name)}" if shop_name else ""
-    return "\n".join([
-        f"🧩 <b>Плагины{name_part}</b>",
-        "",
+    from ui import screen
+
+    return screen("🧩 <b>Плагины</b>", [
         "Покупатель оплатил — бот сам купил товар у поставщика и отправил "
         "его в чат заказа. Без вас.",
         "",
@@ -3361,7 +3360,7 @@ def _plugins_menu_text(settings: dict, shop_name: str = "") -> str:
         "🌙 Ночью и в выходные заказы не ждут вас",
         "⏱ Ни поставщика, ни ручного копирования",
         "🆕 Плагины прибавляются — новые появятся здесь же",
-    ])
+    ], subtitle=shop_name)
 
 
 @router.callback_query(F.data == "plugins:menu")
