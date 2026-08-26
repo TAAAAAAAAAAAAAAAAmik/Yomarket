@@ -1,8 +1,10 @@
+import logging
+
 from aiogram import F, Router
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import ui
@@ -12,9 +14,10 @@ from keyboards.main import main_menu_keyboard
 from storage import delete_token, get_token, save_token, get_settings, save_settings, get_shop_name, save_shop_name, _DATA_DIR
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-08-26-button-layout"
+BOT_VERSION = "2026-08-26-onboarding"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -51,7 +54,9 @@ def _extract_shop(info: dict) -> tuple[str, str]:
 
 async def _send_menu(target: Message | CallbackQuery, user_id: int) -> None:
     from storage import is_admin, menu_header_html
-    name = get_shop_name(user_id) or "Магазин"
+    # Название магазина приходит с маркетплейса: одиночный `<` в нём роняет
+    # отправку целиком, и продавец после подключения не видит меню вообще.
+    name = ui.esc(get_shop_name(user_id) or "Магазин")
     text = (f"🏪 <b>{name}</b>\n\n{menu_header_html()} <b>Главное меню</b>\n"
             "Выберите раздел:")
     kb = main_menu_keyboard(is_admin_user=is_admin(user_id))
@@ -60,6 +65,50 @@ async def _send_menu(target: Message | CallbackQuery, user_id: int) -> None:
         await target.answer()
     else:
         await target.answer(text, reply_markup=kb)
+
+
+PANEL_URL = "https://panel.yoomarket.net"
+
+
+def _welcome_kb(back: bool = False) -> "InlineKeyboardMarkup":
+    """Кнопки под приветствием.
+
+    До этого под первым экраном не было ни одной кнопки: человек читал
+    инструкцию и должен был сам догадаться скопировать ссылку из текста,
+    сходить в браузер и вернуться. Кнопка-ссылка убирает из этой цепочки
+    три шага, а «Не нахожу токен» — единственная причина, по которой на
+    первом экране застревают.
+    """
+    b = InlineKeyboardBuilder()
+    b.button(text="🌐 Открыть панель", url=PANEL_URL)
+    # На самом экране помощи вторая кнопка ведёт назад, а не по кругу в него же.
+    if back:
+        b.button(text="⬅️ К подключению", callback_data="start:back")
+    else:
+        b.button(text="❓ Не нахожу токен", callback_data="start:token_help")
+    return ui.lay(b).as_markup()
+
+
+@router.callback_query(F.data == "start:token_help")
+async def token_help(callback: CallbackQuery, state: FSMContext) -> None:
+    """Подробная подсказка. Ожидание токена при этом не сбрасывается:
+    человек уходит читать и возвращается вставить — форма должна его дождаться."""
+    from storage import render_custom_text
+    await state.set_state(AuthState.waiting_for_token)
+    await callback.message.edit_text(
+        render_custom_text("token_help"), reply_markup=_welcome_kb(back=True),
+        disable_web_page_preview=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "start:back")
+async def back_to_welcome(callback: CallbackQuery, state: FSMContext) -> None:
+    from storage import render_custom_text
+    await state.set_state(AuthState.waiting_for_token)
+    await callback.message.edit_text(
+        render_custom_text("welcome"), reply_markup=_welcome_kb(),
+        disable_web_page_preview=True)
+    await callback.answer()
 
 
 @router.message(CommandStart())
@@ -84,6 +133,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.set_state(AuthState.waiting_for_token)
     # The greeting links to the panel; a link preview would bury the steps.
     await message.answer(render_custom_text("welcome"),
+                         reply_markup=_welcome_kb(),
                          disable_web_page_preview=True)
 
 
@@ -222,59 +272,168 @@ async def cmd_sent(message: Message) -> None:
     await message.answer("\n".join(lines)[:3900])
 
 
+async def _edit(message: Message, text: str,
+                markup: InlineKeyboardMarkup | None = None) -> None:
+    """Переписать сообщение «⏳ проверяю» результатом.
+
+    Раньше каждый шаг подключения добавлял в чат новое сообщение, и к
+    третьей попытке экран был завален «⏳ Проверяю токен...» вперемешку с
+    отказами — а какой из них последний, приходилось искать глазами.
+    """
+    try:
+        await message.edit_text(text, reply_markup=markup,
+                                disable_web_page_preview=True)
+    except Exception:                            # noqa: BLE001
+        await message.answer(text, reply_markup=markup,
+                             disable_web_page_preview=True)
+
+
+def _hidden_note(hidden: bool) -> str:
+    """Что стало с сообщением, в котором был токен.
+
+    Сказать «удалено» там, где удалить не вышло, — ровно та ложь, из-за
+    которой продавец оставит ключ от своего магазина висеть в переписке.
+    """
+    return ("<i>🔒 Сообщение с токеном удалено из переписки.</i>" if hidden else
+            "<i>⚠️ Сообщение с токеном удалить не получилось — сотрите его "
+            "вручную: оно остаётся в истории чата.</i>")
+
+
+async def _hide_token(message: Message) -> bool:
+    """Убрать из переписки сообщение с токеном.
+
+    Токен остаётся в истории чата навсегда: у продавца в телефоне, у того,
+    кому он покажет экран, и в резервной копии Telegram. Удалить его —
+    единственное, что мы можем с этим сделать. Отвечает, получилось ли:
+    обещать безопасность, которой не случилось, хуже, чем не обещать
+    ничего (Telegram не даёт удалять сообщения старше 48 часов, и это не
+    единственная причина отказа).
+    """
+    try:
+        await message.delete()
+        return True
+    except Exception as e:                       # noqa: BLE001 — причин много
+        logger.info("сообщение с токеном не удалилось: %s", e)
+        return False
+
+
+_WAIT = ui.screen("🔑 <b>Подключаю магазин</b>",
+                  ["⏳ Спрашиваю Юмаркет, признаёт ли он этот токен…"])
+
+
+def _retry_kb(again: bool = False) -> InlineKeyboardMarkup:
+    """Кнопки под отказом. `again` — предложить тот же токен ещё раз.
+
+    Она к месту ровно там, где токен ни при чём: предлагать «повторить» на
+    отказе «токен не признан» — обещать, что со второго раза выйдет.
+    """
+    b = InlineKeyboardBuilder()
+    if again:
+        b.button(text="🔁 Повторить", callback_data="start:retry")
+    b.button(text="🌐 Открыть панель", url=PANEL_URL)
+    b.button(text="❓ Не нахожу токен", callback_data="start:token_help")
+    return ui.lay(b).as_markup()
+
+
 @router.message(AuthState.waiting_for_token)
 async def process_token(message: Message, state: FSMContext, **data) -> None:
     token = (message.text or "").strip()
     if not token:
-        await message.answer("❌ Токен не может быть пустым. Отправьте токен:")
+        await message.answer("❌ Пустое сообщение. Пришлите токен одной строкой:",
+                             reply_markup=_retry_kb())
         return
 
-    await message.answer("⏳ Проверяю токен...")
+    # Сначала убрать токен с экрана, потом идти в сеть: проверка занимает
+    # секунды, и всё это время строка висит в переписке.
+    hidden = await _hide_token(message)
+    wait = await message.answer(_WAIT)
+    await _connect(message.from_user.id, token, wait, state,
+                   data.get("task_manager"), hidden)
+
+
+@router.callback_query(F.data == "start:retry")
+async def retry_token(callback: CallbackQuery, state: FSMContext, **data) -> None:
+    """Повторить проверку тем же токеном.
+
+    Кнопка появляется только там, где токен ни при чём: маркетплейс не
+    ответил или попросил сбавить темп. Без неё продавец оказывался в
+    тупике — сообщение с токеном мы уже удалили, а панель показывает токен
+    ровно один раз, и второй раз скопировать его неоткуда.
+    """
+    token = str((await state.get_data()).get("token") or "")
+    if not token:
+        await callback.answer("Токен уже не сохранён — пришлите его снова",
+                              show_alert=True)
+        return
+    await _edit(callback.message, _WAIT)
+    await _connect(callback.from_user.id, token, callback.message, state,
+                   data.get("task_manager"), hidden=True)
+    await callback.answer()
+
+
+async def _connect(uid: int, token: str, wait: Message, state: FSMContext,
+                   task_manager, hidden: bool) -> None:
+    """Спросить Юмаркет про токен и показать результат в сообщении `wait`."""
     api = YooMarketAPI(token)
     await api.start()
     try:
         info = await api.check()
-    except Exception as e:
+    except Exception as e:                       # noqa: BLE001
         await api.close()
-        await message.answer(
-            f"❌ Ошибка авторизации: <code>{e}</code>\n\nПроверьте токен и отправьте снова:"
-        )
+        # Английский код ошибки на этом экране — отписка: это первое, что
+        # видит человек, ещё ничего в боте не сделавший.
+        from api.yoomarket import auth_trouble
+        why, what, ours = auth_trouble(str(e), token)
+        # «Токен ни при чём» и «пришлите токен ещё раз» в одном сообщении —
+        # это экран, спорящий сам с собой. Что делать дальше, зависит от
+        # того, в токене ли дело.
+        if ours:
+            nxt = "Пришлите токен ещё раз — я жду его здесь же."
+            await state.update_data(token=None)
+        else:
+            nxt = ("Токен я запомнил — нажмите «Повторить» через пару минут. "
+                   "Заново копировать его из панели не нужно.")
+            await state.update_data(token=token)
+        await _edit(wait, ui.screen(
+            f"⚠️ <b>{why}</b>", [what, "", nxt],
+            footer=f"<i>Ответ маркетплейса: <code>{ui.esc(str(e))[:120]}</code></i>",
+        ), _retry_kb(again=not ours))
         return
     finally:
         await api.close()
 
-    save_token(message.from_user.id, token)
+    save_token(uid, token)
     await state.clear()
 
     name, balance = _extract_shop(info)
-    save_shop_name(message.from_user.id, name)
+    save_shop_name(uid, name)
 
-    task_manager = data.get("task_manager")
     if task_manager:
-        task_manager.start_for_user(message.from_user.id)
+        task_manager.start_for_user(uid)
 
-    # Step 2 of onboarding: the panel login. Skipped for someone who is already
-    # logged in — no point walking them through a step that is done.
+    # Шаг 2 подключения — вход в панель. Тому, кто уже вошёл, шага не
+    # показываем: проводить человека по сделанному незачем.
     from storage import get_panel_creds, render_custom_text
-    if get_panel_creds(message.from_user.id):
-        await message.answer(
-            f"✅ <b>Токен обновлён</b>\n\n🏪 <b>{name}</b>"
-            # Only when the response carried one — "— ₽" is not a balance.
-            + (f"\n💰 Баланс: <b>{balance} ₽</b>" if balance != "—" else ""))
-        await _send_menu(message, message.from_user.id)
+    # Название магазина приходит с маркетплейса и уходит в HTML-сообщение:
+    # одиночный `<` в нём уронил бы отправку целиком.
+    safe_name = ui.esc(name)
+    if get_panel_creds(uid):
+        await _edit(wait, ui.screen(
+            "✅ <b>Токен обновлён</b>",
+            [f"🏪 <b>{safe_name}</b>"
+             # Только если в ответе была сумма: «— ₽» — это не баланс.
+             + (f"   ·   💰 <b>{ui.esc(balance)} ₽</b>" if balance != "—" else "")],
+            footer=_hidden_note(hidden)))
+        await _send_menu(wait, uid)
         return
 
     b = InlineKeyboardBuilder()
     b.button(text="📧 Войти по email", callback_data="panel:sms_start")
     b.button(text="⏭ Позже", callback_data="menu:main")
     ui.lay(b)
-    # The shop name comes from the marketplace and goes into an HTML message —
-    # a '<' in it would make Telegram reject the whole send.
-    import html as _html
-    await message.answer(
-        render_custom_text("token_ok", name=_html.escape(name),
-                           balance=_html.escape(str(balance))),
-        reply_markup=b.as_markup(), disable_web_page_preview=True)
+    await _edit(wait, render_custom_text(
+        "token_ok", name=safe_name, balance=ui.esc(str(balance)))
+        + "\n\n" + _hidden_note(hidden), b.as_markup())
 
 
 @router.callback_query(F.data == "menu:main")
