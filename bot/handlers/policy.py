@@ -79,3 +79,91 @@ async def show_policy(callback: CallbackQuery, state: FSMContext) -> None:
         disable_web_page_preview=True,
     )
     await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Удаление своих данных
+# ---------------------------------------------------------------------------
+#
+# Право «быть забытым» из политики конфиденциальности. Раздел 12 обещает
+# срок до 72 часов через поддержку — здесь это делается сразу и самим
+# продавцом, потому что обещание, выполняемое кнопкой, надёжнее обещания,
+# выполняемого чужой памятью.
+
+_PURGE_WARNING = (
+    "Будут стёрты <b>безвозвратно</b>:",
+    "",
+    "• токен Юмаркета и вход в панель",
+    "• все настройки автоматики и правила автоответов",
+    "• история заказов, покупателей и переписки, которую видел бот",
+    "• данные Fragment и seed-фраза кошелька TON",
+    "• ключи поставщиков и данные прокси",
+    "• остаток подписки — он <b>сгорит</b>, вернуть его нельзя",
+)
+
+
+def _purge_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🗑 Да, удалить всё", callback_data="policy:purge")
+    b.button(text="❌ Отмена", callback_data=_BACK)
+    # Столбиком, и это не недоделка раскладки: обе кнопки коротки и встали бы
+    # рядом, а промах пальцем здесь стирает магазин без возможности вернуть.
+    b.adjust(1)
+    return b.as_markup()
+
+
+@router.message(Command("forget_me"))
+async def cmd_forget_me(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(ui.screen(
+        "🗑 <b>Удалить мои данные</b>", list(_PURGE_WARNING),
+        footer="<i>Бот не может отозвать выданный ему токен на стороне "
+               "Юмаркета и вывести деньги с кошелька TON — это остаётся за "
+               "вами. Сделайте это после удаления.</i>"),
+        reply_markup=_purge_kb())
+
+
+@router.callback_query(F.data == "policy:forget")
+async def forget_me(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_text(ui.screen(
+        "🗑 <b>Удалить мои данные</b>", list(_PURGE_WARNING),
+        footer="<i>Бот не может отозвать выданный ему токен на стороне "
+               "Юмаркета и вывести деньги с кошелька TON — это остаётся за "
+               "вами. Сделайте это после удаления.</i>"),
+        reply_markup=_purge_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "policy:purge")
+async def purge_confirmed(callback: CallbackQuery, state: FSMContext,
+                          **data) -> None:
+    from storage import purge_user
+
+    uid = callback.from_user.id
+    # Сначала остановить фоновые проходы этого продавца, потом стирать. Они
+    # держат его настройки в памяти и сохраняют их в конце прохода: удаление
+    # на ходу было бы стёрто обратно секундой позже, а продавец получил бы
+    # «✅ удалено» про данные, которые остались на месте.
+    tm = data.get("task_manager")
+    if tm:
+        tm.stop_for_user(uid)
+
+    await state.clear()
+    report = purge_user(uid)
+    if "отказ" in report:
+        await callback.answer(str(report["отказ"]), show_alert=True)
+        return
+
+    body = ([f"Стёрто записей: <b>{sum(report.values())}</b>",
+             "", *(f"• {name}: {n}" for name, n in sorted(report.items()))]
+            if report else
+            ["Стирать было нечего — данных о вас в боте не осталось."])
+    b = InlineKeyboardBuilder()
+    b.button(text="🚀 Начать заново", callback_data="menu:main")
+    await callback.message.edit_text(ui.screen(
+        "✅ <b>Данные удалены</b>", body,
+        footer="<i>Отзовите выданный боту токен в панели Юмаркета — этого "
+               "он за вас сделать не может.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()

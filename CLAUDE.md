@@ -478,7 +478,7 @@ getUpdates request`. Со стороны продавца это выгляди�
 bot/
   main.py               порядок подключения роутеров (важен для имён команд)
   ui.py                 каркас экранов и раскладка кнопок (screen, card, lay)
-  handlers/policy.py    /policy: соглашение, оферта, политика — ссылки из админки
+  handlers/policy.py    /policy и /forget_me: документы и удаление своих данных
   storage.py            настройки, токены, куки; PostgreSQL или JSON-файлы
   orderfields.py        разбор ответов API: цена, статус, ник, чат
   autoreply.py          подбор правил, пауза, лимиты, explain_error

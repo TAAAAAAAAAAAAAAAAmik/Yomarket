@@ -1310,3 +1310,98 @@ def render_custom_text(key: str, **subs) -> str:
     for k, v in subs.items():
         tmpl = tmpl.replace("{" + k + "}", str(v))
     return tmpl
+
+
+# ---------------------------------------------------------------------------
+# Удаление данных продавца
+# ---------------------------------------------------------------------------
+#
+# Политика конфиденциальности обещает две вещи: удаление по запросу и
+# удаление через три дня после окончания подписки. Обещание, которого код не
+# выполняет, — это не недоделка, а ложь в публичном документе, на который
+# сошлются в споре.
+#
+# Хранилищ семь, и данные продавца лежат в шести из них под ключом `{uid}`
+# либо `{uid}::{аккаунт}` — по одному на каждый его магазин. Удаление,
+# прошедшее мимо одного хранилища, хуже отсутствующего: оно ЗАЯВЛЯЕТ
+# полноту. Поэтому список хранилищ здесь один и перечислен явно, а функция
+# возвращает отчёт о том, что действительно стёрла.
+
+# Хранилища, где данные разложены по ключу продавца.
+_USER_BLOBS: tuple[str, ...] = (
+    "tokens", "settings", "panel_creds", "fragment_creds",
+    "approute_creds", "ns_creds",
+)
+
+
+def _user_keys(blob: dict, user_id: int) -> list[str]:
+    """Ключи одного продавца в хранилище — свой и по каждому его магазину."""
+    uid = str(int(user_id))
+    return [k for k in blob if k == uid or str(k).startswith(f"{uid}::")]
+
+
+def purge_user(user_id: int) -> dict:
+    """Стереть все данные продавца. Отдаёт отчёт: {хранилище: сколько записей}.
+
+    Чего НЕ трогает и почему:
+
+    * **чёрный список.** Иначе «удалить мои данные» становится способом
+      снять блокировку: заблокировали — стёр — вернулся;
+    * **владельца бота.** Стереть его данные значит выключить бота себе же;
+      функция на владельце отказывает и говорит об этом отчётом.
+
+    Отчёт возвращается не для красоты: «✅ удалено» без перечня — то самое
+    бодрое сообщение об успехе, по которому нельзя понять, случилось ли
+    что-нибудь. По нему же видно, что удалять было нечего.
+    """
+    uid = int(user_id)
+    if is_owner(uid):
+        return {"отказ": "владелец бота — его данные держат сам бот"}
+
+    report: dict[str, int] = {}
+    for name in _USER_BLOBS:
+        blob = _read_blob(name)
+        keys = _user_keys(blob, uid)
+        if not keys:
+            continue
+        for k in keys:
+            blob.pop(k, None)
+        _write_blob(name, blob)
+        report[name] = len(keys)
+
+    # Подписка и права админа — тоже данные о человеке. Блокировка — нет:
+    # она про защиту бота, а не про удобство того, кого заблокировали.
+    data = _load_admin()
+    dirty = False
+    if str(uid) in (data.get("subscriptions") or {}):
+        data["subscriptions"].pop(str(uid), None)
+        report["subscriptions"] = 1
+        dirty = True
+    admins = [int(x) for x in data.get("admins", [])]
+    if uid in admins:
+        data["admins"] = [x for x in admins if x != uid]
+        report["admins"] = 1
+        dirty = True
+    if dirty:
+        _save_admin(data)
+    return report
+
+
+def expired_before(cutoff: float) -> list[int]:
+    """Продавцы, чья подписка кончилась раньше `cutoff`.
+
+    Только те, у кого запись о подписке ЕСТЬ. Продавец без записи — это не
+    «подписка кончилась бесконечно давно», а человек, работающий в боте с
+    выключенной проверкой подписки; стереть его данные значит снести
+    работающий магазин.
+    """
+    subs = _load_admin().get("subscriptions", {}) or {}
+    out: list[int] = []
+    for uid, row in subs.items():
+        try:
+            expires = float((row or {}).get("expires", 0))
+        except (TypeError, ValueError):
+            continue
+        if expires and expires < cutoff:
+            out.append(int(uid))
+    return out
