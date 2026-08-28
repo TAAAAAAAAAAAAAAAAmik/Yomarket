@@ -14,6 +14,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import ui
 
 from storage import (
+    POLICY_DOCS,
     CUSTOM_TEXTS, MENU_BUTTONS, add_admin, block_user, clear_custom_text,
     clear_header_emoji, count_subscribers, count_users, get_all_users,
     get_bot_price, get_custom_text, get_header_emoji, get_menu_labels,
@@ -37,6 +38,7 @@ class AdminState(StatesGroup):
     broadcast = State()
     add_admin = State()
     remove_admin = State()
+    doc_url = State()
     menu_label = State()
     header_emoji = State()
     edit_text = State()
@@ -51,6 +53,7 @@ def _menu_kb(uid: int):
     b.button(text="📢 Рассылка", callback_data="admin:broadcast")
     b.button(text="🎨 Оформление", callback_data="admin:appearance")
     b.button(text="📝 Тексты сообщений", callback_data="admin:texts")
+    b.button(text="📄 Правовые документы", callback_data="admin:docs")
     b.button(text="🔐 Требовать подписку", callback_data="admin:toggle_sub")
     if is_owner(uid):
         b.button(text="👑 Управление админами", callback_data="admin:admins")
@@ -822,3 +825,126 @@ async def text_reset(callback: CallbackQuery, state: FSMContext) -> None:
     clear_custom_text(key)
     await callback.answer("Текст сброшен к стандартному", show_alert=True)
     await text_view(callback, state)
+
+
+def _esc(value) -> str:
+    """Ссылка приходит от человека и уходит в HTML-сообщение: одиночный «<»
+    в ней уронил бы отправку целиком."""
+    return ui.esc(value)
+
+
+# ── Правовые документы ──────────────────────────────────────────────────────
+#
+# Соглашение, оферта и политика — общие на весь бот: они про продукт, а не
+# про магазин конкретного продавца. Экран показывает, что задано, а что нет,
+# потому что незаполненная ссылка означает отсутствующую кнопку у клиента —
+# и об этом лучше узнать здесь, а не от него.
+
+@router.callback_query(F.data == "admin:docs")
+async def docs_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    from storage import get_policy_links
+    links = get_policy_links()
+
+    body = []
+    b = InlineKeyboardBuilder()
+    for key, title in POLICY_DOCS:
+        url = links.get(key)
+        body.append(f"{'✅' if url else '○'} {title}")
+        body.append(f"   <code>{_esc(url)}</code>" if url
+                    else "   <i>ссылка не задана — кнопки у клиента нет</i>")
+        b.button(text=("✏️ " if url else "➕ ") + title.split(" ", 1)[-1],
+                 callback_data=f"admin:docset:{key}")
+    b.button(text="👁 Как это видит клиент", callback_data="menu:policy")
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
+
+    await callback.message.edit_text(ui.screen(
+        "📄 <b>Правовые документы</b>", body,
+        footer="<i>Кнопка появляется у клиента только там, где задана ссылка: "
+               "кнопка без адреса не «ведёт никуда», а роняет отправку экрана "
+               "целиком — такую клавиатуру Telegram не принимает.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:docset:"))
+async def docs_set_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    key = callback.data.split(":")[-1]
+    title = dict(POLICY_DOCS).get(key)
+    if not title:
+        await callback.answer()
+        return
+    await state.set_state(AdminState.doc_url)
+    await state.update_data(doc_key=key)
+    from storage import get_policy_links
+    cur = get_policy_links().get(key, "")
+
+    b = InlineKeyboardBuilder()
+    if cur:
+        b.button(text="🗑 Убрать ссылку", callback_data=f"admin:docdel:{key}")
+    b.button(text="⬅️ К документам", callback_data="admin:docs")
+    await callback.message.edit_text(ui.screen(
+        f"📄 <b>{title}</b>",
+        [f"Сейчас: <code>{_esc(cur)}</code>" if cur else "Сейчас: не задана",
+         "",
+         "Пришлите ссылку на документ одним сообщением."],
+        footer="<i>Адрес должен начинаться с http:// или https:// — другие "
+               "Telegram в кнопке не принимает, и экран не отправится.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.message(AdminState.doc_url)
+async def docs_set_input(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    key = str((await state.get_data()).get("doc_key") or "")
+    title = dict(POLICY_DOCS).get(key)
+    if not title:
+        await state.clear()
+        return
+
+    url = (message.text or "").strip()
+    # Проверка не придирка: кнопку с другим адресом Telegram отвергает, и
+    # вместе с ней не уходит весь экран. Отказать здесь — значит объяснить;
+    # пропустить — значит сломать экран у клиента и не узнать об этом.
+    if not url.lower().startswith(("http://", "https://")):
+        await message.answer(
+            "❌ Ссылка должна начинаться с <code>http://</code> или "
+            "<code>https://</code>.\n\nПришлите ещё раз:")
+        return
+
+    from storage import set_policy_link
+    set_policy_link(key, url)
+    await state.clear()
+    b = InlineKeyboardBuilder()
+    b.button(text="👁 Как это видит клиент", callback_data="menu:policy")
+    b.button(text="⬅️ К документам", callback_data="admin:docs")
+    await message.answer(ui.screen(
+        "✅ <b>Ссылка сохранена</b>",
+        [f"{title}", f"<code>{_esc(url)}</code>"]),
+        reply_markup=ui.lay(b).as_markup())
+
+
+@router.callback_query(F.data.startswith("admin:docdel:"))
+async def docs_clear(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    key = callback.data.split(":")[-1]
+    if key not in dict(POLICY_DOCS):
+        await callback.answer()
+        return
+    from storage import clear_policy_link
+    clear_policy_link(key)
+    await state.clear()
+    await callback.answer("Ссылка убрана — кнопки у клиента больше нет",
+                          show_alert=True)
+    await docs_menu(callback, state)
