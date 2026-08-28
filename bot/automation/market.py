@@ -1,15 +1,16 @@
-"""Reading the public storefront — the offers list a buyer actually sees.
+"""Чтение публичной витрины — той самой выдачи, которую видит покупатель.
 
-Position is not in the seller API: it only returns the shop's own ads, with no
-notion of who else is on the page or in what order. The place a listing holds
-among competing offers exists only on the storefront, which is public, so it is
-read from there.
+Позиции в API продавца нет: оно отдаёт только собственные объявления
+магазина и ничего не знает о том, кто ещё стоит на странице и в каком
+порядке. Место товара среди чужих предложений существует только на витрине,
+а витрина публичная — оттуда и читаем.
 
-The storefront is a Next.js app, so the offers usually arrive as JSON embedded
-in the page (__NEXT_DATA__ or the RSC flight chunks) rather than as HTML rows.
-Nothing here is guessed from a fixed selector: the page is searched for the
-array that *looks* like a list of offers — several objects each carrying a price
-and a title — which survives a redesign that would break any hardcoded path.
+Витрина написана на Next.js, поэтому предложения обычно приезжают JSON'ом
+внутри страницы (__NEXT_DATA__ или куски RSC), а не строками HTML. Ничего
+здесь не угадывается по жёсткому селектору: в странице ищется массив,
+который ВЫГЛЯДИТ как список предложений — несколько объектов, у каждого
+цена и название. Такой поиск переживает переделку вёрстки, которая сломала
+бы любой зашитый путь.
 """
 from __future__ import annotations
 
@@ -21,9 +22,9 @@ logger = logging.getLogger(__name__)
 
 MARKET_URL = "https://yoomarket.net"
 
-# A discounted card shows two prices — «239,99 ₽» next to a struck-through
-# «490 ₽» — and the payload names them in whatever way the storefront likes, so
-# the sale price is looked for first and the crossed-out one only as a fallback.
+# У карточки со скидкой две цены — «239,99 ₽» рядом с зачёркнутой «490 ₽», —
+# и называет их ответ витрины как ему вздумается. Поэтому сперва ищется цена
+# со скидкой, а зачёркнутая — только если первой не нашлось.
 _PRICE_KEYS = ("price", "amount", "cost", "base_amount", "price_rub", "value",
                "current", "current_price", "final_price", "discount_price",
                "price_with_discount", "new_price", "sale_price", "min_price",
@@ -31,20 +32,21 @@ _PRICE_KEYS = ("price", "amount", "cost", "base_amount", "price_rub", "value",
 _TITLE_KEYS = ("title", "name", "ad_title", "product_name", "label")
 _SELLER_KEYS = ("shop", "seller", "store", "shop_name", "seller_name",
                 "merchant", "user")
-# Not a title and not a price, but only offers carry them — enough to recognise
-# a card whose name sits in a nested node this code would not think to open.
+# Не название и не цена, но встречается только у предложений: этого хватает,
+# чтобы узнать карточку, у которой имя лежит во вложенном узле, открывать
+# который этот код бы и не догадался.
 _RATING_KEYS = ("rating", "reviews_count", "reviews", "rate", "stars",
                 "review_count", "feedback_count")
 
-# A price is a price, not a review counter. «1 620 отзывов» reduces to 1620 once
-# the non-digits are stripped, and that used to look like a perfectly good
-# number — the guard is the units, not the digits.
+# Цена — это цена, а не счётчик отзывов. «1 620 отзывов» после снятия
+# нецифр превращается в 1620, и это выглядело совершенно приличным числом.
+# Отличают их единицы измерения, а не цифры.
 _NOT_PRICE = re.compile(
     r"отзыв|оцен|продаж|шт\.?|штук|рейтинг|review|sold|pcs", re.I)
 
 
 def _num(value) -> float | None:
-    """A price out of whatever shape it arrives in ({'amount': 149}, '149 ₽')."""
+    """Цена из чего угодно, в каком бы виде она ни пришла: {'amount': 149}, «149 ₽»."""
     if isinstance(value, dict):
         for k in _PRICE_KEYS:
             if k in value:
@@ -61,8 +63,9 @@ def _num(value) -> float | None:
             return None
         digits = re.sub(r"[^\d.,]", "", value.replace(" ", "")
                         .replace(" ", "")).replace(",", ".")
-        # «1.299.50» and other multi-separator forms are not a number we can
-        # trust; guessing at the decimal point would invent a price.
+        # «1.299.50» и прочие формы с несколькими разделителями — не то число,
+        # которому можно верить: догадка о том, где здесь десятичная точка,
+        # означала бы выдуманную цену.
         if digits.count(".") > 1:
             digits = digits.replace(".", "", digits.count(".") - 1)
         try:
@@ -82,12 +85,12 @@ def _text(value) -> str:
 
 
 def _looks_like_offer(node) -> bool:
-    """A price plus one other thing only an offer would carry.
+    """Цена плюс ещё что-нибудь, что бывает только у предложения.
 
-    Demanding a price *and* a title was too strict: the storefront keeps the
-    name in a nested product node on some payloads, and the card is still
-    unmistakably an offer because it has a seller and a rating. Requiring the
-    price stays — a row without one is not something a buyer chooses between.
+    Требовать цену И название оказалось слишком строго: на части ответов
+    витрина держит имя во вложенном узле товара, а карточка всё равно
+    несомненно предложение — у неё есть продавец и рейтинг. Требование цены
+    остаётся: строка без неё — не то, между чем выбирает покупатель.
     """
     if not isinstance(node, dict):
         return False
@@ -101,14 +104,14 @@ def _looks_like_offer(node) -> bool:
 
 
 def _offer_lists(node, depth: int = 0, out: list | None = None) -> list:
-    """Every array in the payload that reads as a list of offers."""
+    """Все массивы в ответе, которые читаются как список предложений."""
     if out is None:
         out = []
     if depth > 12:
         return out
     if isinstance(node, list):
         offers = [x for x in node if _looks_like_offer(x)]
-        # Three is enough to be a listing rather than a coincidence
+        # Трёх достаточно, чтобы это была выдача, а не совпадение
         if len(offers) >= 3:
             out.append(offers)
         for x in node:
@@ -120,7 +123,7 @@ def _offer_lists(node, depth: int = 0, out: list | None = None) -> list:
 
 
 def _json_blobs(html: str) -> list:
-    """Decoded JSON payloads embedded in a Next.js page."""
+    """Разобранные куски JSON, вложенные в страницу Next.js."""
     blobs = []
     for m in re.finditer(
             r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S):
@@ -135,7 +138,7 @@ def _json_blobs(html: str) -> list:
             blobs.append(_json.loads(m.group(1)))
         except Exception:
             pass
-    # RSC flight chunks: self.__next_f.push([1,"…json fragment…"])
+    # Куски RSC: self.__next_f.push([1,"…фрагмент json…"])
     chunks = re.findall(r'__next_f\.push\(\[\d+,\s*"((?:[^"\\]|\\.)*)"\]\)', html)
     if chunks:
         joined = "".join(chunks)
@@ -143,7 +146,8 @@ def _json_blobs(html: str) -> list:
             joined = _json.loads(f'"{joined}"')       # unescape as one string
         except Exception:
             joined = joined.replace('\\"', '"').replace("\\n", "\n")
-        # Pull out balanced JSON objects/arrays big enough to hold a listing
+        # Достаём сбалансированные объекты и массивы, достаточно большие,
+        # чтобы вместить выдачу
         for m in re.finditer(r'[\[{]"?\w', joined):
             start = m.start()
             frag = _balanced(joined, start)
@@ -156,7 +160,7 @@ def _json_blobs(html: str) -> list:
 
 
 def _balanced(text: str, start: int, limit: int = 400_000) -> str:
-    """The balanced JSON literal beginning at `start`, or ''."""
+    """Сбалансированный литерал JSON, начинающийся с `start`, либо пустая строка."""
     opening = text[start]
     closing = {"{": "}", "[": "]"}.get(opening)
     if not closing:
@@ -192,20 +196,20 @@ def _seller_of(node) -> str:
     return ""
 
 
-# --- reading the rendered page, when the payload is not in the HTML ---------
+# --- чтение отрисованной страницы, когда данных в HTML нет ------------------
 #
-# The last resort, and deliberately a narrow one. A card on the offers list ends
-# with the seller and their rating — «GadjiSeller ★ 4.97 · 1 620 отзывов» — and
-# that tail is a far steadier landmark than any class name, which a redesign
-# renames. Everything between two tails is one card, and the first price in it
-# is what the buyer pays.
+# Последняя надежда, и намеренно узкая. Карточка в выдаче кончается продавцом
+# и его рейтингом — «GadjiSeller ★ 4.97 · 1 620 отзывов», — и этот хвост куда
+# более надёжная примета, чем любое имя класса, которое переделка вёрстки
+# переименует. Всё между двумя хвостами — одна карточка, а первая цена в ней
+# и есть та, которую платит покупатель.
 
 _STRIP_TAGS = re.compile(r"<(script|style|noscript)\b.*?</\1>", re.S | re.I)
 _TAG = re.compile(r"<[^>]+>")
-# «GadjiSeller 4.97 · 1 620 отзывов» — name, rating, review count.
-# The star is excluded from the name rather than merely allowed to precede it:
-# a one-character shop name used to come back as «★», because the lazy capture
-# had to give its minimum of two characters to something.
+# «GadjiSeller 4.97 · 1 620 отзывов» — имя, рейтинг, число отзывов.
+# Звёздочка исключена из имени, а не просто разрешена перед ним: односимвольное
+# название магазина возвращалось как «★», потому что ленивому захвату надо было
+# отдать свои минимальные два знака хоть чему-нибудь.
 _CARD_TAIL = re.compile(
     r"([^\n·•|★☆]{1,40}?)\s*[★☆]?\s*(\d(?:[.,]\d+)?)"
     r"\s*[·•]\s*([\d\s  ]+)\s*отзыв", re.I)
@@ -220,23 +224,23 @@ def _visible_text(html: str) -> str:
     return re.sub(r"[ \t ]+", " ", text)
 
 
-# How far back from the rating a card can reasonably reach. Bounded on purpose:
-# taking everything since the previous card would swallow the page header on
-# the first one, and its prices with it.
+# Насколько далеко назад от рейтинга может тянуться карточка. Ограничено
+# намеренно: забрав всё от предыдущей карточки, на первой мы проглотили бы
+# шапку страницы, а вместе с ней и её цены.
 _CARD_WINDOW = 400
-# A sale price and its struck-through original sit together — «239,99 ₽ +12
-# 490 ₽». Two prices further apart than this are not a pair, they are this
-# card's price and something the page happened to print above it.
+# Цена со скидкой и её зачёркнутый оригинал стоят вплотную — «239,99 ₽ +12
+# 490 ₽». Две цены, разошедшиеся дальше этого, — не пара, а цена этой
+# карточки и что-то, что страница напечатала выше.
 _PAIR_GAP = 45
 
 
 def _card_price(chunk: str) -> float | None:
-    """This card's price out of everything priced in its window.
+    """Цена этой карточки из всего, что в её окне помечено ценой.
 
-    Taking the last price finds the struck-through original on a discounted
-    card; taking the second-to-last finds a banner on a card with no discount.
-    Neither is a rule — the rule is that the two prices of one card are printed
-    next to each other, and the buyer pays the first of them.
+    Брать последнюю цену — значит найти зачёркнутую старую на карточке со
+    скидкой; брать предпоследнюю — значит найти баннер на карточке без скидки.
+    Ни то, ни другое не правило. Правило в том, что две цены одной карточки
+    напечатаны рядом, а покупатель платит первую из них.
     """
     hits = [(m.start(), m.end(), _num(m.group(1)))
             for m in _PRICE_TEXT.finditer(chunk)]
@@ -249,7 +253,7 @@ def _card_price(chunk: str) -> float | None:
 
 
 def _offers_from_text(html: str) -> list[dict]:
-    """Offers recovered from the rendered markup. [] when it does not fit."""
+    """Предложения, вытащенные из отрисованной разметки. [] — если не вышло."""
     text = _visible_text(html)
     tails = list(_CARD_TAIL.finditer(text))
     if len(tails) < 3:
@@ -259,8 +263,8 @@ def _offers_from_text(html: str) -> list[dict]:
         chunk = text[max(prev_end, t.start() - _CARD_WINDOW):t.start()]
         prev_end = t.end()
         price = _card_price(chunk)
-        # The title is the longest line of the card — the name always outweighs
-        # the badges («-88%», «Black Russia / Вирты») around it.
+        # Название — самая длинная строка карточки: имя всегда перевешивает
+        # значки вокруг него («-88%», «Black Russia / Вирты»).
         lines = [l.strip() for l in chunk.split("\n") if l.strip()]
         title = max(lines, key=len) if lines else ""
         rows.append({
@@ -304,7 +308,7 @@ _BROWSER_HEADERS = {
 
 
 def get_page(url: str) -> tuple[bool, str]:
-    """Blocking: fetch one storefront page. (True, html) or (False, error)."""
+    """Блокирующая: скачать одну страницу витрины → (True, html) либо (False, ошибка)."""
     import requests
     from requests.packages.urllib3.exceptions import InsecureRequestWarning
     requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
@@ -321,19 +325,19 @@ def get_page(url: str) -> tuple[bool, str]:
     return True, r.text
 
 
-# --- the listing as the storefront itself fetches it ------------------------
+# --- выдача так, как её берёт сама витрина ---------------------------------
 #
-# The category page ships no offers: 81 KB of application shell, 1.5 KB of
-# visible text, and the list drawn in the browser afterwards. It is fetched
-# from here — found by reading the addresses compiled into the page's own
-# JavaScript (/pos_api):
+# Страница раздела не везёт ни одного предложения: 81 КБ каркаса приложения,
+# 1,5 КБ видимого текста, а список рисуется в браузере потом. Берётся он
+# отсюда — адрес найден чтением того, что вкомпилировано в JavaScript самой
+# страницы (/pos_api):
 #
 #   https://api.yoo.market/api/products?category=virty&keyword=3.000.000
-#   → {"data": [ …15 offers… ], "meta": {…}, "links": {…}}
+#   → {"data": [ …15 предложений… ], "meta": {…}, "links": {…}}
 #
-# Fifteen at a time, and a category holds hundreds, so the pages matter: the
-# seller's own listing sits far below the first screen, which is the whole
-# reason the feature exists.
+# По пятнадцать за раз, а в разделе их сотни, — значит страницы важны:
+# собственный товар продавца лежит далеко за первым экраном, ради чего вся
+# эта функция и существует.
 API_URL = "https://api.yoo.market"
 _API_HEADERS = {
     "User-Agent": _BROWSER_HEADERS["User-Agent"],
@@ -342,16 +346,17 @@ _API_HEADERS = {
     "Origin": MARKET_URL,
     "Referer": MARKET_URL + "/",
 }
-# 15 offers a page against a category of ~640, so a cap of twenty pages stopped
-# exactly at 300 and reported "не нашёл" for a listing that was simply deeper.
-# Forty-five covers the whole of such a category; the walk still stops the
-# moment the shop is found, so this costs nothing on a listing near the top and
-# only pays out when the seller really is buried.
+# Пятнадцать предложений на странице против раздела примерно в 640: потолок
+# в двадцать страниц останавливался ровно на трёхсотом и отвечал «не нашёл»
+# про товар, который просто лежал глубже. Сорок пять покрывают такой раздел
+# целиком, а обход всё равно прекращается сразу, как найден магазин, — то есть
+# на товаре из верхушки это не стоит ничего и срабатывает только тогда, когда
+# продавец действительно закопан.
 API_MAX_PAGES = 45
 
 
 def listing_path(url: str) -> tuple[list, dict]:
-    """(category slugs, other filters) out of a storefront address.
+    """(куски разделов, прочие фильтры) из адреса витрины.
 
     /categories/black-russia/virty?keyword=3.000.000
       → (["black-russia", "virty"], {"keyword": "3.000.000"})
@@ -408,18 +413,18 @@ def category_meta(slugs: list) -> dict:
     walk(body)
     if found:
         return found
-    # The root is only the answer when the address named it. Handing it back
-    # for /categories/black-russia/akkaunty-s-virtami — which this API answers
-    # with the game, ignoring the section — made the game's own ads_count
-    # "confirm" a query for the whole game, and the position was then counted
-    # in a list of 638 instead of 161.
+    # Корень — верный ответ только тогда, когда его назвал сам адрес. Отдав его
+    # для /categories/black-russia/akkaunty-s-virtami — на что это API отвечает
+    # ИГРОЙ, пропуская раздел, — мы получали `ads_count` самой игры, которым
+    # «подтверждался» запрос на всю игру, и позиция считалась в списке из 638
+    # вместо 161.
     if len(slugs) == 1 and str(body.get("slug") or "") == want:
         return body
     return {}
 
 
 def product_card(market_id: str | int) -> dict:
-    """One listing as the storefront serves it, by its marketplace id."""
+    """Один товар так, как его отдаёт витрина, — по его номеру на маркетплейсе."""
     import requests
     try:
         r = requests.get(f"{API_URL}/api/products/{market_id}",
@@ -476,8 +481,8 @@ def search_keys(title: str) -> list:
     if not words:
         return []
     keys = words[:3]
-    # And the pair, in case the search is happy with several words: when it is,
-    # it narrows the results and our listing surfaces sooner.
+    # И пара слов — на случай, если поиск согласен на несколько: когда согласен,
+    # он сужает выдачу, и наш товар всплывает раньше.
     if len(words) > 1:
         ordered = [w for w in re.findall(r"[\w.]+", str(title), re.UNICODE)
                    if w.strip(".") in words[:2]]
@@ -494,7 +499,7 @@ def search_keys(title: str) -> list:
 
 
 def search_key(title: str) -> str:
-    """The first thing worth searching for — kept for messages and tests."""
+    """Первое, что имеет смысл искать. Оставлено ради сообщений и тестов."""
     keys = search_keys(title)
     return keys[0] if keys else ""
 
@@ -562,8 +567,8 @@ def search_own_listing(market_id: str | int, title: str = "",
     by_word: list[dict] = []          # строки, пришедшие не по одному числу
     for key in search_keys(title):
         facts["keys"].append(key)
-        # A few pages per key: the words that survive a decorated title are not
-        # always distinctive — «Быстрая выдача» matches half a category.
+        # По несколько страниц на слово: то, что уцелело от разукрашенного
+        # названия, не всегда различает — «Быстрая выдача» подходит половине раздела.
         for page in range(1, 4):
             try:
                 r = requests.get(f"{API_URL}/api/products",
@@ -743,22 +748,22 @@ def section_votes(rows: list) -> dict:
 
 def find_own_listing(market_id: str | int, title: str = "",
                      seller: str = "") -> dict:
-    """Our listing as it appears on the storefront, found by searching for it.
+    """Наш товар так, как он выглядит на витрине, — найденный поиском.
 
-    `/api/products/{id}` is not something this marketplace answers, so the id
-    alone gets us nowhere. The search does work — it is the same endpoint the
-    listing pages use — so the title finds the row and the row carries the
-    category the address is built from.
+    `/api/products/{id}` этот маркетплейс не отвечает, поэтому один номер не
+    даёт ничего. А поиск работает — это тот же адрес, которым пользуются
+    страницы выдачи, — так что название находит строку, а строка несёт в себе
+    раздел, из которого собирается адрес.
     """
     return search_own_listing(market_id, title, seller)[0]
 
 
 def _slug_chain(node, depth: int = 0) -> list:
-    """Category slugs found in a payload, outermost first.
+    """Куски разделов, найденные в ответе, — от внешнего к внутреннему.
 
-    A card names its section and, inside or beside it, the game it belongs to.
-    Which key holds which is not fixed, so the tree is walked and the slugs are
-    collected in the order they nest.
+    Карточка называет свой раздел и, внутри или рядом, игру, которой он
+    принадлежит. Какой ключ что держит — не закреплено, поэтому дерево
+    обходится, а куски собираются в том порядке, в каком они вложены.
     """
     out: list = []
     if depth > 6 or not isinstance(node, (dict, list)):
@@ -929,7 +934,7 @@ def slugs_for_section(ref) -> list:
 
 
 def _find_by_id(nodes, want, trail=()) -> list:
-    """The slugs leading down to a category id, outermost first."""
+    """Куски, ведущие вниз к номеру раздела, — от внешнего к внутреннему."""
     for node in nodes if isinstance(nodes, list) else []:
         if not isinstance(node, dict):
             continue
@@ -1031,11 +1036,11 @@ def fetch_category_children(parent_slug: str, cid=None,
 
 
 def category_children(parent_slug: str = "") -> list:
-    """Top-level sections, or the sections inside one game.
+    """Разделы верхнего уровня либо разделы внутри одной игры.
 
-    [{"id":…, "slug":…, "title":…, "has_children": bool}] — enough to offer the
-    catalogue as buttons, which is the one way of naming a section that cannot
-    be got wrong by either side.
+    [{"id":…, "slug":…, "title":…, "has_children": bool}] — этого хватает,
+    чтобы предложить каталог кнопками, а кнопка — единственный способ назвать
+    раздел, в котором не может ошибиться ни одна сторона.
     """
     nodes = category_tree()
     if parent_slug:
@@ -1081,12 +1086,11 @@ def category_children(parent_slug: str = "") -> list:
 
 
 def category_slugs_for(cat_id) -> list:
-    """Where a category sits in the catalogue: ['black-russia', 'virty'].
+    """Где раздел стоит в каталоге: ['black-russia', 'virty'].
 
-    A listing row names its category, but not always the whole path to it — the
-    one we saw carried the game and nothing else, which builds an address for
-    the whole game rather than the section, and our own listing is not in the
-    first hundreds of that.
+    Строка товара называет свой раздел, но не всегда весь путь к нему: та,
+    что мы видели, несла только игру, — а из этого собирается адрес всей игры,
+    а не раздела, и нашего товара в первых сотнях такой выдачи нет.
     """
     if cat_id in (None, ""):
         return []
@@ -1127,13 +1131,13 @@ def category_slugs_by_title(name: str) -> list:
 
 
 def _category_id_of(card: dict):
-    """The category a listing row says it belongs to."""
+    """Раздел, к которому строка товара себя относит."""
     for key in ("category_id", "categoryId", "subcategory_id"):
         if card.get(key) not in (None, ""):
             return card[key]
     node = card.get("category") or card.get("subcategory")
     if isinstance(node, dict):
-        # The deepest id in there — the section, not the game above it
+        # Самый глубокий номер оттуда — это раздел, а не игра над ним
         deepest = node.get("id")
         for key in ("children", "subcategory", "section"):
             inner = node.get(key)
@@ -1145,17 +1149,19 @@ def _category_id_of(card: dict):
 
 def listing_urls_for(market_id: str | int, card: dict | None = None,
                      title: str = "", seller: str = "") -> list:
-    """Storefront addresses a listing of ours could live at, likeliest first.
+    """Адреса витрины, где мог бы жить наш товар, — вероятные первыми.
 
-    Saves the seller from opening the marketplace, finding their own item and
-    copying the address for every listing they want watched — the same work
-    fifteen times over, and the step most easily got wrong.
+    Избавляет продавца от необходимости открывать маркетплейс, находить там
+    свой товар и копировать адрес — и так для каждого товара, за которым он
+    хочет следить: пятнадцать раз одна и та же работа, и тот шаг, в котором
+    легче всего ошибиться.
 
-    Candidates rather than one answer, because the card names its section and
-    its game without saying which is which: a card points at its parent, so the
-    chain usually arrives inside-out, while a breadcrumb arrives the right way
-    round. Guessing would be a coin toss; the caller settles it by asking each
-    address whether our listing is actually in it.
+    Отдаются кандидаты, а не один ответ, потому что карточка называет свой
+    раздел и свою игру, не говоря, что из них что: карточка указывает на
+    родителя, поэтому цепочка обычно приходит вывернутой наизнанку, а
+    «хлебные крошки» — правильной стороной. Угадывание здесь — подбрасывание
+    монеты; вызывающий решает спор, спрашивая у каждого адреса, есть ли в нём
+    на самом деле наш товар.
     """
     # Имя магазина — чтобы узнать свою строку, когда номер витрины не совпал
     # с номером объявления. Без него поиск находил нашу строку и выбрасывал.
@@ -1174,10 +1180,10 @@ def listing_urls_for(market_id: str | int, card: dict | None = None,
             return out
         return []
     out = []
-    # First and best: the catalogue itself, looked up by the category id the
-    # row carries. A row does not have to name the whole path — the one we saw
-    # gave the game and nothing else, and an address for the whole game puts
-    # our listing hundreds of places down a list it does not belong in.
+    # Первое и лучшее: сам каталог, спрошенный по номеру раздела, который несёт
+    # строка. Строка не обязана называть весь путь — та, что мы видели, дала
+    # только игру, а адрес всей игры кладёт наш товар на сотни мест вниз по
+    # списку, к которому он не относится.
     path = slugs_for_section(section_ref_of(card))
     if path:
         out.append(f"{MARKET_URL}/categories/" + "/".join(path[-2:]))
@@ -1186,7 +1192,7 @@ def listing_urls_for(market_id: str | int, card: dict | None = None,
     slugs = [s for s in dict.fromkeys(_slug_chain(card)) if s != own]
     pair = slugs[:2]
     if len(pair) == 2:
-        # The row names its section and its game without saying which is which
+        # Строка называет свой раздел и свою игру, не говоря, что из них что
         out.append(f"{MARKET_URL}/categories/" + "/".join(reversed(pair)))
         out.append(f"{MARKET_URL}/categories/" + "/".join(pair))
     for one in slugs[:2]:
@@ -1195,10 +1201,10 @@ def listing_urls_for(market_id: str | int, card: dict | None = None,
 
 
 def listing_query(url: str) -> dict:
-    """The API query a storefront address stands for.
+    """Запрос к API, которому соответствует адрес витрины.
 
-    Kept for the simple case and for the tests: the section slug plus whatever
-    filters the address carried. `listing_queries` builds the fuller set.
+    Оставлен ради простого случая и ради тестов: кусок раздела плюс те
+    фильтры, что несёт адрес. Полный набор строит `listing_queries`.
     """
     slugs, filters = listing_path(url)
     query = dict(filters)
@@ -1208,15 +1214,14 @@ def listing_query(url: str) -> dict:
 
 
 def listing_queries(url: str, meta: dict | None = None) -> list[dict]:
-    """Every plausible way to ask the API for this listing, best guess first.
+    """Все правдоподобные способы спросить у API про эту выдачу, лучший первым.
 
-    There is no documentation to consult, and the obvious query is wrong in a
-    way that looks right: `category=virty` returns virtual currency across every
-    game, not the Black Russia section the address names. Hundreds of other
-    sellers' offers come back, our own listing is nowhere in the first pages,
-    and the position that would be reported is a number from a different
-    catalogue. So the candidates are tried against the section's own
-    `ads_count` instead of being trusted.
+    Документации, в которую можно заглянуть, нет, а очевидный запрос неверен
+    так, что выглядит верным: `category=virty` возвращает виртуальную валюту
+    по ВСЕМ играм, а не раздел Black Russia, названный в адресе. Приходят сотни
+    чужих предложений, нашего товара нет и на первых страницах, а позиция,
+    которую мы бы сообщили, — это номер из другого каталога. Поэтому кандидаты
+    не принимаются на веру, а проверяются по `ads_count` самого раздела.
     """
     slugs, filters = listing_path(url)
     if not slugs:
@@ -1241,7 +1246,7 @@ def listing_queries(url: str, meta: dict | None = None) -> list[dict]:
 
 
 def _api_get(url: str, params: dict | None) -> tuple[dict | None, str]:
-    """One JSON GET against the storefront API. (body, error)."""
+    """Один GET за JSON к API витрины → (тело, ошибка)."""
     import requests
     from requests.packages.urllib3.exceptions import InsecureRequestWarning
     requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
@@ -1259,7 +1264,7 @@ def _api_get(url: str, params: dict | None) -> tuple[dict | None, str]:
 
 
 def _batch_of(body) -> list:
-    """The offers in one API response, whatever it calls them."""
+    """Предложения из одного ответа API — как бы он их ни называл."""
     batch = body.get("data") if isinstance(body, dict) else body
     if isinstance(batch, list):
         return batch
@@ -1306,14 +1311,15 @@ def _total_of(body) -> int | None:
 
 
 def _pick_query(candidates: list, expected) -> tuple[dict, dict | None, str, str]:
-    """Choose the query that really stands for this section of the catalogue.
+    """Выбрать запрос, который действительно означает этот раздел каталога.
 
-    Returns (query, its first page, note, error). A 200 proves nothing here:
-    `category=virty` answers with hundreds of offers — virtual currency across
-    every game — and the position taken from that list would be a number out of
-    a different catalogue. The section's own `ads_count` is the check that
-    cannot be fooled, so each candidate is judged by whether it returns that
-    many. The response is kept, not thrown away and re-fetched.
+    Отдаёт (запрос, его первую страницу, пояснение, ошибку). HTTP 200 здесь не
+    доказывает ничего: `category=virty` отвечает сотнями предложений —
+    виртуальной валютой по всем играм, — и позиция, взятая из такого списка,
+    была бы номером из другого каталога. Проверка, которую не обмануть, — это
+    `ads_count` самого раздела: каждый кандидат оценивается по тому, столько
+    ли он вернул. Ответ при этом сохраняется, а не выбрасывается ради
+    повторного запроса.
     """
     fallback_query, fallback_body, err = None, None, ""
     all_total = unfiltered_total()
@@ -1354,12 +1360,12 @@ def _pick_query(candidates: list, expected) -> tuple[dict, dict | None, str, str
 def fetch_offers_api(url: str, shop: str = "",
                      max_pages: int = API_MAX_PAGES,
                      category_id=None) -> tuple[bool, object]:
-    """Blocking: the listing straight from the API the storefront calls.
+    """Блокирующая: выдача прямо из того API, которое зовёт витрина.
 
-    Walks the pages until the shop is found and stops the moment it is, so a
-    routine check on a listing near the top costs one request. Returns
-    (True, {"offers": …, "note": …, "total": …, "complete": …}) or
-    (False, error).
+    Идёт по страницам, пока не найдёт магазин, и останавливается сразу, как
+    нашла: обычная проверка товара из верхушки стоит одного запроса. Отдаёт
+    (True, {"offers": …, "note": …, "total": …, "complete": …}) либо
+    (False, ошибка).
     """
     slugs, filters = listing_path(url)
     if category_id not in (None, ""):
@@ -1391,8 +1397,8 @@ def fetch_offers_api(url: str, shop: str = "",
     pages = 0
     total = None
     seen: set = set()
-    # Did the listing run out, or did we merely stop looking? Only the first
-    # makes «не нашёл» a statement about the listing rather than about us.
+    # Выдача кончилась — или это мы перестали смотреть? Только первое делает
+    # «не нашёл» утверждением о выдаче, а не о нас самих.
     exhausted = False
     while body is not None and pages < max(1, max_pages):
         batch = _batch_of(body)
@@ -1414,8 +1420,8 @@ def fetch_offers_api(url: str, shop: str = "",
             break
         if pages >= max(1, max_pages):
             break
-        # Laravel hands the next page over in `links.next`; falling back on
-        # ?page=N keeps this working if that ever stops being included.
+        # Laravel отдаёт следующую страницу в `links.next`; запасной ?page=N
+        # оставлен на случай, если её однажды перестанут присылать.
         links = body.get("links") if isinstance(body, dict) else None
         nxt = (links or {}).get("next") if isinstance(links, dict) else None
         if nxt:
@@ -1444,12 +1450,11 @@ def fetch_offers_api(url: str, shop: str = "",
 
 
 def with_page(url: str, n: int) -> str:
-    """The same listing, page n — keeping every filter already in the address.
+    """Та же выдача, страница n, — с сохранением всех фильтров из адреса.
 
-    The seller's own address carries a search: …/virty?keyword=3.000.000. Naive
-    string concatenation would either drop that or produce a second '?', and
-    either way the page that comes back is a different listing than the one
-    being watched.
+    В собственном адресе продавца бывает поиск: …/virty?keyword=3.000.000.
+    Наивная склейка строк либо потеряет его, либо поставит второй «?», и в
+    обоих случаях вернётся не та выдача, за которой следят.
     """
     from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
     parts = urlparse(url if url.startswith("http") else MARKET_URL + url)
@@ -1460,7 +1465,7 @@ def with_page(url: str, n: int) -> str:
 
 
 def _offers_in(html: str) -> tuple[list, str]:
-    """(raw offer rows, how they were found) for one page's HTML."""
+    """(сырые строки предложений, каким способом нашлись) для HTML одной страницы."""
     lists = []
     for blob in _json_blobs(html):
         lists.extend(_offer_lists(blob))
@@ -1472,7 +1477,7 @@ def _offers_in(html: str) -> tuple[list, str]:
 
 
 def _signature(rows: list) -> tuple:
-    """Enough of a page to tell it apart from the one before it."""
+    """Столько страницы, чтобы отличить её от предыдущей."""
     out = []
     for o in rows[:6]:
         if isinstance(o, dict):
@@ -1482,17 +1487,18 @@ def _signature(rows: list) -> tuple:
 
 def fetch_offers_sync(url: str, *, max_pages: int = 1,
                       want_seller: str = "") -> tuple[bool, object]:
-    """Blocking: the offers on a storefront listing, in the order shown.
+    """Блокирующая: предложения на витрине, в том порядке, в каком они показаны.
 
-    Returns (True, {"offers": [{pos,id,title,price,seller}], "note": str}) or
-    (False, error). Read-only and unauthenticated — this is the public page.
+    Отдаёт (True, {"offers": [{pos,id,title,price,seller}], "note": str}) либо
+    (False, ошибка). Только чтение и без входа — страница публичная.
 
-    With `max_pages` > 1 the following pages are read too and the positions run
-    straight through them. That is the difference between a real answer and a
-    reassuring one: the seller had to scroll past the first screen to find their
-    own card, so a listing read one page deep would either miss them or — worse
-    — report a place counted within a fragment. Reading stops as soon as
-    `want_seller` is found, so the usual check is still a single request.
+    При `max_pages` > 1 читаются и следующие страницы, а позиции идут сквозной
+    нумерацией. Здесь и проходит разница между настоящим ответом и
+    успокоительным: продавцу приходилось прокручивать за первый экран, чтобы
+    найти свою карточку, — значит выдача, прочитанная на одну страницу, либо
+    его не найдёт, либо, что хуже, назовёт место, посчитанное внутри куска.
+    Чтение прекращается, как только найден `want_seller`, поэтому обычная
+    проверка по-прежнему стоит одного запроса.
     """
     ok, first = get_page(url)
     if not ok:
@@ -1549,12 +1555,12 @@ MAX_LIST_PAGES = 6
 
 
 def fetch_listing(url: str, shop: str = "", category_id=None):
-    """The offers behind a storefront address, however they can be had.
+    """Предложения по адресу витрины — любым способом, каким их удастся взять.
 
-    The API first, because on this marketplace it is the only place the listing
-    exists — the page itself is an empty shell. Parsing the markup stays as the
-    second route: it costs nothing to keep, it is covered by tests, and it is
-    the right answer for a page that does render its list server-side.
+    Сперва API: на этом маркетплейсе выдача существует только там, сама
+    страница — пустой каркас. Разбор разметки остаётся вторым путём: держать
+    его ничего не стоит, он покрыт тестами и он же верный ответ для страницы,
+    которая рисует список на сервере.
     """
     ok, res = fetch_offers_api(url, shop, category_id=category_id)
     if ok:
@@ -1581,14 +1587,15 @@ def _norm(s: str) -> str:
 
 def find_position(offers: list[dict], *, ad_id: str = "",
                   title: str = "", seller: str = "") -> dict | None:
-    """Our own row among the offers: by id, then by shop, then by title.
+    """Наша строка среди предложений: по номеру, потом по магазину, потом по названию.
 
-    The order matters and is not the obvious one. An offers list is every
-    seller's copy of the *same* product, so the titles are near-identical —
-    matching on the title first lands on whoever happens to be at the top,
-    which reads as "you are 1st" no matter where the listing really sits. The
-    shop name is what separates our row from the others; the title is only a
-    tie-breaker within it, and a last resort when the page carries no seller.
+    Порядок важен и он не тот, который кажется очевидным. Выдача — это копии
+    ОДНОГО товара у разных продавцов, поэтому названия почти одинаковы: поиск
+    по названию первым попадает в того, кто случайно оказался наверху, и это
+    читается как «вы первый» независимо от того, где товар на самом деле.
+    Отделяет нашу строку от чужих название магазина; название товара — лишь
+    способ выбрать между своими же строками и последняя надежда, когда на
+    странице продавец не указан вовсе.
     """
     if ad_id:
         for row in offers:
