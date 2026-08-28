@@ -1,5 +1,6 @@
-"""Product management through the seller panel (Nova API): list, edit,
-hide/show, clone, delete. Works even when the Integration API can't."""
+"""Работа с товарами через панель продавца (Nova API): список, правка,
+показать/скрыть, копия, удаление. Работает и тогда, когда Integration API
+не может."""
 from __future__ import annotations
 
 import asyncio
@@ -25,13 +26,14 @@ _TIMEOUT = 40
 _CAT_CACHE: dict[int, list[str]] = {}
 _CATS_NAMES: dict[int, dict[int, str]] = {}   # uid -> {category_id: name}
 
-# Ads deleted from the panel can still come back from GET /ads for a while, so
-# their ids are remembered and filtered out — otherwise a removed listing keeps
-# its button and stays in the count. This lives in settings, not memory: the
-# container is rebuilt on every deploy, and an in-memory set was wiped each
-# time, so every deleted item reappeared after the next update.
-# Statuses the marketplace itself uses for a removed listing — filtered even if
-# the id was never recorded, which covers items deleted straight from the site.
+# Товары, удалённые из панели, ещё какое-то время возвращаются из GET /ads,
+# поэтому их номера запоминаются и отсеиваются — иначе у снятого товара
+# остаётся кнопка, и он продолжает считаться. Живёт это в настройках, а не в
+# памяти: контейнер пересобирается при каждом выкате, и множество в памяти
+# стиралось вместе с ним — после обновления все удалённые появлялись заново.
+# Статусы, которыми сам маркетплейс помечает удалённый товар: по ним он
+# отсеивается, даже если номер не записан, — так ловятся удалённые прямо
+# на сайте.
 _GONE_STATUSES = {"deleted", "removed", "trashed", "trash", "destroyed"}
 
 
@@ -71,7 +73,7 @@ def _no_session_kb():
 
 
 async def _run(uid: int, fn, *args):
-    """Run a blocking panel function in a thread with a hard deadline."""
+    """Выполнить блокирующий вызов панели в отдельном потоке, с жёстким сроком."""
     creds = get_panel_creds(uid)
     if not creds or not creds.get("cookies"):
         return None, "no_session"
@@ -89,10 +91,10 @@ async def _run(uid: int, fn, *args):
 
 @router.callback_query(F.data == "pitems:cats")
 async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    """Seller's categories, grouped from the API.
+    """Разделы продавца, собранные по данным API.
 
-    The panel's item rows carry no category at all — only the API does, as
-    category_id, which the reference list turns into a name.
+    В строках товаров у панели раздела нет вовсе — он есть только в API, как
+    `category_id`, а справочник превращает его в название.
     """
     if not api:
         await callback.message.edit_text(
@@ -177,7 +179,7 @@ _STATUS_LABELS = {
 
 async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
                       category: str | None) -> None:
-    """List ads, optionally limited to one category."""
+    """Список товаров, при желании — только по одному разделу."""
     if not api:
         await callback.answer("⚠️ Не настроен API-токен", show_alert=True)
         return
@@ -211,8 +213,8 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
         title = str(ad.get("title") or f"Товар {ad.get('id')}")
         price = _ad_price(ad)
         stock = ad.get("stock")
-        # Titles come from the marketplace; an unescaped '<' would make the
-        # edit fail and freeze the "⏳ Загружаю товары..." placeholder.
+        # Названия приходят с маркетплейса; неэкранированный «<» уронил бы
+        # правку, и заглушка «⏳ Загружаю товары...» осталась бы на экране навсегда.
         lines.append(
             f"{mark} <b>{_esc(title)}</b> — {price} ₽"
             + (f" · остаток {stock}" if stock is not None else ""))
@@ -238,8 +240,8 @@ def _item_kb(item_id: str):
     b.button(text="🚀 На модерацию", callback_data=f"pitem_show:{item_id}")
     b.button(text="🙈 Скрыть", callback_data=f"pitem_hide:{item_id}")
     b.button(text="🗑 Удалить", callback_data=f"pitem_del:{item_id}")
-    # Promotion lived only in the other listing view, so a card opened from
-    # «📦 Товары» had no way to reach it
+    # Продвижение жило только в другом списке товаров, и из карточки,
+    # открытой через «📦 Товары», до него было не добраться
     b.button(text="⭐ Премиум продвижение", callback_data=f"ad_bump:{item_id}")
     b.button(text="⬅️ К товарам", callback_data="pitems:list")
     b.adjust(2, 2, 1, 1, 1)
@@ -313,8 +315,10 @@ async def item_detail(callback: CallbackQuery, state: FSMContext,
 
 
 async def _safe_edit_item(callback: CallbackQuery, text: str, markup) -> None:
-    """Edit, or send a fresh message when the old one cannot be edited
-    (a photo message, or identical text)."""
+    """Правка сообщения, а если старое править нельзя — отправка нового.
+
+    Нельзя, например, у сообщения с фотографией или когда текст совпал.
+    """
     try:
         await callback.message.edit_text(text, reply_markup=markup)
     except Exception as e:
@@ -374,12 +378,14 @@ async def edit_title_save(message: Message, state: FSMContext) -> None:
 
 async def _stock_left(api: YooMarketAPI, item_id: str,
                       ad: dict | None = None) -> tuple[bool, str]:
-    """How much stock an ad has. Returns (has_stock, human_note).
+    """Сколько у товара остатка → (есть ли, пояснение человеку).
 
-    Publishing is refused by the marketplace when an ad has nothing to sell, so
-    this is checked BEFORE the publish call — otherwise the user just gets a
-    rejection with no idea what to fix.
-    On any error it returns True: a failed check must not block publishing.
+    Публиковать товар, которому нечего продавать, маркетплейс отказывается,
+    поэтому проверка идёт ДО вызова публикации: иначе продавец получает
+    отказ и не понимает, что чинить.
+
+    При любой ошибке отвечает «есть»: сорвавшаяся проверка не должна
+    запрещать действие.
     """
     try:
         if ad is None:
@@ -417,14 +423,14 @@ async def _toggle(callback: CallbackQuery, public: bool,
     uid = callback.from_user.id
 
     if public and api:
-        # One fetch serves both checks below.
+        # Одного чтения хватает на обе проверки ниже.
         try:
             ad = await api.get_ad(item_id)
         except Exception as e:
             logger.info("get_ad(%s) failed: %s", item_id, e)
             ad = None
 
-        # Already queued or already live? Say so instead of submitting again.
+        # Уже в очереди или уже в продаже? Скажем об этом, а не отправим повторно.
         status = str(((ad or {}).get("data") or ad or {}).get("status", "")).lower()
         if status in ("moderate", "moderation", "pending", "review"):
             await callback.answer(
@@ -434,7 +440,7 @@ async def _toggle(callback: CallbackQuery, public: bool,
             await callback.answer("🟢 Товар уже опубликован", show_alert=True)
             return
 
-        # Refuse to publish an empty listing — offer to fill it instead.
+        # Пустой товар публиковать не даём — предлагаем сперва наполнить.
         has_stock, note = await _stock_left(api, item_id, ad)
         if not has_stock:
             b = InlineKeyboardBuilder()
@@ -455,8 +461,8 @@ async def _toggle(callback: CallbackQuery, public: bool,
     result, err = await _run(uid, panel_publish_item_sync, item_id, uid, public)
     if result and result[0]:
         if public:
-            # Publishing does not put the ad on sale — it queues it for review,
-            # and it goes live only once that passes.
+            # Публикация не выставляет товар на продажу: она ставит его в очередь
+            # на проверку, и в продажу он попадает, только когда проверку пройдёт.
             text = (f"✅ Товар #{item_id} отправлен на модерацию "
                     f"({result[1]})\n\n"
                     f"🕓 Появится в маркете после проверки.")
@@ -480,7 +486,7 @@ async def item_hide(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "pitems:pubhidden")
 async def publish_all_hidden(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    """Publish every currently-hidden item in one tap."""
+    """Опубликовать все скрытые товары одним нажатием."""
     from automation.panel import panel_list_items_sync, panel_publish_item_sync
     uid = callback.from_user.id
     await callback.answer("⏳")
@@ -500,8 +506,8 @@ async def publish_all_hidden(callback: CallbackQuery, api: YooMarketAPI) -> None
     empty: list[str] = []
     last_err = ""
     for it in hidden:
-        # Skip listings with nothing to sell instead of publishing them into
-        # a rejection — they are reported separately so they can be filled.
+        # Товары, которым нечего продавать, пропускаем, а не отправляем в
+        # заведомый отказ. О них сообщается отдельно — чтобы их наполнили.
         if api:
             has_stock, _note = await _stock_left(api, it["id"])
             if not has_stock:
@@ -557,12 +563,12 @@ async def item_delete_do(callback: CallbackQuery, api: YooMarketAPI) -> None:
     result, err = await _run(uid, panel_delete_item_sync, item_id, uid)
 
     if result and result[0]:
-        # Remember it persistently: the API can keep returning a deleted ad
-        # briefly, and the container is rebuilt on every deploy — an in-memory
-        # note would be lost and the ad would come back.
+        # Запоминаем всерьёз, а не в памяти: API какое-то время продолжает
+        # отдавать удалённый товар, а контейнер пересобирается при каждом
+        # выкате — заметка в памяти пропала бы, и товар вернулся бы на экран.
         _mark_deleted(uid, item_id)
         await callback.answer(f"✅ Товар #{item_id} удалён", show_alert=True)
-        # Straight back to the refreshed list, so the row is actually gone
+        # Сразу назад в обновлённый список, чтобы строка действительно исчезла
         await _render_ads(callback, api, category=None)
         return
 
@@ -574,13 +580,16 @@ async def item_delete_do(callback: CallbackQuery, api: YooMarketAPI) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Stock — has to be filled before an ad can go on sale
+# Остаток — без него товар в продажу не выставить
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("pitem_stock:"))
 async def item_stock_start(callback: CallbackQuery, state: FSMContext) -> None:
-    """Ask for the stock to add. Goes through the Integration API, not the
-    panel: /ads/{id}/items and /ads/{id}/value are the documented routes."""
+    """Спросить, сколько остатка добавить.
+
+    Идёт через Integration API, а не через панель: /ads/{id}/items и
+    /ads/{id}/value — это описанные в документации пути.
+    """
     item_id = callback.data.split(":", 1)[1]
     await state.update_data(item_id=item_id)
     await state.set_state(PanelItemState.waiting_stock)
@@ -648,9 +657,12 @@ async def item_stock_save(message: Message, state: FSMContext,
 
 
 def _ad_price(ad: dict) -> int:
-    """Price of an ad. GET /ads returns it nested:
-    {"amount": 149, "base_amount": 149, "currency": "RUB"} — reading it as a
-    plain number silently skipped every ad in bulk operations."""
+    """Цена товара.
+
+    GET /ads отдаёт её вложенной: {"amount": 149, "base_amount": 149,
+    "currency": "RUB"}. Чтение её как простого числа молча пропускало каждый
+    товар в групповых действиях.
+    """
     p = ad.get("price")
     if isinstance(p, dict):
         p = p.get("amount", p.get("base_amount", 0))
@@ -662,10 +674,11 @@ def _ad_price(ad: dict) -> int:
 
 async def _category_names(api: YooMarketAPI, uid: int,
                           wanted: set[int] | None = None) -> dict[int, str]:
-    """category_id -> name, cached per user.
+    """category_id → название, с запоминанием по продавцу.
 
-    The flat reference only covers the top of the tree, so ids the ads actually
-    use are asked for individually rather than by walking every branch.
+    Плоский справочник покрывает только верх дерева, поэтому номера, которые
+    на самом деле стоят у товаров, спрашиваются поимённо, а не обходом всех
+    ветвей.
     """
     names = _CATS_NAMES.setdefault(uid, {})
     if not names:
@@ -688,8 +701,8 @@ async def _category_names(api: YooMarketAPI, uid: int,
         if label:
             names[cid] = label
 
-    # Anything still unresolved lives deeper in the tree — walk it, bounded,
-    # and only for the ids that are actually needed.
+    # Всё, что не разошлось по названиям, лежит глубже в дереве: обходим его
+    # с ограничением и только ради тех номеров, которые действительно нужны.
     missing = {c for c in (wanted or ()) if c not in names}
     if missing:
         try:
@@ -700,7 +713,10 @@ async def _category_names(api: YooMarketAPI, uid: int,
 
 
 def _wanted_cats(ads: list[dict]) -> set[int]:
-    """The category ids these ads actually use — only those need resolving."""
+    """Номера разделов, которые эти товары действительно используют.
+
+    Разбирать имеет смысл только их: остальное дерево к делу не относится.
+    """
     out: set[int] = set()
     for ad in ads:
         cid = ad.get("category_id")
@@ -712,11 +728,12 @@ def _wanted_cats(ads: list[dict]) -> set[int]:
     return out
 
 
-# Titles read like "100 звезд" — a quantity plus the goods in the genitive.
-# Stripping the number leaves that case ("Звезд"), which is not a category
-# name, so the common goods on this marketplace are mapped back to nominative.
+# Названия выглядят как «100 звезд» — количество плюс товар в родительном
+# падеже. Снятое число оставляет этот падеж («Звезд»), а это не название
+# раздела, поэтому обычные для этого маркетплейса товары приводятся обратно
+# к именительному.
 _GOODS_FORMS = {
-    # English and Russian titles for the same goods share one group
+    # Английское и русское название одного товара идут одной группой
     "звезд": "Звезды", "звёзд": "Звезды", "звезды": "Звезды",
     "звёзды": "Звезды", "stars": "Звезды", "star": "Звезды",
     "подписчиков": "Подписчики", "подписчика": "Подписчики",
@@ -739,10 +756,10 @@ def _label_from_title(title: str) -> str:
     the goods word is looked for anywhere in what remains. All three land on
     «Звезды» instead of each becoming its own category.
     """
-    # Strip emoji and punctuation, keeping letters and digits
+    # Снимаем эмодзи и знаки препинания, оставляем буквы и цифры
     text = re.sub(r"[^\w\s]", " ", str(title or ""), flags=re.UNICODE)
     words = [w for w in text.split() if not w.isdigit()]
-    # Drop quantity prefixes glued to a word ("100зв" stays, "100" goes)
+    # Убираем количество, приклеенное к слову («100зв» остаётся, «100» уходит)
     words = [re.sub(r"^\d+", "", w) for w in words]
     words = [w for w in words if w]
     if not words:
@@ -753,27 +770,27 @@ def _label_from_title(title: str) -> str:
         form = _GOODS_FORMS.get(w)
         if form:
             return form
-    # Two-word goods names ("telegram stars")
+    # Названия из двух слов («telegram stars»)
     for i in range(len(lowered) - 1):
         form = _GOODS_FORMS.get(f"{lowered[i]} {lowered[i + 1]}")
         if form:
             return form
 
-    # Nothing recognised: keep the wording, minus the noise words
+    # Ничего не узнали — оставляем как написано, минус слова-шум
     _NOISE = {"моментально", "быстро", "дешево", "новый", "акция", "хит",
               "лучшая", "цена", "instant", "fast", "cheap"}
     kept = [w for w in words if w.lower() not in _NOISE] or words
     text = " ".join(kept)[:30]
-    # capitalize() would lowercase the rest and turn "Telegram Stars" into
-    # "Telegram stars"
+    # `capitalize()` опустил бы остальное и превратил «Telegram Stars» в
+    # «Telegram stars»
     return text[0].upper() + text[1:]
 
 
 def _ad_category(ad: dict, names: dict[int, str]) -> str:
-    """Category label of an ad.
+    """Название раздела товара.
 
-    Prefers the real name; falls back to a label derived from the title rather
-    than showing a bare id, which tells the seller nothing.
+    Сначала настоящее имя; если его нет — выведенное из названия товара, а не
+    голый номер: номер не говорит продавцу ничего.
     """
     cid = ad.get("category_id")
     if cid not in (None, "", 0):
@@ -788,10 +805,10 @@ def _ad_category(ad: dict, names: dict[int, str]) -> str:
 
 @router.message(Command("ads_debug"))
 async def ads_debug(message: Message, api: YooMarketAPI) -> None:
-    """Show one ad exactly as the Integration API returns it.
+    """Показать один товар ровно так, как его отдаёт Integration API.
 
-    The panel's item rows carry no category at all, so grouping has to come
-    from the API — this prints its field names instead of guessing them.
+    В строках панели раздела нет вовсе, поэтому группировка берётся из API —
+    здесь печатаются имена его полей, а не догадки о них.
     """
     if not api:
         await message.answer("⚠️ Не настроен API-токен")
@@ -814,15 +831,15 @@ async def ads_debug(message: Message, api: YooMarketAPI) -> None:
                 if isinstance(v, (dict, list)):
                     v = _json.dumps(v, ensure_ascii=False)
                 lines.append(f"• {k} = {str(v)[:100]}")
-            # Also check the reference list actually resolves this ad's
-            # category — an id shown raw means the lookup came up empty.
+            # Заодно проверяем, что справочник вообще разбирает раздел этого
+            # товара: показанный сырой номер означает, что поиск ничего не нашёл.
             _CATS_NAMES.pop(message.from_user.id, None)
             cid = ad.get("category_id")
             names = await _category_names(
                 api, message.from_user.id, {int(cid)} if cid else set())
             lines += ["", f"категорий в справочнике: {len(names)}",
                       f"category_id {cid} → {names.get(int(cid)) if cid else None!r}"]
-            # Shape of the reference itself: is it a tree, is it paginated?
+            # Форма самого справочника: дерево ли это, есть ли страницы?
             try:
                 raw = await api.categories_raw()
                 rows = raw.get("data") or raw.get("items") or []
@@ -881,7 +898,7 @@ async def items_debug(message: Message) -> None:
                 val = _json.dumps(val, ensure_ascii=False)[:80]
             name = str(f.get("name") or "")
             line = f"• {f.get('attribute')} | {name} = {str(val)[:80]}"
-            # These columns render HTML; show what is actually read out of them
+            # В этих колонках рисуется HTML — показываем, что из них читается на деле
             if isinstance(val, str) and "<" in val:
                 badges = _html_badges(val)
                 line += (f"\n   → бейджи: {badges}" if badges
@@ -903,10 +920,10 @@ async def items_debug(message: Message) -> None:
 
 @router.message(Command("scan"))
 async def scan_page(message: Message) -> None:  # noqa: C901
-    """/scan /support — read a panel page and find the endpoints it calls.
+    """/scan /support — прочитать страницу панели и найти адреса, которые она зовёт.
 
-    A page that shows messages must fetch them from somewhere; pointing this at
-    the support chat gives that address without needing a browser.
+    Страница, показывающая сообщения, обязана откуда-то их брать; наведя это
+    на чат поддержки, получаем нужный адрес без всякого браузера.
     """
     import re as _re_mod
 
@@ -917,7 +934,7 @@ async def scan_page(message: Message) -> None:  # noqa: C901
             "Адрес возьмите из строки браузера, когда открыт нужный чат.")
         return
     page_path = parts[1].strip()
-    # Accept a full URL pasted from the address bar, not just a path
+    # Принимаем и адрес целиком, скопированный из строки браузера, не только путь
     page_path = _re_mod.sub(r"^https?://[^/]+", "", page_path)
     if not page_path.startswith("/"):
         page_path = "/" + page_path
@@ -942,7 +959,7 @@ async def scan_page(message: Message) -> None:  # noqa: C901
         html = r.text
         out.append(f"{page_path} → {r.status_code}, {len(html)}б")
 
-        # Endpoints named right in the page
+        # Адреса, названные прямо на странице
         inline = set(_re.findall(
             r'["\'`](/[a-z0-9/_-]*(?:chat|support|message|ticket|dialog)[a-z0-9/_-]*)["\'`]',
             html, _re.I))
@@ -966,8 +983,8 @@ async def scan_page(message: Message) -> None:  # noqa: C901
                     hits.add(m)
         out.append(f"в JS: {sorted(hits)[:20] or 'ничего'}")
 
-        # For a page like /chats/1076867 the messages come from a sibling
-        # address — probe the usual shapes directly.
+        # Для страницы вида /chats/1076867 сообщения лежат по соседнему
+        # адресу — пробуем обычные формы напрямую.
         m = _re.match(r"^/([a-z-]+)/(\d+)", page_path)
         if m:
             section, oid = m.group(1), m.group(2)
@@ -1005,11 +1022,12 @@ async def scan_page(message: Message) -> None:  # noqa: C901
 
 @router.message(Command("panel_debug"))
 async def panel_debug(message: Message) -> None:
-    """List what the panel exposes, so support chats can be located.
+    """Что панель отдаёт наружу — чтобы найти чаты поддержки.
 
-    Order chats come from the Integration API, which has no way to list chats —
-    only to read one by id. Anything outside an order (support, moderation)
-    therefore has to come from the panel, if it exposes it at all.
+    Чаты заказов приходят из Integration API, а он списка чатов не отдаёт
+    вовсе: только чтение одного по номеру. Значит всё, что вне заказа —
+    поддержка, модерация, — может прийти только из панели, если она это вообще
+    показывает.
     """
     creds = get_panel_creds(message.from_user.id)
     if not creds or not creds.get("cookies"):
@@ -1034,8 +1052,8 @@ async def panel_debug(message: Message) -> None:
             except Exception as e:
                 out.append(f"{path}: {str(e)[:80]}")
 
-        # Anything chat-shaped is what we are after
-        # "notifies" is the likeliest home for support and moderation notices
+        # Всё, что похоже на чат, — это и есть искомое
+        # «notifies» — самое вероятное место для писем поддержки и модерации
         for guess in ("notifies", "chats", "messages", "dialogs", "tickets",
                       "support", "emails"):
             try:
@@ -1064,8 +1082,8 @@ async def panel_debug(message: Message) -> None:
             except Exception as e:
                 out.append(f"/nova-api/{guess}: {str(e)[:60]}")
 
-        # The support chat is not a Nova resource, so look for the panel's own
-        # endpoint — the same approach that found the login route.
+        # Чат поддержки — не раздел Nova, поэтому ищем собственный адрес
+        # панели: тем же способом когда-то нашёлся и путь входа.
         out.append("\n— свои адреса панели —")
         for path in ("/api/chats", "/api/support", "/chats", "/support",
                      "/api/messages", "/api/tickets", "/api/chat/messages",
@@ -1080,7 +1098,7 @@ async def panel_debug(message: Message) -> None:
             except Exception:
                 continue
 
-        # And what the panel's own scripts call
+        # И то, что зовут скрипты самой панели
         try:
             html = session.get(PANEL_URL + "/", timeout=(6, 12)).text
             srcs = _re.findall(r'src="(/[^"]+\.js[^"]*)"', html)[:4]
@@ -1157,9 +1175,9 @@ async def promo_debug(message: Message) -> None:
             out.append("\n— " + str(f.get("attribute")) + " —")
             out.append(_json.dumps(f, ensure_ascii=False)[:1400])
 
-        # A field with no options is dependent: show what asking the panel to
-        # resolve it actually returns, so the route can be seen rather than
-        # guessed at.
+        # Поле без вариантов — зависимое: показываем, что на самом деле
+        # отвечает панель на просьбу его разобрать, чтобы путь был виден, а не
+        # додуман.
         from automation.panel import panel_action_field_options_sync
 
         picked = {}
@@ -1187,7 +1205,8 @@ async def promo_debug(message: Message) -> None:
     except Exception as e:
         report = f"ошибка: {str(e)[:200]}"
 
-    # One field's JSON alone can exceed a Telegram message, so send in pieces
+    # JSON одного поля сам по себе может не влезть в сообщение Telegram —
+    # шлём частями
     text = _html.escape(report)
     for i in range(0, min(len(text), 12000), 3500):
         await message.answer(f"<code>{text[i:i + 3500]}</code>")
@@ -1195,13 +1214,12 @@ async def promo_debug(message: Message) -> None:
 
 
 def _pos_raw_sync(url: str, shop: str) -> str:
-    """Blocking: report where a storefront page keeps its offers.
+    """Блокирующая: где страница витрины держит свои предложения.
 
-    Read-only and unauthenticated. Answers the one question that cannot be
-    answered from the outside: is the listing inside the HTML at all? If the
-    shop name is in the bytes, the data is there and the parser is at fault; if
-    it is not, the page fills itself in later and the HTML is the wrong thing
-    to read no matter how the parser is written.
+    Только чтение и без входа. Отвечает на вопрос, на который снаружи ответить
+    больше нечем: есть ли выдача в самом HTML? Если название магазина есть в
+    байтах — данные там, и виноват разбор; если нет — страница дозаполняет
+    себя позже, и читать HTML бесполезно, как его ни разбирай.
     """
     import requests
     from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -1227,7 +1245,7 @@ def _pos_raw_sync(url: str, shop: str) -> str:
     out = [f"HTTP {r.status_code}, {len(html)}б, "
            f"тип: {r.headers.get('content-type', '?')[:40]}"]
 
-    # 1. Where a Next.js page could be keeping it
+    # 1. Где страница на Next.js могла бы его держать
     nd = re.search(r'id="__NEXT_DATA__"', html)
     chunks = re.findall(r'__next_f\.push\(\[\d+,\s*"((?:[^"\\]|\\.)*)"\]\)', html)
     out.append(f"__NEXT_DATA__: {'есть' if nd else 'нет'}; "
@@ -1241,7 +1259,7 @@ def _pos_raw_sync(url: str, shop: str) -> str:
                + (f", длиннейший: {max(len(x) for x in lists)}" if lists else ""))
     out.append(f"карточек по разметке: {len(_offers_from_text(html))}")
 
-    # 2. Is the listing in the bytes at all?
+    # 2. Есть ли товар в байтах ответа вообще?
     text = _visible_text(html)
     marks = [m for m in (shop, "отзыв", "₽") if m]
     found = {m: (m in html) for m in marks}
@@ -1249,10 +1267,10 @@ def _pos_raw_sync(url: str, shop: str) -> str:
                                       for k, v in found.items()))
     out.append(f"видимого текста: {len(text.strip())}б")
 
-    # 3. How much of the list came in one response, and where we are in it.
-    # The seller had to scroll to reach their own card, so the question is not
-    # only "did it parse" but "did the whole list arrive" — a listing that
-    # loads in batches would put them past the end of what we can see.
+    # 3. Сколько списка пришло одним ответом и где в нём мы. Продавцу
+    # приходилось прокручивать до собственной карточки, поэтому вопрос не
+    # только «разобралось ли», но и «весь ли список приехал»: выдача,
+    # подгружающаяся частями, оставила бы его за краем видимого.
     rows = _normalize(_offers_from_text(html)) if not lists else \
         _normalize(max(lists, key=len))
     if rows:
@@ -1268,9 +1286,9 @@ def _pos_raw_sync(url: str, shop: str) -> str:
     out.append("признаки подгрузки порциями: "
                + (", ".join(lazy[:8]) if lazy else "не вижу"))
 
-    # Does ?page=2 actually give a different listing? If it comes back
-    # identical, positions past the first screen have to be reached some other
-    # way, and no amount of parsing the first page would tell us that.
+    # Даёт ли ?page=2 на самом деле другую выдачу? Если ответ приходит тот
+    # же, до позиций за первым экраном надо добираться иначе, — и никакой
+    # разбор первой страницы об этом не скажет.
     ok2, html2 = get_page(with_page(url, 2))
     if ok2:
         rows2, _ = (_offers_in(html2) if lists else
@@ -1285,14 +1303,14 @@ def _pos_raw_sync(url: str, shop: str) -> str:
     else:
         out.append(f"страница 2: {html2[:80]}")
 
-    # 4. What the payload around our shop looks like — the shape to parse
+    # 4. Как выглядит кусок ответа вокруг нашего магазина — форма для разбора
     if shop and shop in html:
         i = html.index(shop)
         out.append("")
         out.append(f"--- окрестности «{shop}» ---")
         out.append(html[max(0, i - 300):i + 300])
 
-    # 5. A JSON endpoint would beat parsing any markup
+    # 5. Адрес, отдающий JSON, лучше любого разбора разметки
     apis = sorted(set(re.findall(
         r'["\'](/api/[\w/\-.]+|https?://[\w.\-]*(?:api|graphql)[\w/\-.]*)["\']',
         html)))
@@ -1335,15 +1353,14 @@ async def pos_raw(message: Message) -> None:
 
 
 def _pos_api_sync(url: str, shop: str) -> str:
-    """Blocking: find the request the storefront makes to fill its listing.
+    """Блокирующая: найти запрос, которым витрина наполняет свою выдачу.
 
-    The category page ships no offers at all — 81 KB of application shell — so
-    the list arrives over a separate call made from the browser. That call has
-    to be found, and it is findable: its address is compiled into the page's own
-    JavaScript. The same trick already located the chat API
-    (panel_chat_debug_sync).
+    Страница раздела не отдаёт ни одного предложения — 81 КБ каркаса
+    приложения, — то есть список приезжает отдельным вызовом из браузера. Этот
+    вызов надо найти, и он находим: его адрес вкомпилирован в JavaScript самой
+    страницы. Тем же приёмом когда-то нашлось чат-API (`panel_chat_debug_sync`).
 
-    Read-only: every request here is a GET, and nothing is stored.
+    Только чтение: здесь всё GET, и ничего не сохраняется.
     """
     import json as _json
     from urllib.parse import parse_qsl, urlparse
@@ -1372,7 +1389,7 @@ def _pos_api_sync(url: str, shop: str) -> str:
     except Exception as e:
         return f"страница не открылась: {str(e)[:150]}"
 
-    # --- 1. What the page itself was given -----------------------------------
+    # --- 1. Что странице отдали при загрузке ---------------------------------
     build_id = ""
     m = re.search(r'id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
     if m:
@@ -1382,7 +1399,7 @@ def _pos_api_sync(url: str, shop: str) -> str:
             props = (nd.get("props") or {}).get("pageProps") or {}
             out.append(f"buildId: {build_id or '—'}; "
                        f"pageProps: {sorted(props)[:12]}")
-            # Anything in there shaped like an address or an id we could reuse
+            # Всё, что похоже на адрес или на номер, годный к переиспользованию
             flat = _json.dumps(nd, ensure_ascii=False)
             urls = sorted(set(re.findall(
                 r'"(https?://[\w.\-]+[^"]{0,40})"', flat)))
@@ -1394,7 +1411,7 @@ def _pos_api_sync(url: str, shop: str) -> str:
         except Exception as e:
             out.append(f"__NEXT_DATA__ не разобрался: {str(e)[:60]}")
 
-    # --- 2. The endpoint compiled into the page's JavaScript ------------------
+    # --- 2. Адрес, вкомпилированный в JavaScript страницы --------------------
     scripts = re.findall(r'<script[^>]+src="([^"]+)"', html)
     bases, paths = set(), set()
     for src in list(dict.fromkeys(scripts))[:12]:
@@ -1419,7 +1436,7 @@ def _pos_api_sync(url: str, shop: str) -> str:
     out.append(f"базы из JS: {sorted(bases)[:10] or 'ничего'}")
     out.append(f"пути из JS: {sorted(paths)[:24] or 'ничего'}")
 
-    # --- 3. Try them, and say which one actually answers with the listing -----
+    # --- 3. Пробуем их и говорим, какой отвечает выдачей ---------------------
     def _try(full_url: str, label: str = "") -> str:
         try:
             r = requests.get(full_url, headers=hdrs, timeout=(6, 20),
@@ -1449,7 +1466,7 @@ def _pos_api_sync(url: str, shop: str) -> str:
     out.append("\n— пробую —")
     tried = set()
 
-    # Next.js Pages Router serves the page's own props as JSON
+    # Pages Router у Next.js отдаёт свойства страницы как JSON
     if build_id and len(out) < 60:
         path = parts.path.strip("/")
         nd_url = f"{MARKET_URL}/_next/data/{build_id}/{path}.json"
@@ -1457,7 +1474,7 @@ def _pos_api_sync(url: str, shop: str) -> str:
             nd_url += "?" + parts.query
         out.append(_try(nd_url, f"/_next/data/{build_id}/…"))
 
-    # Whatever the bundles named, with this page's own parameters
+    # То, что назвали сборки, — с параметрами этой самой страницы
     query = "&".join(f"{k}={v}" for k, v in params.items())
     for base in list(sorted(bases))[:3] + [MARKET_URL, "https://api.yoo.market"]:
         if not base.startswith("http"):
@@ -1474,7 +1491,7 @@ def _pos_api_sync(url: str, shop: str) -> str:
             tried.add(full)
             out.append(_try(full))
 
-    # And the shapes such an API usually takes, in case the bundles hid theirs
+    # И обычные формы такого API — на случай, если сборки свою спрятали
     if slugs:
         guesses = [
             f"/api/categories/{'/'.join(slugs)}/offers",
@@ -1705,11 +1722,11 @@ async def _my_ads_for(uid: int) -> list:
 
 
 async def _pos_debug_watches(message: Message) -> None:
-    """Dry-run every watch: position, thresholds and the decision — no charge.
+    """Сухой прогон всех слежений: позиция, пороги и решение — без списаний.
 
-    `evaluate` is called on a throwaway copy of each watch so a diagnostic run
-    cannot move the real state (an alert marked as delivered, a cooldown
-    started) and make the next scheduled run behave differently.
+    `evaluate` вызывается на выброшенной копии каждого слежения: диагностика не
+    имеет права сдвинуть настоящее состояние (пометить тревогу отправленной,
+    начать паузу) и тем изменить поведение следующего настоящего прохода.
     """
     import copy
     import html as _html
@@ -1782,9 +1799,9 @@ async def pos_debug(message: Message) -> None:
     """
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        # Without an address: replay every configured watch and show what the
-        # trigger would decide right now. Nothing is charged — this is the
-        # answer to "почему не поднял" without spending to find out.
+        # Без адреса: прогоняем все настроенные слежения и показываем, что
+        # решило бы каждое прямо сейчас. Денег не тратится — это ответ на
+        # «почему не поднял», полученный без траты на выяснение.
         await _pos_debug_watches(message)
         return
     url = parts[1].strip()
@@ -1864,12 +1881,13 @@ async def chat_send_probe(message: Message) -> None:
 
 @router.message(Command("withdraw_debug"))
 async def withdraw_debug(message: Message) -> None:
-    """Reveal what the panel exposes for withdrawal — a read-only probe.
+    """Показать, что панель даёт для вывода средств, — проба только на чтение.
 
-    The Integration API has no withdrawal endpoint, so a payout has to go
-    through the panel, and its exact shape is unknown. This shows the finance
-    resources and the create-withdrawal form so the real request is captured
-    instead of guessed. It moves no money.
+    В Integration API вывода нет вовсе, значит выплата идёт через панель, а её
+    точная форма неизвестна. Здесь печатаются финансовые разделы и форма
+    создания вывода — чтобы настоящий запрос был снят, а не придуман.
+
+    Денег не двигает.
     """
     creds = get_panel_creds(message.from_user.id)
     if not creds or not creds.get("cookies"):
