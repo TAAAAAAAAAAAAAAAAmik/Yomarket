@@ -1470,8 +1470,8 @@ def _offers_in(html: str) -> tuple[list, str]:
     for blob in _json_blobs(html):
         lists.extend(_offer_lists(blob))
     if lists:
-        # The longest list is the page's own listing; shorter ones are usually
-        # "similar" or "recommended" blocks.
+        # Самый длинный список — это выдача самой страницы; те, что короче,
+        # обычно блоки «похожие» и «рекомендуем».
         return max(lists, key=len), "json"
     return _offers_from_text(html), "разметка"
 
@@ -1530,9 +1530,9 @@ def fetch_offers_sync(url: str, *, max_pages: int = 1,
             break
         sig = _signature(more)
         if sig in seen:
-            # The page parameter did nothing — the same listing came back.
-            # Continuing would count the first page twice and inflate every
-            # position below it.
+            # Параметр страницы ничего не изменил — вернулась та же выдача.
+            # Идти дальше значило бы посчитать первую страницу дважды и завысить
+            # каждую позицию под ней.
             break
         seen.add(sig)
         all_rows.extend(more)
@@ -1547,10 +1547,11 @@ def fetch_offers_sync(url: str, *, max_pages: int = 1,
 
 
 
-# How many pages of a listing to read before giving up on finding ourselves.
-# The seller's own address is a search inside a category and their card sits
-# well past the first screen, so one page is not an answer — but each page is a
-# request, so the walk stops the moment the shop is found.
+# Сколько страниц выдачи прочесть, прежде чем сдаться в поисках себя.
+# Собственный адрес продавца — это поиск внутри раздела, и его карточка
+# лежит заметно за первым экраном, поэтому одна страница — не ответ. Но
+# каждая страница стоит запроса, и обход прекращается сразу, как найден
+# магазин.
 MAX_LIST_PAGES = 6
 
 
@@ -1570,7 +1571,8 @@ def fetch_listing(url: str, shop: str = "", category_id=None):
                                   want_seller=shop)
     if ok2:
         return ok2, res2
-    # Both failed: say so in one line rather than blaming whichever ran last.
+    # Не вышло ни то, ни другое: говорим об этом одной строкой, а не валим
+    # вину на тот способ, что случайно оказался последним.
     return False, f"{api_error}; страница: {res2}"
 
 
@@ -1608,8 +1610,8 @@ def find_position(offers: list[dict], *, ad_id: str = "",
         if len(mine) == 1:
             return mine[0]
         if mine:
-            # Several listings from the same shop on one page — the title picks
-            # out which one is being watched.
+            # Несколько товаров одного магазина на странице — по названию
+            # выбирается тот, за которым следят.
             if title:
                 exact = [r for r in mine if _norm(r["title"]) == _norm(title)]
                 if exact:

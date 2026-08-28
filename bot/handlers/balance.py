@@ -839,8 +839,8 @@ async def _wd_ask_next(message, state: FSMContext) -> None:
                  if not query or query in str(o["label"]).lower()]
         total = len(f["options"])
         # Список банков СБП заметно длиннее тридцати, и обрезка на этом месте
-        # silently hid every bank after the thirtieth — «Яндекс Банк» among
-        # them. What does not fit is reachable by name instead of lost.
+        # молча прятала все банки после тридцатого — «Яндекс Банк» в их числе.
+        # То, что не влезло, теперь находится по названию, а не теряется.
         clipped = shown[:_WD_MAX_BUTTONS]
 
         b = InlineKeyboardBuilder()
@@ -930,8 +930,8 @@ async def wd_pick_option(callback: CallbackQuery, state: FSMContext) -> None:
     values = dict(data.get("wd_values") or {})
     values[f["attribute"]] = o["value"]
     await callback.answer(str(o["label"])[:40])
-    # Cleared with the step: a filter typed for the bank list must not carry
-    # over and hide most of the next field's choices.
+    # Сбрасывается вместе с шагом: слово, набранное для поиска банка, не
+    # должно перейти на следующее поле и спрятать бо́льшую часть его вариантов.
     await state.update_data(wd_values=values, wd_qi=qi + 1, wd_filter="")
     await _wd_ask_next(callback.message, state)
 
@@ -959,7 +959,7 @@ async def wd_req_value(message: Message, state: FSMContext) -> None:
     if not raw:
         await message.answer("❌ Пришлите значение или нажмите «Пропустить».")
         return
-    # Number fields carry only digits; keep text ones as typed
+    # В числовых полях только цифры; текстовые оставляем как набрали
     if str(f.get("component", "")).startswith("number") or f.get("attribute") in (
             "card", "phone", "link_id"):
         cleaned = "".join(ch for ch in raw if ch.isdigit())
@@ -1074,10 +1074,10 @@ async def wd_execute(callback: CallbackQuery, api: YooMarketAPI) -> None:
     res, err = await _run_panel(uid, panel_withdraw_sync,
                                 aw.get("panel_balance_id"),
                                 aw.get("panel_action_key"), values, uid, True)
-    # _run_panel already unpacks (ok, payload): success gives (payload, ""),
-    # failure gives (None, reason). Re-testing for a tuple here made every
-    # outcome read as failure — a payout that went through was reported «❌ не
-    # удалось» with no reason, inviting a second attempt at real money.
+    # `_run_panel` уже разбирает (ok, тело): при успехе отдаёт (тело, ""), при
+    # отказе — (None, причина). Повторная проверка на кортеж здесь делала
+    # отказом ЛЮБОЙ исход: прошедшая выплата показывалась как «❌ не удалось»
+    # без причины — то есть приглашала повторить её настоящими деньгами.
     ok = err == "" and res is not None
     msg = str(res) if ok else (err or "панель не ответила")
     _log_withdrawal(uid, float(amount), "manual", bool(ok))
@@ -1181,7 +1181,7 @@ async def active_withdrawals(callback: CallbackQuery, api: YooMarketAPI) -> None
 async def withdrawal_history(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.answer()
     uid = callback.from_user.id
-    # prefer the API history; fall back to the local log
+    # Сначала история из API, если её нет — собственный журнал
     api_items = []
     if api:
         try:

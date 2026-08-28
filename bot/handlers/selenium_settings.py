@@ -1,4 +1,4 @@
-"""Auto-bump, auto-restore, auto-withdraw via YooMarket Integration API."""
+"""Автоподнятие, автовозврат в продажу и автовывод через Integration API."""
 from __future__ import annotations
 
 import logging
@@ -73,7 +73,7 @@ def _cancel_kb(back: str) -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------------------
 
 def promo_params(s: dict) -> dict:
-    """The tariff the seller picked, as the payload the Nova action expects."""
+    """Тариф, выбранный продавцом, — в том виде, какого ждёт действие Nova."""
     return (s.get("auto_bump", {}).get("promo") or {}).get("values") or {}
 
 
@@ -125,8 +125,10 @@ def promo_pack_problem(s: dict) -> str:
 
 
 def promo_limit(s: dict) -> int:
-    """How many listings the daily ceiling allows at the chosen tariff.
-    0 = no ceiling set, so no cap."""
+    """Сколько товаров позволяет поднять дневной потолок на выбранном тарифе.
+
+    0 — потолок не задан, значит ограничения нет.
+    """
     ceiling = s.get("bump_stats", {}).get("daily_ceiling", 0)
     price = promo_price(s)
     if not ceiling or not price:
@@ -231,11 +233,10 @@ def _bump_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
 
 
 # ---------------------------------------------------------------------------
-# Scheduled promotion — the same slots every day
+# Продвижение по расписанию — одни и те же слоты каждый день
 #
-# The scheduler already fires `bump_schedule` from the fast loop; this is the
-# screen that sets it, next to the promotion it drives rather than in a
-# different menu.
+# Планировщик уже запускает `bump_schedule` из быстрого цикла; здесь экран,
+# который его настраивает, — рядом с самим продвижением, а не в другом меню.
 # ---------------------------------------------------------------------------
 
 def _sched_text(s: dict) -> str:
@@ -350,8 +351,8 @@ async def sched_times_save(message: Message, state: FSMContext) -> None:
         t = part.strip()
         if not t:
             continue
-        # Accept 9:00 and 09.00 alike, then store one canonical HH:MM — the
-        # scheduler compares slots as strings.
+        # Принимаем и 9:00, и 09.00, а храним одну форму ЧЧ:ММ: планировщик
+        # сравнивает слоты строками.
         t = t.replace(".", ":")
         try:
             hh, mm = t.split(":")
@@ -368,8 +369,8 @@ async def sched_times_save(message: Message, state: FSMContext) -> None:
     s = get_settings(message.from_user.id)
     bs = s.setdefault("bump_schedule", {})
     bs["times"] = sorted(set(valid))
-    # Slots already marked as run today would otherwise stay marked under the
-    # new schedule and skip their first day.
+    # Слоты, уже помеченные сегодняшними, иначе остались бы помеченными и в
+    # новом расписании — и пропустили бы свой первый день.
     bs["last_runs"] = {}
     save_settings(message.from_user.id, s)
     note = f"\n⚠️ Не понял: {', '.join(bad)}" if bad else ""
@@ -418,8 +419,8 @@ async def sched_ceiling_save(message: Message, state: FSMContext) -> None:
     s = get_settings(message.from_user.id)
     bs = s.setdefault("bump_schedule", {})
     bs["daily_ceiling"] = amount
-    # The ceiling is enforced against price_per_bump; keep it in step with the
-    # tariff so the cap counts real money rather than a stale figure.
+    # Потолок считается по `price_per_bump`, поэтому держим его в согласии с
+    # тарифом: иначе ограничение считает не настоящие деньги, а устаревшее число.
     if promo_price(s):
         bs["price_per_bump"] = promo_price(s)
     save_settings(message.from_user.id, s)
@@ -427,19 +428,19 @@ async def sched_ceiling_save(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Positional trigger: promote when a listing slips down the offers list
+# Позиционный триггер: поднимать, когда товар съезжает вниз по выдаче
 #
-# Position is not in the seller API — it exists only on the public storefront,
-# so the page a buyer sees is read and our row located in it. One watch per
-# listing: a shop with thirty items does not have one position, it has thirty,
-# and a single page could never speak for all of them.
+# Позиции в API продавца нет — она существует только на публичной витрине,
+# поэтому читается та страница, которую видит покупатель, и в ней ищется наша
+# строка. По одному слежению на товар: у магазина с тридцатью товарами не одна
+# позиция, а тридцать, и одна страница за все говорить не может.
 #
-# The rules themselves live in automation/position.py, away from Telegram, and
-# are covered by bot/tests/test_position.py. This module is the screen.
+# Сами правила живут в automation/position.py, подальше от Telegram, и покрыты
+# bot/tests/test_position.py. Этот модуль — экран.
 # ---------------------------------------------------------------------------
 
 def _pos_settings(uid: int) -> tuple[dict, dict, list]:
-    """(settings, promo_position, watches) with the legacy config migrated."""
+    """(настройки, promo_position, слежения) с переносом прежней конфигурации."""
     from automation.position import watches as _watches
     s = get_settings(uid)
     pp = s.setdefault("promo_position", {})
@@ -472,8 +473,8 @@ def _pos_text(s: dict) -> str:
         f"Товаров под наблюдением: <b>{len(ws)}</b>",
         f"Режим: {'⭐ поднимать автоматически' if pp.get('auto_promote') else '🔔 только предупреждать'}",
     ]
-    # The spending limits are shown in both modes on purpose: they are what one
-    # wants set *before* switching the trigger over to paying, not after.
+    # Пределы трат показываются в обоих режимах намеренно: их хочется задать ДО
+    # того, как переключить триггер на платный, а не после.
     price = promo_price(s)
     auto = pp.get("auto_promote")
     lines.append("")
@@ -544,9 +545,9 @@ def _pos_kb(s: dict) -> InlineKeyboardMarkup:
              callback_data="pos:interval")
     b.button(text=("💰 Дешевле: сообщать" if pp.get("undercut_notify", True)
                    else "💰 Дешевле: молчать"), callback_data="pos:undercut")
-    # Always offered, in both modes: a spending cap is something to set before
-    # turning the paying on, and hiding it behind that switch put it out of
-    # reach exactly when it was wanted.
+    # Предлагается всегда, в обоих режимах: потолок трат задают перед тем, как
+    # включать платное, а спрятанный за этим переключателем он оказывался
+    # недоступен ровно тогда, когда был нужен.
     b.button(text=f"⏸ Пауза: {pp.get('cooldown_hours', 6):.0f} ч",
              callback_data="pos:cooldown")
     b.button(text=f"🧾 Лимит/сутки: {pp.get('daily_limit', 3) or '∞'}",
@@ -558,8 +559,8 @@ def _pos_kb(s: dict) -> InlineKeyboardMarkup:
         b.button(text="🔍 Проверить все", callback_data="pos:checkall")
     b.button(text="🧾 Отчёт по тратам", callback_data="pos:report")
     b.button(text="⬅️ К продвижению", callback_data="selenium:bump:menu")
-    # One watch per row so its name and place stay readable; the settings pair
-    # up below them.
+    # По одному слежению на строку, чтобы название и место оставались читаемы;
+    # настройки сдваиваются под ними.
     rows = [1] * len(ws[:MAX_WATCHES])
     rows += [1] if len(ws) < MAX_WATCHES else []
     rows += [2, 2, 2, 1]                  # switches, checks, limits, budget
@@ -575,11 +576,11 @@ async def _pos_screen(callback: CallbackQuery) -> None:
 
 
 async def _pos_edit(message, text: str, kb: InlineKeyboardMarkup) -> None:
-    """Edit, and fall back to a fresh message when Telegram refuses.
+    """Правка, а если Telegram отказал — новое сообщение.
 
-    "message is not modified" comes back for a screen redrawn unchanged — the
-    normal case for a check that found nothing new — and an unhandled one used
-    to look like the button did nothing.
+    «message is not modified» приходит на экран, перерисованный без изменений,
+    — обычное дело для проверки, не нашедшей ничего нового. Необработанным он
+    выглядел так, будто кнопка ничего не сделала.
     """
     try:
         await message.edit_text(text[:4000], reply_markup=kb)
@@ -719,7 +720,7 @@ async def pos_report_screen(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "pos:add")
 async def pos_add_start(callback: CallbackQuery, state: FSMContext) -> None:
-    """Two ways in, and the one that needs no copying is offered first."""
+    """Два пути внутрь, и первым предлагается тот, где ничего копировать не надо."""
     await state.clear()
     b = InlineKeyboardBuilder()
     b.button(text="📦 Выбрать из моих товаров", callback_data="pos:addlist")
@@ -851,7 +852,7 @@ _MY_ADS_CACHE: dict[int, list] = {}
 
 
 async def _my_ads(uid: int, reload: bool = False) -> list:
-    """The shop's own listings, as the marketplace reports them."""
+    """Собственные товары магазина — так, как их называет маркетплейс."""
     from api.yoomarket import YooMarketAPI
     from storage import get_token
 
@@ -1040,11 +1041,11 @@ async def _find_listing_page(uid: int, ad: dict
 
 @router.callback_query(F.data.startswith("pos:addpick:"))
 async def pos_add_pick(callback: CallbackQuery) -> None:
-    """Set a watch up from one of our own listings, end to end.
+    """Настроить слежение по одному из наших товаров, от начала до конца.
 
-    Finds the page it appears on, checks that it is really there, and binds the
-    panel record that a promotion will be charged against — the three steps the
-    seller would otherwise do by hand for every listing.
+    Находит страницу, на которой он стоит, убеждается, что он там правда есть,
+    и привязывает запись панели, с которой спишется поднятие, — три шага,
+    которые продавец иначе делал бы руками для каждого товара.
     """
     import asyncio
 
@@ -1080,8 +1081,8 @@ async def pos_add_pick(callback: CallbackQuery) -> None:
         callback.from_user.id, ad)
 
     if not chosen:
-        # Say which of the two steps failed. "Не смог" alone left nothing to
-        # act on — and the two causes need different things from the seller.
+        # Говорим, какой из двух шагов не удался. Одно «Не смог» не давало
+        # никакой опоры — а причины эти требуют от продавца разного.
         from automation.market import search_keys
         # Две причины — два разных действия продавца, и путать их нельзя.
         if urls:
@@ -1123,8 +1124,8 @@ async def pos_add_pick(callback: CallbackQuery) -> None:
                     _watch_kb(s, idx_new))
 
 
-# The listing a seller picked but whose page could not be worked out, kept
-# while they name its section by hand.
+# Товар, который продавец выбрал, но чью страницу вычислить не удалось:
+# держим, пока он называет раздел руками.
 _PENDING_AD: dict[int, dict] = {}
 
 # Путь, которым продавец идёт по каталогу, и что он по дороге видел.
@@ -1156,11 +1157,11 @@ def _walk_to(uid: int, slug: str) -> list[str]:
 
 @router.callback_query(F.data.startswith("pos:cat:"))
 async def pos_pick_category(callback: CallbackQuery) -> None:
-    """Name the section by tapping the marketplace's own catalogue.
+    """Назвать раздел, нажимая по каталогу самого маркетплейса.
 
-    Automatic detection reads what the listing row happens to carry, and that
-    is not always the section. The catalogue always is — and two taps beat
-    copying an address, which is what this whole screen exists to avoid.
+    Определение само читает то, что случайно несёт строка товара, а это не
+    всегда раздел. Каталог — всегда он. К тому же два нажатия лучше
+    копирования адреса, ради избавления от которого весь этот экран и написан.
     """
     import asyncio
 
@@ -1372,11 +1373,11 @@ async def pos_category_chosen(callback: CallbackQuery) -> None:
 
 
 async def _bind_panel_item(uid: int, idx: int, title: str) -> str:
-    """Match the watch to the panel record a promotion is charged against.
+    """Связать слежение с записью панели, с которой спишется поднятие.
 
-    The panel's ids are not the marketplace's, so this is a separate lookup;
-    doing it here means the seller does not have to walk a second list to make
-    the watch able to spend.
+    Номера в панели и на маркетплейсе разные, поэтому это отдельный поиск;
+    сделанный здесь, он избавляет продавца от прохода по второму списку ради
+    того, чтобы слежение вообще могло тратить.
     """
     import asyncio
 
@@ -1448,12 +1449,13 @@ async def pos_url_save(message: Message, state: FSMContext) -> None:
 
 async def _match_by_own_ads(uid: int, offers: list[dict]) -> tuple[dict | None,
                                                                   set]:
-    """Our row in the listing, matched against the shop's own ad ids.
+    """Наша строка в выдаче, опознанная по номерам собственных объявлений.
 
-    The storefront does not have to name the seller, and a shop name can be
-    changed or repeated. The ad ids cannot: the marketplace hands ours over
-    through the seller API, and a listing row carrying one of them is ours
-    beyond doubt. Returns (row or None, the ids we know about).
+    Витрина не обязана называть продавца, а название магазина можно сменить и
+    можно повторить. Номера объявлений — нельзя: маркетплейс отдаёт наши через
+    API продавца, и строка выдачи с таким номером — наша вне всяких сомнений.
+
+    Отдаёт (строку или None, номера, которые нам известны).
     """
     from api.yoomarket import YooMarketAPI
     from storage import get_token
@@ -1484,12 +1486,12 @@ async def _match_by_own_ads(uid: int, offers: list[dict]) -> tuple[dict | None,
 
 
 async def _pos_probe(uid: int, idx: int, message=None) -> str:
-    """Read the page once and try to recognise our own row.
+    """Прочитать страницу один раз и попробовать узнать в ней свою строку.
 
-    Done at the moment the page is added, because a watch that cannot find its
-    listing is useless and the seller should learn that now — not from silence
-    a week later. The matched title is remembered: it is what tells two
-    listings of the same shop apart on later checks.
+    Делается в момент добавления страницы: слежение, не находящее свой товар,
+    бесполезно, и узнать об этом продавец должен сейчас, а не из тишины через
+    неделю. Совпавшее название запоминается — именно оно отличает два товара
+    одного магазина при следующих проверках.
     """
     import asyncio
 
@@ -1522,9 +1524,9 @@ async def _pos_probe(uid: int, idx: int, message=None) -> str:
     offers = res["offers"]
     mine = find_position(offers, seller=shop) if shop else None
     if not mine:
-        # The listing may not name the seller at all. Our own ad ids do
-        # identify us, and the marketplace hands them over for the asking —
-        # a surer match than a shop name, and free of guesswork.
+        # Выдача может не называть продавца вовсе. А номера наших объявлений
+        # опознают нас точно, и маркетплейс отдаёт их по первому запросу —
+        # совпадение надёжнее названия магазина и свободно от догадок.
         mine, ad_ids = await _match_by_own_ads(uid, offers)
         if not mine:
             seen = ", ".join(dict.fromkeys(
@@ -1536,9 +1538,9 @@ async def _pos_probe(uid: int, idx: int, message=None) -> str:
                     f"Если товар лежит глубже — пришлите адрес с фильтром, "
                     f"который его сужает, иначе бот дочитывает не весь список.")
     w["title"] = mine["title"] or w.get("title") or ""
-    # The storefront id, kept for finding this row again — NOT the panel id the
-    # paid action needs. Those are different numbers, and binding the listing
-    # in the panel is a separate, deliberate step.
+    # Номер витрины, сохранённый ради повторного поиска этой строки, — НЕ
+    # номер панели, который нужен платному действию. Это разные числа, и
+    # привязка товара в панели — отдельный, осознанный шаг.
     if mine.get("id"):
         w["market_id"] = str(mine["id"])
     w["last_pos"] = int(mine["pos"])
@@ -1634,7 +1636,7 @@ def _watch_kb(s: dict, idx: int) -> InlineKeyboardMarkup:
 
 
 def _watch_at(uid: int, data: str) -> tuple[dict, dict, list, int] | None:
-    """(settings, pp, watches, idx) for a `pos:xx:<idx>` callback, or None."""
+    """(настройки, pp, слежения, номер) для кнопки `pos:xx:<номер>`, либо None."""
     from automation.position import watches
     try:
         idx = int(str(data).split(":")[-1])
@@ -1681,7 +1683,7 @@ async def pos_watch_delete(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("pos:wc:"))
 async def pos_watch_check(callback: CallbackQuery) -> None:
-    """Read this watch's page right now. Reads only — spends nothing."""
+    """Прочитать страницу этого слежения прямо сейчас. Только чтение, без трат."""
     got = _watch_at(callback.from_user.id, callback.data)
     if not got:
         await callback.answer("Наблюдение не найдено", show_alert=True)
@@ -1696,7 +1698,7 @@ async def pos_watch_check(callback: CallbackQuery) -> None:
 
 
 async def _pos_report(uid: int, idx: int) -> str:
-    """The standings on one watched page, as the seller sees them."""
+    """Расстановка на одной отслеживаемой странице — так, как её видит продавец."""
     import asyncio
 
     from automation.market import cheapest, fetch_listing, find_position
@@ -1725,8 +1727,8 @@ async def _pos_report(uid: int, idx: int) -> str:
     mine = find_position(offers, ad_id=str(w.get("market_id") or ""),
                          title=str(w.get("title") or ""), seller=shop)
     if not mine:
-        # The shop name is not the only handle we have on our own row, and it
-        # is the weaker one — our ad ids come from the marketplace itself.
+        # Название магазина — не единственная зацепка за собственную строку и не
+        # самая надёжная: номера наших объявлений приходят от самого маркетплейса.
         mine, _ids = await _match_by_own_ads(uid, offers)
     thr = int(w.get("max_position") or 3)
     scope = f"<b>{len(offers)}</b>" + (f" из {total}" if total else "")
@@ -1746,8 +1748,8 @@ async def _pos_report(uid: int, idx: int) -> str:
         if mine["price"]:
             lines.append(f"Ваша цена: <b>{float(mine['price']):.0f} ₽</b>")
     elif res.get("complete"):
-        # The whole listing was read and we are not in it — that is a fact
-        # about the listing, not about how far the bot got.
+        # Выдача прочитана целиком, и нас в ней нет — это факт о выдаче, а не о
+        # том, докуда добрался бот.
         lines.append(f"❔ Вашего товара нет в этом списке целиком "
                      f"(магазин «{_esc(shop) or '—'}»). Проверьте, что адрес "
                      f"ведёт в ту же категорию и с тем же поиском, где товар "
@@ -1797,14 +1799,14 @@ async def pos_check_all(callback: CallbackQuery) -> None:
                     _pos_kb(s))
 
 
-# --- binding a watch to a panel listing ------------------------------------
+# --- привязка слежения к товару в панели -----------------------------------
 
 @router.callback_query(F.data.startswith("pos:wi:"))
 async def pos_watch_item(callback: CallbackQuery) -> None:
-    """Pick which panel listing this watch promotes.
+    """Выбрать, какой товар панели поднимает это слежение.
 
-    Without it the trigger can detect a slip and do nothing about it: the panel
-    action is per-listing, and the storefront id is not the panel id.
+    Без этого триггер умеет заметить падение и не умеет ничего с ним сделать:
+    действие панели работает по одному товару, а номер витрины — не номер панели.
     """
     import asyncio
 
@@ -2084,7 +2086,7 @@ async def pos_price_save(message: Message, state: FSMContext) -> None:
     await message.answer(_watch_text(s, idx), reply_markup=_watch_kb(s, idx))
 
 
-# --- shop-wide settings ----------------------------------------------------
+# --- настройки на весь магазин ---------------------------------------------
 
 @router.callback_query(F.data == "pos:interval")
 async def pos_interval_start(callback: CallbackQuery, state: FSMContext) -> None:
@@ -2228,13 +2230,13 @@ async def pos_budget_save(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tariff picker for the paid «Премиум» action
+# Выбор тарифа для платного действия «Премиум»
 #
-# The action refuses to run without up_id (service), parameter_id (duration,
-# 19/49/89 ₽) and system_id (payment method — СБП, cards, crypto, some with a
-# commission). None of that can be guessed: each combination costs a different
-# amount and charges a different account, so the options are read from the
-# panel and chosen here once, then reused by every promotion.
+# Действие отказывается работать без up_id (услуга), parameter_id (срок,
+# 19/49/89 ₽) и system_id (способ оплаты — СБП, карты, крипта, часть с
+# комиссией). Угадать здесь нельзя ничего: каждое сочетание стоит разных денег
+# и списывает с разных счетов, поэтому варианты читаются из панели и
+# выбираются здесь один раз, а дальше используются каждым продвижением.
 # ---------------------------------------------------------------------------
 
 async def _load_promo_spec(uid: int) -> tuple[bool, object]:
@@ -2270,10 +2272,10 @@ def _promo_step_kb(spec: dict, step: int) -> InlineKeyboardMarkup:
 
 async def _promo_step(user_id: int, send, state: FSMContext,
                       spec: dict, step: int, picked: dict) -> None:
-    """Show the next field that still needs a choice, or save the tariff.
+    """Показать следующее поле, которому не хватает выбора, — или сохранить тариф.
 
-    `send(text, reply_markup=None)` delivers each step, so the same walk works
-    whether it was reached by a button or by a typed value.
+    Каждый шаг доставляется через `send(текст, reply_markup=None)`, поэтому
+    один и тот же обход работает и когда пришли кнопкой, и когда ввели значение.
     """
     import asyncio
 
@@ -2286,8 +2288,8 @@ async def _promo_step(user_id: int, send, state: FSMContext,
         opts = f["options"]
 
         if not opts and f.get("lookup"):
-            # A dependent field only gets its options once the choices it
-            # depends on are known, so this is asked for here, not up front.
+            # Зависимое поле получает свои варианты только после того, как известно
+            # то, от чего оно зависит, — поэтому спрашивается здесь, а не заранее.
             creds = get_panel_creds(user_id) or {}
             chosen = {k: v["value"] for k, v in picked.items()}
             await send(f"⏳ Узнаю варианты для «{f['label']}»...")
@@ -2301,7 +2303,7 @@ async def _promo_step(user_id: int, send, state: FSMContext,
             f["trace"] = trace
 
         if len(opts) == 1:
-            # One possibility is not a choice — take it and move on
+            # Одна возможность — это не выбор: берём её и идём дальше
             picked[f["attribute"]] = {"value": opts[0]["value"],
                                       "label": opts[0]["label"],
                                       "price": opts[0].get("price", 0)}
@@ -2312,8 +2314,8 @@ async def _promo_step(user_id: int, send, state: FSMContext,
                                 promo_step=step)
 
         if not opts:
-            # Never skip an option-less field: the panel validates it anyway,
-            # and skipping it is exactly what made promotion fail with 422.
+            # Поле без вариантов не пропускаем никогда: панель всё равно его
+            # проверяет, и именно пропуск был причиной отказа 422 в продвижении.
             await state.set_state(SeleniumState.waiting_promo_value)
             info = _esc(f"{f.get('shape') or ''} | {f.get('trace') or ''}")
             b = InlineKeyboardBuilder()
@@ -2366,10 +2368,10 @@ def _msg_send(message: Message):
 
 
 # ---------------------------------------------------------------------------
-# Which listings to promote
+# Какие товары поднимать
 #
-# Promotion is charged per listing, so "promote everything" is the expensive
-# default. Picking positions is what makes a budget last.
+# Поднятие платное за каждый товар, поэтому «поднимать всё» — самый дорогой
+# вариант по умолчанию. Бюджета хватает надолго именно от выбора позиций.
 # ---------------------------------------------------------------------------
 
 _ITEMS_CACHE: dict[int, list] = {}
@@ -2466,8 +2468,11 @@ async def promo_item_toggle(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "promo:it_all")
 async def promo_item_all(callback: CallbackQuery) -> None:
-    """Empty selection means everything — clearer than storing every id, and it
-    keeps working when new listings appear."""
+    """Пустой выбор означает «все».
+
+    Это яснее, чем хранить перечень всех номеров, и продолжает работать, когда
+    появляются новые товары.
+    """
     uid = callback.from_user.id
     s = get_settings(uid)
     s.setdefault("auto_bump", {})["only_items"] = []
@@ -2478,8 +2483,11 @@ async def promo_item_all(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "promo:it_none")
 async def promo_item_none(callback: CallbackQuery) -> None:
-    """Deselect all: pick nothing, which is 'all' — so this offers the safer
-    reading, one item, rather than silently meaning the whole shop."""
+    """Снять выбор со всех.
+
+    «Не выбрано ничего» — это и есть «все», поэтому здесь предлагается более
+    безопасное прочтение: один товар, а не молчаливо весь магазин.
+    """
     uid = callback.from_user.id
     items = _ITEMS_CACHE.get(uid) or []
     s = get_settings(uid)
@@ -2529,8 +2537,8 @@ async def promo_pick(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(SeleniumState.waiting_promo_value)
 async def promo_manual_value(message: Message, state: FSMContext) -> None:
-    """Take a value the seller read off the panel for a field Nova would not
-    describe, then carry on with the remaining steps."""
+    """Принять значение, которое продавец списал с панели для поля, что Nova
+    описывать отказалась, и пойти дальше по оставшимся шагам."""
     raw = (message.text or "").strip()
     if not raw:
         await message.answer("❌ Пришлите значение поля")
@@ -2556,7 +2564,7 @@ async def bump_menu(callback: CallbackQuery, state: FSMContext,
                     api: YooMarketAPI) -> None:
     await state.clear()
     s = get_settings(callback.from_user.id)
-    # What this will cost is the first thing worth knowing here
+    # Сколько это будет стоить — первое, что здесь стоит знать
     _can_pay, _covers, money = await promo_afford(api, s)
     tail = f"\n\n💸 {money[0].upper()}{money[1:]}." if money else ""
     await callback.message.edit_text(_bump_text(s) + tail,
@@ -2603,7 +2611,7 @@ async def bump_save_interval(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "selenium:run:bump")
 async def run_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    """Ask first — promoting every listing spends money on each one."""
+    """Сперва спросить: поднять все товары — значит заплатить за каждый."""
     s = get_settings(callback.from_user.id)
     if not promo_params(s):
         b = InlineKeyboardBuilder()
@@ -2659,8 +2667,8 @@ async def run_bump_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None
     await callback.answer("⏳ Продвигаю объявления...", show_alert=False)
     await callback.message.edit_text("⏳ Продвигаю объявления через панель...")
     try:
-        # Whichever runs out first — the daily ceiling or the balance — decides
-        # how many listings this run pays for.
+        # Что кончится раньше — дневной потолок или баланс, — то и решает,
+        # за сколько товаров заплатит этот проход.
         caps = [c for c in (promo_limit(s), covers) if c]
         loop = asyncio.get_event_loop()
         count, msg = await asyncio.wait_for(
@@ -2697,19 +2705,20 @@ def _restore_text(s: dict, creds=None, uid: int | None = None) -> str:
     total = int(ar.get("restored_total", 0) or 0)
     held = len([f for f in (ar.get("failures") or {}).values()
                 if float(f.get("until", 0) or 0) > _time.time()])
-    # The build stamp lives here on purpose: several rounds were spent reading
-    # output from a container that had not been rebuilt, and a screenshot that
-    # names its own build settles that in one glance.
+    # Метка сборки стоит здесь намеренно: несколько кругов ушло на чтение
+    # вывода из контейнера, который не пересобрался, а снимок экрана,
+    # называющий свою сборку, снимает этот вопрос с одного взгляда.
     from handlers.start import BOT_VERSION
     lines = [f"🔄 <b>Авто-восстановление</b>  <code>{BOT_VERSION}</code>\n"]
     if uid is not None:
-        # Which shop this acts on. Adding an account is not switching to it,
-        # and a token from one shop paired with a panel from another is the
-        # failure mode that costs the most time to recognise.
+        # С каким магазином мы работаем. Добавить аккаунт — не то же самое, что
+        # переключиться на него, а токен от одного магазина в паре с панелью от
+        # другого — та поломка, на распознавание которой уходит больше всего времени.
         from storage import get_active_account, get_panel_creds, get_shop_name
         acc = get_active_account(uid)
-        # Both sides on one line: restore needs them to be the same shop, and
-        # showing only one half is what let them drift apart unnoticed.
+        # Обе стороны одной строкой: возврату в продажу нужно, чтобы магазин был
+        # один и тот же, а показ только одной половины и позволял им незаметно
+        # разъезжаться.
         panel_login = (get_panel_creds(uid) or {}).get("login") or "вход не выполнен"
         lines.append(f"🏪 {_esc(get_shop_name(uid) or '—')}"
                      + (f" «{_esc(acc)}»" if acc else "")
@@ -2729,8 +2738,9 @@ def _restore_text(s: dict, creds=None, uid: int | None = None) -> str:
         tail.append(f"⏸ отложено {held}")
     if tail:
         lines.append("  ·  ".join(tail))
-    # A barred status silences restore for every ad in it, so it cannot stay
-    # invisible: "поднято 0" with no explanation reads as a broken feature.
+    # Запрещённый статус глушит возврат для всех объявлений в нём, поэтому
+    # невидимым он быть не может: «поднято 0» без объяснения читается как
+    # сломанная функция.
     from tasks.manager import _barred_map
     barred = [st for st, until in _barred_map(ar).items() if until > _time.time()]
     if barred:
@@ -2761,9 +2771,9 @@ def _restore_kb(s: dict, creds=None) -> InlineKeyboardMarkup:
              callback_data="restore:instant")
     held = [f for f in (ar.get("failures") or {}).values()
             if float(f.get("until", 0) or 0) > _time.time()]
-    # A barred status holds ads back just as a per-ad wait does, and it used to
-    # hide the only button that lifts either — leaving no way out of a ban that
-    # silences the whole feature.
+    # Запрещённый статус держит объявления так же, как и пауза по каждому, и
+    # раньше он прятал единственную кнопку, снимающую и то и другое, — то есть
+    # из бана, глушащего всю функцию, выхода не было вовсе.
     from tasks.manager import _barred_map
     barred = [st for st, u in _barred_map(ar).items() if u > _time.time()]
     if held or barred:
@@ -2790,8 +2800,8 @@ async def restore_toggle(callback: CallbackQuery) -> None:
     uid = callback.from_user.id
     s = get_settings(callback.from_user.id)
     s["auto_restore"]["enabled"] = not s["auto_restore"].get("enabled", False)
-    # Turning it on should act promptly, not wait out an interval that already
-    # elapsed while it was off
+    # Включение должно сработать сразу, а не пережидать промежуток, который
+    # и так прошёл, пока функция была выключена
     if s["auto_restore"]["enabled"]:
         s["auto_restore"]["last_restore_run"] = 0
     save_settings(callback.from_user.id, s)
@@ -2860,7 +2870,7 @@ async def restore_save_interval(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "restore:held")
 async def restore_held(callback: CallbackQuery) -> None:
-    """Ads put aside after the marketplace refused them, and why."""
+    """Объявления, отложенные после отказа маркетплейса, и причины отказов."""
     s = get_settings(callback.from_user.id)
     ar = s.get("auto_restore", {})
     now = _time.time()
@@ -2874,8 +2884,9 @@ async def restore_held(callback: CallbackQuery) -> None:
     b.button(text="⬅️ Назад", callback_data="selenium:restore:menu")
     ui.lay(b)
 
-    # A barred status quietly skips every ad in it, so it has to be visible —
-    # otherwise a seller sees listings that never come back and no reason why.
+    # Запрещённый статус молча пропускает все объявления в нём, поэтому он
+    # обязан быть виден: иначе продавец видит товары, которые не возвращаются,
+    # и не видит ни одной причины.
     barred_block = ""
     if barred:
         barred_block = ("\n\n🚫 <b>Статусы, которые маркетплейс отказался "
@@ -2910,8 +2921,9 @@ async def restore_unhold(callback: CallbackQuery) -> None:
     s = get_settings(callback.from_user.id)
     ar = s.setdefault("auto_restore", {})
     ar["failures"] = {}
-    # Barred statuses are the broader half of the same hold, so clearing one
-    # without the other leaves the seller wondering why nothing changed.
+    # Запрещённые статусы — более широкая половина того же удержания, и снять
+    # одно без другого значит оставить продавца гадать, почему ничего не
+    # изменилось.
     ar["barred_until"] = {}
     ar.pop("barred_statuses", None)
     save_settings(callback.from_user.id, s)
@@ -2921,10 +2933,10 @@ async def restore_unhold(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "restore:preview")
 async def restore_preview(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    """Show what a run would touch, without touching anything.
+    """Показать, что затронул бы проход, ничего при этом не трогая.
 
-    Restoring publishes to a live marketplace, so being able to look before
-    acting is worth a button.
+    Возврат в продажу публикует на живой маркетплейс, поэтому возможность
+    посмотреть до того, как делать, стоит отдельной кнопки.
     """
     if not api:
         await callback.answer("⚠️ API токен не настроен", show_alert=True)
@@ -2997,18 +3009,18 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
         from handlers.panel_items import _deleted_ids
         from tasks.manager import _barred_map, _RESTORE_BARRED_TTL
         now = _time.time()
-        # A manual run is a deliberate retry, so a status barred earlier is
-        # given another chance here rather than skipped again.
+        # Ручной запуск — это осознанная повторная попытка, поэтому статусу,
+        # запрещённому раньше, здесь даётся ещё один шанс, а не отказ.
         barred_until = _barred_map(ar)
         rep = await api.restore_ads(
             require_stock=bool(ar.get("require_stock", True)),
             skip_ids=_deleted_ids(uid),
             skip_statuses=[])
 
-        # The same panel fallback the schedule uses. Without it, pressing
-        # «Запустить сейчас» reported incorrect_status and stopped there, while
-        # the automatic pass quietly recovered the very same listings — the
-        # manual button looked broken next to the feature that worked.
+        # Тот же запасной путь через панель, которым пользуется расписание. Без
+        # него «Запустить сейчас» отвечало `incorrect_status` и на этом
+        # останавливалось, а автоматический проход тихо возвращал те же самые
+        # товары: ручная кнопка выглядела сломанной рядом с работающей функцией.
         retryable = [r for r in rep["failed"]
                      if "incorrect_status" in str(r.get("reason", ""))]
         done = []
@@ -3019,14 +3031,15 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
             rep["failed"] = [r for r in rep["failed"]
                              if r not in retryable] + still
 
-        # A status the panel just published from is not barred, and a standing
-        # ban on it is lifted: the API refusing «unpublish» is exactly what the
-        # fallback is for, and barring it would silence restore for the one
-        # state it exists to handle.
-        # A pass that never got a verdict out of the panel — no login, or the
-        # listing not located there — says nothing about any status, so bans
-        # standing from one are dropped. Marked on the row rather than matched
-        # in its text: the text form let «в панели не нашёл этот товар» through.
+        # Статус, из которого панель только что опубликовала, не запрещён, и
+        # стоящий на нём запрет снимается: отказ API на «unpublish» — это ровно то,
+        # ради чего запасной путь и написан, и запрет на нём заглушил бы возврат в
+        # том единственном состоянии, ради которого он существует.
+        # Проход, так и не получивший от панели вердикта — не вошли, или товар там
+        # не нашёлся, — не говорит ни о каком статусе ничего, поэтому запреты,
+        # стоящие от него, снимаются. Отмечается это признаком в строке, а не
+        # поиском по её тексту: текстовая проверка пропускала «в панели не нашёл
+        # этот товар».
         if any(r.get("panel") in ("unreached", "not_found")
                for r in rep["failed"]):
             barred_until.clear()
@@ -3037,8 +3050,8 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
             reason = str(row.get("reason", ""))
             if "incorrect_status" not in reason:
                 continue
-            # Only the panel actually refusing the action is evidence about
-            # the status.
+            # Свидетельство о статусе — только настоящий отказ панели выполнить
+            # действие.
             if row.get("panel") != "refused":
                 continue
             st = str(row.get("status") or "").lower()
@@ -3048,7 +3061,8 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
         ar.pop("barred_statuses", None)
         ar["last_restore_run"] = _time.time()
         ar["restored_total"] = int(ar.get("restored_total", 0) or 0) + len(rep["restored"])
-        # A manual run is a deliberate retry: clear the waits it just resolved
+        # Ручной запуск — осознанная повторная попытка: снимаем паузы, которые
+        # он только что разрешил
         failures = ar.setdefault("failures", {})
         for row in rep["restored"]:
             failures.pop(str(row["id"]), None)
@@ -3098,7 +3112,7 @@ async def run_restore(callback: CallbackQuery, api: YooMarketAPI) -> None:
 # ---------------------------------------------------------------------------
 
 async def _panel_actions_for(uid: int, item_id) -> str:
-    """Read-only: which Nova actions the panel offers for this listing."""
+    """Только чтение: какие действия Nova панель предлагает для этого товара."""
     import asyncio
     from storage import get_panel_creds
     creds = get_panel_creds(uid)
@@ -3148,11 +3162,11 @@ async def withdraw_form(message: Message) -> None:
 
 @router.message(Command("panel_map"))
 async def panel_map(message: Message) -> None:
-    """Every panel resource, its size and sample names — read-only.
+    """Все разделы панели, их размер и примеры имён — только чтение.
 
-    Walking resources blind and reporting a truncated trace is how three runs
-    went by without locating the listings. This prints the whole census at
-    once, and marks the resource whose rows carry the name being looked for.
+    Обход разделов вслепую с отчётом из обрезанного следа — это то, как три
+    прохода прошли, так и не найдя товары. Здесь перепись печатается целиком, а
+    раздел, в строках которого нашлось искомое имя, отмечается.
     """
     import asyncio as _a
     import html as _html
@@ -3179,14 +3193,15 @@ async def panel_map(message: Message) -> None:
 
 @router.message(Command("restore_debug"))
 async def restore_debug(message: Message, api: YooMarketAPI) -> None:
-    """Print, for the listings restore wants to fix, exactly what the API says.
+    """Напечатать, что API говорит о товарах, которые возврат хочет починить.
 
-    A live run refused every candidate with incorrect_status while reporting
-    their status as «unpublish» — the state restore was built around. Rather
-    than guess what that state really means, this prints the raw list row, the
-    raw detail record and the stock verdict for each one, so the classification
-    can be corrected from the marketplace's own answer. Read-only: it publishes
-    nothing.
+    Живой проход отверг всех кандидатов с `incorrect_status`, показывая их
+    статус как «unpublish» — то самое состояние, вокруг которого возврат и
+    построен. Вместо того чтобы гадать, что это состояние значит на самом деле,
+    здесь печатается сырая строка списка, сырая карточка и вердикт по остатку
+    для каждого — чтобы разбор был исправлен по ответу самого маркетплейса.
+
+    Только чтение: не публикует ничего.
     """
     if not api:
         await message.answer("⚠️ Не настроен API-токен")
@@ -3235,8 +3250,8 @@ async def restore_debug(message: Message, api: YooMarketAPI) -> None:
                 lines.append(f"ОСТАТКИ: has={has} {note}")
             except Exception as e:
                 lines.append(f"ОСТАТКИ: ошибка {str(e)[:90]}")
-            # Does the panel know this id, and what can it do with it? This is
-            # what decides whether the panel fallback can work at all.
+            # Знает ли панель этот номер и что она умеет с ним сделать? От этого и
+            # зависит, может ли запасной путь через панель работать вообще.
             lines.append(f"ПАНЕЛЬ: {await _panel_actions_for(message.from_user.id, aid)}")
         report = "\n".join(lines)
     except Exception as e:
