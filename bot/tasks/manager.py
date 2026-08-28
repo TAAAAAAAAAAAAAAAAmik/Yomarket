@@ -18,26 +18,27 @@ from storage import get_token, get_settings, save_settings
 
 logger = logging.getLogger(__name__)
 
-# Selenium loop interval in seconds (check every 30 minutes)
+# Промежуток медленного цикла в секундах — проверка раз в полчаса
 _AUTO_LOOP_INTERVAL = 30 * 60
 
-# Scheduled promotions are evaluated in the fast 60s loop, so a slot normally
-# fires within a minute of its time. This catch-up window lets a slot still run
-# if the bot was briefly down at that minute, without replaying long-stale slots
-# (e.g. after the bot was off all morning) on the next start.
+# Продвижение по расписанию считается в быстром проходе (60 с), поэтому слот
+# обычно срабатывает в течение минуты от своего времени. Это окно-догонялка
+# позволяет слоту всё же отработать, если бот в ту минуту ненадолго лежал, — и
+# при этом не переигрывать давно протухшие слоты (например, когда бот был
+# выключен всё утро) при следующем запуске.
 _BUMP_CATCHUP_SECONDS = 2 * 3600
 
-# How many listings one restore pass will act on. Each candidate costs a stock
-# check plus a publish, run one after another while the per-user lock is held —
-# and the 60s orders loop needs that same lock. A shop with a few hundred ads
-# down would otherwise stall order notifications for minutes. A backlog is
-# drained over consecutive passes instead.
+# Сколько товаров затрагивает один проход возврата в продажу. Каждый кандидат
+# стоит проверки остатка плюс публикации, идущих друг за другом под замком
+# продавца, — а тот же замок нужен шестидесятисекундному проходу по заказам.
+# Магазин с парой сотен снятых объявлений иначе останавливал бы уведомления о
+# заказах на минуты. Накопившееся разбирается за несколько проходов подряд.
 _RESTORE_MAX_PER_PASS = 40
 
-# A status the marketplace refused with incorrect_status is skipped, but not
-# forever: the ban is inferred from one ad's answer and applied to every ad in
-# that state, so it is re-tested after a week in case it was transient or the
-# marketplace changed its mind.
+# Статус, на котором маркетплейс ответил `incorrect_status`, пропускается — но
+# не навсегда: запрет выведен из ответа по одному объявлению и применён ко всем
+# в этом состоянии, поэтому через неделю он пробуется заново, вдруг это было
+# временно или маркетплейс передумал.
 _RESTORE_BARRED_TTL = 7 * 86400
 
 # Догоняющее автопринятие: заказ уже лежит оплаченным, а в работу не взят.
@@ -98,11 +99,11 @@ async def shop_balance(user_id: int, api,
 
 
 def _barred_map(ar: dict) -> dict:
-    """{status: expiry} of statuses restore should skip.
+    """{статус: до какого времени} — статусы, которые возврат в продажу пропускает.
 
-    Accepts the older plain-list form, which carried no expiry, and dates it
-    from now so an existing install starts re-testing instead of skipping those
-    statuses forever.
+    Принимает и прежнюю форму простым списком, в которой срока не было, и
+    датирует её от сегодня: иначе уже поставленный бот пропускал бы эти статусы
+    вечно, вместо того чтобы пробовать их заново.
     """
     raw = ar.get("barred_until")
     if isinstance(raw, dict):
@@ -236,11 +237,11 @@ def _msg_rows(data) -> list[dict]:
 
 
 def _newest_id(rows: list[dict]) -> str:
-    """The largest message id present.
+    """Наибольший номер сообщения из имеющихся.
 
-    Taking rows[-1] assumed the API sorts oldest-first. If it sorts the other
-    way round, that is the OLDEST message, "is there anything newer" is false
-    forever, and no notification is ever sent.
+    `rows[-1]` предполагает, что API сортирует от старых к новым. Если он
+    сортирует наоборот, это САМОЕ СТАРОЕ сообщение, ответ на «есть ли что
+    новее» становится «нет» навсегда, и уведомление не приходит никогда.
     """
     best = ""
     for m in rows:
@@ -426,10 +427,10 @@ _NOT_A_USERNAME = frozenset({
 
 
 def _extract_username(text: str) -> str:
-    """Pull a Telegram @username out of free-form buyer text."""
+    """Вытащить телеграмовский @ник из вольного текста покупателя."""
     if not text:
         return ""
-    # Prefer an explicit @mention
+    # Явное упоминание через @ предпочтительнее
     for m in re.finditer(r"@([a-zA-Z][a-zA-Z0-9_]{3,31})", text):
         if m.group(1).lower() not in _NOT_A_USERNAME:
             return m.group(1)
@@ -458,7 +459,7 @@ def _is_complaint_text(text: str) -> bool:
 
 
 def _order_field(order: dict, *keys, default=None):
-    """First non-empty value among keys (supports nested buyer.*)."""
+    """Первое непустое значение среди ключей; понимает вложенные вида buyer.*."""
     for k in keys:
         if "." in k:
             a, b = k.split(".", 1)
@@ -472,7 +473,7 @@ def _order_field(order: dict, *keys, default=None):
 
 
 def _order_username(order: dict) -> str:
-    """Buyer @username / contact if the API exposes it."""
+    """@ник или контакт покупателя, если API вообще его отдаёт."""
     u = _order_field(order, "buyer_username", "username", "buyer.username",
                      "buyer.login", "contact", "buyer.contact")
     if not u:
@@ -489,9 +490,9 @@ from orderfields import (BACK as _BACK_STATUSES, DONE as _DONE_STATUSES,
                          status_ru as _status_ru)
 
 
-# Windowed order figures used to live here. They now come from stats_source,
-# which reads the panel's ledger and falls back to this same local history, so
-# the report and the «Статистика» screen cannot disagree about a day.
+# Здесь жили заказы, посчитанные за отрезок времени. Теперь они приходят из
+# stats_source, который читает журнал панели, а запасным путём — эту же
+# локальную историю: отчёт и экран «Статистика» не могут разойтись в дне.
 
 
 # Сколько чатов заказов опрашивать за проход. Каждый — отдельный запрос, но
@@ -689,10 +690,10 @@ def _ar_log(settings: dict, chat_id: str, text: str, ok: bool, err: str,
 
 def _today_stats(order_details: dict, known_orders: dict,
                  settings: dict | None = None) -> tuple[int, int]:
-    """(orders today, revenue today ₽) from locally tracked order details.
+    """(заказов за сегодня, выручка за сегодня ₽) по локально сохранённым карточкам.
 
-    Kept for the new-purchase notification's running tally, which counts every
-    order taken today, not only completed ones.
+    Оставлено ради бегущего счётчика в уведомлении о покупке: он считает все
+    взятые сегодня заказы, а не только завершённые.
     """
     now = time.time()
     from stats_source import day_start as _day_start
@@ -740,15 +741,18 @@ from ui import RULE as _RULE  # noqa: E402
 
 
 def _esc(text) -> str:
-    """Notifications are sent with HTML parsing, so anything typed by a buyer or
-    by support — a '<' in a message, an angle bracket in a title — would make
-    Telegram reject the send and the notification would never arrive."""
+    """Экранирование чужого текста для уведомления.
+
+    Уведомления уходят с разбором HTML, поэтому что угодно, набранное
+    покупателем или поддержкой, — «<» в письме, угловая скобка в названии —
+    заставило бы Telegram отвергнуть отправку, и уведомление не пришло бы вовсе.
+    """
     return (str(text or "").replace("&", "&amp;")
             .replace("<", "&lt;").replace(">", "&gt;"))
 
 
 def _money(value) -> str:
-    """1234567 -> '1 234 567' — a thin space every three digits."""
+    """1234567 → «1 234 567»: тонкий пробел через каждые три цифры."""
     try:
         return f"{int(float(str(value).replace(' ', '').replace(',', '.'))):,}".replace(",", " ")
     except (TypeError, ValueError):
@@ -756,7 +760,7 @@ def _money(value) -> str:
 
 
 def _watch_name(w: dict) -> str:
-    """What to call a watched listing in a notification."""
+    """Как назвать отслеживаемый товар в уведомлении."""
     title = str(w.get("title") or "").strip()
     if title:
         return title[:40]
@@ -864,7 +868,7 @@ def _stars_failure_hint(result) -> str:
 
 def _order_notify_kb(order_id: str, chat_id: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    # Quick actions straight from the notification (no need to open the order).
+    # Быстрые действия прямо из уведомления, не открывая заказ.
     #
     # Кнопки «В работу» здесь нет намеренно. Что делает POST /orders/{id}/work
     # на этом маркетплейсе, до конца не выяснено: на тестовом заказе покупатель
@@ -890,9 +894,12 @@ def _balance_notify_kb() -> InlineKeyboardMarkup:
 
 
 def _watched_notify_kb(chat_id: str) -> InlineKeyboardMarkup:
-    """For a support/moderation message: the marketplace API refuses a reply
-    (no active order), so answering goes through the panel chat token in-bot,
-    with a link to the panel as a fallback."""
+    """Кнопки под письмом из поддержки или модерации.
+
+    API маркетплейса отвечать туда не даёт — активного заказа нет, — поэтому
+    ответ идёт чат-токеном панели прямо из бота, а ссылка на панель оставлена
+    как запасной путь.
+    """
     digits = "".join(ch for ch in str(chat_id) if ch.isdigit()) or str(chat_id)
     builder = InlineKeyboardBuilder()
     builder.button(text="✉️ Ответить", callback_data=f"sreply:{chat_id}")
@@ -915,7 +922,7 @@ def _message_notify_kb(chat_id: str, order_id: str = "") -> InlineKeyboardMarkup
     builder.button(text="✉️ Ответить", callback_data=f"reply_init:{chat_id}")
     builder.button(text="💬 Открыть чат", callback_data=f"chat:{chat_id}:")
     if order_id:
-        # Most replies are followed by acting on the order, so keep those here
+        # После ответа обычно что-то делают с заказом — держим действия рядом
         builder.button(text="✅ Подтвердить",
                        callback_data=f"order:{order_id}:confirm")
         builder.adjust(2, 1)
@@ -965,23 +972,23 @@ async def panel_republish(user_id: int, rows: list[dict]
                                   panel_publish_item_sync)
     loop = asyncio.get_event_loop()
 
-    # The two systems number the same listing differently, and not every
-    # listing lives in the panel's `items` resource — an id from the API
-    # answered 404 there. Find each one by title across the panel's own lists,
-    # then act on the resource that actually holds it.
+    # Две системы нумеруют один и тот же товар по-разному, и не всякий товар
+    # живёт в разделе `items` панели: номер из API отвечал там 404. Ищем каждый
+    # по названию по собственным спискам панели, а потом работаем с тем
+    # разделом, в котором он на самом деле лежит.
     found, trace = await loop.run_in_executor(
         None, panel_find_listing_sync, creds["cookies"],
         [r.get("title") for r in rows])
 
-    # Nothing matched at all, while the panel clearly holds listings: that is
-    # not a naming quirk but the panel being logged into a different shop than
-    # the API token belongs to. Said plainly, because no amount of matching can
-    # fix an account mismatch — and it is the same cause behind the panel
-    # answering "нет прав" to promotion.
-    # Deliberately not concluding "different shops" from an empty result: this
-    # panel keeps listings in more than one resource, so failing to find them
-    # means the search missed, not that the shop is wrong. That inference cost
-    # several rounds chasing a configuration that was correct all along.
+    # Не совпало вообще ничего, притом что товары в панели явно есть: это не
+    # причуда именования, а панель, вошедшая в ДРУГОЙ магазин, не тот, которому
+    # принадлежит токен API. Говорим прямо, потому что несовпадение аккаунтов
+    # никаким сопоставлением не чинится — и оно же стоит за ответом панели
+    # «нет прав» на продвижение.
+    # Вывод «магазины разные» из пустого результата намеренно НЕ делается: эта
+    # панель держит товары не в одном разделе, поэтому «не нашли» означает
+    # промах поиска, а не неверный магазин. Такой вывод однажды стоил
+    # нескольких кругов погони за настройкой, которая всё это время была верной.
     mismatch = False
     done, failed = [], []
     for row in rows:
@@ -990,8 +997,8 @@ async def panel_republish(user_id: int, rows: list[dict]
             note = (f" · ⚠️ панель и токен — разные магазины ({_shop_label(user_id)})"
                     if mismatch else
                     f" · в панели не нашёл этот товар (искал: {trace})")
-            # Not found is a verdict on where the listing is, not on its
-            # status — marked so, so it cannot bar anything.
+            # «Не найден» — это вердикт о том, где лежит товар, а не о его
+            # статусе: помечаем именно так, чтобы он ничего не мог запретить.
             failed.append({**row, "panel": "not_found",
                            "reason": f"{row.get('reason', '')}{note}"})
             continue
@@ -1007,8 +1014,8 @@ async def panel_republish(user_id: int, rows: list[dict]
         if ok:
             done.append(row)
         else:
-            # The panel's own markup is stripped: the reason is escaped
-            # downstream, so its tags would reach the seller as literal <code>.
+            # Собственная разметка панели снимается: причина экранируется дальше по
+            # пути, и её теги дошли бы до продавца буквальным текстом <code>.
             plain = re.sub(r"<[^>]+>", "", str(msg)).replace("\n", " ")
             failed.append({**row, "panel": "refused",
                            "reason": f"{row.get('reason', '')} · панель "
@@ -1017,17 +1024,18 @@ async def panel_republish(user_id: int, rows: list[dict]
 
 
 def _title_key(title) -> str:
-    """A title reduced to what both systems agree on: letters and digits.
+    """Название, сведённое к тому, в чём обе системы согласны: буквы и цифры.
 
-    Titles carry emoji, pipes and spacing that differ between the API and the
-    panel, so comparing them raw finds nothing.
+    В названиях есть эмодзи, палки и пробелы, и расставлены они в API и в
+    панели по-разному, — сравнение как есть не находит ничего.
     """
     return re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", "", str(title or "")).lower()
 
 
 def _match_panel_id(title, by_title: dict) -> str:
-    """The panel id for a listing title: exact first, then a containment match
-    for the truncation and decoration the two lists apply differently."""
+    """Номер в панели по названию товара: сперва точное совпадение, потом
+    вхождение — из-за обрезки и украшений, которые оба списка накладывают
+    по-своему."""
     key = _title_key(title)
     if not key:
         return ""
@@ -1067,10 +1075,11 @@ class TaskManager:
         # Подобранный темп опроса чатов, по продавцу. Начинается с пола и
         # отступает, только если маркетплейс сам попросит (см. `_pace_chats`).
         self._chat_pace: dict[int, float] = {}
-        # Per-user lock: the orders loop (60s) and the auto-tasks loop (30min)
-        # both load→mutate→save the whole settings blob. Without serializing
-        # them, whichever saves last silently clobbers the other's changes
-        # (e.g. AutoStars pending / known_orders vs bump_schedule.last_runs).
+        # Замок на продавца: проход по заказам (60 с) и проход авто-функций
+        # (30 мин) оба читают, правят и сохраняют весь словарь настроек целиком.
+        # Без выстраивания их в очередь тот, кто сохранит последним, молча затрёт
+        # правки другого — например, очередь AutoStars и known_orders против
+        # bump_schedule.last_runs.
         self._locks: dict[int, asyncio.Lock] = {}
         # Каталог AppRoute на пару минут: он отдаётся ОДНИМ ответом на 1263
         # услуги, а читался заново под каждый заказ. Два оплаченных заказа
@@ -1093,7 +1102,7 @@ class TaskManager:
         if user_id in self._chat_tasks and not self._chat_tasks[user_id].done():
             self._chat_tasks[user_id].cancel()
         self._chat_tasks[user_id] = asyncio.create_task(self._chat_loop(user_id))
-        # Also start the auto-features loop
+        # Заодно запускаем цикл авто-функций
         if user_id in self._auto_tasks and not self._auto_tasks[user_id].done():
             self._auto_tasks[user_id].cancel()
         self._auto_tasks[user_id] = asyncio.create_task(self._auto_loop(user_id))
@@ -1208,14 +1217,14 @@ class TaskManager:
             await self._maybe_bump_schedule(user_id, settings)
 
     async def _maybe_bump_schedule(self, user_id: int, settings: dict) -> None:
-        """Fire scheduled promotions at their configured times.
+        """Запускать продвижение по расписанию в назначенные часы.
 
-        Runs in the fast (60s) loop. In the auto loop this was evaluated every
-        30 minutes against a 35-minute window — two periods so close that any
-        drift in that loop (a slow panel call, a restart) pushed the tick past
-        the window and the slot was silently dropped for the whole day. Here a
-        slot fires within a minute of its time, and a catch-up window covers
-        brief downtime instead of losing the run.
+        Идёт в быстром проходе (60 с). В медленном цикле это считалось раз в
+        30 минут против окна в 35 минут — два срока настолько близких, что любой
+        сдвиг того цикла (медленный вызов панели, перезапуск) уводил проход за
+        окно, и слот молча пропадал на весь день. Здесь слот срабатывает в течение
+        минуты от своего времени, а окно-догонялка покрывает короткий простой
+        вместо того, чтобы терять запуск.
         """
         bs = settings.get("bump_schedule", {})
         if not (bs.get("enabled") and bs.get("times")):
@@ -1234,8 +1243,8 @@ class TaskManager:
             bs["spent_today"] = 0.0
             dirty = True
 
-        # Run-markers are keyed "{date}_{slot}"; drop previous days' so the
-        # settings blob doesn't grow without bound.
+        # Отметки о запусках лежат под ключом «{дата}_{слот}»; вчерашние
+        # выбрасываем, иначе словарь настроек растёт без предела.
         stale = [k for k in last_runs if not k.startswith(f"{today_str}_")]
         if stale:
             for k in stale:
@@ -1264,8 +1273,8 @@ class TaskManager:
         ceiling = float(bs.get("daily_ceiling", 0) or 0)
         spent_today = float(bs.get("spent_today", 0) or 0)
 
-        # Ceiling already reached: mark the due slots handled so this stops
-        # being re-checked every minute, and say so once.
+        # Потолок уже выбран: помечаем наступившие слоты обработанными, чтобы
+        # это перестало перепроверяться каждую минуту, и говорим об этом один раз.
         if ceiling > 0 and price_per_bump > 0 and spent_today >= ceiling:
             for slot in due:
                 last_runs[f"{today_str}_{slot}"] = now_dt.isoformat()
@@ -1277,8 +1286,8 @@ class TaskManager:
             )
             return
 
-        # One run promotes every listing, so slots that came due together
-        # (after downtime) collapse into a single pass — never paying twice.
+        # Один запуск поднимает все товары, поэтому слоты, наступившие вместе
+        # (после простоя), схлопываются в один проход — платим не дважды.
         try:
             count, msg = await self._panel_bump(user_id)
         except Exception as e:
@@ -1317,13 +1326,13 @@ class TaskManager:
             blacklist: list = settings.get("blacklist", [])
             reminded: list = settings.setdefault("reminded_orders", [])
 
-            # First-run baseline: on the very first pass (fresh DB / new account)
-            # record existing orders SILENTLY — otherwise every old order would
-            # be treated as "new" and spam a notification. Only orders that
-            # appear AFTER initialization trigger alerts/auto-actions.
+            # Первый проход: на самом первом заходе (чистая база, новый аккаунт)
+            # уже имеющиеся заказы записываются МОЛЧА — иначе каждый старый заказ
+            # сочли бы новым и завалили бы продавца уведомлениями. Тревоги и
+            # автодействия достаются только заказам, появившимся ПОСЛЕ этого.
             initialized = settings.get("orders_initialized", False)
 
-            # Listings that just sold, for the instant put-back-on-sale below.
+            # Товары, которые только что продались, — для мгновенного возврата ниже.
             sold_now = False
             sold_ads: set[str] = set()
 
@@ -1440,12 +1449,12 @@ class TaskManager:
                     "work_result": prev_det.get("work_result", ""),
                 }
 
-                # If order moved to a terminal/changed status, clear its reminder record
+                # Заказ ушёл в конечный или изменившийся статус — снимаем напоминание
                 if prev_status is not None and prev_status != status:
                     if oid in reminded:
                         reminded.remove(oid)
 
-                # Complaint/dispute status → high-priority alert
+                # Статус жалобы или спора — тревога с высоким приоритетом
                 cn = settings.get("complaint_notify", {"enabled": True})
                 if (initialized and cn.get("enabled", True) and prev_status != status
                         and any(cs in str(status).lower() for cs in _COMPLAINT_STATUSES)):
@@ -1471,14 +1480,14 @@ class TaskManager:
                 is_blacklisted = buyer in blacklist
 
                 if prev_status is None and not initialized:
-                    # baseline pass: record silently, no notify / no auto-actions
+                    # первый проход: записываем молча, без уведомлений и автодействий
                     known[oid] = status
                     continue
 
                 if prev_status is None:
-                    # A sale is the moment the listing may have gone off sale —
-                    # note it so it can be put back up right now instead of
-                    # waiting out the restore interval.
+                    # Продажа — тот момент, когда товар мог уйти из продажи: помечаем,
+                    # чтобы вернуть его прямо сейчас, а не пережидать промежуток между
+                    # проходами возврата.
                     sold_now = True
                     sold_ad = _order_field(order, "ad_id", "product_id",
                                            "item_id", "listing_id",
@@ -1486,8 +1495,8 @@ class TaskManager:
                     if sold_ad:
                         sold_ads.add(str(sold_ad))
 
-                    # Auto-accept: press "начать заказ" so the order does not
-                    # sit unaccepted (an unaccepted order the buyer can cancel).
+                    # Автопринятие: жмём «начать заказ», чтобы он не висел непринятым —
+                    # непринятый заказ покупатель может отменить.
                     accepted, real = await self._maybe_accept_order(
                         user_id, api, settings, oid, status, order_details)
                     if accepted:
@@ -1535,7 +1544,7 @@ class TaskManager:
                             _ar_context(order_details.get(oid), oid, settings))
                         ok, err = await self._send_chat(api, chat_id, msg, settings)
                         _ar_log(settings, chat_id, msg, ok, err, "новый заказ")
-                    # AutoStars: ask the buyer for their @username in chat
+                    # AutoStars: спрашиваем у покупателя @ник прямо в чате
                     await self._maybe_ask_stars_username(
                         api, settings, oid, title, chat_id, status)
                     # Гифт-карты, и Robux среди них: спрашивать нечего,
@@ -1670,18 +1679,18 @@ class TaskManager:
 
     async def _check_watched_chats(self, user_id: int, api: YooMarketAPI,
                                    settings: dict) -> None:
-        """Poll chats that belong to no order — support, moderation.
+        """Опрос чатов, не принадлежащих ни одному заказу, — поддержка, модерация.
 
-        The API cannot list chats, only read one by id, so these are the ids the
-        seller added by hand. Without this, support messages never reach the bot
-        at all: order polling has nothing to find them by.
+        Списка чатов API не отдаёт, только чтение одного по номеру, поэтому здесь
+        те номера, которые продавец добавил руками. Без этого письма из поддержки
+        не доходят до бота вообще: опросу заказов их не по чему найти.
         """
         watched: dict = settings.get("watched_chats") or {}
         if not watched:
             return
-        # Support and moderation are chat traffic too — the same switch covers
-        # them, but their position is still tracked so nothing is re-sent when
-        # notifications are turned back on.
+        # Поддержка и модерация — это тоже переписка, и тот же переключатель
+        # накрывает их. Но место в них всё равно отмечается, чтобы ничего не
+        # ушло по второму разу, когда уведомления включат обратно.
         announce = settings.get("notify_messages", {}).get("enabled", True)
 
         for chat_id, info in list(watched.items()):
@@ -1785,10 +1794,11 @@ class TaskManager:
             # к нему и привязываем товар, ник и очередь выдачи звёзд.
             order_id = chat_orders[0]
             try:
-                # Messages live under the ORDER'S CHAT, not the order:
-                # GET /chats/{chat_id}/messages. Querying by order id returned
-                # nothing whenever the two differ, so buyer messages never
-                # arrived. The id was already stored when the order was seen.
+                # Сообщения лежат под ЧАТОМ ЗАКАЗА, а не под заказом:
+                # GET /chats/{chat_id}/messages. Запрос по номеру заказа не возвращал
+                # ничего всякий раз, когда эти номера различались, — и письма
+                # покупателей не доходили вовсе. Номер чата сохраняется ещё тогда,
+                # когда заказ впервые увиден.
                 details = order_details.get(order_id, {})
 
                 data = fetched.get(chat_id)
@@ -1883,9 +1893,10 @@ class TaskManager:
                     if not _is_newer(msg_id, last_known_id):
                         continue
                     poll["new_msgs"] += 1
-                    # Skip what the shop itself sent; anything else counts as
-                    # the buyer. Requiring a known buyer value meant an
-                    # unfamiliar wording silently dropped every message.
+                    # Пропускаем то, что отправил сам магазин; всё прочее считаем
+                    # письмом покупателя. Требование знакомого значения «покупатель»
+                    # приводило к тому, что незнакомая формулировка молча съедала все
+                    # сообщения.
                     if _is_own_message(msg):
                         continue
                     # Отметка маркетплейса о заказе — не письмо покупателя.
@@ -1955,11 +1966,11 @@ class TaskManager:
                     time_str = _fmt_time(msg.get("created_at")
                                          or msg.get("date"), settings)
                     time_part = f"  •  🕐 {time_str}" if time_str else ""
-                    # raw_text stays intact for the rules below; only the copy
-                    # that goes into an HTML message is escaped
+                    # raw_text остаётся нетронутым для правил ниже; экранируется только
+                    # та копия, что уходит в HTML-сообщение
                     msg_text = _esc(raw_text[:200])
 
-                    # AutoStars: buyer replied with their @username → deliver
+                    # AutoStars: покупатель ответил своим @ником — выдаём
                     handled = await self._maybe_deliver_stars_reply(
                         user_id, api, settings, order_id, raw_text, chat_id)
                     if handled:
@@ -1989,9 +2000,8 @@ class TaskManager:
                                 reply_markup=_message_notify_kb(chat_id, order_id),
                             )
 
-                    # A complaint is an alert, not chat traffic, and is sent
-                    # above regardless — this switch only silences ordinary
-                    # buyer messages.
+                    # Жалоба — это тревога, а не переписка, и она уходит выше в любом
+                    # случае: этот переключатель глушит только обычные письма покупателей.
                     if not alerted and settings.get(
                             "notify_messages", {}).get("enabled", True):
                         await self._notify(
@@ -2454,7 +2464,7 @@ class TaskManager:
         settings["known_orders"] = known_orders
 
     # ------------------------------------------------------------------
-    # AutoStars — Telegram Stars auto-delivery via Fragment
+    # AutoStars — автовыдача звёзд Telegram через Fragment
     # ------------------------------------------------------------------
 
     async def _supplier_catalog(self, user_id: int, creds: dict) -> tuple[bool, object]:
@@ -3125,8 +3135,10 @@ class TaskManager:
         self, user_id: int, api: YooMarketAPI, settings: dict,
         order_id: str, buyer_text: str, chat_id: str,
     ) -> bool:
-        """If this order is awaiting a username, try to deliver. Returns True
-        if the message was consumed by the stars flow."""
+        """Если по этому заказу ждут ник — попробовать выдать.
+
+        Отдаёт True, когда письмо забрала себе выдача звёзд.
+        """
         p = settings.get("plugins", {}).get("auto_stars", {})
         if not p.get("enabled"):
             return False
@@ -3198,7 +3210,7 @@ class TaskManager:
                        "Выдача не запускалась — деньги за заказ не поступили."]))
             return True
 
-        # Deliver via Fragment in a thread
+        # Выдаём через Fragment в отдельном потоке
         from automation.fragment import buy_stars_sync
         from storage import get_fragment_creds
         creds = get_fragment_creds(user_id)
@@ -3211,9 +3223,9 @@ class TaskManager:
             )
             return True
 
-        # Check the wallet can cover it before the buyer is left waiting. A
-        # purchase that dies halfway is worse than one that never started: the
-        # buyer has already been told it is on its way.
+        # Убеждаемся, что кошелёк потянет, ДО того как покупатель останется
+        # ждать. Покупка, умершая на полпути, хуже несостоявшейся: покупателю
+        # уже сказали, что товар в пути.
         from automation.stars import deliveries_left, ton_needed
         need = ton_needed(qty)
         loop = asyncio.get_event_loop()
@@ -3278,7 +3290,7 @@ class TaskManager:
             # ошибки. Имя класса некрасиво, но это хотя бы факт.
             ok, result = False, f"ошибка: {str(e)[:100] or type(e).__name__}"
 
-        # Update plugin state
+        # Обновляем состояние плагина
         pending.pop(order_id, None)
         if ok:
             p.setdefault("delivered", []).append(order_id)
@@ -3288,7 +3300,7 @@ class TaskManager:
                 api, chat_id,
                 stars_text(settings, "done", qty=qty, username=username),
                 settings)
-            # try to confirm the order automatically
+            # пробуем подтвердить заказ сами
             try:
                 await api.confirm_order(order_id)
             except Exception as e:
@@ -3397,16 +3409,16 @@ class TaskManager:
     # неудачи шли подряд одинаковыми уведомлениями.
     _STARS_MAX_TRIES = 3
 
-    # How long a buyer is given to send their username before being nudged, and
-    # how long before the seller is told the order is stuck. A paid order left
-    # silently waiting is the worst outcome here: the buyer is out of pocket
-    # and nobody knows.
+    # Сколько покупателю даётся на присылку ника до напоминания и сколько — до
+    # того, как продавцу скажут, что заказ застрял. Оплаченный заказ, молча
+    # висящий в ожидании, — худший из здешних исходов: покупатель без денег, и
+    # никто об этом не знает.
     _STARS_REMIND_AFTER = 1800          # 30 minutes
     _STARS_ESCALATE_AFTER = 6 * 3600
 
     async def _stars_pending_sweep(self, user_id: int, api: YooMarketAPI,
                                    settings: dict, now: float) -> str:
-        """Chase the orders that asked for a username and never got one."""
+        """Догнать заказы, у которых спросили ник и так его и не получили."""
         p = settings.get("plugins", {}).get("auto_stars", {})
         if not p.get("enabled"):
             return ""
@@ -3522,11 +3534,11 @@ class TaskManager:
 
     async def _stars_balance_watch(self, user_id: int, settings: dict,
                                    now: float) -> str:
-        """Warn while there is still time to top up, not at the checkout.
+        """Предупредить, пока есть время пополнить, а не у кассы.
 
-        Running out mid-delivery leaves a buyer waiting on an order they have
-        already paid for, so the wallet is looked at on a schedule rather than
-        only when an order arrives.
+        Кончившийся посреди выдачи баланс оставляет покупателя ждать уже
+        оплаченный заказ, поэтому в кошелёк заглядываем по расписанию, а не только
+        когда придёт заказ.
         """
         from automation.stars import deliveries_left, ton_needed
 
@@ -3771,12 +3783,11 @@ class TaskManager:
 
     async def _panel_bump(self, user_id: int, api: YooMarketAPI | None = None,
                           ) -> tuple[int, str]:
-        """Promote all listings through the panel.
+        """Поднять все товары через панель.
 
-        Runs only from schedules the owner switched on themselves, so
-        confirm=True is passed here; the tariff they picked decides what is
-        bought, and the daily spend ceiling caps how many listings a run pays
-        for.
+        Запускается только из расписаний, которые владелец включил сам, поэтому
+        сюда передаётся confirm=True; что именно покупается, решает выбранный им
+        тариф, а сколько товаров оплатит проход — дневной потолок трат.
         """
         from storage import get_panel_creds
         from automation.panel import panel_bump_all_sync
@@ -3802,8 +3813,9 @@ class TaskManager:
         if problem:
             return 0, problem
 
-        # Not gated on the shop balance: «Премиум» is paid by СБП/card/crypto,
-        # not from it, so the balance says nothing about whether this can run.
+        # Не привязано к балансу магазина: «Премиум» оплачивается СБП, картой
+        # или криптой, а не с него, — то есть баланс ничего не говорит о том,
+        # может ли это сработать.
         caps = [c for c in (promo_limit(settings),) if c]
         loop = asyncio.get_event_loop()
         try:
@@ -3924,13 +3936,13 @@ class TaskManager:
 
     async def _check_position(self, user_id: int, settings: dict, now: float,
                               api: YooMarketAPI | None = None) -> str:
-        """Walk the watched listings; act on the ones that slipped.
+        """Обойти отслеживаемые товары и заняться теми, что съехали.
 
-        Returns a notification, or '' to stay quiet. One watch per listing:
-        a shop does not have "a position", each listing has its own, on its own
-        page. Promotion costs money, so a slip only *pays* when the seller
-        switched that on — and even then the cooldown and the daily cap in
-        automation/position.py stand between a bad day and an empty card.
+        Отдаёт уведомление либо пустую строку — промолчать. По одному слежению на
+        товар: у магазина нет «позиции», у каждого товара она своя и на своей
+        странице. Поднятие стоит денег, поэтому падение ПЛАТИТ только там, где
+        продавец это включил, — и даже тогда между неудачным днём и пустой картой
+        стоят пауза и дневной потолок из automation/position.py.
         """
         from automation.market import fetch_listing
         from automation.position import (budget_left, evaluate, is_due,
@@ -3967,9 +3979,10 @@ class TaskManager:
                 logger.warning("position check for %s: %s", user_id, e)
                 ok, res = False, str(e)[:120]
             if not ok:
-                # A page that will not load says nothing about the position, so
-                # nothing is claimed and nothing is paid. Repeated failures are
-                # reported once — silence would let a dead watch look healthy.
+                # Страница, которая не грузится, не говорит о позиции ничего —
+                # значит ничего не утверждаем и ничего не платим. О повторяющихся
+                # сбоях сообщаем один раз: молчание позволило бы мёртвому слежению
+                # выглядеть исправным.
                 w["last_check"] = now
                 w["fails"] = int(w.get("fails") or 0) + 1
                 if w["fails"] == 3:
@@ -3993,9 +4006,9 @@ class TaskManager:
                     user_id, str(w.get("item_id") or ""), settings)
                 if ok_paid:
                     price = _promo_price(settings)
-                    # Only a promotion that went through is recorded: a refusal
-                    # is not a purchase, and charging the day's budget for it
-                    # would stop the next real one.
+                    # Записывается только прошедшее поднятие: отказ — не покупка, и
+                    # списать за него дневной бюджет значит остановить следующее,
+                    # настоящее.
                     note_promotion(w, now, price, pp)
                     w.pop("last_fail", None)
                     left = budget_left(pp, now)
@@ -4004,10 +4017,9 @@ class TaskManager:
                                     if left >= 0 else "")
                                  + f": {_esc(str(msg))[:160]}")
                 else:
-                    # A listing that stays down retries every hour, and a
-                    # misconfiguration — no tariff, nothing bound — fails the
-                    # same way every time. Say it once, and again only when the
-                    # answer changes.
+                    # Не поднявшийся товар пробуется каждый час, а неверная настройка —
+                    # нет тарифа, ничего не привязано — падает одинаково каждый раз.
+                    # Говорим об этом один раз и повторяем, только когда ответ изменится.
                     reason = str(msg)[:160]
                     if w.get("last_fail") != reason:
                         w["last_fail"] = reason
@@ -4020,9 +4032,10 @@ class TaskManager:
 
         if not blocks:
             return ""
-        # An over-long send fails whole — including the part that says money was
-        # spent — so the message is kept well inside Telegram's 4096 as the
-        # watch list grows. Whole blocks are dropped, never a cut mid-tag.
+        # Слишком длинная отправка не проходит целиком — вместе с той частью,
+        # где сказано, что деньги потрачены, — поэтому по мере роста списка
+        # слежений сообщение держится с запасом внутри 4096 знаков Telegram.
+        # Выбрасываются блоки целиком, а не обрывается посреди тега.
         kept, used = [], 0
         for block in blocks:
             if used + len(block) > 2800 and kept:
@@ -4035,15 +4048,15 @@ class TaskManager:
 
     async def _daily_report_text(self, user_id: int, api: YooMarketAPI,
                                  settings: dict) -> str:
-        """The end-of-day summary, as today's numbers rather than lifetime ones.
+        """Итог дня — сегодняшними цифрами, а не за всё время.
 
-        The figures come from the panel's own ledger, with the bot's order
-        history as the fallback: built from local tracking alone, the report
-        counted only what the poller happened to witness, so a restart or a
-        sale made before the bot came up simply vanished from the day.
+        Числа берутся из журнала панели, а собственная история заказов оставлена
+        запасным путём: собранный только по локальному учёту, отчёт считал лишь то,
+        что успел увидеть опрос, — и перезапуск или продажа до подъёма бота просто
+        пропадали из дня.
 
-        The balance line used to read an undefined name — the exception was
-        caught and every report went out saying «—». It is passed in now.
+        В строке баланса раньше стояло несуществующее имя: исключение
+        перехватывалось, и каждый отчёт уходил с «—». Теперь оно передаётся снаружи.
         """
         from stats_source import LOCAL, day_start, events_for, summarize
 
@@ -4107,19 +4120,18 @@ class TaskManager:
     async def _restore_after_sale(self, user_id: int, api: YooMarketAPI,
                                   settings: dict, sold_ads: set, sold_now: bool
                                   ) -> None:
-        """Put a listing back on sale the moment it sells.
+        """Вернуть товар в продажу в тот же миг, когда он продался.
 
-        The scheduled pass runs on an interval — an hour by default — so a
-        listing that sold out sat off-sale for up to that long. A sale is the
-        one event that reliably means "this may have gone down", so it drives
-        the restore directly, in the 60s orders loop.
+        Проход по расписанию идёт с промежутком — по умолчанию час, — то есть
+        распроданный товар до часа стоял снятым. Продажа — единственное событие,
+        которое надёжно означает «оно могло уйти из продажи», поэтому она запускает
+        возврат напрямую, в шестидесятисекундном проходе по заказам.
 
-        Two paths. When the order says which listing it was, that listing alone
-        is republished: one detail fetch and one publish, no full sweep, and no
-        throttle needed. When the order carries no listing id, a normal restore
-        pass is used instead — that costs a full listing fetch, so it is capped
-        to once every few minutes rather than running every time an order lands
-        during a rush.
+        Путей два. Когда заказ называет, какой это был товар, публикуется он один:
+        одно дочитывание карточки и одна публикация — ни полного обхода, ни
+        ограничения по частоте. Когда номера товара в заказе нет, идёт обычный
+        проход возврата, а он стоит полного чтения списка, — поэтому такой ограничен
+        одним разом в несколько минут, а не запускается на каждый заказ в наплыв.
         """
         ar = settings.setdefault("auto_restore", {})
         if not (ar.get("enabled") and ar.get("instant", True)):
@@ -4147,8 +4159,8 @@ class TaskManager:
                 try:
                     await api.restore_ad(aid)
                 except Exception as e:
-                    # Same dead end as the scheduled pass: the API won't publish
-                    # out of «unpublish». Take the panel route instead.
+                    # Тот же тупик, что и у прохода по расписанию: из «unpublish» API
+                    # публиковать не даёт. Идём через панель.
                     if "incorrect_status" not in str(e):
                         raise
                     done, _still = await self._panel_republish(
@@ -4168,7 +4180,8 @@ class TaskManager:
                       + ["", "<i>Вернул сразу после продажи.</i>"]))
             return
 
-        # No listing id in the order — fall back to a normal pass, rate-limited.
+        # Номера товара в заказе нет — падаем в обычный проход, не чаще
+        # оговорённого.
         if sold_now and now - float(ar.get("last_instant_run", 0) or 0) >= 300:
             ar["last_instant_run"] = now
             note = await self._auto_restore(user_id, api, settings, now)
@@ -4187,17 +4200,17 @@ class TaskManager:
         ar = settings.setdefault("auto_restore", {})
         failures: dict = ar.setdefault("failures", {})
 
-        # An ad the marketplace refused is not retried immediately: the reason
-        # rarely changes within the hour, and a schedule would otherwise repeat
-        # the same rejected call forever. The wait doubles, up to a day.
+        # Объявление, которому маркетплейс отказал, сразу не повторяется:
+        # причина редко меняется в пределах часа, и расписание иначе гоняло бы
+        # один и тот же отвергнутый вызов вечно. Пауза удваивается, до суток.
         held = {aid for aid, f in failures.items()
                 if float(f.get("until", 0) or 0) > now}
 
         from handlers.panel_items import _deleted_ids
         skip = set(held) | _deleted_ids(user_id)
 
-        # Statuses barred by a past incorrect_status, minus the ones whose ban
-        # has aged out and is due for a re-test.
+        # Статусы, запрещённые прошлым `incorrect_status`, минус те, чей
+        # запрет отлежался и подлежит повторной проверке.
         barred_until: dict = _barred_map(ar)
         active_barred = [st for st, until in barred_until.items() if until > now]
 
@@ -4213,10 +4226,10 @@ class TaskManager:
 
         ar["last_restore_run"] = now
 
-        # Anything the API refused because of the listing's state gets a second
-        # try through the panel, which can make that transition when the API
-        # cannot. Recovered listings move into `restored` and are reported as
-        # normal successes — the route taken is an implementation detail.
+        # Всё, чему API отказал из-за состояния товара, получает вторую
+        # попытку через панель: она умеет этот переход, а API нет.
+        # Вернувшиеся товары уходят в `restored` и показываются обычным
+        # успехом — каким путём это вышло, продавца не касается.
         via_panel: list[dict] = []
         retryable = [r for r in rep["failed"]
                      if "incorrect_status" in str(r.get("reason", ""))]
@@ -4229,21 +4242,21 @@ class TaskManager:
             failures.pop(str(row["id"]), None)      # it worked; forget the past
         ar["restored_total"] = int(ar.get("restored_total", 0)) + len(rep["restored"])
 
-        # Learn which statuses the marketplace itself refuses to publish, so
-        # the next pass skips them instead of re-asking every hour. This is the
-        # answer coming from the marketplace, not a guess about its states.
-        # Each ban carries an expiry: it is inferred from a single ad and
-        # applied to every ad in that state, so it must be able to heal.
+        # Выясняем, какие статусы маркетплейс сам отказывается публиковать, чтобы
+        # следующий проход их пропускал, а не переспрашивал каждый час. Это ответ,
+        # приходящий от маркетплейса, а не догадка о его состояниях.
+        # У каждого запрета есть срок: он выведен из одного объявления и применён
+        # ко всем в этом состоянии, значит обязан уметь заживать.
         #
-        # A status the panel just published from is not barred, and any
-        # standing ban on it is lifted. The API refusing `unpublish` is the
-        # normal case the panel fallback exists to handle — barring it would
-        # switch off restore for the one state it is built around, and every
-        # later pass would skip in silence.
-        # A pass that never got a verdict out of the panel — no login, or the
-        # listing not located there — says nothing about any status. Bans
-        # standing from such a pass were never evidence, so they are dropped
-        # rather than holding restore back for a week after the cause is fixed.
+        # Статус, из которого панель только что опубликовала, не запрещён, и
+        # стоящий на нём запрет снимается. Отказ API на `unpublish` — обычный
+        # случай, ради которого запасной путь через панель и существует; запрет на
+        # нём выключил бы возврат в том единственном состоянии, вокруг которого он
+        # построен, и каждый следующий проход пропускал бы молча.
+        # Проход, так и не получивший от панели вердикта — не вошли или товар там
+        # не нашёлся, — не говорит ни о каком статусе ничего. Запреты, поставленные
+        # таким проходом, свидетельством не были никогда, поэтому снимаются, а не
+        # держат возврат ещё неделю после того, как причина устранена.
         if any(r.get("panel") in ("unreached", "not_found")
                for r in rep["failed"]):
             barred_until.clear()
@@ -4254,10 +4267,10 @@ class TaskManager:
             reason = str(row.get("reason", ""))
             if "incorrect_status" not in reason:
                 continue
-            # Only the panel actually refusing the action is evidence about
-            # the status. Matching on the reason text was tried and let «в
-            # панели не нашёл этот товар» through, which barred `unpublish` —
-            # the one state restore exists for — over a lookup problem.
+            # Свидетельство о статусе — только настоящий отказ панели выполнить
+            # действие. Проверка по тексту причины уже пробовалась и пропускала
+            # «в панели не нашёл этот товар»: из-за неудачи поиска запрещался
+            # `unpublish` — то самое состояние, ради которого возврат и написан.
             if row.get("panel") != "refused":
                 continue
             st = str(row.get("status") or "").lower()
@@ -4278,20 +4291,22 @@ class TaskManager:
             if prev.get("reason") != row["reason"]:
                 fresh_failures.append(row)          # only new news is reported
 
-        # Keep the memory from growing without bound
+        # Не даём памяти расти без предела
         for aid in [a for a, f in failures.items()
                     if float(f.get("until", 0) or 0) < now - 7 * 86400]:
             failures.pop(aid, None)
         ar["failures"] = failures
 
-        # A status in neither list is the signal that the marketplace has a
-        # state this code doesn't know about — exactly how «unpublish» hid for
-        # so long. Reporting it only when something *else* happened defeats the
-        # purpose, so a status not seen before counts as news in its own right.
-        # Each distinct status is announced once, not every hour.
-        # Taken down by hand: the marketplace will not publish these back, so
-        # they are named once and then left alone. Reporting them every pass
-        # would be an hourly error about something only the seller can undo.
+        # Статус, не попавший ни в один список, — это признак того, что у
+        # маркетплейса есть состояние, которого код не знает; ровно так и прятался
+        # «unpublish» столько времени. Сообщать о нём только тогда, когда случилось
+        # что-то ЕЩЁ, значит свести затею на нет, поэтому невиданный прежде статус
+        # сам по себе считается новостью. О каждом отдельном статусе говорится
+        # один раз, а не каждый час.
+        # Снятые руками: обратно маркетплейс их не опубликует, поэтому они
+        # называются один раз, и дальше их не трогают. Сообщать о них каждый проход
+        # значило бы ежечасно отчитываться об ошибке, отменить которую может только
+        # сам продавец.
         told_manual = set(str(x) for x in (ar.get("told_manual") or []))
         manual_new = [r for r in (rep.get("manual") or [])
                       if str(r["id"]) not in told_manual]
@@ -4305,8 +4320,8 @@ class TaskManager:
         if new_unknown:
             ar["seen_unknown"] = sorted(seen_unknown | set(new_unknown))
 
-        # Listings left over because the pass is capped; picked up next round
-        # rather than after another full interval.
+        # Товары, оставшиеся из-за потолка на проход: подбираются следующим
+        # кругом, а не через ещё один полный промежуток.
         backlog = max(0, int(rep.get("candidates", 0)) - _RESTORE_MAX_PER_PASS)
         if backlog:
             ar["last_restore_run"] = 0
@@ -4366,8 +4381,8 @@ class TaskManager:
             body.append("")
             body.append(f"⛔ Маркетплейс отказал: <b>{len(fresh_failures)}</b>")
             for row in fresh_failures[:5]:
-                # The status is the whole point of an incorrect_status refusal
-                # — without it the seller can't tell what to change.
+                # Статус — это и есть весь смысл отказа `incorrect_status`: без
+                # него продавцу не понять, что менять.
                 st = _esc(str(row.get("status") or "?"))
                 body.append(f"   • {_esc(row['title'])[:26]}  <code>{st}</code>\n"
                             f"     {_esc(row['reason'])[:400]}")
@@ -4382,10 +4397,10 @@ class TaskManager:
                      f"📦 Всего объявлений: {rep['total']}")
 
     async def _check_panel_session(self, user_id: int, settings: dict, now: float) -> None:
-        """Warn once when the stored panel session stops working.
+        """Предупредить один раз, когда сохранённая сессия панели перестала работать.
 
-        Checked at most every 6 hours, and the warning is sent only on the
-        transition from working to dead, so a logged-out user is not nagged.
+        Проверяется не чаще раза в 6 часов, а предупреждение уходит только на
+        переходе «работала → умерла»: вышедшего из панели продавца не дёргаем.
         """
         from storage import get_panel_creds
 
@@ -4432,8 +4447,8 @@ class TaskManager:
             # раз без разметки. Разрыв связи не значит «не дошло».
             if not _is_formatting_error(e):
                 return
-        # A notification is worth more unformatted than not at all: if the HTML
-        # was rejected, strip the tags and send it as plain text.
+        # Уведомление без разметки лучше, чем никакого: если HTML не приняли,
+        # снимаем теги и шлём простым текстом.
         try:
             plain = re.sub(r"<[^>]+>", "", text)
             await self.bot.send_message(user_id, plain, reply_markup=reply_markup)
@@ -4441,12 +4456,12 @@ class TaskManager:
             logger.warning("Notify plain fallback failed (user %s): %s", user_id, e)
 
     # ------------------------------------------------------------------
-    # Auto-features loop (separate from the orders loop)
+    # Цикл авто-функций — отдельный от прохода по заказам
     # ------------------------------------------------------------------
 
     async def _auto_loop(self, user_id: int) -> None:
-        """Background loop for the auto features (bump / restore / withdraw)."""
-        # Initial delay so it doesn't run immediately on startup
+        """Фоновый цикл авто-функций: поднятие, возврат в продажу, вывод средств."""
+        # Задержка на старте, чтобы не срабатывало сразу при запуске
         await asyncio.sleep(60)
         while True:
             try:
@@ -4458,7 +4473,7 @@ class TaskManager:
             await asyncio.sleep(_AUTO_LOOP_INTERVAL)
 
     async def _tick_auto(self, user_id: int) -> None:
-        """Run auto-bump / auto-restore / auto-withdraw via the Integration API."""
+        """Проход авто-функций через Integration API: поднятие, возврат, вывод."""
         token = get_token(user_id)
         if not token:
             return
@@ -4482,15 +4497,14 @@ class TaskManager:
                 interval_hours = ab.get("interval_hours", 24)
                 last_run = ab.get("last_bump_run", 0)
                 if (now - last_run) / 3600 >= interval_hours:
-                    # Bumping runs against the panel, not the Integration API:
-                    # the API has no such method, the panel exposes it as a
-                    # Nova action.
+                    # Поднятие идёт через панель, а не через Integration API: в API
+                    # такого метода нет, панель отдаёт его действием Nova.
                     logger.info("Auto-bump for user %s via panel", user_id)
                     count, msg = await self._panel_bump(user_id, api)
                     settings["auto_bump"]["last_bump_run"] = now
                     messages.append(f"⬆️ Авто-поднятие: {msg}")
 
-            # --- AutoStars: stuck orders and a wallet that is running out ---
+            # --- AutoStars: застрявшие заказы и кончающийся кошелёк ---
             if settings.get("plugins", {}).get("auto_stars", {}).get("enabled"):
                 for note in (await self._stars_pending_sweep(
                                  user_id, api, settings, now),
@@ -4517,11 +4531,11 @@ class TaskManager:
                     if note:
                         messages.append(note)
 
-            # --- Auto-withdraw ---
-            # --- Panel session health ---
-            # Panel operations (product creation, item management) run on
-            # cookies that expire silently; without this the user only finds
-            # out when an action fails mid-use.
+            # --- Автовывод средств ---
+            # --- Здоровье сессии панели ---
+            # Работа с панелью — создание товаров, управление позициями — идёт на
+            # куках, которые истекают молча; без этой проверки продавец узнаёт об
+            # этом только тогда, когда действие срывается посреди работы.
             try:
                 await self._check_panel_session(user_id, settings, now)
             except Exception as e:
@@ -4534,13 +4548,13 @@ class TaskManager:
                 last_bal = float(bn.get("last_notified_balance", 0.0) or 0)
                 try:
                     balance, balance_str = await shop_balance(user_id, api)
-                    # An unreadable balance must not be recorded as 0: that would
-                    # re-arm the alert and fire a false "crossed the threshold"
-                    # the moment a real number came back.
+                    # Непрочитанный баланс не записывается как 0: это взвело бы
+                    # уведомление заново и выдало ложное «порог перейдён» в тот миг,
+                    # когда вернётся настоящее число.
                     if balance_str != "—":
                         settings["balance_notify"]["last_notified_balance"] = balance
-                        # Edge-triggered: fire once as the balance crosses up to
-                        # the threshold, re-arm only after it drops back below.
+                        # Срабатывание по фронту: один раз, когда баланс переходит порог
+                        # вверх; взводится заново, только когда он упадёт обратно.
                         if balance >= threshold > last_bal:
                             await self._notify(
                                 user_id,
@@ -4567,10 +4581,10 @@ class TaskManager:
                             user_id,
                             await self._daily_report_text(user_id, api, settings),
                             reply_markup=_balance_notify_kb())
-                        # Marked only once it actually went out. Marking first
-                        # meant a panel timeout or a failed send burned the day:
-                        # the report was recorded as delivered and never
-                        # retried, which is «статистика не приходит» exactly.
+                        # Помечается только после того, как отчёт действительно ушёл.
+                        # Пометка заранее означала, что таймаут панели или неудачная
+                        # отправка сжигали день: отчёт числился доставленным и никогда не
+                        # повторялся — это и есть «статистика не приходит».
                         settings["daily_report"]["last_report_day"] = today_str
                     except Exception as e:
                         logger.warning("Daily report error for user %s: %s", user_id, e)
@@ -4604,9 +4618,9 @@ class TaskManager:
                     logger.warning("Reviews monitor error for user %s: %s",
                                    user_id, e)
 
-            # --- Bump scheduler ---
-            # Moved to the fast 60s loop (_maybe_bump_schedule) so slots fire at
-            # their exact time instead of drifting with this 30-min loop.
+            # --- Планировщик поднятий ---
+            # Переехал в быстрый проход (60 с, `_maybe_bump_schedule`), чтобы слоты
+            # срабатывали в своё время, а не плыли вместе с этим получасовым циклом.
 
         except Exception as e:
             logger.error("Auto-tasks error for user %s: %s", user_id, e)
@@ -4614,10 +4628,11 @@ class TaskManager:
         finally:
             await api.close()
 
-        # Always persist: balance_notify / daily_report / reviews_monitor update
-        # their dedupe state (last_notified_balance, last_report_day,
-        # known_review_ids) WITHOUT appending to `messages`. Saving only when
-        # `messages` was non-empty lost that state every cycle → repeated spam.
+        # Сохраняем всегда: `balance_notify`, `daily_report` и `reviews_monitor`
+        # правят своё состояние против повторов — last_notified_balance,
+        # last_report_day, known_review_ids — НЕ дописывая ничего в `messages`.
+        # Сохранение только при непустом `messages` теряло это состояние каждый
+        # круг, и уведомления шли по второму разу.
         save_settings(user_id, settings)
 
         if messages:
