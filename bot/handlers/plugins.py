@@ -350,10 +350,10 @@ async def stars_settings(callback: CallbackQuery, state: FSMContext) -> None:
 
 # ── Данные Fragment (cookies + seed-фраза) ──────────────────────────────────
 
-# The three cookies Fragment logs a seller in with. They are asked for one at
-# a time because two of them are HttpOnly: `document.cookie` simply does not
-# contain them, so pasting that string left the session half-built and the
-# failure only showed up at the first delivery.
+# Три куки, которыми Fragment узнаёт продавца. Спрашиваются по одной,
+# потому что две из них HttpOnly: в `document.cookie` их просто нет, и
+# вставка этой строки собирала сессию наполовину — а выяснялось это только
+# на первой выдаче.
 FRAGMENT_COOKIES = (
     ("stel_token", "🔑 stel_token"),
     ("stel_ssid", "🆔 stel_ssid"),
@@ -435,8 +435,8 @@ _PHONE_HELP = (
     "Дальше — как на компьютере: Application → Cookies → fragment.com."
 )
 
-# Where each cookie is found, because two of them are HttpOnly and the console
-# trick does not reveal them.
+# Где искать каждую куку: две из них HttpOnly, и фокус с консолью их не
+# покажет.
 _COOKIE_HELP = {
     "stel_token": ("Основной токен сессии Fragment.\n\n"
                    "F12 → вкладка <b>Application</b> (в Firefox — "
@@ -455,11 +455,12 @@ _COOKIE_HELP = {
 @router.callback_query(F.data.startswith("plugins:stars:ck:"))
 async def stars_set_one_cookie_prompt(callback: CallbackQuery,
                                       state: FSMContext) -> None:
-    """Ask for a single cookie.
+    """Спросить одну куку.
 
-    Pasting `document.cookie` cannot work here: stel_token and stel_ssid are
-    HttpOnly, so that string is missing exactly the values the session needs,
-    and nothing said so until the first delivery failed.
+    Вставить сюда `document.cookie` нельзя в принципе: `stel_token` и
+    `stel_ssid` помечены HttpOnly, и в этой строке нет как раз тех значений,
+    ради которых всё затевается. Раньше об этом не говорилось нигде — беда
+    вылезала на первой же выдаче.
     """
     try:
         idx = int(callback.data.split(":")[-1])
@@ -496,8 +497,8 @@ async def stars_set_one_cookie_input(message: Message,
         pass
     creds = get_fragment_creds(message.from_user.id) or {}
     cookies = dict(creds.get("cookies") or {})
-    # Pasted as «stel_token=abc» or as a whole cookie string — take what fits
-    # rather than saving the name as part of the value.
+    # Присылают и «stel_token=abc», и всю строку кук целиком — берём то, что
+    # подходит, а не сохраняем имя куки как часть значения.
     if "=" in raw:
         parsed = _parse_cookies(raw)
         if parsed.get(name):
@@ -573,8 +574,8 @@ async def stars_set_cookies_input(message: Message, state: FSMContext) -> None:
             reply_markup=_creds_kb(False, (get_fragment_creds(
                 message.from_user.id) or {}).get("cookies")))
         return
-    # Merge, never replace: the HttpOnly ones were entered by hand and are not
-    # in this string, and dropping them would undo that work silently.
+    # Дополняем, а не заменяем: HttpOnly-куки вводились руками и в этой строке
+    # их нет — замена молча стёрла бы эту работу.
     existing = dict((get_fragment_creds(message.from_user.id) or {}).get(
         "cookies") or {})
     existing.update(cookies)
@@ -619,7 +620,7 @@ async def stars_set_mnemonic_input(message: Message, state: FSMContext) -> None:
             reply_markup=_creds_kb(False, (get_fragment_creds(
                 message.from_user.id) or {}).get("cookies")))
         return
-    # validate the phrase derives a wallet before saving
+    # перед сохранением убеждаемся, что из фразы вообще выводится кошелёк
     try:
         from automation.fragment import _wallet_from_mnemonic
         wv = get_settings(message.from_user.id)["plugins"]["auto_stars"].get("wallet_version", "v4r2")
@@ -645,11 +646,11 @@ async def stars_set_mnemonic_input(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "plugins:stars:check_creds")
 async def stars_check_creds(callback: CallbackQuery) -> None:
-    """Check the session — and keep the api hash if the check had to find one.
+    """Проверить сессию — и сохранить хеш, если проверке пришлось его добыть.
 
-    Fragment stamps every request with a per-session hash. The hardcoded one
-    belonged to somebody else's session, which is answered with «Bad request»;
-    discovering the right one is most of what this check is for.
+    Fragment помечает каждый запрос хешем своей сессии. Зашитый в коде хеш
+    принадлежал чужой сессии, и на него отвечали «Bad request»; добыть
+    правильный — большая часть того, ради чего эта проверка написана.
     """
     from automation.fragment import (check_fragment_session_sync, _same_wallet,
                                      wallet_address_sync, wallet_on_page_sync)
@@ -882,7 +883,7 @@ async def stars_set_hash_prompt(callback: CallbackQuery, state: FSMContext) -> N
 async def stars_set_hash_input(message: Message, state: FSMContext) -> None:
     raw = (message.text or "").strip()
     await state.clear()
-    # Pasted as a whole URL or as «hash=…» — take the value out of it.
+    # Присылают и адрес целиком, и «hash=…» — вытаскиваем оттуда значение.
     m = re.search(r"hash=([0-9a-zA-Z]+)", raw)
     if m:
         raw = m.group(1)
@@ -980,7 +981,11 @@ async def stars_del_creds(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "plugins:stars:toggle_warn")
 async def stars_toggle_warn(callback: CallbackQuery) -> None:
-    """Warn while the wallet can still be topped up, not at the checkout."""
+    """Предупредить, пока кошелёк ещё можно пополнить, а не у кассы.
+
+        Сообщение «не хватает TON» в момент оплаченного заказа приходит поздно:
+        покупатель уже ждёт звёзды.
+        """
     uid = callback.from_user.id
     s = get_settings(uid)
     p = s["plugins"]["auto_stars"]
@@ -3324,7 +3329,7 @@ async def gift_make_handoff(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plugins main menu
+# Главный экран плагинов
 # ---------------------------------------------------------------------------
 
 def _plugins_menu_text(settings: dict, shop_name: str = "") -> str:

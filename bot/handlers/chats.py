@@ -20,8 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 def _newest_id(rows: list[dict]) -> str:
-    """The largest message id present — not rows[-1], which is only the newest
-    if the API sorts oldest-first."""
+    """Наибольший номер сообщения — не `rows[-1]`.
+
+    Последняя строка была бы свежей только если API отдаёт от старых к
+    новым, а Юмаркет отдаёт наоборот."""
     best = ""
     for m in rows:
         mid = str(m.get("id", ""))
@@ -37,20 +39,20 @@ def _newest_id(rows: list[dict]) -> str:
 
 
 def _esc(text) -> str:
-    """Text that came from outside — chat messages, labels, error bodies — goes
-    into HTML-parsed messages, where a stray '<' makes Telegram reject the whole
-    send and the reply silently never arrives."""
+    """Чужой текст — письмо покупателя, название, тело ошибки — уходит в
+    сообщение с HTML-разметкой, и одиночный «<» в нём заставляет Telegram
+    отвергнуть отправку целиком: ответ молча не доходит."""
     return (str(text or "").replace("&", "&amp;")
             .replace("<", "&lt;").replace(">", "&gt;"))
 
 
 def _send_error(e: Exception) -> str:
-    """A readable reason a chat message could not be sent.
+    """Понятная причина, по которой письмо не ушло в чат.
 
-    The Integration API only accepts a message while the chat has an ACTIVE
-    order — support and moderation chats have none, and a finished order's chat
-    stops accepting too. That comes back as no_active_orders_in_chat; showing
-    the raw JSON left the seller with no idea what it meant."""
+    Integration API принимает сообщение, только пока в чате есть АКТИВНЫЙ
+    заказ. У чатов поддержки и модерации его нет вовсе, а у закрытого заказа
+    он кончился. Приходит это как `no_active_orders_in_chat`, и сырой JSON
+    на экране не объяснял продавцу ничего."""
     s = str(e)
     if "no_active" in s or "no active order" in s.lower():
         return ("💬 В этом чате нет активного заказа, поэтому ответить через "
@@ -298,9 +300,9 @@ def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None,
                        callback_data=ChatCallback(chat_id=oid).pack())
     if next_cursor:
         builder.button(text="Следующая →", callback_data=PaginationCallback(entity="chat_orders", cursor=next_cursor).pack())
-    # Support and moderation live outside orders, so they get their own entry.
-    # It must survive an empty order list — otherwise followed chats become
-    # unreachable exactly when they are the only chats there are.
+    # Поддержка и модерация живут вне заказов, поэтому у них свой вход. Он
+    # обязан пережить пустой список заказов: иначе отслеживаемые чаты
+    # становятся недоступны ровно тогда, когда они единственные.
     n = len(watched or {})
     builder.button(text=f"🛟 Поддержка и модерация{f' · {n}' if n else ''}",
                    callback_data="wchats:list")
@@ -447,7 +449,7 @@ async def show_chats(callback: CallbackQuery, api: YooMarketAPI) -> None:
                        if watched else ""))
         keyboard = _build_chat_orders_keyboard(orders, next_cursor, watched, details)
     except Exception as e:
-        # The order list failing must not hide chats that do not depend on it
+        # Упавший список заказов не должен прятать чаты, которые от него не зависят
         text = f"❌ Заказы не загрузились: {e}"
         keyboard = _build_chat_orders_keyboard([], None, watched, details)
     await _safe_edit(callback, text, keyboard)
@@ -519,7 +521,7 @@ async def show_chat_messages(callback: CallbackQuery, api: YooMarketAPI) -> None
         quick_replies: list = settings.get("quick_replies", [])
         builder = InlineKeyboardBuilder()
         builder.button(text="✉️ Ответить", callback_data=f"reply_init:{chat_id}")
-        # quick replies each full-width (long text), then 2-col nav
+        # быстрые ответы во всю ширину (текст длинный), навигация — по две
         for i, qr in enumerate(quick_replies[:3]):
             builder.button(text=f"💬 {qr[:28]}", callback_data=f"qr:{chat_id}:{i}")
         builder.button(text="🔄 Обновить", callback_data=ChatCallback(chat_id=chat_id).pack())
@@ -626,13 +628,13 @@ async def send_quick_reply(callback: CallbackQuery, api: YooMarketAPI) -> None:
         _mark_answered(callback.from_user.id, chat_id)
         await callback.answer("✅ Отправлено!", show_alert=True)
     except Exception as e:
-        # Alerts are short and plain-text; strip the HTML the helper adds
+        # Всплывающее короткое и без разметки — снимаем HTML, добавленный помощником
         msg = _send_error(e).replace("<b>", "").replace("</b>", "")
         await callback.answer(msg[:200], show_alert=True)
 
 
 # ---------------------------------------------------------------------------
-# Chats outside orders — support, moderation
+# Чаты вне заказов — поддержка, модерация
 # ---------------------------------------------------------------------------
 
 @router.message(Command("watch_chat"))
@@ -767,8 +769,8 @@ async def _wchat_screen(callback: CallbackQuery, cid: str) -> None:
     digits = "".join(ch for ch in str(cid) if ch.isdigit())
     b = InlineKeyboardBuilder()
     b.button(text="📜 Показать историю", callback_data=f"wchat_hist:{cid}")
-    # Reply in-bot via the panel chat API (support has no active order, so the
-    # marketplace API refuses it — the panel token is used instead).
+    # Отвечаем из бота через чат-API панели: активного заказа у поддержки нет,
+    # и API маркетплейса такое письмо не примет — идём токеном панели.
     b.button(text="✉️ Ответить", callback_data=f"sreply:{cid}")
     b.button(text="🌐 Открыть в панели",
              url=f"https://panel.yoomarket.net/chats/{digits or cid}")
@@ -868,8 +870,10 @@ async def wchat_del(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("wchat_hist:"))
 async def wchat_history(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    """Send the messages already in the chat — following it only reports what
-    arrives afterwards, so past ones would otherwise stay unseen."""
+    """Показать то, что в чате уже написано.
+
+    Слежение сообщает только о пришедшем после подписки, поэтому без этого
+    прежние письма так и остались бы непрочитанными."""
     cid = callback.data.split(":", 1)[1]
     if not api:
         await callback.answer("⚠️ Не настроен API-токен", show_alert=True)
@@ -925,13 +929,13 @@ def _fmt_msg_time(raw, settings: dict | None = None) -> str:
 
 async def _add_watched(message: Message, api: YooMarketAPI,
                        chat_id: str, label: str) -> None:
-    """Verify a chat is readable, then follow it from its newest message."""
+    """Убедиться, что чат читается, и следить за ним с самого свежего письма."""
     if not api:
         await message.answer("⚠️ Не настроен API-токен")
         return
-    # People paste the id however it appears — <963101>, #963101, a full url.
-    # Anything but the digits also lands in the error text below, where an
-    # angle bracket would break the message's HTML and silence the reply.
+    # Номер присылают как придётся: <963101>, #963101, адрес целиком. Всё, что
+    # не цифры, попадает и в текст ошибки ниже, а там угловая скобка сломает
+    # разметку сообщения — и ответ не дойдёт вовсе.
     chat_id = "".join(ch for ch in str(chat_id) if ch.isdigit())
     if not chat_id:
         await message.answer("❌ В номере чата нет цифр. Пример: "
@@ -947,9 +951,9 @@ async def _add_watched(message: Message, api: YooMarketAPI,
         return
     settings = get_settings(message.from_user.id)
     watched = settings.setdefault("watched_chats", {})
-    # The largest id, not the last row: the baseline has to be the newest
-    # message however the API happens to sort them, or following the chat
-    # starts from the wrong point.
+    # Наибольший номер, а не последняя строка: точкой отсчёта должно быть
+    # самое свежее письмо при любом порядке выдачи, иначе слежение начнётся
+    # не с того места.
     watched[str(chat_id)] = {
         "label": label,
         "last_msg": _newest_id(rows) or None,
@@ -965,10 +969,10 @@ async def _add_watched(message: Message, api: YooMarketAPI,
 
 @router.message(Command("chats_debug"))
 async def chats_debug(message: Message, api: YooMarketAPI) -> None:
-    """What the follower sees right now, per watched chat.
+    """Что слежение видит прямо сейчас — по каждому чату.
 
-    Whether a support message would have produced a notification is otherwise
-    only answerable by waiting for one to arrive.
+    Иначе на вопрос «пришло бы уведомление о письме из поддержки» можно
+    ответить только одним способом: дождаться письма.
     """
     watched = get_settings(message.from_user.id).get("watched_chats") or {}
     if not watched:

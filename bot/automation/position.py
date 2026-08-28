@@ -37,8 +37,8 @@ import time as _time
 
 DEFAULT_MAX_POSITION = 3
 DEFAULT_INTERVAL_HOURS = 1.0
-# A promotion is charged every time. Two guards stand between a slipping
-# listing and an empty card: a cooldown, and a per-day count.
+# Каждое поднятие платное. Между съезжающим товаром и пустой картой стоят
+# две защиты: пауза между поднятиями и счёт за сутки.
 DEFAULT_COOLDOWN_HOURS = 6.0
 DEFAULT_DAILY_LIMIT = 3
 # Предел был 10, когда интервал был один на всех: чаще проверять — значит
@@ -46,8 +46,9 @@ DEFAULT_DAILY_LIMIT = 3
 # и спокойные позиции можно проверять раз в несколько часов, поэтому список
 # может быть длиннее.
 MAX_WATCHES = 30
-# How many silent failures before the seller is told the watch stopped working.
-# One is noise (a page hiccups); three in a row is a broken watch.
+# Сколько молчаливых сбоев подряд до того, как сказать продавцу, что
+# слежение перестало работать. Один — это шум (страница икнула), три
+# подряд — это сломанное слежение.
 FAILS_BEFORE_ALARM = 3
 
 
@@ -61,10 +62,10 @@ def new_watch(url: str, *, title: str = "", item_id: str = "",
         "url": str(url or "").strip(),
         "item_id": str(item_id or ""),          # panel record — what gets paid
         "market_id": str(market_id or ""),      # storefront row — what gets found
-        # The section id, when the catalogue named it outright. Worth more than
-        # the address: this API answers /categories/<game>/<section> with the
-        # game, so a section inferred from the address can quietly become the
-        # whole game — 638 offers instead of 161, and a position counted in the
+        # Номер раздела, если каталог назвал его прямо. Он ценнее адреса: на
+        # /categories/<игра>/<раздел> это API отвечает ИГРОЙ, поэтому раздел,
+        # выведенный из адреса, тихо превращается во всю игру — 638 предложений
+        # вместо 161, и позиция считается в
         # wrong one.
         "category_id": category_id,
         "title": str(title or ""),
@@ -88,11 +89,11 @@ def new_watch(url: str, *, title: str = "", item_id: str = "",
 
 
 def watches(pp: dict) -> list[dict]:
-    """The watch list, migrating the single-page settings it grew out of.
+    """Список слежений — с переносом настроек той версии, из которой он вырос.
 
-    The first version followed one page for the whole shop. Those settings are
-    turned into the first watch rather than dropped: a seller who configured it
-    should not find the screen empty after an update.
+    Первая версия следила за одной страницей на весь магазин. Её настройки
+    превращаются в первое слежение, а не выбрасываются: продавец, который
+    всё настроил, не должен после обновления увидеть пустой экран.
     """
     got = pp.get("watches")
     if isinstance(got, list) and got:
@@ -203,7 +204,7 @@ def daily_budget(pp: dict) -> float:
 
 
 def spent_today(pp: dict, now: float) -> float:
-    """What this trigger has already spent today, in roubles."""
+    """Сколько это слежение уже потратило сегодня, в рублях."""
     if pp.get("spent_day") != _day(now, pp):
         return 0.0
     try:
@@ -213,7 +214,7 @@ def spent_today(pp: dict, now: float) -> float:
 
 
 def promos_left(watch: dict, pp: dict, now: float) -> int:
-    """How many more paid promotions this watch may make today. -1 = unlimited."""
+    """Сколько платных поднятий слежению осталось на сегодня. -1 — без счёта."""
     limit = daily_limit(pp)
     if not limit:
         return -1
@@ -222,7 +223,7 @@ def promos_left(watch: dict, pp: dict, now: float) -> int:
 
 
 def budget_left(pp: dict, now: float) -> float:
-    """Roubles still available today. -1 = no cap set."""
+    """Сколько рублей ещё можно потратить сегодня. -1 — потолок не задан."""
     budget = daily_budget(pp)
     if not budget:
         return -1.0
@@ -236,10 +237,10 @@ PROMO_LOG_LIMIT = 200
 
 def note_promotion(watch: dict, now: float, price: float = 0,
                    pp: dict | None = None) -> None:
-    """Record a promotion that actually happened.
+    """Записать поднятие, которое действительно случилось.
 
-    Only what really went through is recorded: a refused action is not a
-    promotion, and counting it would spend the day's budget on nothing.
+    Записывается только прошедшее: отказ — это не поднятие, и зачесть его
+    значит потратить дневной бюджет впустую.
     """
     today = _day(now, pp)
     if watch.get("promo_day") != today:
@@ -286,11 +287,13 @@ def note_position_after(pp: dict, item_id: str, pos: int, now: float,
 
 
 class Verdict:
-    """What one reading of one page means.
+    """Что означает одно чтение одной страницы.
 
-    `lines` is what to tell the seller (empty = nothing worth saying), `promote`
-    is whether to spend, `reason` says why not when it is False — so a run that
-    decides to do nothing can still explain itself on the debug screen.
+    `lines` — что сказать продавцу (пусто — говорить нечего), `promote` —
+    тратить ли деньги, `reason` — почему нет, когда `promote` ложно. Проход,
+    решивший ничего не делать, обязан уметь объяснить это на экране
+    диагностики: «ничего не произошло» без причины и есть та беда, из-за
+    которой продавец считает бота сломанным.
     """
 
     __slots__ = ("found", "pos", "price", "cheapest", "cheapest_above",
@@ -301,8 +304,8 @@ class Verdict:
         self.pos = 0
         self.price: float | None = None
         self.cheapest: float | None = None
-        # What the offers standing above us cost — the only ones a paid
-        # position has to beat.
+        # Сколько стоят предложения, стоящие выше нас: только их и надо
+        # обогнать платной позицией.
         self.cheapest_above: float | None = None
         self.cost = 0
         self.lines: list[str] = []
@@ -319,11 +322,11 @@ class Verdict:
 def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
              pp: dict | None = None, now: float | None = None,
              auto_promote: bool | None = None, price: int = 0) -> Verdict:
-    """Read one page's standings and decide. Updates the watch's own state.
+    """Прочитать позиции на одной странице и решить. Правит состояние слежения.
 
-    Deliberately quiet: this runs every hour, and an alert repeated every hour
-    is an alert nobody reads. A slip is announced once, and again only when it
-    gets worse; a recovery is announced once.
+    Молчит намеренно: проход идёт каждый час, а тревога, повторяемая раз в
+    час, — это тревога, которую перестают читать. Про падение говорим один
+    раз и повторяем, только если стало хуже; про возвращение — один раз.
     """
     from automation.market import cheapest as _cheapest, find_position
 
@@ -335,16 +338,16 @@ def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
     v = Verdict()
     watch["last_check"] = now
 
-    # market_id, not item_id: the row is looked up on the storefront, and the
-    # panel's record id means nothing there.
+    # market_id, а не item_id: строка ищется на витрине, и номер записи из
+    # панели там не значит ничего.
     mine = find_position(offers,
                          ad_id=str(watch.get("market_id") or ""),
                          title=str(watch.get("title") or ""),
                          seller=shop)
     if not mine:
-        # Not finding ourselves is not evidence of anything about the position,
-        # so nothing is promoted and nothing is claimed — but a watch that never
-        # finds its listing is broken, and silence would hide that.
+        # Не найдя себя, мы не узнали о позиции ничего — значит ничего не
+        # поднимаем и ничего не утверждаем. Но слежение, которое ни разу не
+        # находит свой товар, сломано, и молчание это скроет.
         watch["misses"] = int(watch.get("misses") or 0) + 1
         v.reason = "не нашёл товар на странице"
         if watch["misses"] >= FAILS_BEFORE_ALARM and not watch.get("alarmed"):
@@ -380,10 +383,10 @@ def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
 
     others = [o for o in offers if o.get("pos") != v.pos]
     v.cheapest = _cheapest(others if others else offers)
-    # Only the offers *above* us decide whether paying for position is worth
-    # it: those are the ones a buyer sees first. A real listing had a 1 ₽ lot
-    # sitting far below — a price nobody is competing with, and taking it as
-    # "the competition" would have blocked every promotion for good.
+    # Стоит ли платить за позицию, решают только предложения ВЫШЕ нас: их
+    # покупатель видит первыми. На живом товаре далеко внизу лежал лот за
+    # 1 ₽ — цена, с которой никто не соревнуется, и приняв её за «конкурента»,
+    # мы заблокировали бы поднятия навсегда.
     v.cheapest_above = _cheapest([o for o in offers
                                   if int(o.get("pos") or 0) < v.pos])
 
@@ -412,11 +415,10 @@ def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
     rival = v.cheapest_above if v.cheapest_above is not None else v.cheapest
     if guard and rival is not None and v.price is not None \
             and (v.price - rival) > guard:
-        # Paying for the top slot while someone visibly cheaper stands above us
-        # buys a view that converts for them, not for us. Measured against the
-        # offers above only: a cut-price lot further down the list is not
-        # competing for this position, and treating it as competition would
-        # block every promotion for good.
+        # Платить за верх, когда выше стоит кто-то заметно дешевле, — значит
+        # купить просмотр, который сработает не нам. Меряем только по стоящим
+        # выше: дешёвый лот ниже по списку за эту позицию не борется, и считать
+        # его конкурентом значит заблокировать поднятия навсегда.
         v.reason = (f"выше вас есть дешевле на {v.price - rival:.0f} ₽ "
                     f"(порог {guard:.0f}) — поднятие не окупится")
         v.lines.append(f"⛔ Не поднимаю: {v.reason}")

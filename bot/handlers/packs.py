@@ -1,4 +1,4 @@
-"""Ad packs: group listings into named packs and bump the whole pack at once."""
+"""Паки объявлений: собрать товары в именованный набор и поднимать его целиком."""
 from __future__ import annotations
 
 import logging
@@ -278,7 +278,7 @@ async def pack_toggle(callback: CallbackQuery, api: YooMarketAPI) -> None:
     s["ad_packs"][name] = ids
     save_settings(uid, s)
     await callback.answer("Обновлено")
-    # re-render the add list
+    # перерисовываем список добавления
     await pack_add_list(callback, api)
 
 

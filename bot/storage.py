@@ -7,29 +7,28 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_data_dir() -> str:
-    """
-    Pick a data directory that survives container re-deploys.
+    """Выбрать папку данных, которая переживёт пересборку контейнера.
 
-    Priority:
-      1. $DATA_DIR env var (explicit override — e.g. a Railway volume mount path)
-      2. /app/data — the volume mount point declared in docker-compose.yml
-         (`bot_data:/app/data`). Persistent across `docker compose up --build`.
-      3. ~/.yomarket — fallback for bare-metal / non-Docker runs.
+    По порядку:
+      1. переменная $DATA_DIR — явное указание, например точка тома Railway;
+      2. /app/data — том, объявленный в docker-compose.yml
+         (`bot_data:/app/data`); переживает `docker compose up --build`;
+      3. ~/.yomarket — запасной вариант для запуска без Docker.
 
-    The previous version defaulted to ~/.yomarket even inside Docker, which is
-    NOT covered by the docker-compose volume, so data was wiped on every redeploy.
+    Прежняя версия выбирала ~/.yomarket даже внутри Docker, а эта папка томом
+    НЕ накрыта — данные стирались при каждом выкате.
     """
     env = os.environ.get("DATA_DIR")
     if env:
         return env
-    # In the Docker image WORKDIR is /app and the compose volume maps /app/data.
+    # В образе Docker рабочая папка — /app, и том compose ведёт в /app/data.
     if os.path.isdir("/app"):
         return "/app/data"
     return os.path.join(os.path.expanduser("~"), ".yomarket")
 
 
 _DATA_DIR = _resolve_data_dir()
-# Where storage files might have been written by older versions of the bot.
+# Куда прежние версии бота могли складывать файлы хранилища.
 _LEGACY_DIRS = [
     os.path.join(os.path.dirname(__file__), "data"),     # bot/data/
     os.path.join(os.path.expanduser("~"), ".yomarket"),  # previous (broken) default
@@ -37,7 +36,7 @@ _LEGACY_DIRS = [
 
 
 def _migrate_legacy() -> None:
-    """Move *.json from any known legacy location into the active data dir, once."""
+    """Один раз перенести *.json из всех прежних мест в нынешнюю папку данных."""
     os.makedirs(_DATA_DIR, exist_ok=True)
     for legacy in _LEGACY_DIRS:
         if not os.path.isdir(legacy) or os.path.abspath(legacy) == os.path.abspath(_DATA_DIR):
@@ -57,7 +56,8 @@ _migrate_legacy()
 _FILE = os.path.join(_DATA_DIR, "tokens.json")
 _SETTINGS_FILE = os.path.join(_DATA_DIR, "settings.json")
 _PANEL_FILE = os.path.join(_DATA_DIR, "panel_creds.json")
-# Sensitive: Fragment cookies + TON wallet seed phrase. Never logged/committed.
+# Секретное: куки Fragment и seed-фраза кошелька TON. Ни в логи, ни в
+# репозиторий не попадают никогда — это доступ к чужому кошельку.
 _FRAGMENT_FILE = os.path.join(_DATA_DIR, "fragment_creds.json")
 _NS_FILE = os.path.join(_DATA_DIR, "ns_creds.json")
 _AR_FILE = os.path.join(_DATA_DIR, "approute_creds.json")
@@ -143,8 +143,9 @@ _DEFAULT_SETTINGS = {
     "known_order_details": {},  # {order_id: {title, buyer, price, chat_id, seen_at}}
     "known_messages": {},  # {order_id: last_msg_id}
     "deleted_ads": [],  # ids удалённых товаров — API отдаёт их ещё какое-то время
-    # Chats to watch that belong to no order — support, moderation. They cannot
-    # be discovered (the API has no chat list), so their ids are added by hand.
+    # Отслеживаемые чаты, не привязанные ни к одному заказу, — поддержка и
+    # модерация. Найти их сами мы не можем: списка чатов в API нет вовсе,
+    # поэтому номера добавляются руками.
     "watched_chats": {},   # {chat_id: {"label": str, "last_msg": str}}
     "blacklist": [],  # list of buyer names to suppress notifications for
     "reminders": {"enabled": False, "hours": 24},
@@ -228,27 +229,28 @@ _DEFAULT_ACCOUNT = "Основной"
 
 
 # ---------------------------------------------------------------------------
-# Storage backend: PostgreSQL when DATABASE_URL is set, else JSON files.
-# The rest of the module (and the whole bot) is unchanged — only _read_blob /
-# _write_blob differ. Each legacy JSON file becomes one row in kv_store, and
-# existing files are auto-migrated into the DB on first read.
+# Где лежат данные: PostgreSQL, если задан DATABASE_URL, иначе JSON-файлы.
+# Остальной модуль (и весь бот) от этого не меняется — различаются только
+# `_read_blob` и `_write_blob`. Каждый прежний JSON-файл становится строкой
+# в kv_store, а имеющиеся файлы переезжают в базу при первом чтении.
 # ---------------------------------------------------------------------------
 
 import threading as _threading
 
 
 def _resolve_database_url() -> str:
-    """Find a Postgres URL from the common env-var names Railway/Heroku use,
-    or assemble one from PG* parts. Returns '' if none configured."""
+    """Найти адрес Postgres среди имён переменных, принятых у Railway и Heroku,
+    либо собрать его из частей PG*. Пусто — значит база не настроена.
+    """
     for var in ("DATABASE_URL", "DATABASE_PRIVATE_URL", "POSTGRES_URL",
                 "POSTGRESQL_URL", "PG_URL", "DATABASE_PUBLIC_URL"):
         url = os.environ.get(var, "").strip()
         if url:
-            # psycopg2 accepts postgres:// but normalize to postgresql://
+            # psycopg2 принимает и postgres://, но приводим к postgresql://
             if url.startswith("postgres://"):
                 url = "postgresql://" + url[len("postgres://"):]
             return url
-    # Assemble from individual PG* variables if present
+    # Если есть отдельные переменные PG*, собираем адрес из них
     host = os.environ.get("PGHOST", "").strip()
     if host:
         user = os.environ.get("PGUSER", "postgres")
@@ -266,7 +268,7 @@ _db_lock = _threading.Lock()
 _db_pool = None
 _cache: dict[str, str] = {}
 
-# blob key -> legacy file path (used for migration + file-mode fallback)
+# ключ хранилища → прежний путь файла: для переезда и для работы без базы
 _BLOBS = {
     "tokens": _FILE,
     "settings": _SETTINGS_FILE,
@@ -321,7 +323,7 @@ def _db_write_raw(key: str, raw: str) -> None:
 
 
 def _read_blob(key: str) -> dict:
-    """Load a JSON blob (dict) for a storage key from DB or file."""
+    """Прочитать словарь по ключу хранилища — из базы или из файла."""
     if not _USE_DB:
         path = _BLOBS[key]
         if os.path.exists(path):
@@ -335,7 +337,7 @@ def _read_blob(key: str) -> dict:
         if key not in _cache:
             raw = _db_read_raw(key)
             if raw is None:
-                # one-time migration from a legacy JSON file, if present
+                # разовый переезд из прежнего JSON-файла, если он ещё лежит
                 path = _BLOBS[key]
                 if os.path.exists(path):
                     try:
@@ -355,7 +357,7 @@ def _read_blob(key: str) -> dict:
 
 
 def _write_blob(key: str, data: dict) -> None:
-    """Persist a JSON blob (dict) for a storage key to DB or file."""
+    """Записать словарь по ключу хранилища — в базу или в файл."""
     if not _USE_DB:
         path = _BLOBS[key]
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -377,7 +379,7 @@ def _save_tokens(data: dict) -> None:
 
 
 def _user_entry(data: dict, user_id: int) -> dict | None:
-    """Return the v2 accounts entry for a user, migrating a bare token string."""
+    """Запись аккаунтов продавца, с переносом старого формата «просто токен»."""
     raw = data.get(str(user_id))
     if raw is None:
         return None
@@ -390,11 +392,11 @@ def _user_entry(data: dict, user_id: int) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Multi-account API
+# Несколько аккаунтов
 # ---------------------------------------------------------------------------
 
 def get_accounts(user_id: int) -> dict:
-    """{name: {"token": ...}} for the user (empty dict if none)."""
+    """Аккаунты продавца: {имя: {"token": …}}. Пусто — ни одного нет."""
     entry = _user_entry(_load(), user_id)
     return (entry or {}).get("accounts", {})
 
@@ -447,7 +449,7 @@ def remove_account(user_id: int, name: str) -> bool:
 
 
 def get_token(user_id: int) -> str | None:
-    """Token of the ACTIVE account (backward-compatible entry point)."""
+    """Токен АКТИВНОГО аккаунта — вход, совместимый со старым кодом."""
     entry = _user_entry(_load(), user_id)
     if not entry:
         return None
@@ -457,7 +459,7 @@ def get_token(user_id: int) -> str | None:
 
 
 def save_token(user_id: int, token: str) -> None:
-    """Set the token on the active account (creates the default account)."""
+    """Записать токен активному аккаунту; если аккаунтов нет — создать первый."""
     data = _load()
     entry = _user_entry(data, user_id)
     if entry is None:
@@ -473,7 +475,7 @@ def save_token(user_id: int, token: str) -> None:
 
 
 def delete_token(user_id: int) -> None:
-    """Remove the active account (logout). Other accounts stay."""
+    """Убрать активный аккаунт (выход). Остальные остаются на месте."""
     data = _load()
     entry = _user_entry(data, user_id)
     if not entry:
@@ -519,7 +521,7 @@ def _merge_defaults(settings: dict) -> dict:
 
 
 def _account_key(user_id: int) -> str:
-    """Per-account storage key: '{uid}::{account}'. Falls back to plain uid."""
+    """Ключ хранилища по аккаунту: «{продавец}::{аккаунт}», иначе просто номер."""
     account = get_active_account(user_id)
     return f"{user_id}::{account}" if account else str(user_id)
 
@@ -591,7 +593,7 @@ def save_shop_name(user_id: int, name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Panel credentials (YooMarket seller panel login/password)
+# Доступ к панели продавца Юмаркета
 # ---------------------------------------------------------------------------
 
 def _load_panel_creds() -> dict:
@@ -603,7 +605,7 @@ def _save_panel_data(data: dict) -> None:
 
 
 def get_panel_creds(user_id: int) -> dict | None:
-    """Panel cookies for the ACTIVE account (per-account, legacy migrated)."""
+    """Куки панели активного аккаунта; старый общий формат переносится сюда же."""
     data = _load_panel_creds()
     if _take_legacy(data, user_id):
         _save_panel_data(data)
@@ -626,14 +628,14 @@ def accounts_with_panel(user_id: int) -> list[str]:
 
 
 def save_panel_creds(user_id: int, creds: dict) -> None:
-    """Save panel credentials for the user's active account."""
+    """Сохранить доступ к панели для активного аккаунта продавца."""
     data = _load_panel_creds()
     data[_account_key(user_id)] = creds
     _save_panel_data(data)
 
 
 def delete_panel_creds(user_id: int) -> None:
-    """Remove panel credentials for the user's active account."""
+    """Убрать доступ к панели у активного аккаунта продавца."""
     data = _load_panel_creds()
     data.pop(_account_key(user_id), None)
     data.pop(str(user_id), None)
@@ -641,9 +643,9 @@ def delete_panel_creds(user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fragment credentials (Telegram Stars auto-delivery) — SENSITIVE
-# {cookies: {...}, mnemonic: "24 words", wallet_version: "v4r2", api_hash: "..."}
-# Stored per active account. Never log the mnemonic or cookie values.
+# Доступ к Fragment (автовыдача звёзд Telegram) — СЕКРЕТНОЕ
+# {cookies: {…}, mnemonic: «24 слова», wallet_version: "v4r2", api_hash: "…"}
+# Хранится по активному аккаунту. Ни фраза, ни значения кук в логи не идут.
 # ---------------------------------------------------------------------------
 
 # Ключ шифрования seed-фразы. Берётся из окружения и в репозиторий не
@@ -868,8 +870,8 @@ def delete_fragment_creds(user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Global admin / subscription store (owner + admins, subscriptions, price,
-# blocked users). Not per-account — bot-wide.
+# Общее на весь бот: владелец и админы, подписки, цена, заблокированные.
+# Не по аккаунтам.
 # ---------------------------------------------------------------------------
 
 import time as _time
@@ -923,8 +925,10 @@ def list_admins() -> list[int]:
 # --- Subscriptions ---------------------------------------------------------
 
 def grant_subscription(user_id: int, days: int, by: int = 0) -> float:
-    """Add `days` to a user's subscription (from now, or extends existing).
-    Returns the new expiry timestamp."""
+    """Добавить продавцу `days` подписки — от сегодня либо к уже имеющейся.
+
+    Отдаёт новый момент окончания.
+    """
     data = _load_admin()
     subs = data.setdefault("subscriptions", {})
     now = _time.time()
@@ -981,7 +985,7 @@ def set_bot_price(price: int) -> None:
     _save_admin(data)
 
 
-# --- Blocked users (bot-wide) ----------------------------------------------
+# --- Заблокированные, на весь бот -------------------------------------------
 
 def block_user(user_id: int) -> None:
     data = _load_admin()
@@ -1026,12 +1030,12 @@ def set_require_subscription(enabled: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Appearance / branding (bot-wide): custom main-menu button labels and an
-# optional custom-emoji header. Buttons can't be truly colored on Telegram,
-# so "coloring" = colored emoji in the label.
+# Оформление, на весь бот: свои надписи кнопок главного меню и, если задано,
+# кастомное эмодзи в заголовке. По-настоящему покрасить кнопку Telegram не
+# даёт, поэтому «раскраска» — это цветное эмодзи в надписи.
 # ---------------------------------------------------------------------------
 
-# key -> (default label, callback) for the main menu
+# ключ → (стандартная надпись, кнопка) для главного меню
 MENU_BUTTONS = [
     ("ads",      "🚀 Объявления", "menu:ads"),
     ("orders",   "🛒 Заказы",     "menu:orders"),
@@ -1049,7 +1053,7 @@ def get_appearance() -> dict:
 
 
 def get_menu_labels() -> dict:
-    """{key: label} with admin overrides applied over defaults."""
+    """Надписи пунктов меню: {ключ: надпись}, поверх стандартных — правки админа."""
     overrides = get_appearance().get("menu_labels", {})
     return {key: overrides.get(key, default) for key, default, _cb in MENU_BUTTONS}
 
@@ -1069,7 +1073,7 @@ def reset_menu_labels() -> None:
 
 
 def get_header_emoji() -> dict | None:
-    """{'id': custom_emoji_id, 'fallback': '🏠'} or None."""
+    """{'id': номер кастомного эмодзи, 'fallback': '🏠'} либо None."""
     return get_appearance().get("header_emoji")
 
 
@@ -1087,8 +1091,9 @@ def clear_header_emoji() -> None:
 
 
 def menu_header_html() -> str:
-    """Header prefix for the main menu: custom emoji if set, else a plain
-    emoji if the admin chose one, else the default 🏠."""
+    """Значок в заголовке главного меню: кастомное эмодзи, если задано; иначе
+    обычное, если админ его выбрал; иначе 🏠.
+    """
     he = get_header_emoji()
     if he:
         fb = he.get("fallback") or "🏠"
@@ -1099,9 +1104,9 @@ def menu_header_html() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Editable bot message texts (bot-wide), with custom-emoji support.
-# Stored as ready-to-send HTML (from message.html_text). Placeholders in
-# {curly} are substituted at render time.
+# Редактируемые тексты бота, общие на весь бот, с кастомными эмодзи.
+# Хранятся готовым к отправке HTML (из message.html_text). Подстановки в
+# {фигурных} скобках заполняются при сборке сообщения.
 # ---------------------------------------------------------------------------
 
 # Первый экран заканчивается тем, что человек должен сделать прямо сейчас,
@@ -1222,7 +1227,7 @@ CUSTOM_TEXTS = {
 
 
 def get_custom_text(key: str) -> str:
-    """Stored HTML for a text key, or its default."""
+    """Сохранённый HTML по ключу текста — либо стандартный, если своего нет."""
     saved = get_appearance().get("texts", {}).get(key)
     if saved is not None:
         return saved
@@ -1249,7 +1254,7 @@ def is_custom_text_set(key: str) -> bool:
 
 
 def render_custom_text(key: str, **subs) -> str:
-    """Render a text with {placeholder} substitution (brace-safe)."""
+    """Собрать текст с подстановками вида {имя} — не спотыкаясь о чужие скобки."""
     tmpl = get_custom_text(key)
     for k, v in subs.items():
         tmpl = tmpl.replace("{" + k + "}", str(v))

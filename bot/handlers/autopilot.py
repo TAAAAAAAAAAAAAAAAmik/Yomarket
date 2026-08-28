@@ -27,13 +27,13 @@ router = Router()
 
 
 # ---------------------------------------------------------------------------
-# Registry: every automation the bot has, declared once.
-#   path     — where the on/off flag lives in the settings blob
-#   defaults — sibling values filled in when switching it ON, so the automation
-#              actually does something without a second visit
-#   costs    — spends the seller's money (promotion, withdrawals, price cuts)
-#   warn     — returns a message when it's on but still can't run
-#   tune     — callback of the detailed screen
+# Перечень: вся автоматика бота, объявленная в одном месте.
+#   path     — где в настройках лежит признак «включено»
+#   defaults — что дописать рядом при включении, чтобы функция сразу работала,
+#              а не требовала второго захода в настройки
+#   costs    — тратит деньги продавца (продвижение, вывод, снижение цены)
+#   warn     — сообщение о том, почему включённое всё ещё не работает
+#   tune     — кнопка подробного экрана
 # ---------------------------------------------------------------------------
 
 def _no_tariff(s: dict) -> tuple[str, str]:
@@ -49,7 +49,8 @@ def _no_tariff(s: dict) -> tuple[str, str]:
 
 
 def _no_showcase_url(s: dict) -> tuple[str, str]:
-    """Position is per listing, so the watch list is what must not be empty."""
+    """Позиция считается по каждому товару отдельно — значит пустым не должен
+        быть список слежений, а не адрес витрины."""
     from automation.position import watches
     if not watches(dict(s.get("promo_position", {}))):
         return "добавьте товар для наблюдения", "pos:add"
@@ -222,10 +223,11 @@ AUTOMATIONS: list[dict] = [
 
 _BY_KEY = {a["key"]: a for a in AUTOMATIONS}
 
-# Sections of the main screen. Seventeen toggles in one list is a wall on a
-# phone; the main screen now shows sections with an "on / total" count and the
-# toggles live one tap in. Keys are stable strings, not positions, so a
-# keyboard still open in a client can't send a tap to the wrong section.
+# Разделы главного экрана. Семнадцать тумблеров одним списком — это стена
+# на телефоне; теперь на главном экране разделы со счётом «включено из
+# всего», а сами тумблеры на одно нажатие глубже. Ключи — постоянные
+# строки, а не номера: иначе клавиатура, открытая у клиента со вчера,
+# отправила бы нажатие не в тот раздел.
 GROUP_KEYS = {
     "💬 Общение с покупателем": "chat",
     "📦 Заказы": "orders",
@@ -233,8 +235,8 @@ GROUP_KEYS = {
     "🔔 Уведомления": "notify",
     "💰 Баланс": "money",
 }
-# Button labels: the full titles read well in the text block but get chopped
-# in a half-width button.
+# Надписи кнопок: полные названия хорошо читаются в тексте, но в кнопке
+# половинной ширины обрезаются.
 GROUP_SHORT = {
     "chat": "💬 Общение", "orders": "📦 Заказы", "goods": "🛒 Товары",
     "notify": "🔔 Уведомления", "money": "💰 Баланс",
@@ -260,8 +262,8 @@ _SAFE = ["reply", "refunded", "accept", "confirm", "reminders", "restore",
          "notify_orders", "notify_messages", "complaints", "reviews",
          "balance", "daily"]
 # "Максимум" adds the promotion schedule and position watch. Position watch
-# only warns by default (auto_promote stays off), so this still spends nothing
-# without a further, explicit decision.
+# по умолчанию только предупреждает (auto_promote остаётся выключенным),
+# так что без отдельного осознанного решения денег это не тратит.
 _MAX = _SAFE + ["promo_sched", "promo_position"]
 _NOTIFY = ["notify_orders", "notify_messages", "complaints", "reviews",
            "balance", "daily"]
@@ -275,7 +277,7 @@ PRESETS = {
 
 
 # ---------------------------------------------------------------------------
-# Settings helpers (paths are nested, e.g. auto_events.on_refunded.enabled)
+# Работа с настройками: пути вложенные, вида auto_events.on_refunded.enabled
 # ---------------------------------------------------------------------------
 
 def _get_path(s: dict, path: tuple):
@@ -323,10 +325,10 @@ def _baseline_past_slots(bs: dict, s: dict | None = None) -> None:
 
 
 def _apply_defaults(s: dict, auto: dict) -> None:
-    """Fill in what an automation needs to actually run.
+    """Дописать то, без чего автоматика включится, но работать не будет.
 
-    Only writes what's missing, so a client's own tuning survives toggling the
-    switch off and on again.
+    Записывается только недостающее: собственная настройка продавца должна
+    пережить выключение и повторное включение тумблера.
     """
     for path, value in (auto.get("defaults") or {}).items():
         if _get_path(s, path) in (None, "", [], {}, 0):
@@ -346,7 +348,11 @@ def set_automation(s: dict, auto: dict, on: bool) -> None:
 # ---------------------------------------------------------------------------
 
 def _blocked(s: dict) -> list[tuple[dict, str, str]]:
-    """Automations that are ON but still can't run: (automation, reason, fix)."""
+    """Что включено, но всё равно не работает: (автоматика, причина, куда идти).
+
+        Включённый тумблер над неработающей функцией — это то самое «бодрое
+        сообщение об успехе там, где ничего не происходит».
+        """
     out = []
     for a in AUTOMATIONS:
         if not is_on(s, a):
@@ -370,8 +376,8 @@ def _autopilot_text(s: dict) -> str:
             "и не потратит ни рубля.",
         ]
     else:
-        # One line per section: what's on, and what it's set to. The toggles
-        # themselves are a tap in, so this stays a summary.
+        # По строке на раздел: что включено и как настроено. Сами тумблеры на
+        # нажатие глубже, поэтому здесь только сводка.
         lines.append("")
         for gkey, title in GROUPS:
             items = group_items(gkey)
@@ -415,15 +421,15 @@ def _autopilot_kb(s: dict) -> InlineKeyboardMarkup:
     b.button(text="🔔 Только уведомления", callback_data="ap:p:notify")
     rows.append(2)
 
-    # Straight to the screen that fixes it, instead of making the seller hunt
-    # for the menu named in the warning.
+    # Сразу на экран, где это чинится, вместо того чтобы заставлять продавца
+    # искать меню, названное в предупреждении.
     for a, msg, fix in _blocked(s)[:3]:
         target = fix or a.get("tune")
         if target:
             b.button(text=f"⚠️ {a['short']} — {msg}", callback_data=target)
             rows.append(1)
 
-    # Sections, two per row, each showing how much of it is on.
+    # Разделы по два в ряд, у каждого видно, сколько в нём включено.
     n = 0
     for gkey, title in GROUPS:
         items = group_items(gkey)
@@ -497,8 +503,8 @@ def _group_kb(s: dict, gkey: str) -> InlineKeyboardMarkup:
         n += 1
     rows.extend([2] * (n // 2) + ([1] if n % 2 else []))
 
-    # Bulk-on is offered only where nothing in the section spends money —
-    # switching on paid promotion in one tap is not something to stumble into.
+    # «Включить всё» предлагается только там, где в разделе нет ничего
+    # денежного: включить платное продвижение одним нажатием случайно нельзя.
     if not any(a.get("costs") for a in items):
         b.button(text="✅ Включить всё", callback_data=f"ap:ga:{gkey}")
         rows.append(1)
@@ -513,7 +519,7 @@ def _group_kb(s: dict, gkey: str) -> InlineKeyboardMarkup:
 
 
 def _toggle_alert(s: dict, auto: dict, now_on: bool) -> str:
-    """Popup text after flipping a switch: confirm, or name what's still needed."""
+    """Что показать после нажатия тумблера: подтверждение — или чего не хватает."""
     if not now_on:
         return f"🔴 {auto['title']} — выключено"
     warn = auto.get("warn")
@@ -544,8 +550,8 @@ async def autopilot_menu(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "ap:noop")
 async def autopilot_noop(callback: CallbackQuery) -> None:
-    # The group separators are gone, but keyboards already sitting in clients'
-    # chats still carry them — answer so the tap doesn't hang on a spinner.
+    # Разделителей групп больше нет, но в чатах у клиентов остались старые
+    # клавиатуры с ними — отвечаем, чтобы нажатие не висело крутящейся кнопкой.
     await callback.answer()
 
 

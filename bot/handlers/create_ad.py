@@ -1,4 +1,4 @@
-"""Handler for creating new product listings via the API."""
+"""Мастер создания товара через API: шаги, предпросмотр, публикация."""
 from __future__ import annotations
 
 import asyncio
@@ -430,7 +430,7 @@ async def _show_preview(msg, state: FSMContext, edit: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Edit fields from preview
+# Правка полей с экрана предпросмотра
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("create_ad:edit:"))
@@ -453,7 +453,7 @@ async def edit_field(callback: CallbackQuery, state: FSMContext) -> None:
     if field not in prompts:
         await callback.answer()
         return
-    # editing=True → step handler returns to preview instead of walking the wizard
+    # editing=True → шаг вернёт на предпросмотр, а не поведёт дальше по мастеру
     await state.update_data(editing=True)
     await state.set_state(states[field])
     b = InlineKeyboardBuilder()
@@ -627,7 +627,7 @@ def _autopick_match(options: list, words) -> dict | None:
 
 
 async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
-    """Ask the user to pick the next required select option, or create the product."""
+    """Спросить следующее обязательное поле-список — или уже создать товар."""
     from storage import get_panel_creds
     from automation.panel import panel_sync_field_options_sync
 
@@ -715,7 +715,7 @@ _PER_PAGE = 16
 
 
 async def _render_select(msg, state: FSMContext, edit: bool = True) -> None:
-    """Render the current select page with pagination + search hint."""
+    """Нарисовать страницу списка: варианты, листалка и подсказка про поиск."""
     data = await state.get_data()
     label = data.get("current_label") or data.get("current_attr") or ""
     view: list = data.get("current_view") or []
@@ -757,7 +757,7 @@ async def _render_select(msg, state: FSMContext, edit: bool = True) -> None:
             sent = await msg.answer(text, reply_markup=b.as_markup())
         except Exception:
             sent = None
-    # Remember the live select message so search can edit it in place
+    # Запоминаем сообщение со списком, чтобы поиск правил именно его
     if sent is not None and getattr(sent, "message_id", None):
         await state.update_data(
             select_msg_id=sent.message_id, select_chat_id=sent.chat.id)
@@ -781,7 +781,7 @@ async def select_page(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(CreateAdState.panel_select)
 async def select_search(message: Message, state: FSMContext) -> None:
-    """Free-text search over the current select's options (local + remote)."""
+    """Поиск словом по вариантам списка — и по загруженным, и по запросу в панель."""
     from storage import get_panel_creds
     from automation.panel import panel_sync_field_options_sync
 
@@ -824,13 +824,13 @@ async def select_search(message: Message, state: FSMContext) -> None:
     await state.update_data(
         current_options=base, current_view=filtered, current_page=0,
     )
-    # Remove the buyer's search text to keep the chat clean
+    # Убираем введённое слово, чтобы не засорять переписку
     try:
         await message.delete()
     except Exception:
         pass
-    # Edit the SAME select message in place so its button indices always match
-    # current_view (a fresh message would leave a stale keyboard behind).
+    # Правим ТО ЖЕ сообщение со списком: номера кнопок должны совпадать с
+    # текущей страницей, а новое сообщение оставило бы позади старую клавиатуру.
     sel_id = data.get("select_msg_id")
     sel_chat = data.get("select_chat_id")
     if sel_id and sel_chat:
@@ -1100,9 +1100,9 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
                 pub_note = ("\n🕓 Отправлен на модерацию "
                             f"({html.escape(str(pub_msg)[:150])})")
             else:
-                # A fresh listing usually has nothing to sell yet, and the
-                # marketplace refuses to publish an empty one — say what to do
-                # instead of just reporting a failure.
+                # У свежего товара обычно ещё нечего продавать, а пустой
+                # маркетплейс публиковать отказывается. Говорим, что делать, а
+                # не просто сообщаем об отказе.
                 #
                 # Раньше «отправлен на модерацию» писалось по одному коду
                 # ответа панели, без проверки. Панель отвечает 200 и на отказ,
@@ -1200,7 +1200,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
 
 @router.callback_query(F.data.startswith("cadpub:"))
 async def publish_item(callback: CallbackQuery) -> None:
-    """Manually retry making a created item public."""
+    """Повторить публикацию уже созданного товара вручную."""
     from storage import get_panel_creds
     from automation.panel import panel_publish_item_sync
 

@@ -123,7 +123,7 @@ async def notif_menu(callback: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Orders / chat messages
+# Заказы и письма из чатов
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "notif:toggle:orders")
