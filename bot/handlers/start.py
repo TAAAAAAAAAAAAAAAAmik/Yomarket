@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Bumped on every meaningful code change — lets us confirm which version is running.
-BOT_VERSION = "2026-08-26-onboarding"
+BOT_VERSION = "2026-08-28-fast-chats"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления

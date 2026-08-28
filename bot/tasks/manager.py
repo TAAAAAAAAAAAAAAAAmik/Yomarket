@@ -495,8 +495,70 @@ from orderfields import (BACK as _BACK_STATUSES, DONE as _DONE_STATUSES,
 
 
 # Сколько чатов заказов опрашивать за проход. Каждый — отдельный запрос, но
-# проход раз в минуту, так что два десятка вполне посильны.
+# читаются они пачками (`_CHAT_PARALLEL`), так что два десятка посильны.
 _CHAT_POLL_LIMIT = 25
+
+# ---------------------------------------------------------------------------
+# Темп опроса чатов
+# ---------------------------------------------------------------------------
+#
+# Письмо покупателя доходило до продавца за минуту в лучшем случае и за
+# одиннадцать минут в худшем. Складывалось это так: опрос чатов стоял в
+# конце общего прохода — после списка заказов, после дочитывания карточек,
+# после выдачи подарочных карт, — а общий проход шёл раз в минуту. Выдача,
+# ждущая кода от поставщика, держала поток до десяти минут, и всё это время
+# чаты не читались вообще.
+#
+# Теперь у чатов свой цикл, и в нём нет ничего, кроме чатов.
+#
+# Сколько запросов в минуту разрешает Юмаркет — нигде не написано, и
+# подставить сюда угаданное число значит либо не разогнаться, либо получить
+# бан. Поэтому темп подбирается сам: идём с пола, а когда маркетплейс
+# отвечает «сбавьте темп» — отступаем вдвое, до потолка. Причина замедления
+# пишется в пульс опроса, её видно в `/chat_debug`.
+_CHAT_FAST = 10.0            # пол: быстрее не надо, письма так часто не идут
+_CHAT_SLOW = 120.0           # потолок отступления
+_CHAT_BACKOFF = 2.0          # во сколько раз отступаем на «сбавьте темп»
+_CHAT_RECOVER = 0.8          # и как возвращаемся, когда проход прошёл чисто
+
+# Сколько чатов читать одновременно. Двадцать пять запросов подряд занимали
+# проход целиком: при ответе в полсекунды это двенадцать секунд, при
+# медленном маркетплейсе — минута. Пачками по шесть те же двадцать пять
+# укладываются в четыре круга.
+_CHAT_PARALLEL = 6
+
+# Быстрый проход читает не все двадцать пять чатов, а только «горячие».
+#
+# Это не экономия ради экономии. Двадцать пять чатов раз в десять секунд —
+# полтораста запросов в минуту на одного продавца; маркетплейс на такое
+# ответит «сбавьте темп», опрос осядет на потолке в две минуты, и выйдет
+# МЕДЛЕННЕЕ, чем было раньше. Горячих же почти всегда единицы.
+#
+# Горячий — тот, где письмо может прийти прямо сейчас: покупатель уже
+# написал и ждёт ответа, либо заказ свежий и вопросы по нему ещё будут.
+# Остальные читаются полным проходом в прежнем темпе, так что ни один чат
+# из-под наблюдения не выпадает — меняется только частота.
+_CHAT_HOT_AGE = 2 * 3600     # «свежий заказ» — два часа с момента, как увидели
+_CHAT_FULL_EVERY = 60.0      # полный обход всех чатов — как и прежде, раз в минуту
+
+
+def _hot_chats(known_orders: dict, order_details: dict,
+               now: float | None = None) -> list[str]:
+    """Заказы, чаты которых стоит читать каждые несколько секунд."""
+    now = time.time() if now is None else now
+    hot: list[str] = []
+    for oid in _chats_to_poll(known_orders, order_details):
+        det = order_details.get(oid) or {}
+        if det.get("waiting"):
+            hot.append(oid)
+            continue
+        try:
+            seen = float(det.get("seen_at") or 0)
+        except (TypeError, ValueError):
+            seen = 0.0
+        if seen and now - seen <= _CHAT_HOT_AGE:
+            hot.append(oid)
+    return hot
 _CLOSED_QUIET_AFTER = 7 * 86400
 
 
@@ -559,7 +621,15 @@ def _chats_to_poll(known_orders: dict, order_details: dict) -> list[str]:
     rows: list[tuple[float, str]] = []
     for oid, status in known_orders.items():
         det = order_details.get(oid) or {}
-        seen = float(det.get("seen_at") or 0)
+        # Нечисло здесь роняло весь опрос: не один заказ, а все чаты
+        # продавца разом — то есть уведомления замолкали целиком, и по
+        # экрану это выглядело как «бот сломался». Настройки приезжают из
+        # базы и переживают все прежние версии формата, так что верить их
+        # содержимому нельзя.
+        try:
+            seen = float(det.get("seen_at") or 0)
+        except (TypeError, ValueError):
+            seen = 0.0
         closed = str(status) in _BACK_STATUSES
         # Возврат недельной давности писем уже не приносит.
         if closed and seen and now - seen > _CLOSED_QUIET_AFTER:
@@ -572,6 +642,31 @@ def _chats_to_poll(known_orders: dict, order_details: dict) -> list[str]:
         rows.append((seen, str(oid)))
     rows.sort(key=lambda r: r[0], reverse=True)
     return [oid for _, oid in rows[:_CHAT_POLL_LIMIT]]
+
+
+async def _fetch_chats(api, chat_ids: list[str],
+                       parallel: int = _CHAT_PARALLEL) -> dict:
+    """Прочитать переписку нескольких чатов сразу → {чат: ответ или ошибка}.
+
+    Запросы шли подряд: двадцать пять чатов — двадцать пять ожиданий сети
+    друг за другом. Пачками по шесть то же самое занимает вчетверо меньше.
+
+    Ошибка не бросается, а кладётся в ответ: разбор ниже идёт по чатам
+    последовательно и на каждый отвечает по-своему — считает промахи,
+    помечает пропавший чат. Один упавший чат не должен уносить с собой
+    остальные двадцать четыре.
+    """
+    sem = asyncio.Semaphore(max(1, int(parallel)))
+
+    async def one(cid: str):
+        async with sem:
+            try:
+                return await api.get_messages(cid)
+            except Exception as e:                # noqa: BLE001
+                return e
+
+    done = await asyncio.gather(*(one(c) for c in chat_ids))
+    return dict(zip(chat_ids, done))
 
 
 def _ar_context(details: dict | None, order_id: str, settings: dict) -> dict:
@@ -966,6 +1061,12 @@ class TaskManager:
         self.bot = bot
         self._tasks: dict[int, asyncio.Task] = {}
         self._auto_tasks: dict[int, asyncio.Task] = {}
+        # Чаты — отдельной задачей и в своём темпе: письмо покупателя не
+        # должно ждать, пока досчитаются заказы и допоставятся коды.
+        self._chat_tasks: dict[int, asyncio.Task] = {}
+        # Подобранный темп опроса чатов, по продавцу. Начинается с пола и
+        # отступает, только если маркетплейс сам попросит (см. `_pace_chats`).
+        self._chat_pace: dict[int, float] = {}
         # Per-user lock: the orders loop (60s) and the auto-tasks loop (30min)
         # both load→mutate→save the whole settings blob. Without serializing
         # them, whichever saves last silently clobbers the other's changes
@@ -989,6 +1090,9 @@ class TaskManager:
         if user_id in self._tasks and not self._tasks[user_id].done():
             self._tasks[user_id].cancel()
         self._tasks[user_id] = asyncio.create_task(self._user_loop(user_id))
+        if user_id in self._chat_tasks and not self._chat_tasks[user_id].done():
+            self._chat_tasks[user_id].cancel()
+        self._chat_tasks[user_id] = asyncio.create_task(self._chat_loop(user_id))
         # Also start the auto-features loop
         if user_id in self._auto_tasks and not self._auto_tasks[user_id].done():
             self._auto_tasks[user_id].cancel()
@@ -998,6 +1102,10 @@ class TaskManager:
         if user_id in self._tasks:
             self._tasks[user_id].cancel()
             del self._tasks[user_id]
+        if user_id in self._chat_tasks:
+            self._chat_tasks[user_id].cancel()
+            del self._chat_tasks[user_id]
+            self._chat_pace.pop(user_id, None)
         if user_id in self._auto_tasks:
             self._auto_tasks[user_id].cancel()
             del self._auto_tasks[user_id]
@@ -1016,6 +1124,76 @@ class TaskManager:
             except Exception as e:
                 logger.error("Task error for user %s: %s", user_id, e)
             await asyncio.sleep(60)
+
+    async def _chat_loop(self, user_id: int) -> None:
+        """Отдельный цикл под чаты — только они, и ничего больше.
+
+        Раньше письма читались в самом конце общего прохода: после списка
+        заказов, после дочитывания карточек, после выдачи подарочных карт.
+        Каждая из этих частей отодвигала письмо покупателя, а выдача,
+        ждущая кода у поставщика, отодвигала его на минуты.
+        """
+        while True:
+            try:
+                await self._chat_tick(user_id)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Chat loop error for user %s: %s", user_id, e)
+            await asyncio.sleep(self._chat_pace.get(user_id, _CHAT_FAST))
+
+    async def _chat_tick(self, user_id: int) -> None:
+        token = get_token(user_id)
+        if not token:
+            return
+        # Тот же замок, что у общего прохода: настройки продавца — один
+        # словарь на всё, и две записи подряд затёрли бы друг друга.
+        async with self._lock(user_id):
+            settings = get_settings(user_id)
+            if not _claim_sender(settings):
+                return
+            poll = settings.get("_chat_poll") or {}
+            since_full = time.time() - float(poll.get("full_ts") or 0)
+            full = since_full >= _CHAT_FULL_EVERY
+            api = YooMarketAPI(token)
+            await api.start()
+            try:
+                await self._check_messages(user_id, api, settings,
+                                           hot_only=not full)
+                # Чаты вне заказов (поддержка, модерация) — только полным
+                # проходом: писем там единицы, а запрос на каждый отдельный.
+                if full:
+                    await self._check_watched_chats(user_id, api, settings)
+            finally:
+                self._pace_chats(user_id, settings)
+                try:
+                    save_settings(user_id, settings)
+                except Exception as e:
+                    logger.error("Save settings failed (user %s): %s", user_id, e)
+                await api.close()
+
+    def _pace_chats(self, user_id: int, settings: dict) -> None:
+        """Подобрать темп опроса по тому, что ответил маркетплейс.
+
+        Разрешённая частота нигде не написана, поэтому она не угадывается, а
+        нащупывается: идём с пола, на «сбавьте темп» отступаем вдвое, а после
+        чистого прохода понемногу возвращаемся. Замедление не молчаливое —
+        оно записано в пульс опроса и видно в `/chat_debug`.
+        """
+        from api.yoomarket import is_rate_limit
+        poll = settings.get("_chat_poll") or {}
+        now = float(self._chat_pace.get(user_id, _CHAT_FAST))
+        if is_rate_limit(poll.get("error")):
+            now = min(_CHAT_SLOW, max(_CHAT_FAST, now) * _CHAT_BACKOFF)
+            poll["paced"] = ("Юмаркет попросил сбавить темп — читаю чаты "
+                             f"раз в {int(now)} с")
+        else:
+            now = max(_CHAT_FAST, now * _CHAT_RECOVER)
+            poll["paced"] = "" if now <= _CHAT_FAST else (
+                f"возвращаю темп: раз в {int(now)} с")
+        self._chat_pace[user_id] = now
+        poll["every"] = now
+        settings["_chat_poll"] = poll
 
     async def _tick(self, user_id: int) -> None:
         token = get_token(user_id)
@@ -1469,8 +1647,9 @@ class TaskManager:
             await self._gift_forced_sweep(user_id, api, settings, robux_tried)
             await self._gift_resume(user_id, api, settings, robux_tried)
 
-            await self._check_messages(user_id, api, settings)
-            await self._check_watched_chats(user_id, api, settings)
+            # Чаты здесь больше не читаются: у них свой цикл (`_chat_loop`),
+            # и стоять в очереди за дочитыванием карточек и выдачей карт
+            # письму покупателя незачем.
             await self._auto_confirm(user_id, api, settings)
             await self._auto_refund(user_id, api, settings)
             if sold_ads or sold_now:
@@ -1561,12 +1740,22 @@ class TaskManager:
 
         settings["watched_chats"] = watched
 
-    async def _check_messages(self, user_id: int, api: YooMarketAPI, settings: dict) -> None:
+    async def _check_messages(self, user_id: int, api: YooMarketAPI,
+                              settings: dict, hot_only: bool = False) -> None:
+        """Прочитать чаты и разобрать новые письма.
+
+        `hot_only` — быстрый проход: только те чаты, где письмо может прийти
+        прямо сейчас. Полный обход идёт реже и своим чередом, так что из-под
+        наблюдения не выпадает ни один чат — меняется только частота.
+        """
         known_orders: dict = settings.get("known_orders", {})
         known_messages: dict = settings.setdefault("known_messages", {})
         order_details: dict = settings.get("known_order_details", {})
 
-        active = _chats_to_poll(known_orders, order_details)
+        active = (_hot_chats(known_orders, order_details) if hot_only
+                  else _chats_to_poll(known_orders, order_details))
+        if hot_only and not active:
+            return
         # Постоянный покупатель ведёт ВСЕ свои заказы в одном чате: у второго
         # и третьего заказа тот же chat_id. Опрос шёл по заказам, поэтому один
         # и тот же чат читался столько раз, сколько у покупателя заказов, — и
@@ -1585,6 +1774,11 @@ class TaskManager:
         # Они собираются здесь и уходят одной сводкой, а не пачкой уведомлений.
         missed: list[tuple[str, str, str]] = []
 
+        # Сеть — одной пачкой, разбор — по одному. Разбор правит общие
+        # настройки продавца (отметки «дочитано», очередь выдачи звёзд), и
+        # параллелить его нельзя: две правки одного словаря затрут друг друга.
+        fetched = await _fetch_chats(api, list(by_chat))
+
         for chat_id, chat_orders in by_chat.items():
             # `active` отсортирован от свежих к старым, значит первый — самый
             # свежий заказ этого покупателя. Письмо почти наверняка про него:
@@ -1597,7 +1791,11 @@ class TaskManager:
                 # arrived. The id was already stored when the order was seen.
                 details = order_details.get(order_id, {})
 
-                data = await api.get_messages(chat_id)
+                data = fetched.get(chat_id)
+                if isinstance(data, Exception):
+                    raise data
+                if data is None:
+                    continue
                 # Чат прочитался — прошлые сбои больше не в счёт. Отметку
                 # снимаем здесь, а не в конце разбора: ниже несколько
                 # законных `continue`, и до конца доходит не каждый проход.
@@ -1843,8 +2041,16 @@ class TaskManager:
                                          f"больше не опрашиваю")
 
         settings["known_messages"] = known_messages
-        poll["ts"] = time.time()
+        now = time.time()
+        poll["ts"] = now
         poll["missed"] = len(missed)
+        poll["hot"] = len(by_chat) if hot_only else 0
+        # Отметка полного обхода — по ней решается, когда идти за остальными
+        # чатами. Быстрый проход её не трогает: иначе он вечно откладывал бы
+        # полный, и старые чаты не читались бы никогда.
+        if not hot_only:
+            poll["full_ts"] = now
+            poll["chats_all"] = len(by_chat)
         settings["_chat_poll"] = poll
 
         if missed and settings.get("notify_messages", {}).get("enabled", True):
@@ -2287,13 +2493,20 @@ class TaskManager:
     # минуту на весь кабинет, и упереться в него значит получить отказ
     # вместо кода, который уже куплен.
     _ROBUX_POLL_STEPS = (12, 12, 15, 20, 30, 30, 30, 45, 60, 60)
-    _ROBUX_POLL_CEILING = 600.0        # десять минут, дальше — на следующий проход
+    _ROBUX_POLL_CEILING = 120.0        # см. `_GIFT_POLL_CEILING` — тот же довод
 
     # То же для гифт-карт. Значения совпадают, но константы свои: лимит
     # `GET /orders?unhide=true` общий на кабинет, а вот менять темп одному
     # плагину, не трогая другой, должно быть можно.
     _GIFT_POLL_STEPS = (12, 12, 15, 20, 30, 30, 30, 45, 60, 60)
-    _GIFT_POLL_CEILING = 600.0
+    # Потолок был 600 секунд, и всё это время поток продавца занят: на нём
+    # стоит общий проход, а замок общего прохода — тот же, что у опроса
+    # чатов. То есть длинная выдача глушила уведомления из чатов на минуты,
+    # притом что сама от ожидания в этом же проходе ничего не выигрывает:
+    # недоведённую запись подбирает `_gift_resume` следующим проходом.
+    # Ста двадцати секунд хватает на шесть шагов из десяти — этого хватает
+    # почти всегда, а редкий долгий заказ доедет через минуту.
+    _GIFT_POLL_CEILING = 120.0
 
     # -----------------------------------------------------------------
     # Гифт-карты: один путь к деньгам на все карты реестра

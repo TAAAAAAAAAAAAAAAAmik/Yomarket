@@ -1139,10 +1139,19 @@ async def ar_why(callback: CallbackQuery) -> None:
     ts = float(poll.get("ts") or 0)
     if ts:
         # Разность моментов эпохи от часового пояса не зависит:
-        # это «сколько минут назад», а не время на часах.
-        ago = int((datetime.now().timestamp() - ts) / 60)
-        lines.append(f"{_sw(ago < 5)} Чаты читались "
-                     + ("только что" if ago < 1 else f"{ago} мин назад"))
+        # это «сколько назад», а не время на часах.
+        ago = max(0.0, datetime.now().timestamp() - ts)
+        # Свежесть считается от НАСТОЯЩЕГО темпа опроса, а не от пяти минут.
+        # При опросе раз в десять секунд «читалось три минуты назад» — это
+        # не «нормально», это остановившийся цикл.
+        every = float(poll.get("every") or 60)
+        lines.append(f"{_sw(ago < every * 3)} Чаты читались "
+                     + ("только что" if ago < 60 else f"{int(ago / 60)} мин назад"))
+        lines.append(f"   темп опроса: <b>раз в {int(every)} с</b>")
+        # Замедление не молчаливое: опрос, отступивший по просьбе
+        # маркетплейса, снаружи неотличим от сломанного.
+        if poll.get("paced"):
+            lines.append(f"   ⏳ {_esc(poll['paced'])}")
         watched = int(poll.get("chats", 0) or 0)
         total = int(poll.get("orders", 0) or 0)
         lines.append(f"   под наблюдением: <b>{watched}</b> из {total} заказов")
@@ -1158,8 +1167,9 @@ async def ar_why(callback: CallbackQuery) -> None:
             lines.append(f"   ⚠️ {_esc(poll['error'])}")
     else:
         lines.append("🔴 Чаты ещё ни разу не читались")
-        lines.append("   <i>Фоновый опрос запускается после /start и идёт "
-                     "раз в минуту. Если так и осталось — перезапустите бота.</i>")
+        lines.append("   <i>Фоновый опрос запускается после /start, у чатов "
+                     "он свой и идёт раз в несколько секунд. Если так и "
+                     "осталось — перезапустите бота.</i>")
 
     skip = conf.get("last_skip") or {}
     if skip:
