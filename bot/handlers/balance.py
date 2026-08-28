@@ -30,10 +30,10 @@ class WithdrawState(StatesGroup):
 
 
 def _pick(*sources_and_keys) -> object | None:
-    """First value whose key is actually present.
+    """Первое значение, ключ которого действительно есть в ответе.
 
-    A plain `a.get(x) or a.get(y)` chain drops a real balance of 0, because
-    zero is falsy — the value is discarded and the search moves on.
+    Обычная цепочка `a.get(x) or a.get(y)` теряет настоящий баланс в ноль:
+    ноль ложен, значение отбрасывается, и поиск идёт дальше.
     """
     sources, keys = sources_and_keys[0], sources_and_keys[1:]
     for src in sources:
@@ -73,11 +73,11 @@ def _plain(value) -> str:
 
 
 def _deep_find(node, keys, depth: int = 4):
-    """First value under any of `keys`, searched breadth-first.
+    """Первое значение под любым из `keys`, поиск в ширину.
 
-    A one-level lookup missed a balance nested one dict deeper than expected
-    and reported zero, which reads as "the shop has no money" rather than "the
-    bot did not look there".
+    Просмотр на один уровень не находил баланс, лежащий словарём глубже, и
+    показывал ноль — а это читается как «в магазине нет денег», а не как
+    «бот туда не заглянул».
     """
     level = [node]
     for _ in range(depth):
@@ -98,7 +98,8 @@ def _deep_find(node, keys, depth: int = 4):
 
 
 def _shape(data, limit: int = 12) -> str:
-    """The keys a response actually has — for saying why nothing was found."""
+    """Какие ключи в ответе есть на самом деле — чтобы объяснить, почему ничего
+        не нашлось. «Не найдено» без формы ответа не даёт сделать следующий шаг."""
     if isinstance(data, dict):
         inner = [f"{k}:{_shape(v, 4)}" if isinstance(v, dict) else k
                  for k in list(data)[:limit] for v in [data[k]]]
@@ -143,11 +144,11 @@ async def _run_panel(uid, fn, *args):
 
 
 async def _panel_balance(uid: int) -> tuple[str | None, str]:
-    """The balance as the panel reports it → (formatted, error).
+    """Баланс так, как его называет панель → (готовая строка, ошибка).
 
-    The Integration API has no balance anywhere: /check returns identity only.
-    The panel's balances resource is the sole source, and it is the same one
-    withdrawal acts on, so the figure shown and the figure withdrawn agree.
+    В Integration API баланса нет нигде: /check отвечает только «кто вы».
+    Раздел балансов в панели — единственный источник, и вывод средств
+    работает с ним же, поэтому показанная сумма и выводимая совпадают.
     """
     import asyncio as _a
     from storage import get_panel_creds
@@ -157,8 +158,8 @@ async def _panel_balance(uid: int) -> tuple[str | None, str]:
     from automation.panel import panel_balances_sync, panel_shop_balance_sync
     loop = _a.get_event_loop()
 
-    # Where the panel actually shows it: the shop's own page. The `balances`
-    # resource was the earlier guess and answers nothing on this panel.
+    # Где панель показывает его на самом деле: на странице самого магазина.
+    # Раздел `balances` был прежней догадкой и на этой панели не отвечает ничем.
     #
     # Имя магазина — чтобы читать баланс СВОЕГО. Одна панельная сессия видит
     # все магазины продавца, и без имени бот брал первый попавшийся: под
@@ -187,8 +188,8 @@ async def _panel_balance(uid: int) -> tuple[str | None, str]:
         # будто balances вообще не спрашивали.
         return None, f"магазин: {shop_err} · balances: {str(rows)[:120]}"
 
-    # Several rows can exist (one per currency); the roubles one is the balance
-    # a seller means, and any single row is unambiguous on its own.
+    # Строк может быть несколько — по одной на валюту. Продавец имеет в виду
+    # рублёвую, а единственная строка однозначна и без выбора.
     best = None
     for row in rows:
         amt = _money(row.get("amount"))
@@ -236,21 +237,21 @@ def _other_account_hint(uid: int) -> str:
 
 
 def _parse_check(data: dict) -> tuple[str, str, str | None]:
-    """Parse /check response → (name, balance, pending)."""
+    """Разбор ответа /check → (название, баланс, ожидает зачисления)."""
     logger.info("CHECK raw response: %s", data)
     shop = data.get("shop") or data.get("data") or data
     if not isinstance(shop, dict):
         shop = data
     srcs = (shop, data)
 
-    # The shop name sits as deep as the balance does — a one-level lookup
-    # reported «—» for a shop the response plainly names.
+    # Название магазина лежит так же глубоко, как баланс: просмотр на один
+    # уровень показывал «—» для магазина, прямо названного в ответе.
     name = (_pick(srcs, "name", "shop_name", "title")
             or _deep_find(data, ("name", "shop_name", "title")) or "—")
     balance = _deep_find(data, _MONEY_KEYS)
     pending = _deep_find(data, _PENDING_KEYS)
 
-    # Empty, not "0": a balance the response never carried is not a balance of
+    # Пусто, а не «0»: баланс, которого в ответе не было, — это не баланс в
     # zero, and showing zero for it reads as «денег нет» instead of «не нашёл».
     bal_str = _plain(balance) if balance is not None else ""
     pend = _money(pending) if pending is not None else None
@@ -276,10 +277,10 @@ def _shown(value) -> str:
 
 
 def _earned(details: dict, known: dict, since: float) -> tuple[int, int]:
-    """(completed sales, revenue ₽) over orders first seen at/after `since`.
+    """(закрытых продаж, выручка ₽) по заказам, впервые увиденным с `since`.
 
-    Reads what the order poller already stores, so the balance screen can show
-    what came in today and this week without another round-trip to the API.
+    Считается по тому, что фоновый опрос уже сохранил, — поэтому экран
+    баланса показывает сегодняшнее и недельное, не ходя лишний раз в API.
     """
     sales = revenue = 0
     for oid, det in details.items():
@@ -298,8 +299,11 @@ def _earned(details: dict, known: dict, since: float) -> tuple[int, int]:
 
 
 def _bump_spent(s: dict, since: float) -> float:
-    """Promotion spend to subtract from revenue. Only today's is tracked
-    precisely; for the week it is the best figure available."""
+    """Траты на продвижение, которые вычитаются из выручки.
+
+    Точно учитывается только сегодняшнее; за неделю это лучшее из того, что
+    есть, и выдавать его за точное нельзя.
+    """
     bs = s.get("bump_schedule", {})
     if bs.get("spent_day") == _lt.today_str(s):
         return float(bs.get("spent_today", 0) or 0)
@@ -365,7 +369,7 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
         err = str(e)[:200]
         logger.error("Balance check error: %s", e)
 
-    # If /check didn't give a usable number, try the dedicated balance endpoints
+    # Если из /check пригодного числа не вышло — пробуем отдельные адреса баланса
     if balance in (None, "", "0", "—"):
         try:
             amount, bal_str = await api.get_balance()
@@ -375,9 +379,9 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
             if err is None:
                 err = str(e)[:200]
 
-    # /check answers {status, shop:{id,title}, integration:{…}, ts} — an auth
-    # probe with no money in it, which is why the balance always read zero.
-    # The panel is where the figure lives, and where withdrawal already reads
+    # /check отдаёт {status, shop:{id,title}, integration:{…}, ts} — проверку
+    # доступа, в которой денег нет вовсе; отсюда и вечный ноль в балансе.
+    # Сумма живёт в панели, и вывод средств читает её оттуда же
     # it from.
     panel_err = ""
     if balance in (None, "", "—"):
@@ -386,11 +390,11 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
             balance = panel_bal
 
     if balance in (None, "", "—"):
-        # Neither source answered. Report both attempts, not just the API's
-        # shape: the previous version hid the panel's reason behind a message
-        # about /check, so two rounds went by without knowing what the panel
-        # said. The build stamp is here for the same reason it is on the
-        # restore screen — output from a stale container looks identical.
+        # Не ответил ни один источник. Показываем обе попытки, а не только
+        # форму ответа API: прежняя версия прятала причину от панели за
+        # сообщением про /check, и два круга прошли, не узнав, что ответила
+        # панель. Метка сборки здесь по той же причине, что и на экране
+        # возврата в продажу: вывод из устаревшего контейнера выглядит так же.
         from handlers.start import BOT_VERSION
         from storage import get_panel_creds
         has_panel = bool((get_panel_creds(callback.from_user.id) or {}).get("cookies"))
@@ -417,7 +421,7 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
         )
         if pending:
             text += f"⏳ В ожидании: <b>{_shown(pending)} ₽</b>\n"
-        # Tie the number to what produced it — a balance with no sales context
+        # Привязываем число к тому, из чего оно вышло: баланс без продаж рядом
         # is just a figure
         text += _activity_block(callback.from_user.id)
         threshold = get_settings(callback.from_user.id).get(
@@ -427,7 +431,7 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
                      f"<b>{_RUB(float(threshold.get('threshold', 0) or 0))} ₽</b>")
         kb = _kb()
     else:
-        # Nothing usable — show diagnostics so the real response shape is visible
+        # Пригодного нет — показываем диагностику, чтобы была видна форма ответа
         text = "❌ <b>Не удалось получить баланс</b>\n\n"
         if err:
             text += f"Ошибка: <code>{err}</code>\n\n"
@@ -578,8 +582,8 @@ async def threshold_save(message: Message, state: FSMContext) -> None:
     bn = s.setdefault("balance_notify", {})
     bn["threshold"] = amount
     bn["enabled"] = True
-    # Reset the arm so an already-high balance still triggers once next tick,
-    # instead of being treated as "already notified".
+    # Взводим заново, чтобы уже высокий баланс сработал один раз на следующем
+    # проходе, а не считался «об этом уже сообщали».
     bn["last_notified_balance"] = 0.0
     save_settings(message.from_user.id, s)
     b = InlineKeyboardBuilder()
@@ -660,7 +664,7 @@ async def auto_menu(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "balance:auto_setup")
 async def auto_setup(callback: CallbackQuery, state: FSMContext) -> None:
-    """Start the withdrawal wizard: pick a balance to withdraw from."""
+    """Начало мастера вывода: с какого баланса выводим."""
     from automation.panel import panel_balances_sync
     await state.clear()
     await callback.answer("⏳")
@@ -674,8 +678,8 @@ async def auto_setup(callback: CallbackQuery, state: FSMContext) -> None:
             f"❌ Не удалось прочитать счета: {_esc(err or res)}",
             reply_markup=b.as_markup())
         return
-    # Keep only what the next step needs — the full Nova rows in "raw" are large
-    # and would bloat the FSM state for no reason.
+    # Держим только нужное следующему шагу: полные строки Nova в "raw" велики
+    # и раздували бы состояние формы без всякой пользы.
     slim = [{"id": bl["id"], "currency": bl.get("currency", ""),
              "amount": bl.get("amount", "")} for bl in res]
     await state.update_data(wd_balances=slim)
@@ -744,8 +748,8 @@ async def wd_pick_system(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await callback.answer(str(sysopt["label"])[:60])
     await callback.message.edit_text("⏳ Уточняю, какие нужны реквизиты...")
-    # Re-read the form with the system chosen — the panel then marks the
-    # requisites that method needs as visible.
+    # Перечитываем форму с выбранной системой: панель тогда делает видимыми
+    # те реквизиты, которые нужны этому способу.
     res, err = await _run_panel(callback.from_user.id,
                                 panel_withdraw_fields_sync,
                                 data["wd_balance_id"], {"system": sysopt["value"]})
@@ -756,19 +760,20 @@ async def wd_pick_system(callback: CallbackQuery, state: FSMContext) -> None:
                     and f["attribute"] != "system"):
                 reqs.append(f)
     if not reqs:
-        # Fallback map if the re-read did not reshape visibility
+        # Запасной список, если перечитывание не изменило видимость полей
         reqs = _fallback_reqs(str(sysopt["label"]), res)
     values = {"system": sysopt["value"]}
-    # Carried in state: the option lookup below needs the seller's panel
-    # session, and the step that performs it only has the message to hand.
+    # Едет в состоянии формы: разбор вариантов ниже требует сессии панели, а у
+    # шага, который его делает, на руках только сообщение.
     await state.update_data(wd_values=values, wd_system_label=str(sysopt["label"]),
                             wd_queue=reqs, wd_qi=0, wd_uid=callback.from_user.id)
     await _wd_ask_next(callback.message, state)
 
 
 def _fallback_reqs(system_label: str, res) -> list:
-    """If Nova did not reshape the form, ask for the requisites the chosen
-    method obviously needs, by its own field labels."""
+    """Если Nova не перестроила форму — спросить реквизиты, которые выбранный
+    способ очевидно требует, по названиям его же полей.
+    """
     lab = system_label.lower()
     fields = {f["attribute"]: f for f in (res.get("fields") if isinstance(res, dict) else [])}
     want: list[str] = []
@@ -787,7 +792,7 @@ async def _wd_ask_next(message, state: FSMContext) -> None:
     data = await state.get_data()
     queue = data.get("wd_queue") or []
     qi = data.get("wd_qi", 0)
-    # Skip past any field already answered
+    # Пропускаем поля, на которые уже ответили
     while qi < len(queue) and queue[qi]["attribute"] in (data.get("wd_values") or {}):
         qi += 1
     if qi >= len(queue):
@@ -798,11 +803,11 @@ async def _wd_ask_next(message, state: FSMContext) -> None:
     label = _esc(f["label"])
     hint = f"\n<i>{_esc(f['help'])}</i>" if f.get("help") else ""
 
-    # A dependent select ships with `options: []` until the choices it depends
+    # Зависимый список приходит с `options: []` до тех пор, пока не выбрано то,
     # on are known — «Банк» arrives empty and only fills in once the payment
-    # system is picked. Without asking for them the wizard fell through to a
-    # text prompt and made the seller type a bank name by hand. The promotion
-    # flow already resolves dependent options this way; withdrawal now does too.
+    # от чего он зависит. Не спросив их, мастер сваливался в ввод текстом и
+    # заставлял продавца печатать название банка руками. В продвижении зависимые
+    # списки уже разбирались так же — теперь и в выводе.
     if (not f["options"] and f.get("component", "").endswith("select-field")
             and not f.get("_looked_up")):
         f["_looked_up"] = True
@@ -827,13 +832,13 @@ async def _wd_ask_next(message, state: FSMContext) -> None:
         await state.update_data(wd_queue=queue)
 
     if f["options"]:
-        # Indices point into the full list, never into a filtered view: the
-        # answer handler resolves them against `f["options"]`.
+        # Номера указывают в полный список, а не в отфильтрованный вид: обработчик
+        # ответа ищет их в `f["options"]`.
         query = (data.get("wd_filter") or "").strip().lower()
         shown = [(i, o) for i, o in enumerate(f["options"])
                  if not query or query in str(o["label"]).lower()]
         total = len(f["options"])
-        # The SBP bank list runs well past thirty entries, and cutting it there
+        # Список банков СБП заметно длиннее тридцати, и обрезка на этом месте
         # silently hid every bank after the thirtieth — «Яндекс Банк» among
         # them. What does not fit is reachable by name instead of lost.
         clipped = shown[:_WD_MAX_BUTTONS]
@@ -882,7 +887,7 @@ _WD_MAX_BUTTONS = 30
 
 @router.callback_query(F.data == "wd:find")
 async def wd_find(callback: CallbackQuery, state: FSMContext) -> None:
-    """Ask for a few letters, so a long list is reachable by name."""
+    """Спросить несколько букв: длинный список иначе не пролистать."""
     await state.set_state(WithdrawState.waiting_option_search)
     b = InlineKeyboardBuilder()
     b.button(text="↩️ Весь список", callback_data="wd:findoff")
@@ -969,7 +974,7 @@ async def wd_req_value(message: Message, state: FSMContext) -> None:
 
 
 async def _wd_finish(message, state: FSMContext) -> None:
-    """Requisites gathered — save the method and show what was configured."""
+    """Реквизиты собраны: сохраняем способ и показываем, что настроено."""
     data = await state.get_data()
     uid = message.chat.id
     s = get_settings(uid)
@@ -1122,8 +1127,10 @@ def _one_btn(text: str, cb: str) -> InlineKeyboardMarkup:
 
 
 async def _safe_edit(message, text: str, reply_markup=None) -> None:
-    """Edit a message, surviving both Telegram's 4096 limit and a rejected
-    edit — a message that fails to update is what makes the bot look hung."""
+    """Правка сообщения, переживающая и предел Telegram в 4096 знаков, и отказ
+    в правке: не обновившееся сообщение и есть то, из-за чего бот выглядит
+    зависшим.
+    """
     text = text[:4000]
     try:
         await message.edit_text(text, reply_markup=reply_markup)
