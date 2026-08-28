@@ -17,8 +17,8 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# The ledger is one HTTP round-trip per screen; a seller clicking through the
-# statistics sub-screens would otherwise re-read it on every tap.
+# Журнал — это поход в сеть на каждый экран. Без запоминания продавец,
+# переключающий разделы статистики, перечитывал бы его на каждое нажатие.
 _TTL = 120
 _CACHE: dict[int, tuple[float, list, str, str]] = {}
 
@@ -35,10 +35,10 @@ def invalidate(uid: int) -> None:
 
 
 async def _panel_events(uid: int) -> tuple[list[dict], str]:
-    """The panel's ledger as events, or ([], reason).
+    """Журнал операций панели событиями, либо ([], причина).
 
-    Which resource holds the ledger is discovered once and remembered: probing
-    a list of candidate names on every read costs a request each.
+    В каком разделе панели лежит журнал, выясняется один раз и запоминается:
+    перебор кандидатов при каждом чтении стоит по запросу на имя.
     """
     from automation.panel import panel_find_ledger_sync, panel_operations_sync
     from handlers.balance import _run_panel
@@ -63,12 +63,12 @@ async def _panel_events(uid: int) -> tuple[list[dict], str]:
     if not isinstance(ops, list):
         return [], (err or "панель не отдала операции")[:200]
 
-    # A row with no date cannot be placed in any window, and counting it into
-    # "today" would inflate the day with the shop's whole history.
+    # Запись без даты не ложится ни в какой отрезок, а зачесть её в «сегодня»
+    # значит приписать одному дню всю историю магазина.
     dated = [o for o in ops if o.get("ts")]
     if not dated:
-        # Reached the panel, read nothing usable — a different thing from not
-        # reaching it, and the seller should be told which happened.
+        # До панели дошли, но ничего пригодного не прочли — это не то же самое,
+        # что «не дошли», и продавцу надо сказать, что именно случилось.
         return [], "панель ответила, но операций в журнале нет"
     return dated, ""
 
@@ -121,7 +121,12 @@ def local_events(settings: dict) -> list[dict]:
 
 async def events_for(uid: int, settings: dict | None = None,
                      force: bool = False) -> tuple[list[dict], str, str]:
-    """(events, source, panel error). `source` is PANEL or LOCAL."""
+    """(события, откуда, ошибка панели). «Откуда» — PANEL или LOCAL.
+
+        Продавец должен видеть, чем посчитаны цифры: журналом панели или тем,
+        что бот записал у себя. Это разные числа, и разница объяснима только
+        если сказать, какое из двух перед ним.
+        """
     now = time.time()
     hit = _CACHE.get(uid)
     if hit and not force and now - hit[0] < _TTL:
@@ -147,7 +152,7 @@ async def events_for(uid: int, settings: dict | None = None,
 
 def summarize(events: list[dict], since: float = 0.0,
               until: float | None = None) -> dict:
-    """Totals over a time window. Refunds are not revenue; bumps are spend."""
+    """Итоги за отрезок времени. Возврат — не выручка, поднятие — трата."""
     res = {"sales": 0, "revenue": 0.0, "orders": 0, "refunds": 0,
            "spend": 0.0, "payouts": 0.0, "payout_count": 0, "other_in": 0.0}
     for e in events:
@@ -180,11 +185,11 @@ def summarize(events: list[dict], since: float = 0.0,
 
 def day_start(now: float | None = None,
               settings: dict | None = None) -> float:
-    """Midnight local time, as epoch seconds.
+    """Полночь по местному времени, в секундах эпохи.
 
-    `now - now % 86400` is midnight UTC, which for a Moscow seller cuts the day
-    three hours late — sales made between 00:00 and 03:00 were counted into the
-    previous day's report.
+    `now - now % 86400` — это полночь по UTC, и московскому продавцу она
+    режет сутки на три часа позже: продажи с 00:00 до 03:00 попадали во
+    вчерашний отчёт.
     """
     from datetime import timedelta, timezone
     import localtime as _lt

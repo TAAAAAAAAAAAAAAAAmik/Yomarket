@@ -18,14 +18,14 @@ from storage import get_panel_creds, save_panel_creds, delete_panel_creds, get_t
 logger = logging.getLogger(__name__)
 router = Router()
 
-# {user_id: YooMarketPanelHTTP} — live HTTP session kept between the send-code
-# and enter-code steps, so the code is verified on the same session (it holds
-# the cookies and CSRF token the panel issued).
+# {продавец: YooMarketPanelHTTP} — живая HTTP-сессия между «выслать код» и
+# «ввести код»: проверять код надо на той же сессии, потому что в ней лежат
+# куки и CSRF-токен, которые выдала панель.
 _login_sessions: dict[int, YooMarketPanelHTTP] = {}
 
 
 class PanelState(StatesGroup):
-    # email → code mailed by the panel
+    # почта → код, который панель пришлёт письмом
     waiting_email = State()
     waiting_code = State()
     waiting_cookies = State()
@@ -51,12 +51,12 @@ def _status_text(creds: dict | None, has_token: bool = False) -> str:
 
 
 def _menu_kb(creds: dict | None, has_token: bool = False):
-    """Email + code only.
+    """Только почта и код из письма.
 
-    The cookie-paste and token paths are gone on purpose: pasting cookies is
-    something no seller should be asked to do, and neither of those routes ever
-    yields the chat token the panel mints at email login — the one that makes
-    replying to support work. One way in, and it is the one that works fully.
+    Вход по вставленным кукам и по токену убран намеренно. Просить продавца
+    вставлять куки нельзя, и ни один из этих путей не даёт чат-токен,
+    который панель выпускает при входе по почте, — а без него не работает
+    ответ поддержке. Дорога одна, зато рабочая целиком.
     """
     b = InlineKeyboardBuilder()
     if creds:
@@ -79,9 +79,11 @@ def _cancel_kb(back: str = "panel:menu"):
 
 
 async def _safe_edit(msg: Message, text: str, **kwargs) -> None:
-    """Edit a message, falling back to unformatted text if Telegram rejects the
-    markup. Diagnostics carry page dumps and URLs; one stray tag used to make
-    the send fail, leaving the user looking at a frozen "in progress" message."""
+    """Правка сообщения с откатом на текст без разметки.
+
+    В диагностику попадают куски страниц и адреса; одного случайного тега
+    хватало, чтобы отправка не прошла, — и продавец оставался смотреть на
+    застывшее «выполняется»."""
     try:
         await msg.edit_text(text, **kwargs)
         return
@@ -110,10 +112,12 @@ async def _finish_login(
     message: Message, status_msg: Message, uid: int, login: str, cookies: str,
     chat_token: str = "",
 ) -> None:
-    """Store the fresh panel session and confirm it works against the Nova API.
-    Shared by both login flows (code and password)."""
+    """Сохранить свежую сессию панели и проверить её на Nova API.
+
+    Общая часть обоих входов — по коду и по паролю: HTTP 200 на входе ещё не
+    значит, что сессия рабочая, поэтому она сразу пробуется делом."""
     creds = {"login": login, "cookies": cookies}
-    # Keep any existing chat token unless the login produced a fresh one
+    # Прежний чат-токен не трогаем, пока вход не выдал свежий
     if chat_token:
         creds["chat_token"] = chat_token
     elif (get_panel_creds(uid) or {}).get("chat_token"):
@@ -202,7 +206,7 @@ async def panel_check(callback: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Auto login via API token
+# Автовход по токену API
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "panel:token_login")
@@ -234,7 +238,7 @@ async def panel_token_login(callback: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
-# OTP login (the panel's real flow): step 1 — email → send code
+# Вход по одноразовому коду — настоящий путь панели. Шаг 1: почта → выслать код
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "panel:sms_start")
@@ -266,8 +270,8 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
 
     status_msg = await message.answer("⏳ Запрашиваю код на почту...")
 
-    # Plain HTTP: the endpoint and payload were captured from the site itself
-    # (POST /token with an empty "code" field), so no browser is needed.
+    # Обычный HTTP: адрес и тело запроса сняты с самого сайта (POST /token с
+    # пустым полем "code"), поэтому браузер здесь не нужен.
     http = YooMarketPanelHTTP()
     try:
         await http.start()
@@ -304,7 +308,7 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# OTP login: step 2 — verify the code from the letter
+# Вход по коду, шаг 2: проверяем код из письма
 # ---------------------------------------------------------------------------
 
 @router.message(PanelState.waiting_code)

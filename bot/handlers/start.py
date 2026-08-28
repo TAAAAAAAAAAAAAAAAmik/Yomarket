@@ -16,7 +16,7 @@ from storage import delete_token, get_token, save_token, get_settings, save_sett
 router = Router()
 logger = logging.getLogger(__name__)
 
-# Bumped on every meaningful code change — lets us confirm which version is running.
+# Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
 BOT_VERSION = "2026-08-28-fast-chats"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
@@ -36,11 +36,11 @@ class AuthState(StatesGroup):
 
 
 def _extract_shop(info: dict) -> tuple[str, str]:
-    """Returns (name, balance_str) from /check response.
+    """Название магазина и баланс строкой из ответа /check.
 
-    /check answers {status, shop:{id,title}, integration:{…}, ts} — identity
-    only, no money. The balance comes back "—" here on purpose; it is read from
-    the panel where it actually lives.
+    /check отдаёт {status, shop:{id,title}, integration:{…}, ts} — то есть
+    только «кто вы», без денег. Баланс здесь возвращается прочерком
+    намеренно: он читается из панели, где и лежит на самом деле.
     """
     shop = info.get("shop") or info.get("data") or info
     if isinstance(shop, dict):
@@ -131,7 +131,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
     from storage import render_custom_text
     await state.set_state(AuthState.waiting_for_token)
-    # The greeting links to the panel; a link preview would bury the steps.
+    # В приветствии есть ссылка на панель, и превью к ней завалило бы собой
+    # сами шаги подключения.
     await message.answer(render_custom_text("welcome"),
                          reply_markup=_welcome_kb(),
                          disable_web_page_preview=True)
@@ -139,7 +140,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @router.message(Command("version"))
 async def cmd_version(message: Message) -> None:
-    """Show running bot version and where/how data is stored — deploy diagnostics."""
+    """Версия работающего бота и где лежат его данные — диагностика выката."""
     import os
     import storage
 
@@ -167,7 +168,7 @@ async def cmd_version(message: Message) -> None:
     redis_on = bool(os.environ.get("REDIS_URL", "").strip())
     redis_line = "🧩 FSM: 🟢 Redis" if redis_on else "🧩 FSM: ⚪ память (сбрасывается при рестарте)"
 
-    # 3. Is THIS user's token actually stored right now?
+    # 3. Лежит ли прямо сейчас токен ИМЕННО этого продавца
     has_token = bool(storage.get_token(uid))
     accounts = storage.get_accounts(uid)
     token_line = (f"🔑 Ваш токен: {'✅ сохранён' if has_token else '❌ нет'}"

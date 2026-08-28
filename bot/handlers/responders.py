@@ -25,7 +25,7 @@ def _esc(value) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Category emoji mapping (best-effort)
+# Значки разделов — подбор по названию, без обещаний точности
 # ---------------------------------------------------------------------------
 _CAT_EMOJI: dict[str, str] = {
     "игры": "🎮",
@@ -148,7 +148,7 @@ def _ad_category(ad: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Category list
+# Шаг 2: список разделов
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "resp:cats")
@@ -199,7 +199,7 @@ async def show_categories(callback: CallbackQuery, api) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Game list within a category
+# Шаг 3: игры внутри раздела
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("resp:cat:"))
@@ -208,13 +208,13 @@ async def show_games(callback: CallbackQuery, api) -> None:
 
     ads = await _load_all_ads(api)
 
-    # Ads whose category key matches the one from the button
+    # Товары, у которых ключ раздела совпал с нажатым
     filtered = [
         ad for ad in ads
         if _key(_ad_category(ad)) == cat_key
     ]
 
-    # Full category name from first match
+    # Полное название раздела берём из первого совпадения
     cat_full = _ad_category(filtered[0]) if filtered else ""
 
     builder = InlineKeyboardBuilder()
@@ -234,14 +234,14 @@ async def show_games(callback: CallbackQuery, api) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Show current responder for a game
+# Шаг 4: показать нынешний ответ по игре
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("resp:game:"))
 async def show_game_responder(callback: CallbackQuery, api) -> None:
     title_key = callback.data[len("resp:game:"):]
 
-    # Resolve full title & category from ads
+    # Полное название и раздел добираем из списка товаров
     ads_list = await _load_all_ads(api)
     full_title = title_key
     cat_full = ""
@@ -281,7 +281,7 @@ async def show_game_responder(callback: CallbackQuery, api) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 5a: Add responder — prompt for message
+# Шаг 5а: добавить ответ — просим текст
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("resp:add:"))
@@ -302,7 +302,7 @@ async def add_responder_start(callback: CallbackQuery, state: FSMContext, api) -
 
 
 # ---------------------------------------------------------------------------
-# Step 5b: Edit responder — prompt for message
+# Шаг 5б: изменить ответ — просим текст
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data.startswith("resp:edit:"))
@@ -323,7 +323,7 @@ async def edit_responder_start(callback: CallbackQuery, state: FSMContext, api) 
 
 
 # ---------------------------------------------------------------------------
-# Step 6: User typed message → show preview
+# Шаг 6: текст введён — показываем предпросмотр
 # ---------------------------------------------------------------------------
 
 @router.message(ResponderState.waiting_message)
@@ -379,7 +379,7 @@ async def save_responder(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Re-edit: go back to typing
+# Правка ещё раз: возвращаемся к вводу
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "resp:reedit")
@@ -442,11 +442,15 @@ async def delete_responder_do(callback: CallbackQuery, api) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Internal helper: resolve full title + category from title_key via ads API
+# Служебное: добрать полное название и раздел по ключу через список товаров
 # ---------------------------------------------------------------------------
 
 async def _resolve_title(title_key: str, api) -> tuple[str, str]:
-    """Return (full_title, category) for a given truncated title_key."""
+    """Полное название и раздел по обрезанному ключу товара.
+
+        На кнопку помещается 64 байта, поэтому в `callback_data` едет обрезок, а
+        полное название добирается отсюда.
+        """
     ads_list = await _load_all_ads(api)
     for ad in ads_list:
         if _key(_ad_title(ad)) == title_key:

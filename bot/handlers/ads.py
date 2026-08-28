@@ -12,8 +12,8 @@ from keyboards.main import AdCallback, PaginationCallback, back_keyboard
 
 router = Router()
 
-# What this marketplace actually reports is publish / unpublish; the older
-# names are kept because other endpoints still use them.
+# На деле этот маркетплейс говорит «опубликовано» и «снято с публикации».
+# Прежние имена оставлены потому, что ими пользуются другие вызовы.
 STATUS_EMOJI = {
     "publish": "🟢 В продаже",
     "active": "🟢 Активен",
@@ -25,10 +25,10 @@ STATUS_EMOJI = {
 }
 
 def _manual_only(raw: str) -> bool:
-    """Taken down by hand — this marketplace only republishes expired listings.
+    """Снято руками: этот маркетплейс возвращает в продажу только истёкшие.
 
-    Offering a button that is certain to answer incorrect_status is worse than
-    saying plainly that it has to be done on the site.
+    Кнопка, которая заведомо ответит `incorrect_status`, хуже прямого «это
+    делается на сайте»: она обещает то, чего не будет.
     """
     from api.yoomarket import YooMarketAPI
     return str(raw).lower() in YooMarketAPI._MANUAL_ONLY
@@ -48,10 +48,10 @@ def _price_text(ad: dict) -> str:
 
 
 def _load_error(e: Exception) -> str:
-    """Say what actually went wrong loading listings.
+    """Сказать, что на самом деле помешало загрузить товары.
 
-    An empty or opaque error here is the difference between "the bot is broken"
-    and "your token expired" — the seller can act on the second one.
+    Пустая или непонятная ошибка здесь — это разница между «бот сломался» и
+    «у вас истёк токен»: со вторым продавец может что-то сделать.
     """
     s = str(e) or type(e).__name__
     low = s.lower()
@@ -76,9 +76,9 @@ def _load_error(e: Exception) -> str:
                               "connection")):
         return ("🌐 <b>Нет связи с Юмаркетом</b>\n\n"
                 "Сервер маркетплейса недоступен. Это пройдёт само — повторите позже.")
-    # Escaped: the raw error can carry '<', which makes Telegram reject the
+    # Экранируем: в сырой ошибке может оказаться «<», и тогда Telegram
     # whole edit — leaving the "⏳ Загружаю..." text on screen forever, i.e.
-    # the exact hang this message exists to explain.
+    # зависание, ради объяснения которого это сообщение и написано.
     import html as _html
     return (f"❌ <b>Не удалось загрузить объявления</b>\n\n"
             f"<code>{_html.escape(str(s)[:250])}</code>")
@@ -129,8 +129,8 @@ def _ads_keyboard(ads: list[dict], next_cursor: str | None):
     b.button(text="💰 Цены", callback_data="prices:menu")
     b.button(text="➕ Добавить товар", callback_data="create_ad:start")
     b.button(text="📦 Паки", callback_data="packs:menu")
-    # Listing automation lives here rather than in the auto-settings menu:
-    # both act on ads, so this is where they are looked for.
+    # Автоматика по товарам живёт здесь, а не в меню авто-функций: и то и
+    # другое делается над объявлениями, и ищут это именно тут.
     b.button(text="⭐ Премиум продвижение", callback_data="selenium:bump:menu")
     b.button(text="🔄 Авто-восстановление", callback_data="selenium:restore:menu")
     b.button(text="🔄 Обновить", callback_data="ads_load")
@@ -141,8 +141,8 @@ def _ads_keyboard(ads: list[dict], next_cursor: str | None):
 
 @router.callback_query(F.data.in_({"menu:ads", "ads_load"}))
 async def ads_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    # Answer the callback first: Telegram spins the button for a few seconds and
-    # then reports a timeout on its own if it is left unanswered.
+    # Сначала отвечаем на нажатие: иначе Telegram несколько секунд крутит
+    # кнопку и сам сообщает о таймауте.
     await callback.answer()
     await _safe_edit(callback.message, "⏳ Загружаю объявления...")
     try:
@@ -252,7 +252,7 @@ async def bump_ad(callback: CallbackQuery, api: YooMarketAPI) -> None:
 
 @router.callback_query(F.data.startswith("ad_bump_ok:"))
 async def bump_ad_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    """Run the paid promotion through the panel — the API has no such method."""
+    """Платное продвижение идёт через панель: в API такого метода нет вовсе."""
     import asyncio
 
     from automation.panel import panel_bump_item_sync
@@ -296,7 +296,7 @@ async def bump_ad_confirmed(callback: CallbackQuery, api: YooMarketAPI) -> None:
         else:
             hint = ""
             if "нет прав" in msg.lower():
-                # Nova authorizes per record, so this is about this listing
+                # Nova разрешает по каждой записи отдельно — значит дело в этом товаре
                 hint = ("\n\nПанель отказала в самом действии. Чаще всего "
                         "это значит, что <b>панель и токен — разные "
                         "магазины</b>: чужие объявления панель трогать не "

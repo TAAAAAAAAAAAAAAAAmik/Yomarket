@@ -1,15 +1,17 @@
-"""Telegram Stars auto-delivery via Fragment (fragment.com) + TON wallet.
+"""Автовыдача звёзд Telegram через Fragment (fragment.com) и кошелёк TON.
 
-Flow (all blocking — call through loop.run_in_executor):
-  1. searchStarsRecipient(username)   → recipient id
-  2. initBuyStarsRequest(recipient, quantity) → req_id
-  3. derive TON wallet from mnemonic  → address
-  4. getBuyStarsLink(req_id, address) → transaction messages
-  5. for each message: build signed BOC, send to TonCenter, confirmReq
-  6. wait for the wallet seqno to advance = on-chain confirmation
+Цепочка (всё блокирующее — вызывать через loop.run_in_executor):
+  1. searchStarsRecipient(ник)                → id получателя
+  2. initBuyStarsRequest(получатель, сколько) → req_id
+  3. кошелёк TON из seed-фразы                → адрес
+  4. getBuyStarsLink(req_id, адрес)           → сообщения транзакции
+  5. на каждое: собрать подписанный BOC, отправить в TonCenter, confirmReq
+  6. дождаться, пока у кошелька вырастет seqno — это и есть подтверждение
+     в сети
 
-Secrets (Fragment cookies, wallet mnemonic) are passed in by the caller and
-never logged. Based on the seller-provided fragment_utils API sample.
+Секреты — куки Fragment и seed-фраза кошелька — приходят от вызывающего и
+в логи не попадают никогда: это доступ к чужому кошельку. За истину взята
+документация рабочего клиента, которую дал продавец.
 """
 from __future__ import annotations
 
@@ -341,8 +343,8 @@ def _send_boc(boc_b64: str) -> bool:
 def get_wallet_balance_sync(
     mnemonic: str, wallet_version: str = "v4r2",
 ) -> tuple[bool, object]:
-    """Return (True, {"ton": float, "nano": int, "address": str}) or (False, err).
-    Blocking — run in an executor."""
+    """Баланс кошелька: (True, {"ton", "nano", "address"}) или (False, ошибка).
+    Блокирующая — вызывать через executor."""
     if not mnemonic or len(mnemonic.split()) < 12:
         return False, "Не настроена seed-фраза кошелька"
     try:
@@ -612,7 +614,11 @@ def buy_stars_sync(
     return True, f"✅ {quantity}⭐ отправлены на @{username}{tail}"
 
 def _wait_seqno_advance(address: str, from_seqno: int) -> bool:
-    """Poll until wallet seqno exceeds from_seqno. Returns True if advanced."""
+    """Ждать, пока seqno кошелька станет больше `from_seqno`.
+
+        Выросший seqno — единственное доказательство, что перевод дошёл до сети:
+        ответ `sendBoc` говорит лишь о том, что его приняли в очередь.
+        """
     deadline = time.time() + SEQNO_MAX_WAIT_SECS
     while time.time() < deadline:
         try:
@@ -931,7 +937,7 @@ def wallet_hash(addr: str) -> str:
         raw = base64.urlsafe_b64decode(v + "=" * (-len(v) % 4))
     except Exception:
         return ""
-    # tag(1) + workchain(1) + hash(32) + crc(2)
+    # метка(1) + workchain(1) + хеш(32) + crc(2)
     return raw[2:34].hex() if len(raw) == 36 else ""
 
 
@@ -1992,11 +1998,12 @@ def probe_page_api_sync(cookies: dict) -> list[str]:
 
 def check_fragment_session_sync(cookies: dict,
                                 api_hash: str = "") -> tuple[bool, object]:
-    """Light check that the Fragment session is alive.
+    """Лёгкая проверка, жива ли сессия Fragment.
 
-    Returns (ok, message) or, when a fresh hash was discovered along the way,
-    (True, {"message":…, "api_hash":…}) so the caller can keep it: the hash is
-    what the previous version got wrong, and finding it is most of the fix.
+    Отдаёт (ok, сообщение), а если по дороге удалось снять свежий хеш —
+    (True, {"message":…, "api_hash":…}), чтобы вызывающий его сохранил:
+    именно в хеше ошибалась прошлая версия, и его добыча — большая часть
+    починки.
     """
     if not cookies:
         return False, "cookies не заданы"

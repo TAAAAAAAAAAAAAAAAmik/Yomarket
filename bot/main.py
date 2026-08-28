@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 
 
 class AccessMiddleware:
-    """Blocks banned users and (optionally) gates access behind a subscription.
-    Owner and admins always pass."""
+    """Отсекает заблокированных и, если включена подписка, — тех, у кого её нет.
+    Владелец и админы проходят всегда."""
 
     async def __call__(
         self,
@@ -46,9 +46,9 @@ class AccessMiddleware:
         if user:
             uid = user.id
             if is_blocked(uid) and not is_admin(uid):
-                return  # banned — silently drop
-            # Subscription gate: allow /start so the user can see the notice,
-            # and always allow admins.
+                return  # заблокирован — молча не отвечаем
+            # Проверка подписки: /start пропускаем всегда — иначе человек не увидит
+            # даже сообщения о том, что подписка нужна. Админы проходят без проверки.
             if (require_subscription_enabled() and not is_admin(uid)
                     and not has_active_subscription(uid)):
                 text = getattr(event, "text", "") or ""
@@ -356,7 +356,7 @@ def _install_error_reporter(dp: Dispatcher) -> None:
 
 
 class YooMarketMiddleware:
-    """Injects per-user YooMarketAPI instance into handler data."""
+    """Кладёт в данные обработчика клиент Integration API этого продавца."""
 
     async def __call__(
         self,
@@ -392,7 +392,8 @@ async def main() -> None:
         session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    # FSM state store: Redis if REDIS_URL is set (survives restarts), else memory
+    # Где живут незаконченные формы: Redis, если задан REDIS_URL (переживает
+    # перезапуск), иначе память — там они пропадают вместе с процессом
     redis_url = os.environ.get("REDIS_URL", "").strip()
     if redis_url:
         try:

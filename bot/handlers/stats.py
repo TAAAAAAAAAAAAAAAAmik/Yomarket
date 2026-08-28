@@ -42,7 +42,7 @@ def _esc(value) -> str:
 
 
 def _sales(events: list, since: float = 0.0) -> list:
-    """Sale events in the window, newest first."""
+    """Продажи за отрезок времени, от свежих к старым."""
     out = [e for e in events if e.get("kind") == "sale" and float(e.get("ts") or 0) >= since]
     out.sort(key=lambda e: float(e.get("ts") or 0), reverse=True)
     return out
@@ -75,7 +75,11 @@ def _stats_kb() -> InlineKeyboardBuilder:
 
 @router.callback_query(F.data == "stats:reload")
 async def reload_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
-    """Refresh means refresh — drop the cached ledger, then redraw."""
+    """«Обновить» значит обновить: сбрасываем запомненный журнал и перерисовываем.
+
+        Кнопка, перерисовывающая те же запомненные цифры, — обман: продавец
+        жмёт её именно потому, что не верит показанному.
+        """
     invalidate(callback.from_user.id)
     await show_stats(callback, api)
 
@@ -95,8 +99,8 @@ async def show_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
     month = summarize(events, now - 30 * 86400)
     total = summarize(events)
 
-    # Only the panel's ledger prices its own promotion charges; when the numbers
-    # come from the bot's own history, the bump spend it tracked is the figure.
+    # Списания за продвижение оценены только в журнале панели. Когда цифры
+    # берутся из истории самого бота, тратой считается то, что он записал сам.
     d_spend = today["spend"] or (_bump_spent(settings, d0) if source == LOCAL else 0.0)
     d_net = today["revenue"] - d_spend
 
@@ -122,7 +126,7 @@ async def show_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
         except Exception as e:
             logger.warning("Stats ads error: %s", e)
 
-    # The API's /check carries no money; the panel is where the balance lives.
+    # В /check денег нет вовсе — баланс живёт в панели.
     if balance_str == "—":
         from handlers.balance import _panel_balance
         panel_bal, _ = await _panel_balance(uid)
@@ -165,7 +169,7 @@ async def show_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
 
 @router.callback_query(F.data == "stats:ops")
 async def show_operations(callback: CallbackQuery) -> None:
-    """The panel's ledger as the panel wrote it — the raw truth behind the totals."""
+    """Журнал панели как есть — то сырьё, из которого посчитаны итоги."""
     await callback.answer()
     await callback.message.edit_text("⏳ Читаю операции из панели...")
     events, source, err = await _events(callback.from_user.id)
@@ -212,7 +216,7 @@ async def show_revenue(callback: CallbackQuery) -> None:
 
     now = time.time()
     # «Сегодня» means since midnight, not «за последние 24 часа» — a seller
-    # comparing the figure against the panel counts the calendar day.
+    # сверяя цифру с панелью, продавец считает календарные сутки.
     since = day_start(now, settings) if days == 1 else (now - days * 86400 if days else 0.0)
     agg = summarize(events, since)
     count, revenue = agg["sales"], agg["revenue"]
@@ -223,9 +227,9 @@ async def show_revenue(callback: CallbackQuery) -> None:
         by_title[title][0] += 1
         by_title[title][1] += float(e.get("amount") or 0)
 
-    # Promotion spend for the same window, so revenue and the cost of chasing
-    # it sit side by side. The panel's ledger prices each charge and can be
-    # windowed exactly; the bot's own tracking only knows today's precisely.
+    # Траты на продвижение за тот же отрезок — чтобы выручка и цена её
+    # добычи стояли рядом. Журнал панели оценивает каждое списание и режется
+    # по времени точно; собственный учёт бота точно знает только сегодняшний.
     spent = agg["spend"]
     spent_exact = True
     if not spent and source == LOCAL:
@@ -320,8 +324,8 @@ async def show_chart(callback: CallbackQuery) -> None:
     for i in range(7):
         day_date = today - timedelta(days=6 - i)
         label = day_date.strftime("%d.%m")
-        # Bars scale by money, not by count: two 5 000 ₽ days and one 50 ₽ day
-        # drew as equal columns, which is not what a sales chart is for.
+        # Столбцы меряются деньгами, а не числом продаж: два дня по 5 000 ₽ и
+        # один на 50 ₽ рисовались одинаковыми — не за этим смотрят на график.
         rev = days_revenue.get(i, 0.0)
         filled = round((rev / max_rev) * bar_length)
         bar = "█" * filled + "░" * (bar_length - filled)
@@ -609,7 +613,7 @@ async def show_hours_chart(callback: CallbackQuery) -> None:
     s = get_settings(callback.from_user.id)
     hour_counts: dict[int, int] = defaultdict(int)
     # Local time, not UTC: a «пиковый час» three hours off tells the seller to
-    # promote at the wrong time of day.
+    # продвигаться не в те часы.
     for e in _sales(events):
         hour_counts[_lt.to_local(float(e["ts"]), s).hour] += 1
 
@@ -622,7 +626,7 @@ async def show_hours_chart(callback: CallbackQuery) -> None:
         return
 
     bar_length = 8
-    # normalize against the max 2-hour bucket sum (bars sum two hours)
+    # приводим к самому большому двухчасовому ведру (столбец — сумма за два часа)
     buckets = [hour_counts.get(b * 2, 0) + hour_counts.get(b * 2 + 1, 0)
                for b in range(12)]
     max_count = max(buckets) or 1
@@ -678,9 +682,9 @@ async def show_repeat_buyers(callback: CallbackQuery) -> None:
             price = 0
         buyer_revenue[buyer] += price
 
-    # Buyers are the one figure the panel's money ledger does not carry — it
-    # records amounts, not who paid — so this screen stays on the bot's own
-    # order history and says so.
+    # Покупатели — единственная цифра, которой в денежном журнале панели нет:
+    # он записывает суммы, а не то, кто платил. Поэтому экран считает по
+    # собственной истории заказов и прямо об этом говорит.
     if not buyer_counts:
         text = ("👥 <b>Повторные покупатели</b>\n\nПока нет данных.\n\n"
                 "<i>Покупателей знает только сам бот — считаются заказы, "
@@ -706,11 +710,11 @@ _KIND_RU = {"sale": "Продажа", "payout": "Вывод", "bump": "Прод�
 
 @router.callback_query(F.data == "stats:export_csv")
 async def export_orders_csv(callback: CallbackQuery) -> None:
-    """The same ledger the screens are built from, as a spreadsheet.
+    """Тот же журнал, по которому построены экраны, — таблицей.
 
-    The export used to read the bot's own order history while the figures on
-    screen came from the panel, so the file and the screen disagreed with each
-    other. Both read the same events now.
+    Раньше выгрузка читала собственную историю заказов бота, а цифры на
+    экране приходили из панели: файл и экран расходились между собой.
+    Теперь у обоих один источник.
     """
     await callback.answer("⏳ Генерирую CSV...", show_alert=False)
 
@@ -753,11 +757,11 @@ async def export_orders_csv(callback: CallbackQuery) -> None:
 
 @router.message(Command("stats_debug"))
 async def stats_debug(message: Message) -> None:
-    """What the panel's ledger actually says — read-only, changes nothing.
+    """Что на самом деле лежит в журнале панели — только чтение, ничего не меняет.
 
-    Every real answer in this bot came from printing the server's own response
-    instead of guessing at it. If a total looks wrong, this shows the rows it
-    was summed from and how each one was read.
+    Каждый настоящий ответ в этом проекте получался тем, что печатался
+    ответ сервера, а не догадка о нём. Если итог выглядит неверным, здесь
+    видно, из каких строк он сложен и как прочитана каждая.
     """
     import asyncio as _a
     import html as _html

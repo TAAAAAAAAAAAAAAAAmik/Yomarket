@@ -1,4 +1,4 @@
-"""Multi-account management: several YooMarket shops in one bot."""
+"""Несколько магазинов Юмаркета в одном боте: список, добавление, выбор."""
 from __future__ import annotations
 
 import logging
@@ -35,11 +35,11 @@ def _names(user_id: int) -> list[str]:
 
 
 def _shop_of(user_id: int, account: str) -> str:
-    """The shop name stored for one account.
+    """Название магазина, сохранённое для одного аккаунта.
 
-    Settings are keyed per account, so the name saved when that token was last
-    checked is read from its own key rather than the active one — otherwise
-    every row would show the same shop.
+    Настройки разложены по аккаунтам, поэтому имя берётся из ключа СВОЕГО
+    аккаунта, а не активного: иначе все строки списка показывали бы один и
+    тот же магазин.
     """
     try:
         from storage import _load_settings, _merge_defaults
@@ -58,9 +58,9 @@ async def _render_menu(msg, user_id: int, edit: bool = True) -> None:
         lines.append("Нет добавленных аккаунтов. Отправьте /start и введите токен.")
     else:
         lines.append("Нажмите на аккаунт, чтобы переключиться:\n")
-        # The account name says nothing about which shop its token opens, so
-        # picking the right one was guesswork — and picking wrong is what makes
-        # the panel and the token disagree.
+        # Название аккаунта ничего не говорит о том, какой магазин открывает его
+        # токен, поэтому выбор был угадыванием — а промах здесь и есть та причина,
+        # по которой панель и токен начинают показывать разные магазины.
         for i, name in enumerate(accounts):
             mark = " ✅" if name == active else ""
             shop = _shop_of(user_id, name)
@@ -100,16 +100,16 @@ async def switch_account(callback: CallbackQuery) -> None:
         await callback.answer("Уже активен")
         return
     set_active_account(uid, name)
-    # Ask the marketplace who this token belongs to instead of trusting a name
-    # cached long ago: a stale shop name is what makes the wrong account look
-    # like the right one.
+    # Спрашиваем у маркетплейса, чей это токен, вместо того чтобы верить
+    # давно сохранённому имени: как раз устаревшее имя и делает чужой аккаунт
+    # похожим на нужный.
     shop = await _refresh_shop(uid)
     await callback.answer(f"✅ Переключено на «{shop or name}»", show_alert=True)
     await _render_menu(callback.message, uid)
 
 
 async def _refresh_shop(uid: int) -> str:
-    """Re-read the active token's shop name from the marketplace."""
+    """Перечитать у маркетплейса, какому магазину принадлежит активный токен."""
     from storage import get_token, save_shop_name
     token = get_token(uid)
     if not token:

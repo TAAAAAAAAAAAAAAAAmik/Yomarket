@@ -1,5 +1,5 @@
-"""Owner/admin panel: subscriptions, blacklist, stats, bot price, broadcasts,
-granting admin. Access limited to the owner and granted admins."""
+"""Панель владельца: подписки, чёрный список, статистика, цена бота,
+рассылки, выдача админки. Доступ — только владельцу и выданным админам."""
 from __future__ import annotations
 
 import asyncio
@@ -218,9 +218,9 @@ async def _do_grant(msg, state: FSMContext, days: int, admin_id: int, bot: Bot) 
             await msg.answer(text, reply_markup=b.as_markup())
     else:
         await msg.answer(text, reply_markup=b.as_markup())
-    # Greet the client and put them straight into the onboarding step. Setting
-    # the token-waiting state matters: the greeting asks for the API token, and
-    # without the state their reply would land nowhere.
+    # Здороваемся с клиентом и сразу ставим его на шаг подключения. Состояние
+    # «жду токен» здесь не мелочь: приветствие просит прислать токен, а без
+    # состояния его ответ не поймает никто.
     try:
         from storage import get_token, render_custom_text
         await bot.send_message(
@@ -233,10 +233,11 @@ async def _do_grant(msg, state: FSMContext, days: int, admin_id: int, bot: Bot) 
 
 
 async def _arm_token_state(state: FSMContext, target: int, bot: Bot) -> None:
-    """Put another user's FSM into "waiting for API token".
+    """Поставить ЧУЖУЮ форму в состояние «жду токен».
 
-    The greeting is sent to them, not to the admin running the command, so the
-    state has to be written against that user's own storage key.
+    Приветствие уходит клиенту, а не админу, который выдал подписку, — значит
+    и состояние записывается по ключу клиента. По своему ключу оно ловило бы
+    ответы админа, а клиента бот бы не услышал.
     """
     from aiogram.fsm.storage.base import StorageKey
 
@@ -640,13 +641,13 @@ async def header_emoji_save(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
     await state.clear()
-    # find a custom_emoji entity
+    # ищем в сообщении кастомное эмодзи
     emoji_id = None
     fallback = "🏠"
     for ent in (message.entities or []):
         if ent.type == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
             emoji_id = ent.custom_emoji_id
-            # the fallback glyph is the text the entity covers
+            # запасной значок — это тот текст, который эмодзи собой закрывает
             txt = message.text or ""
             fallback = txt[ent.offset:ent.offset + ent.length] or "🏠"
             break
@@ -659,8 +660,8 @@ async def header_emoji_save(message: Message, state: FSMContext) -> None:
             "Откройте /start — увидите его в шапке меню.",
             reply_markup=b.as_markup())
     else:
-        # no custom emoji — use the first plain glyph as the header
-        # (id="" → menu_header_html renders the fallback glyph directly)
+        # кастомного эмодзи нет — берём в заголовок первый обычный значок
+        # (id="" → menu_header_html нарисует запасной значок как есть)
         txt = (message.text or "").strip()
         if txt:
             set_header_emoji("", txt[0])
@@ -741,7 +742,7 @@ async def text_view(callback: CallbackQuery, state: FSMContext) -> None:
         b.adjust(2, 1)  # 2 actions on one row + nav on its own row
     else:
         b.adjust(1)
-    # show a live preview (render placeholders with sample values)
+    # показываем живой предпросмотр: подстановки заполнены примерами
     sample = {"price": " 💰 500 ₽", "days": "30", "left": "30"}
     preview = get_custom_text(key)
     for v in meta.get("vars", []):
@@ -793,7 +794,7 @@ async def text_edit_save(message: Message, state: FSMContext) -> None:
     if not key or key not in CUSTOM_TEXTS:
         await message.answer("❌ Потерян ключ текста. Начните заново.")
         return
-    # html_text preserves formatting AND custom emoji as <tg-emoji>
+    # html_text сохраняет и разметку, и кастомные эмодзи как <tg-emoji>
     html = message.html_text if message.text else ""
     if not html.strip():
         await message.answer("❌ Пустой текст. Пришлите текст сообщением.")
@@ -804,7 +805,7 @@ async def text_edit_save(message: Message, state: FSMContext) -> None:
     b.button(text="📝 К текстам", callback_data="admin:texts")
     ui.lay(b)
     await message.answer("✅ Текст сохранён!", reply_markup=b.as_markup())
-    # show how it will actually look
+    # показываем, как это будет выглядеть на самом деле
     try:
         await message.answer("<b>Так это увидят пользователи:</b>")
         await message.answer(html)
