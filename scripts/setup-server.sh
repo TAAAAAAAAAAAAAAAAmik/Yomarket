@@ -28,7 +28,13 @@ die()  { printf '\n❌ %s\n' "$*" >&2; exit 1; }
 REPO="${DEPLOY_PATH:-/opt/yomarket}"
 BRANCH="${DEPLOY_BRANCH:-claude/where-we-left-off-mul8tu}"
 SERVICE="${SERVICE_NAME:-yomarket}"
-RUN_USER="${SUDO_USER:-$(id -un)}"
+# От чьего имени будет работать бот. Обычно это тот, кто запустил скрипт
+# через sudo. Но бывает, что sudo у него нет вовсе и заходить приходится
+# root'ом — тогда без этой переменной бот остался бы работать от root, что
+# для процесса с чужими токенами и seed-фразами лишнее.
+RUN_USER="${RUN_USER:-${SUDO_USER:-$(id -un)}}"
+id -u "$RUN_USER" >/dev/null 2>&1 || die "пользователя $RUN_USER на сервере нет.
+Создайте его или укажите другого: RUN_USER=имя bash $0"
 
 [ "$(id -u)" = 0 ] || die "нужен root: запустите через sudo"
 
@@ -72,6 +78,7 @@ else
 fi
 chown -R "$RUN_USER":"$RUN_USER" "$REPO"
 say "код в $REPO, ветка $BRANCH"
+say "бот будет работать от пользователя $RUN_USER"
 
 # --- 3. Окружение ---------------------------------------------------------
 step "Виртуальное окружение и зависимости"

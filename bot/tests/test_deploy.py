@@ -443,6 +443,18 @@ class TheFirstTimeSetupScriptMatchesTheCode(unittest.TestCase):
         self.assertIn("sys.version_info", self.sh)
         self.assertIn("-venv", self.sh)
 
+    def test_the_service_user_can_be_named_explicitly(self):
+        """Запускать скрипт и работать под ботом могут разные пользователи.
+
+        На сервере продавца у `tamik` не оказалось прав sudo вовсе, и
+        заходить пришлось root'ом. Без этой возможности бот остался бы
+        работать от root — процесс с чужими токенами и seed-фразами.
+        """
+        self.assertIn("RUN_USER:-", self.sh)
+
+    def test_a_missing_service_user_is_named_and_not_silently_created(self):
+        self.assertIn("на сервере нет", self.sh)
+
     def test_a_failed_venv_stops_the_run_instead_of_going_on(self):
         # Без окружения нет pip, а без pip любая следующая проверка врёт:
         # «пакета нет» вместо «проверять было нечем».
