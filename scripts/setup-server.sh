@@ -38,6 +38,14 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq git python3 python3-venv python3-pip curl \
     build-essential libffi-dev libpq-dev pkg-config >/dev/null
+
+# На свежих Ubuntu пакет venv привязан к версии интерпретатора, и
+# `python3-venv` может оказаться пустышкой: окружение тогда не создаётся с
+# «ensurepip is not available», а причина названа только в тексте ошибки.
+# Спрашиваем у самого Python, какой он версии, и ставим ровно его пакет.
+PYVER="$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+apt-get install -y -qq "python${PYVER}-venv" >/dev/null 2>&1 || true
+say "python $PYVER"
 # Это не «на всякий случай». У четырёх зависимостей есть нативные части, и
 # если под текущий Python готовой сборки нет, pip собирает их из исходников:
 #   libffi-dev + build-essential — `cryptography`; без них падает вся защита
@@ -67,7 +75,13 @@ say "код в $REPO, ветка $BRANCH"
 
 # --- 3. Окружение ---------------------------------------------------------
 step "Виртуальное окружение и зависимости"
-sudo -u "$RUN_USER" python3 -m venv "$REPO/.venv"
+if ! sudo -u "$RUN_USER" python3 -m venv "$REPO/.venv"; then
+    die "не создалось виртуальное окружение (python $PYVER).
+
+Чаще всего не хватает пакета venv под ЭТУ версию интерпретатора:
+    apt-get install -y python${PYVER}-venv
+и запустите скрипт снова."
+fi
 sudo -u "$RUN_USER" "$REPO/.venv/bin/pip" install -q --upgrade pip
 if ! sudo -u "$RUN_USER" "$REPO/.venv/bin/pip" install -q -r "$REPO/bot/requirements.txt"; then
     PYV="$(sudo -u "$RUN_USER" "$REPO/.venv/bin/python" -c 'import sys;print("%d.%d"%sys.version_info[:2])')"

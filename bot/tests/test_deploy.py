@@ -432,6 +432,25 @@ class TheFirstTimeSetupScriptMatchesTheCode(unittest.TestCase):
     def test_it_checks_the_version_before_saying_it_is_done(self):
         self.assertIn("код не доехал", self.sh)
 
+    def test_it_installs_the_venv_package_for_the_actual_python(self):
+        """На свежих Ubuntu пакет venv привязан к версии интерпретатора.
+
+        `python3-venv` может оказаться пустышкой, и тогда окружение не
+        создаётся с «ensurepip is not available» — а причина названа только
+        в тексте ошибки. Скрипт спрашивает версию у самого Python и ставит
+        ровно её пакет.
+        """
+        self.assertIn("sys.version_info", self.sh)
+        self.assertIn("-venv", self.sh)
+
+    def test_a_failed_venv_stops_the_run_instead_of_going_on(self):
+        # Без окружения нет pip, а без pip любая следующая проверка врёт:
+        # «пакета нет» вместо «проверять было нечем».
+        self.assertIn("не создалось виртуальное окружение", self.sh)
+
+    def test_failed_dependencies_stop_the_run_too(self):
+        self.assertIn("зависимости не поставились", self.sh)
+
     def test_it_does_not_call_a_deaf_bot_a_success(self):
         # «Поднялся» и «слышит Telegram» — разные вещи, и при переезде они
         # расходятся особенно часто.
