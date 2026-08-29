@@ -37,10 +37,17 @@ step "Ставлю зависимости системы"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq git python3 python3-venv python3-pip curl \
-    build-essential libffi-dev >/dev/null
-# libffi-dev и build-essential здесь не для красоты: без них ломается сборка
-# `cryptography`, и падают все тесты шифрования seed-фразы с
-# `ModuleNotFoundError: No module named '_cffi_backend'`.
+    build-essential libffi-dev libpq-dev pkg-config >/dev/null
+# Это не «на всякий случай». У четырёх зависимостей есть нативные части, и
+# если под текущий Python готовой сборки нет, pip собирает их из исходников:
+#   libffi-dev + build-essential — `cryptography`; без них падает вся защита
+#   seed-фраз с `ModuleNotFoundError: No module named '_cffi_backend'`;
+#   libpq-dev + pkg-config       — `psycopg2`, который отстаёт от свежих
+#   версий Python дольше остальных.
+# Часть пакетов может собираться и Rust'ом (`cryptography`, `pydantic-core`).
+# Ставить его заранее не стали: на свежем сервере это лишние сотни мегабайт,
+# а нужен он только там, где готовой сборки нет. Если pip попросит Rust —
+# скрипт остановится и скажет об этом прямо, а не молча.
 say "git, python3, venv, curl — на месте"
 
 # --- 2. Код ---------------------------------------------------------------
@@ -62,7 +69,23 @@ say "код в $REPO, ветка $BRANCH"
 step "Виртуальное окружение и зависимости"
 sudo -u "$RUN_USER" python3 -m venv "$REPO/.venv"
 sudo -u "$RUN_USER" "$REPO/.venv/bin/pip" install -q --upgrade pip
-sudo -u "$RUN_USER" "$REPO/.venv/bin/pip" install -q -r "$REPO/bot/requirements.txt"
+if ! sudo -u "$RUN_USER" "$REPO/.venv/bin/pip" install -q -r "$REPO/bot/requirements.txt"; then
+    PYV="$(sudo -u "$RUN_USER" "$REPO/.venv/bin/python" -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+    die "зависимости не поставились (Python $PYV).
+
+Самая частая причина на свежем Python — под него ещё нет готовых сборок, и
+pip пробует собрать пакет из исходников. Что делать:
+
+  1. Посмотрите выше, какой пакет упал.
+  2. Если в ошибке упомянут Rust или cargo:
+       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+       source \$HOME/.cargo/env
+     и запустите этот скрипт снова.
+  3. Надёжнее — поставить Python, под который сборки есть, и указать его:
+       apt-get install -y python3.12 python3.12-venv
+       rm -rf $REPO/.venv && python3.12 -m venv $REPO/.venv
+     затем запустите скрипт снова."
+fi
 say "зависимости поставлены из bot/requirements.txt"
 
 # --- 4. Секреты -----------------------------------------------------------
