@@ -175,6 +175,25 @@ def _note_sent_notification(text: str) -> None:
     del _SENT_LOG[:-_SENT_LOG_MAX]
 
 
+# Ответы Telegram, означающие «этому человеку писать нельзя» — навсегда, а не
+# сейчас. Отличать их от сетевого сбоя обязательно: повторять первое
+# бессмысленно, а объявлять недостижимым второе — значит замолчать при
+# первом же таймауте.
+_UNREACHABLE = (
+    "bot can't initiate conversation",   # не нажимал /start у ЭТОГО бота
+    "bot was blocked by the user",
+    "user is deactivated",
+    "chat not found",
+    "peer_id_invalid",
+    "user not found",
+)
+
+
+def _unreachable(err) -> bool:
+    low = str(err or "").lower()
+    return any(n in low for n in _UNREACHABLE)
+
+
 def _is_formatting_error(exc: Exception) -> bool:
     """Telegram отказался разбирать HTML — единственный случай, когда то же
     сообщение можно послать заново.
@@ -1157,6 +1176,55 @@ class TaskManager:
             except Exception as e:                # noqa: BLE001
                 logger.error("Проход удаления данных не удался: %s", e)
             await asyncio.sleep(self.PURGE_EVERY)
+
+    def _clear_unreachable(self, user_id: int) -> None:
+        """Уведомление дошло — снять отметку, чтобы о следующем сбое сказали.
+
+        Без этого отметка стоит вечно: продавец нажал /start, всё
+        починилось, а о новой поломке владелец уже не узнает.
+        """
+        from storage import get_settings, save_settings
+        try:
+            settings = get_settings(user_id)
+            if settings.pop("unreachable_since", None) is not None:
+                save_settings(user_id, settings)
+        except Exception as e:                    # noqa: BLE001
+            logger.warning("не снял отметку недостижимости %s: %s", user_id, e)
+
+    async def _warn_owner_unreachable(self, user_id: int, err) -> None:
+        """Сказать владельцу, что продавец не получает уведомлений. Один раз.
+
+        Один раз — потому что фоновый проход идёт каждую минуту, и без
+        отметки владелец получал бы одно и то же сообщение о каждом
+        недостижимом продавце круглые сутки. Отметка снимается сама, как
+        только уведомление до продавца дойдёт.
+        """
+        from storage import OWNER_ID, get_settings, save_settings
+        try:
+            settings = get_settings(user_id)
+            if settings.get("unreachable_since"):
+                return
+            settings["unreachable_since"] = time.time()
+            save_settings(user_id, settings)
+        except Exception as e:                    # noqa: BLE001
+            logger.error("не смог отметить недостижимость %s: %s", user_id, e)
+            return
+        try:
+            await self.bot.send_message(OWNER_ID, _card(
+                "📵 <b>ПРОДАВЕЦ НЕ ПОЛУЧАЕТ УВЕДОМЛЕНИЙ</b>",
+                [f"Продавец <code>{user_id}</code> недостижим для бота.",
+                 "",
+                 f"Ответ Telegram: <code>{_esc(str(err))[:120]}</code>",
+                 "",
+                 "Чаще всего это значит, что он не запускал ЭТОГО бота — "
+                 "так бывает после смены токена. Его заказы обрабатываются "
+                 "как обычно, но он об этом не узнаёт.",
+                 "",
+                 "Попросите его открыть бота и нажать /start."],
+                "Сообщение об этом продавце придёт один раз"),
+                parse_mode="HTML")
+        except Exception as e:                    # noqa: BLE001
+            logger.error("не смог предупредить владельца о %s: %s", user_id, e)
 
     async def purge_expired(self, now: float | None = None) -> list[int]:
         """Стереть данные тех, у кого подписка кончилась больше трёх дней назад.
@@ -4512,9 +4580,20 @@ class TaskManager:
         try:
             await self.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=reply_markup)
             _note_sent_notification(text)
+            self._clear_unreachable(user_id)
             return
         except Exception as e:
             logger.warning("Notify failed (user %s): %s", user_id, e)
+            # Продавец недостижим — это не сбой сети, а постоянное состояние:
+            # он не запускал этого бота, заблокировал его или удалил аккаунт.
+            # Сообщать надо владельцу, потому что самому продавцу — некуда.
+            #
+            # Молчание здесь дороже всего при смене токена бота: заказы
+            # обрабатываются, чаты читаются, а уведомления не доходят ни до
+            # кого, и снаружи это выглядит как исправно работающий бот.
+            if _unreachable(e):
+                await self._warn_owner_unreachable(user_id, e)
+                return
             # Повторять можно только то, что Telegram ТОЧНО не принял.
             # Раньше повтор шёл на любую ошибку, включая таймаут: сообщение
             # при этом уже доставлено, и продавец получал его дважды — второй
