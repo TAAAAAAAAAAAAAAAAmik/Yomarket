@@ -438,8 +438,25 @@ class TheFirstTimeSetupScriptMatchesTheCode(unittest.TestCase):
         self.assertIn("НЕ получает сообщения", self.sh)
 
     def test_no_secret_is_baked_into_the_script(self):
-        for leak in ("BOT_TOKEN=", "SECRET_KEY=", "150.241", "tamik"):
-            self.assertNotIn(leak, self.sh, f"в скрипте оказалось: {leak}")
+        """Секреты спрашиваются при запуске и в репозиторий не попадают.
+
+        Образцы утечек подбираются ПО ФОРМЕ, а не перечислением настоящих
+        значений: первая версия этого теста искала подстрокой реальные адрес
+        и логин сервера — и тем самым занесла их в репозиторий сама.
+        """
+        import re
+        self.assertNotIn("BOT_TOKEN=", self.sh)
+        self.assertNotIn("SECRET_KEY=", self.sh)
+        # Токен Telegram: цифры, двоеточие, длинная строка.
+        self.assertIsNone(re.search(r"\b\d{8,}:[A-Za-z0-9_-]{30,}", self.sh),
+                          "в скрипте похоже на токен бота")
+        # Адрес сервера в открытом виде. Петля (127.0.0.1) законна: по ней
+        # скрипт стучится в health на самой машине.
+        addresses = [a for a in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", self.sh)
+                     if not a.startswith("127.")]
+        self.assertEqual(addresses, [], f"в скрипте зашит адрес: {addresses}")
+        self.assertNotIn("sshpass", self.sh,
+                         "вход по паролю: ключ надёжнее и нужен для Actions")
 
 
 if __name__ == "__main__":
