@@ -127,7 +127,12 @@ else
         if [ -z "$value" ] && [ -n "$required" ]; then
             die "$var обязательна — без неё бот не запустится"
         fi
-        [ -n "$value" ] && printf '%s=%s\n' "$var" "$value" >> "$ENV_FILE"
+        # Не `[ ... ] && printf`: это последняя строка функции, и при пустом
+        # необязательном ответе она вернула бы 1 — а `set -e` убил бы скрипт
+        # ровно там, где мы сами предложили ответить пусто.
+        if [ -n "$value" ]; then
+            printf '%s=%s\n' "$var" "$value" >> "$ENV_FILE"
+        fi
     }
     : > "$ENV_FILE"
     chmod 600 "$ENV_FILE"

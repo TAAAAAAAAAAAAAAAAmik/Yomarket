@@ -587,5 +587,117 @@ class TheFirstTimeSetupScriptMatchesTheCode(unittest.TestCase):
                          "вход по паролю: ключ надёжнее и нужен для Actions")
 
 
+class AnEmptyOptionalAnswerDoesNotKillTheSetup(unittest.TestCase):
+    """Пустой ответ на необязательный вопрос обязан быть просто пустым
+    ответом, а не концом установки.
+
+    Оба скрипта настройки спрашивают секреты функцией `ask` и работают под
+    `set -e`. Последней строкой в `ask` стояло
+    `[ -n "$value" ] && printf ... >> .env`: при пустом ответе проверка
+    возвращает 1, это последняя команда функции — значит и функция вернула
+    1, и `set -e` оборвал скрипт. Ровно там, где мы сами написали «Пусто —
+    данные лягут в файлы».
+
+    Снаружи это выглядело бы как самая дорогая поломка проекта: установка
+    молча прекращается на середине, `.env` уже создан с токеном и ключом, а
+    ни службы, ни запуска, ни сверки версии нет. Второй запуск сказал бы
+    «.env уже есть — не трогаю» и прошёл дальше — то есть беда исчезла бы
+    сама, не будучи понятой.
+
+    Проверяется не текст строки, а поведение: функция `ask` вынимается из
+    скрипта и выполняется настоящим bash с теми же ключами.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parents[2]
+    SCRIPTS = ("setup-user.sh", "setup-server.sh")
+
+    def _ask_source(self, name):
+        """Вырезать из скрипта определение `ask` целиком."""
+        text = (self.ROOT / "scripts" / name).read_text()
+        start = text.index("    ask() {")
+        end = text.index("\n    }\n", start) + len("\n    }\n")
+        body = text[start:end]
+        self.assertIn("read -r value", body, f"{name}: вырезали не ту функцию")
+        return body
+
+    def _run(self, name, answer):
+        """Выполнить `ask` под `set -Eeuo pipefail`, подсунув ответ."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = os.path.join(tmp, ".env")
+            script = "\n".join([
+                "set -Eeuo pipefail",
+                f'ENV_FILE={env_file!r}',
+                'die() { printf "%s\\n" "$*" >&2; exit 1; }',
+                'RUN_USER="$(id -un)"',
+                ': > "$ENV_FILE"',
+                self._ask_source(name),
+                'ask DATABASE_URL "адрес базы"',
+                'echo ДОШЛИ-ДО-КОНЦА',
+            ])
+            # /dev/tty в тесте нет — подменяем на файл с ответом.
+            answer_file = os.path.join(tmp, "answer")
+            with open(answer_file, "w") as fh:
+                fh.write(answer + "\n")
+            script = script.replace("</dev/tty", f"<{answer_file}")
+            r = subprocess.run(["bash", "-c", script],
+                               capture_output=True, text=True)
+            written = ""
+            if os.path.exists(env_file):
+                with open(env_file) as fh:
+                    written = fh.read()
+            return r, written
+
+    def test_an_empty_answer_lets_the_setup_go_on(self):
+        for name in self.SCRIPTS:
+            with self.subTest(name):
+                r, written = self._run(name, "")
+                self.assertIn("ДОШЛИ-ДО-КОНЦА", r.stdout,
+                              f"{name}: скрипт оборвался на пустом ответе\n"
+                              f"код {r.returncode}, stderr: {r.stderr}")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(written, "",
+                                 f"{name}: пустой ответ записан в .env")
+
+    def test_an_answer_that_was_given_is_written_down(self):
+        """Обратная сторона: непустой ответ обязан доехать до `.env` —
+        иначе «поправили» можно было бы и удалением строки."""
+        for name in self.SCRIPTS:
+            with self.subTest(name):
+                r, written = self._run(name, "postgresql://x/y")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(written, "DATABASE_URL=postgresql://x/y\n",
+                                 f"{name}: ответ не записан")
+
+    def test_a_missing_required_answer_still_stops_everything(self):
+        """А вот пустой ОБЯЗАТЕЛЬНЫЙ ответ обязан останавливать: бот без
+        токена не запустится, и лучше сказать это здесь, чем показать
+        пустую службу, падающую в цикле."""
+        for name in self.SCRIPTS:
+            with self.subTest(name):
+                body = self._ask_source(name)
+                with tempfile.TemporaryDirectory() as tmp:
+                    env_file = os.path.join(tmp, ".env")
+                    answer_file = os.path.join(tmp, "answer")
+                    with open(answer_file, "w") as fh:
+                        fh.write("\n")
+                    script = "\n".join([
+                        "set -Eeuo pipefail",
+                        f'ENV_FILE={env_file!r}',
+                        'die() { printf "%s\\n" "$*" >&2; exit 1; }',
+                        'RUN_USER="$(id -un)"',
+                        ': > "$ENV_FILE"',
+                        body,
+                        'ask BOT_TOKEN "токен" yes',
+                        'echo ДОШЛИ-ДО-КОНЦА',
+                    ]).replace("</dev/tty", f"<{answer_file}")
+                    r = subprocess.run(["bash", "-c", script],
+                                       capture_output=True, text=True)
+                self.assertNotEqual(r.returncode, 0,
+                                    f"{name}: без токена установка продолжилась")
+                self.assertNotIn("ДОШЛИ-ДО-КОНЦА", r.stdout)
+                self.assertIn("BOT_TOKEN", r.stderr,
+                              f"{name}: отказ не назвал, чего не хватает")
+
+
 if __name__ == "__main__":
     unittest.main()
