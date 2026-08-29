@@ -379,6 +379,103 @@ class TheWorkflowRunsThisVeryScript(unittest.TestCase):
                         "scripts/deploy.sh без права на запуск")
 
 
+class TheRootlessSetupScriptMatchesTheCode(unittest.TestCase):
+    """`scripts/setup-user.sh` ставит бота там, где нет ни sudo, ни root.
+
+    Такой сервер попался при переезде 29.08: у пользователя нет прав, пароль
+    root неизвестен, системного Python с модулем venv нет. Скрипт обходится
+    без администратора: свой Python через `uv`, код архивом, служба в
+    профиле пользователя.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+    def setUp(self):
+        self.sh = (self.ROOT / "scripts" / "setup-user.sh").read_text()
+
+    def test_it_is_valid_shell(self):
+        r = subprocess.run(["bash", "-n",
+                            str(self.ROOT / "scripts" / "setup-user.sh")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_it_refuses_to_run_as_root(self):
+        # От root правильный скрипт другой: он заведёт СИСТЕМНУЮ службу,
+        # которая переживает перезагрузку без плясок с linger.
+        self.assertIn('[ "$(id -u)" != 0 ]', self.sh)
+        self.assertIn("setup-server.sh", self.sh)
+
+    def test_it_never_calls_sudo_or_apt(self):
+        # Весь смысл в том, что прав нет. Одна такая строка — и скрипт
+        # падает ровно там, где должен был помочь.
+        for forbidden in ("sudo ", "apt-get", "apt "):
+            self.assertNotIn(forbidden, self.sh, f"скрипт зовёт {forbidden!r}")
+
+    def test_it_brings_its_own_python(self):
+        self.assertIn("uv python install", self.sh)
+
+    def test_uv_has_a_second_source(self):
+        """astral.sh может быть недоступен у провайдера, а GitHub нужен и так.
+
+        Проверяется строка СКАЧИВАНИЯ, а не любое упоминание адреса: первая
+        версия этого теста проходила по ссылке из текста ошибки «неизвестная
+        архитектура» — то есть запасной источник можно было выбросить, и
+        тест бы этого не заметил.
+        """
+        self.assertIn("astral.sh/uv/install.sh", self.sh)
+        self.assertIn("releases/latest/download/uv-", self.sh)
+
+    def test_it_works_without_git(self):
+        # git на том сервере не установлен, и поставить его нечем.
+        self.assertIn("codeload.github.com", self.sh)
+
+    def test_data_lives_outside_the_code_directory(self):
+        """Повторный запуск перекачивает код поверх — данные внутри него
+        стёрлись бы вместе со старой версией.
+
+        Проверяется само присваивание. Первая версия искала «yomarket-data»
+        по всему файлу и проходила по строке из шапки с описанием
+        переменных: каталог данных можно было увести внутрь кода, и тест
+        молчал бы.
+        """
+        import re
+        line = re.search(r'^DATA="\$\{DATA_DIR:-([^}]*)\}"', self.sh, re.M)
+        self.assertIsNotNone(line, "не нашёл, куда кладутся данные")
+        self.assertNotIn("$REPO", line.group(1),
+                         "данные лежат внутри каталога кода")
+        self.assertIn("$HOME", line.group(1))
+
+    def test_it_never_overwrites_an_existing_env(self):
+        self.assertIn('if [ -f "$ENV_FILE" ]', self.sh)
+
+    def test_it_asks_for_the_encryption_key_and_says_why(self):
+        self.assertIn("SECRET_KEY", self.sh)
+        self.assertIn("открытым текстом", self.sh)
+
+    def test_it_says_when_autostart_is_weaker_than_promised(self):
+        """Без linger служба гаснет при выходе из SSH; cron не поднимет бота
+        после падения. И то и другое — «работает», но по-разному.
+
+        Проверяются сами предупреждения. Первая версия искала слово
+        «linger» где угодно и проходила по комментарию — то есть
+        предупреждение можно было убрать незаметно.
+        """
+        self.assertIn("linger включить не удалось", self.sh)
+        self.assertIn("loginctl enable-linger", self.sh)
+        self.assertIn("сам не", self.sh)
+
+    def test_it_checks_the_version_and_the_polling_before_declaring_success(self):
+        self.assertIn("поднялась версия", self.sh)
+        self.assertIn("НЕ получает сообщения", self.sh)
+
+    def test_no_secret_is_baked_into_it(self):
+        import re
+        self.assertIsNone(re.search(r"\b\d{8,}:[A-Za-z0-9_-]{30,}", self.sh))
+        addresses = [a for a in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", self.sh)
+                     if not a.startswith("127.")]
+        self.assertEqual(addresses, [])
+
+
 class TheFirstTimeSetupScriptMatchesTheCode(unittest.TestCase):
     """`scripts/setup-server.sh` поднимает бота на чистом сервере.
 
