@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -376,6 +377,69 @@ class TheWorkflowRunsThisVeryScript(unittest.TestCase):
     def test_the_script_is_executable(self):
         self.assertTrue(os.access(DEPLOY, os.X_OK),
                         "scripts/deploy.sh без права на запуск")
+
+
+class TheFirstTimeSetupScriptMatchesTheCode(unittest.TestCase):
+    """`scripts/setup-server.sh` поднимает бота на чистом сервере.
+
+    Скрипт живёт отдельно от кода и разойтись с ним может молча: путь до
+    `main.py` переехал, ключ в ответе `/health` переименовали — а узнаётся
+    это на живом переезде, когда бот уже не поднялся.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+    def setUp(self):
+        self.sh = (self.ROOT / "scripts" / "setup-server.sh").read_text()
+
+    def test_it_is_valid_shell(self):
+        r = subprocess.run(["bash", "-n",
+                            str(self.ROOT / "scripts" / "setup-server.sh")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_it_starts_the_entry_point_that_actually_exists(self):
+        self.assertTrue((self.ROOT / "bot" / "main.py").exists())
+        self.assertIn("main.py", self.sh)
+
+    def test_it_installs_from_the_real_requirements_file(self):
+        self.assertTrue((self.ROOT / "bot" / "requirements.txt").exists())
+        self.assertIn("bot/requirements.txt", self.sh)
+
+    def test_it_reads_the_keys_health_actually_returns(self):
+        # Ключи берутся из `health_payload`, а не из памяти: переименуют —
+        # тест упадёт здесь, а не на переезде.
+        main = (self.ROOT / "bot" / "main.py").read_text()
+        for key in ('"version"', '"polling"'):
+            self.assertIn(key, main, f"{key} пропал из health_payload")
+            self.assertIn(key.strip('"'), self.sh)
+
+    def test_it_asks_for_the_encryption_key_and_says_why(self):
+        # Без SECRET_KEY seed-фразы лежат в базе открытыми, и `/version`
+        # говорит об этом прямо. Скрипт обязан спросить ключ, а не молча
+        # поднять бота без него.
+        self.assertIn("SECRET_KEY", self.sh)
+        self.assertIn("открытым текстом", self.sh)
+
+    def test_it_warns_that_a_new_key_makes_old_phrases_unreadable(self):
+        self.assertIn("не расшифруются", self.sh)
+
+    def test_it_never_overwrites_an_existing_env(self):
+        # В `.env` работающего сервера лежит ключ, которым зашифрованы чужие
+        # seed-фразы. Перезаписать его — потерять доступ к чужим кошелькам.
+        self.assertIn('if [ -f "$ENV_FILE" ]', self.sh)
+
+    def test_it_checks_the_version_before_saying_it_is_done(self):
+        self.assertIn("код не доехал", self.sh)
+
+    def test_it_does_not_call_a_deaf_bot_a_success(self):
+        # «Поднялся» и «слышит Telegram» — разные вещи, и при переезде они
+        # расходятся особенно часто.
+        self.assertIn("НЕ получает сообщения", self.sh)
+
+    def test_no_secret_is_baked_into_the_script(self):
+        for leak in ("BOT_TOKEN=", "SECRET_KEY=", "150.241", "tamik"):
+            self.assertNotIn(leak, self.sh, f"в скрипте оказалось: {leak}")
 
 
 if __name__ == "__main__":
