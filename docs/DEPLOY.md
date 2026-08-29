@@ -204,3 +204,94 @@ sudo -u ПОЛЬЗОВАТЕЛЬ DEPLOY_PATH=/opt/yomarket bash /opt/yomarket/sc
 `DEPLOY_PATH` в настройках репозитория. **`SSH_KEY` — приватный ключ, а не
 пароль**: пароль в секретах GitHub не поддерживается, да и на публичном IP
 с паролем сервер живёт до первого сканера.
+
+---
+
+## С телефона через Termius
+
+Порядок для чистого сервера. Всё, что надо набирать руками, сведено к
+минимуму: на телефоне опечатка — главный враг.
+
+### 1. Добавить сервер
+
+**Hosts → +** → `Address` — адрес сервера, `Username` — логин, `Password` —
+пароль. Подключиться, согласиться с отпечатком ключа.
+
+### 2. Перестать входить по паролю
+
+Публичный адрес с паролем сканеры находят за часы, а на сервере будут лежать
+seed-фразы чужих кошельков. Ключ нужен и для автовыката из GitHub Actions —
+пароль тот не принимает вовсе.
+
+**Keychain → + → Generate key** (ED25519, без пароля), затем в настройках
+хоста **Use key** вместо пароля. Termius сам положит публичный ключ на
+сервер при первом входе по паролю (кнопка «Copy key to server»), либо
+вручную:
+
+```bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+echo 'СЮДА_ПУБЛИЧНЫЙ_КЛЮЧ' >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+Убедившись, что вход по ключу работает, закрыть парольный:
+
+```bash
+sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sudo systemctl restart ssh
+```
+
+### 3. Положить код на сервер
+
+**Если репозиторий публичный** — одной командой:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/ВАШ_АККАУНТ/Yomarket/claude/where-we-left-off-mul8tu/scripts/setup-server.sh
+sudo REPO_URL=https://github.com/ВАШ_АККАУНТ/Yomarket.git DEPLOY_PATH=/opt/yomarket bash setup-server.sh
+```
+
+**Если приватный** — ключом развёртывания, без токенов в файлах:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/github -N '' -C yomarket-server
+cat ~/.ssh/github.pub
+```
+
+Показанную строку скопировать (в Termius — долгое нажатие → Copy) и вставить
+на github.com: **репозиторий → Settings → Deploy keys → Add**, галку «Allow
+write access» НЕ ставить. Затем:
+
+```bash
+printf 'Host github.com\n  IdentityFile ~/.ssh/github\n  IdentitiesOnly yes\n' >> ~/.ssh/config
+sudo mkdir -p /opt/yomarket && sudo chown $USER:$USER /opt/yomarket
+git clone -b claude/where-we-left-off-mul8tu git@github.com:ВАШ_АККАУНТ/Yomarket.git /opt/yomarket
+sudo DEPLOY_PATH=/opt/yomarket bash /opt/yomarket/scripts/setup-server.sh
+```
+
+Скрипт видит, что репозиторий уже на месте, и клонировать не пытается.
+
+### 4. Ответить на четыре вопроса
+
+Скрипт спросит `BOT_TOKEN`, `SECRET_KEY`, `DATABASE_URL` и `PORT` — что это
+и что будет без них, написано выше в разделе про переезд. **`SECRET_KEY`
+берётся со старого сервера**, а не придумывается новый.
+
+Закончит он не словом «готово», а сверкой: та ли версия поднялась и слышит
+ли бот Telegram.
+
+### 5. Сохранить команды в Snippets
+
+Это то, ради чего Termius и стоит на телефоне: **Snippets → +**, команду
+сохранить, дальше запускать одним нажатием на любом хосте.
+
+| Название | Команда |
+|---|---|
+| Обновить бота | `sudo -u $USER DEPLOY_PATH=/opt/yomarket bash /opt/yomarket/scripts/deploy.sh` |
+| Логи | `journalctl -u yomarket -n 50 --no-pager` |
+| Логи вживую | `journalctl -u yomarket -f` |
+| Состояние | `systemctl status yomarket --no-pager` |
+| Перезапуск | `sudo systemctl restart yomarket` |
+| Версия и слух | `curl -s localhost:8080/health` |
+
+Последняя — самая полезная: `"status":"ok"` означает, что бот слышит
+Telegram, `"deaf"` — что не слышит, и тогда смотреть логи.
