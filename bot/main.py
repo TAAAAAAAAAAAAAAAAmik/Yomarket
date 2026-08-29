@@ -54,9 +54,11 @@ class AccessMiddleware:
                 text = getattr(event, "text", "") or ""
                 is_start = text.startswith("/start")
                 if not is_start:
-                    from storage import render_custom_text
-                    price = get_bot_price()
-                    price_line = f"\n💰 Стоимость: <b>{price} ₽</b>" if price else ""
+                    from storage import price_lines, render_custom_text
+                    # Тарифы по срокам, а не одно число: документы обещают
+                    # скидку за длинный срок, и клиент должен её видеть.
+                    rows = price_lines()
+                    price_line = ("\n\n" + "\n".join(rows)) if rows else ""
                     msg = render_custom_text("subscription", price=price_line)
                     try:
                         from aiogram.types import CallbackQuery as _CQ, Message as _Msg

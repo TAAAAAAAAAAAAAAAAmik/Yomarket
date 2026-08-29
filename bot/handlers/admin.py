@@ -14,6 +14,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import ui
 
 from storage import (
+    PRICE_TIERS,
     POLICY_DOCS,
     CUSTOM_TEXTS, MENU_BUTTONS, add_admin, block_user, clear_custom_text,
     clear_header_emoji, count_subscribers, count_users, get_all_users,
@@ -21,7 +22,7 @@ from storage import (
     get_subscription, grant_subscription, is_admin, is_custom_text_set,
     is_owner, list_admins, list_blocked, remove_admin,
     require_subscription_enabled, reset_menu_labels, revoke_subscription,
-    set_bot_price, set_custom_text, set_header_emoji, set_menu_label,
+    set_custom_text, set_header_emoji, set_menu_label,
     set_require_subscription, subscription_days_left, unblock_user,
 )
 
@@ -34,11 +35,12 @@ class AdminState(StatesGroup):
     sub_days = State()
     block_user = State()
     unblock_user = State()
-    price = State()
     broadcast = State()
     add_admin = State()
     remove_admin = State()
     doc_url = State()
+    tier_price = State()
+    trial_days = State()
     menu_label = State()
     header_emoji = State()
     edit_text = State()
@@ -49,7 +51,7 @@ def _menu_kb(uid: int):
     b.button(text="📊 Статистика", callback_data="admin:stats")
     b.button(text="🎫 Выдать подписку", callback_data="admin:sub")
     b.button(text="🚫 Чёрный список", callback_data="admin:blacklist")
-    b.button(text="💰 Цена бота", callback_data="admin:price")
+    b.button(text="💰 Тарифы", callback_data="admin:prices")
     b.button(text="📢 Рассылка", callback_data="admin:broadcast")
     b.button(text="🎨 Оформление", callback_data="admin:appearance")
     b.button(text="📝 Тексты сообщений", callback_data="admin:texts")
@@ -71,7 +73,7 @@ async def _show_menu(msg, uid: int, edit: bool = True) -> None:
         "👑 <b>Админ-панель</b>\n\n"
         f"👥 Пользователей: <b>{count_users()}</b>\n"
         f"🎫 С подпиской: <b>{count_subscribers()}</b>\n"
-        f"💰 Цена бота: <b>{get_bot_price()} ₽</b>\n"
+        f"💰 Тарифов задано: <b>{len(_prices())}</b> из {len(PRICE_TIERS)}\n"
         f"🔐 Требовать подписку: <b>{req}</b>"
     )
     if edit:
@@ -339,39 +341,8 @@ async def unblock_input(message: Message, state: FSMContext) -> None:
 
 # ── Цена бота ───────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "admin:price")
-async def price_start(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    await state.set_state(AdminState.price)
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data="admin:menu")
-    await callback.message.edit_text(
-        f"💰 <b>Цена бота</b>\n\nТекущая: <b>{get_bot_price()} ₽</b>\n\n"
-        "Введите новую цену (число):",
-        reply_markup=b.as_markup(),
-    )
-    await callback.answer()
 
 
-@router.message(AdminState.price)
-async def price_input(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-    try:
-        price = int((message.text or "").strip().replace(" ", ""))
-        if price < 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите число:")
-        return
-    await state.clear()
-    set_bot_price(price)
-    b = InlineKeyboardBuilder()
-    b.button(text="⬅️ Админ-панель", callback_data="admin:menu")
-    await message.answer(f"✅ Цена бота: <b>{price} ₽</b>", reply_markup=b.as_markup())
 
 
 # ── Требовать подписку ──────────────────────────────────────────────────────
@@ -948,3 +919,179 @@ async def docs_clear(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer("Ссылка убрана — кнопки у клиента больше нет",
                           show_alert=True)
     await docs_menu(callback, state)
+
+
+# ── Тарифы и пробный период ─────────────────────────────────────────────────
+#
+# Цена была одним числом, а документы обещают градацию по срокам со скидкой
+# за длинный срок. Цена, которой клиент нигде не видит, обещанием не
+# является — поэтому тарифы задаются здесь и показываются на экране
+# «нужна подписка».
+
+def _prices() -> dict:
+    from storage import get_prices
+    return get_prices()
+
+
+@router.callback_query(F.data == "admin:prices")
+async def prices_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    from storage import get_trial_days, price_lines
+
+    prices = _prices()
+    body = []
+    b = InlineKeyboardBuilder()
+    for days, label in PRICE_TIERS:
+        price = prices.get(days)
+        body.append(f"{'✅' if price else '○'} {label} — "
+                    + (f"<b>{price} ₽</b>" if price else
+                       "<i>не задан, клиенту не показывается</i>"))
+        b.button(text=("✏️ " if price else "➕ ") + label,
+                 callback_data=f"admin:tier:{days}")
+
+    trial = get_trial_days()
+    body += ["", f"🎁 Пробный период: "
+             + (f"<b>{trial} дн.</b>" if trial else "<b>выключен</b>")]
+    b.button(text="🎁 Пробный период", callback_data="admin:trial")
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
+
+    shown = price_lines()
+    footer = ("<i>Клиент увидит:</i>\n" + "\n".join(shown)) if shown else (
+        "<i>Ни одного тарифа не задано — клиенту цена не показывается вовсе.</i>")
+    await callback.message.edit_text(
+        ui.screen("💰 <b>Тарифы</b>", body, footer=footer),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:tier:"))
+async def tier_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        days = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    label = dict(PRICE_TIERS).get(days)
+    if not label:
+        await callback.answer()
+        return
+    await state.set_state(AdminState.tier_price)
+    await state.update_data(tier_days=days)
+    cur = _prices().get(days)
+
+    b = InlineKeyboardBuilder()
+    if cur:
+        b.button(text="🗑 Убрать тариф", callback_data=f"admin:tierdel:{days}")
+    b.button(text="⬅️ К тарифам", callback_data="admin:prices")
+    await callback.message.edit_text(ui.screen(
+        f"💰 <b>{label}</b>",
+        [f"Сейчас: <b>{cur} ₽</b>" if cur else "Сейчас: тариф не задан", "",
+         "Введите цену в рублях числом."],
+        footer="<i>Ноль убирает тариф: «0 ₽» на экране читается как "
+               "«бесплатно», а это обещание, за которое спросят.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.message(AdminState.tier_price)
+async def tier_input(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    days = int((await state.get_data()).get("tier_days") or 0)
+    if days not in dict(PRICE_TIERS):
+        await state.clear()
+        return
+    try:
+        price = int((message.text or "").strip().replace(" ", ""))
+    except ValueError:
+        await message.answer("❌ Нужно число в рублях. Введите ещё раз:")
+        return
+    if price < 0:
+        await message.answer("❌ Цена не может быть отрицательной. Ещё раз:")
+        return
+
+    from storage import set_price
+    set_price(days, price)
+    await state.clear()
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ К тарифам", callback_data="admin:prices")
+    label = dict(PRICE_TIERS)[days]
+    await message.answer(ui.screen(
+        "✅ <b>Тариф сохранён</b>",
+        [f"{label} — " + (f"<b>{price} ₽</b>" if price else
+                          "<i>убран, клиенту не показывается</i>")]),
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("admin:tierdel:"))
+async def tier_clear(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        days = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    if days in dict(PRICE_TIERS):
+        from storage import set_price
+        set_price(days, 0)
+    await state.clear()
+    await callback.answer("Тариф убран — клиенту он больше не показывается",
+                          show_alert=True)
+    await prices_menu(callback, state)
+
+
+@router.callback_query(F.data == "admin:trial")
+async def trial_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminState.trial_days)
+    from storage import get_trial_days
+    cur = get_trial_days()
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ К тарифам", callback_data="admin:prices")
+    await callback.message.edit_text(ui.screen(
+        "🎁 <b>Пробный период</b>",
+        [f"Сейчас: <b>{cur} дн.</b>" if cur else "Сейчас: <b>выключен</b>", "",
+         "Введите число дней. Ноль — выключить."],
+        footer="<i>Выдаётся один раз на человека при первом /start. Отметка "
+               "о выданной пробе переживает удаление данных: иначе "
+               "/forget_me становится способом брать её бесконечно. Это "
+               "оговорено в политике конфиденциальности.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.message(AdminState.trial_days)
+async def trial_input(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        days = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ Нужно число дней. Введите ещё раз:")
+        return
+    if days < 0:
+        await message.answer("❌ Отрицательного срока не бывает. Ещё раз:")
+        return
+
+    from storage import set_trial_days
+    set_trial_days(days)
+    await state.clear()
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ К тарифам", callback_data="admin:prices")
+    await message.answer(ui.screen(
+        "✅ <b>Сохранено</b>",
+        [f"Пробный период: <b>{days} дн.</b>" if days else
+         "Пробный период <b>выключен</b> — бот о нём не упоминает."]),
+        reply_markup=b.as_markup())

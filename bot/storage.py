@@ -1347,6 +1347,11 @@ def purge_user(user_id: int) -> dict:
 
     * **чёрный список.** Иначе «удалить мои данные» становится способом
       снять блокировку: заблокировали — стёр — вернулся;
+    * **отметку о выданном пробном периоде.** По той же причине: иначе
+      `/forget_me` превращается в способ брать бесплатные дни сколько
+      угодно раз. Обе оговорки записаны в политике конфиденциальности —
+      данные, тайно оставленные после «полного удаления», это ложь в
+      опубликованном документе;
     * **владельца бота.** Стереть его данные значит выключить бота себе же;
       функция на владельце отказывает и говорит об этом отчётом.
 
@@ -1405,3 +1410,132 @@ def expired_before(cutoff: float) -> list[int]:
         if expires and expires < cutoff:
             out.append(int(uid))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Тарифы по срокам и пробный период
+# ---------------------------------------------------------------------------
+#
+# До этого цена была одним числом `bot_price`, и экран «нужна подписка»
+# показывал его же. Документы обещают градацию по срокам со скидкой за
+# длинный срок — значит она должна быть в интерфейсе, а не только в тексте
+# оферты: цена, которой клиент нигде не видит, обещанием не является.
+#
+# `bot_price` оставлен и продолжает работать: это цена месяца и запасной
+# ответ, когда тарифы не заданы.
+
+# Сроки, под которые заводятся тарифы. Дни, а не «месяцы»: `grant_subscription`
+# считает днями, и перевод месяцев в дни в двух местах разошёлся бы.
+PRICE_TIERS: tuple[tuple[int, str], ...] = (
+    (30, "1 месяц"),
+    (90, "3 месяца"),
+    (180, "6 месяцев"),
+    (365, "12 месяцев"),
+)
+
+# Пробный период. Ноль — выключен: тогда бот про него не заикается, а не
+# обещает «3 дня» и молчит в ответ.
+TRIAL_DAYS_DEFAULT = 3
+
+
+def get_prices() -> dict[int, int]:
+    """{дней: цена ₽}. Незаданные тарифы отсутствуют, а не равны нулю.
+
+    Ноль и «не задано» — разные вещи: «0 ₽» на экране читается как
+    «бесплатно», а это обещание, за которое спросят.
+    """
+    saved = _load_admin().get("prices", {}) or {}
+    out: dict[int, int] = {}
+    for days, _label in PRICE_TIERS:
+        try:
+            value = int(saved.get(str(days), 0))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            out[days] = value
+    return out
+
+
+def set_price(days: int, price: int) -> None:
+    data = _load_admin()
+    prices = data.setdefault("prices", {})
+    if int(price) > 0:
+        prices[str(int(days))] = int(price)
+    else:
+        prices.pop(str(int(days)), None)
+    _save_admin(data)
+
+
+def price_lines() -> list[str]:
+    """Тарифы строками для экрана «нужна подписка».
+
+    Скидка считается от цены месяца и показывается только там, где она
+    действительно есть: приписка «выгоднее» к тарифу без выгоды — враньё,
+    которое клиент проверит за десять секунд.
+    """
+    prices = get_prices()
+    if not prices:
+        base = get_bot_price()
+        return [f"💰 Стоимость: <b>{base} ₽</b>"] if base else []
+
+    month = prices.get(30) or get_bot_price()
+    lines: list[str] = []
+    for days, label in PRICE_TIERS:
+        price = prices.get(days)
+        if not price:
+            continue
+        row = f"• {label} — <b>{price} ₽</b>"
+        if month and days > 30:
+            full = month * days / 30
+            saved = round((1 - price / full) * 100)
+            if saved >= 1:
+                row += f"  <i>(−{saved}%)</i>"
+        lines.append(row)
+    return lines
+
+
+# --- Пробный период ---------------------------------------------------------
+#
+# Кому пробный период уже выдавался. Список ПЕРЕЖИВАЕТ удаление данных —
+# иначе `/forget_me` превращается в способ брать три дня бесплатно сколько
+# угодно раз. Это ровно та же оговорка, что и у чёрного списка, и она
+# записана в политике конфиденциальности: тайно оставленные после «полного
+# удаления» данные — это ложь в опубликованном документе.
+
+
+def get_trial_days() -> int:
+    return int(_load_admin().get("trial_days", TRIAL_DAYS_DEFAULT))
+
+
+def set_trial_days(days: int) -> None:
+    data = _load_admin()
+    data["trial_days"] = max(0, int(days))
+    _save_admin(data)
+
+
+def trial_used(user_id: int) -> bool:
+    return int(user_id) in [int(x) for x in _load_admin().get("trials", [])]
+
+
+def note_trial(user_id: int) -> None:
+    data = _load_admin()
+    used = [int(x) for x in data.get("trials", [])]
+    if int(user_id) not in used:
+        used.append(int(user_id))
+        data["trials"] = used
+        _save_admin(data)
+
+
+def start_trial(user_id: int) -> int:
+    """Выдать пробный период → сколько дней выдано (0 — не положено).
+
+    Ноль возвращается в трёх случаях: пробный период выключен владельцем,
+    он уже брался этим человеком, либо подписка и так действует. Вызывающий
+    по нулю ничего не обещает — молчит.
+    """
+    days = get_trial_days()
+    if days <= 0 or trial_used(user_id) or has_active_subscription(user_id):
+        return 0
+    note_trial(user_id)
+    grant_subscription(user_id, days)
+    return days

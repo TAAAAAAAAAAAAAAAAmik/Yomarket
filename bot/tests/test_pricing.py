@@ -1,0 +1,267 @@
+"""Тарифы по срокам и пробный период.
+
+Документы обещают градацию цен со скидкой за длинный срок и бесплатные три
+дня. До этого в коде не было ни того, ни другого: цена была одним числом, а
+пробного периода не существовало вовсе. Обещание в опубликованном
+документе, которого код не выполняет, — ложь в том, на что сошлются.
+
+Два места здесь особенно скользкие.
+
+Скидка: приписать «−20%» к тарифу, который выгоды не даёт, — враньё,
+которое клиент проверит за десять секунд.
+
+Отметка о выданной пробе: она обязана пережить `/forget_me`, иначе удаление
+данных превращается в способ брать три дня бесконечно. И наоборот — она не
+должна мешать тому, кто пробу не брал.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import time
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+os.environ.setdefault("BOT_TOKEN", "x")
+
+import storage                                             # noqa: E402
+
+
+class Admin(unittest.TestCase):
+    """Общее хранилище — словарь в памяти, с откатом в tearDown."""
+
+    def setUp(self):
+        self.admin: dict = {}
+        self.blobs: dict = {}
+        self._load, self._save = storage._load_admin, storage._save_admin
+        self._read, self._write = storage._read_blob, storage._write_blob
+        self._owner = storage.is_owner
+        storage._load_admin = lambda: self.admin
+        storage._save_admin = lambda d: self.admin.update(d)
+        storage._read_blob = lambda n: (self.admin if n == "admin"
+                                        else self.blobs.setdefault(n, {}))
+        storage._write_blob = lambda n, d: (self.admin.update(d) if n == "admin"
+                                            else self.blobs.__setitem__(n, d))
+        storage.is_owner = lambda uid: False
+
+    def tearDown(self):
+        storage._load_admin, storage._save_admin = self._load, self._save
+        storage._read_blob, storage._write_blob = self._read, self._write
+        storage.is_owner = self._owner
+
+    def set_all(self):
+        for days, price in ((30, 990), (90, 2490), (180, 4490), (365, 7900)):
+            storage.set_price(days, price)
+
+
+class PricesAreShownByTerm(Admin):
+
+    def test_with_nothing_set_the_client_is_shown_no_price_at_all(self):
+        # «0 ₽» на экране читается как «бесплатно» — это обещание.
+        self.assertEqual(storage.get_prices(), {})
+        self.assertEqual(storage.price_lines(), [])
+
+    def test_every_term_that_was_set_is_offered(self):
+        self.set_all()
+        shown = "\n".join(storage.price_lines())
+        for label in ("1 месяц", "3 месяца", "6 месяцев", "12 месяцев"):
+            self.assertIn(label, shown)
+
+    def test_a_term_without_a_price_is_simply_absent(self):
+        storage.set_price(30, 990)
+        storage.set_price(365, 7900)
+        shown = "\n".join(storage.price_lines())
+        self.assertIn("1 месяц", shown)
+        self.assertNotIn("3 месяца", shown)
+
+    def test_zero_removes_a_term_rather_than_pricing_it_at_nothing(self):
+        storage.set_price(30, 990)
+        storage.set_price(30, 0)
+        self.assertEqual(storage.get_prices(), {})
+
+    def test_a_negative_price_is_not_stored(self):
+        storage.set_price(30, -100)
+        self.assertEqual(storage.get_prices(), {})
+
+    def test_rubbish_in_storage_does_not_crash_the_screen(self):
+        # Хранилище — правимый JSON.
+        self.admin["prices"] = {"30": "дёшево", "90": 2490}
+        self.assertEqual(storage.get_prices(), {90: 2490})
+
+    def test_the_old_single_price_still_works_for_installs_that_had_one(self):
+        self.admin["bot_price"] = 500
+        self.assertIn("500", "\n".join(storage.price_lines()))
+
+
+class TheDiscountIsOnlyClaimedWhereItExists(Admin):
+
+    def test_a_longer_term_that_is_cheaper_per_month_says_so(self):
+        self.set_all()
+        year = [l for l in storage.price_lines() if "12 месяцев" in l][0]
+        self.assertIn("−", year)
+
+    def test_a_term_with_no_saving_is_not_advertised_as_one(self):
+        # 3 месяца по цене трёх месяцев — это не скидка.
+        storage.set_price(30, 1000)
+        storage.set_price(90, 3000)
+        quarter = [l for l in storage.price_lines() if "3 месяца" in l][0]
+        self.assertNotIn("−", quarter)
+
+    def test_a_term_that_costs_more_is_not_advertised_as_a_saving(self):
+        storage.set_price(30, 1000)
+        storage.set_price(90, 3600)
+        quarter = [l for l in storage.price_lines() if "3 месяца" in l][0]
+        self.assertNotIn("−", quarter)
+
+    def test_the_monthly_term_never_advertises_a_discount_against_itself(self):
+        self.set_all()
+        month = [l for l in storage.price_lines() if "1 месяц" in l][0]
+        self.assertNotIn("−", month)
+
+    def test_the_percentage_is_the_real_one(self):
+        # 12 месяцев по 6000 против 1000 в месяц — это ровно вдвое дешевле.
+        storage.set_price(30, 1000)
+        storage.set_price(365, 6083)      # 12 167 ₽ за год по месячной цене
+        year = [l for l in storage.price_lines() if "12 месяцев" in l][0]
+        self.assertIn("−50%", year)
+
+
+class TheTrialIsGivenOnceAndOnlyOnce(Admin):
+
+    def test_a_new_seller_gets_the_trial(self):
+        self.assertEqual(storage.start_trial(7), 3)
+        self.assertTrue(storage.has_active_subscription(7))
+
+    def test_the_same_seller_does_not_get_it_twice(self):
+        storage.start_trial(7)
+        self.assertEqual(storage.start_trial(7), 0)
+
+    def test_a_second_attempt_does_not_extend_the_first(self):
+        storage.start_trial(7)
+        first = storage.get_subscription(7)["expires"]
+        storage.start_trial(7)
+        self.assertEqual(storage.get_subscription(7)["expires"], first)
+
+    def test_with_the_trial_switched_off_nobody_gets_anything(self):
+        # Ноль дней означает «выключен», а не «выдать ноль дней»: иначе бот
+        # объявлял бы пробный период и не давал доступа.
+        storage.set_trial_days(0)
+        self.assertEqual(storage.start_trial(7), 0)
+        self.assertFalse(storage.has_active_subscription(7))
+
+    def test_a_switched_off_trial_does_not_burn_the_right_to_it(self):
+        """Худший из здешних исходов, и он тихий.
+
+        Отметка «уже брал», поставленная тому, кто ничего не получил,
+        отбирает пробный период навсегда: владелец выключил его на день,
+        человек зашёл, отметку получил, — и когда пробу включат обратно,
+        ему уже не положено. Узнать об этом неоткуда ни ему, ни владельцу.
+        """
+        storage.set_trial_days(0)
+        storage.start_trial(7)
+        self.assertFalse(storage.trial_used(7))
+
+        storage.set_trial_days(3)
+        self.assertEqual(storage.start_trial(7), 3)
+
+    def test_a_paying_seller_is_not_given_a_trial_on_top(self):
+        storage.grant_subscription(7, 30)
+        self.assertEqual(storage.start_trial(7), 0)
+
+    def test_a_seller_who_never_took_it_still_can_after_someone_else_did(self):
+        storage.start_trial(7)
+        self.assertEqual(storage.start_trial(8), 3)
+
+    def test_the_length_follows_the_setting(self):
+        storage.set_trial_days(14)
+        self.assertEqual(storage.start_trial(7), 14)
+        # `subscription_days_left` округляет вниз, поэтому сразу после
+        # выдачи показывает 13: остаток чуть меньше полных четырнадцати
+        # суток. Занижение безопаснее завышения, менять не стали — здесь
+        # проверяется сам срок, а не как он округлён.
+        left = storage.get_subscription(7)["expires"] - time.time()
+        self.assertAlmostEqual(left / 86400, 14, places=2)
+
+    def test_a_negative_setting_is_read_as_switched_off(self):
+        storage.set_trial_days(-5)
+        self.assertEqual(storage.get_trial_days(), 0)
+
+
+class DeletingDataIsNotAWayToTakeTheTrialAgain(Admin):
+
+    def test_the_mark_survives_full_deletion(self):
+        storage.start_trial(7)
+        storage.purge_user(7)
+        self.assertTrue(storage.trial_used(7))
+        self.assertEqual(storage.start_trial(7), 0)
+
+    def test_everything_else_still_goes(self):
+        # Оговорка про пробу не должна превратиться в «ничего не удаляем».
+        self.blobs["settings"] = {"7": {"личное": True}}
+        storage.start_trial(7)
+        storage.purge_user(7)
+        self.assertEqual(self.blobs["settings"], {})
+        self.assertNotIn("7", self.admin.get("subscriptions", {}))
+
+    def test_someone_who_never_took_the_trial_is_not_marked_by_deletion(self):
+        storage.purge_user(7)
+        self.assertFalse(storage.trial_used(7))
+        self.assertEqual(storage.start_trial(7), 3)
+
+    def test_the_documents_say_this_out_loud(self):
+        # Данные, тайно оставленные после «полного удаления», — ложь в
+        # опубликованном документе.
+        legal = Path(__file__).resolve().parents[2] / "docs" / "legal"
+
+        def flat(name: str) -> str:
+            # Перенос строки в середине фразы — не повод считать, что её
+            # в документе нет.
+            return " ".join((legal / name).read_text().lower().split())
+
+        privacy = flat("privacy.md")
+        self.assertIn("пробный период", privacy)
+        self.assertIn("не удаляются только две записи", privacy)
+        self.assertIn("не удаляется", flat("terms.md"))
+
+
+class TheAdminCanSetAllOfIt(unittest.TestCase):
+
+    def test_the_panel_offers_tiers_and_the_trial(self):
+        src = (Path(__file__).resolve().parents[1]
+               / "handlers" / "admin.py").read_text()
+        self.assertIn('callback_data="admin:prices"', src)
+        self.assertIn('callback_data="admin:trial"', src)
+
+    def test_the_superseded_single_price_screen_is_gone(self):
+        # Экран, до которого не ведёт ни одна кнопка, — мёртвый код,
+        # который следующая сессия примет за рабочий.
+        import handlers.admin as A
+        names = [h.callback.__name__ for h in A.router.callback_query.handlers]
+        self.assertNotIn("price_start", names)
+
+    def test_the_subscription_screen_shows_the_tiers(self):
+        src = (Path(__file__).resolve().parents[1] / "main.py").read_text()
+        self.assertIn("price_lines", src)
+
+    def test_the_trial_is_handed_out_by_start_and_not_by_some_other_screen(self):
+        """Проверяется ФУНКЦИЯ, а не наличие строки в файле.
+
+        Первая версия этого теста искала «start_trial» по всему файлу — и
+        прошла бы, когда выдача пробы по ошибке оказалась в экране помощи
+        «❓ Не нахожу токен» вместо `/start`. Там она падала с NameError на
+        каждое нажатие, а тест бы этого не заметил.
+        """
+        import ast
+        src = (Path(__file__).resolve().parents[1]
+               / "handlers" / "start.py").read_text()
+        where = {n.name for n in ast.walk(ast.parse(src))
+                 if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
+                 and "start_trial" in ast.dump(n)}
+        self.assertIn("cmd_start", where)
+        self.assertEqual(where - {"cmd_start"}, set(),
+                         f"проба выдаётся не только из /start: {where}")
+
+
+if __name__ == "__main__":
+    unittest.main()

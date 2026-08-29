@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-28-forget-me"
+BOT_VERSION = "2026-08-29-trial-prices"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -129,7 +129,21 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         await _send_menu(message, message.from_user.id)
         return
 
-    from storage import render_custom_text
+    from storage import render_custom_text, start_trial
+
+    # Пробный период — при первом заходе, до просьбы прислать токен: человек
+    # должен увидеть, что доступ у него уже есть, а не гадать, дадут ли.
+    # `start_trial` сам решает, положен ли он, и отвечает нулём, когда нет, —
+    # тогда о пробном периоде не говорится ни слова. Обещание «три дня»
+    # тому, кто их уже брал, — обещание невозможного.
+    days = start_trial(message.from_user.id)
+    if days:
+        await message.answer(ui.screen(
+            "🎁 <b>Пробный период открыт</b>",
+            [f"Полный доступ на <b>{days} дн.</b> — без оплаты.",
+             "",
+             "Подключите магазин, и автоматика заработает сразу."]))
+
     await state.set_state(AuthState.waiting_for_token)
     # В приветствии есть ссылка на панель, и превью к ней завалило бы собой
     # сами шаги подключения.
