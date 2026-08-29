@@ -406,10 +406,24 @@ class TheRootlessSetupScriptMatchesTheCode(unittest.TestCase):
         self.assertIn("setup-server.sh", self.sh)
 
     def test_it_never_calls_sudo_or_apt(self):
-        # Весь смысл в том, что прав нет. Одна такая строка — и скрипт
-        # падает ровно там, где должен был помочь.
-        for forbidden in ("sudo ", "apt-get", "apt "):
-            self.assertNotIn(forbidden, self.sh, f"скрипт зовёт {forbidden!r}")
+        """Весь смысл скрипта в том, что прав нет: один такой ВЫЗОВ — и он
+        падает ровно там, где должен был помочь.
+
+        Ищется команда, а не слово. Первая версия запрещала подстроку
+        «apt » где угодно и запретила заодно совет «попросите админа:
+        apt install cron» — то есть проверяла прозу. Совет админу с правами
+        законен; беззаконен вызов.
+        """
+        import re
+        # Строки без комментариев: комментарий про apt ничего не выполняет.
+        body = "\n".join(re.sub(r"(?<!\\)#.*$", "", ln)
+                         for ln in self.sh.splitlines())
+        # Позиция команды: начало строки, после ;/&/| или внутри $( ).
+        hits = re.findall(
+            r"(?:^\s*|[;&|]\s*|\$\(\s*|\bthen\s+|\bdo\s+|\belse\s+)"
+            r"(sudo|apt-get|apt)\b",
+            body, re.M)
+        self.assertEqual(hits, [], f"скрипт вызывает {set(hits)}")
 
     def test_it_brings_its_own_python(self):
         self.assertIn("uv python install", self.sh)
@@ -640,7 +654,8 @@ class AnEmptyOptionalAnswerDoesNotKillTheSetup(unittest.TestCase):
                 fh.write(answer + "\n")
             script = script.replace("</dev/tty", f"<{answer_file}")
             r = subprocess.run(["bash", "-c", script],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, timeout=60)
             written = ""
             if os.path.exists(env_file):
                 with open(env_file) as fh:
@@ -691,12 +706,93 @@ class AnEmptyOptionalAnswerDoesNotKillTheSetup(unittest.TestCase):
                         'echo ДОШЛИ-ДО-КОНЦА',
                     ]).replace("</dev/tty", f"<{answer_file}")
                     r = subprocess.run(["bash", "-c", script],
-                                       capture_output=True, text=True)
+                                       capture_output=True, text=True,
+                                       stdin=subprocess.DEVNULL, timeout=60)
                 self.assertNotEqual(r.returncode, 0,
                                     f"{name}: без токена установка продолжилась")
                 self.assertNotIn("ДОШЛИ-ДО-КОНЦА", r.stdout)
                 self.assertIn("BOT_TOKEN", r.stderr,
                               f"{name}: отказ не назвал, чего не хватает")
+
+
+class AMissingCronIsSaidOutLoudNotDiedOn(unittest.TestCase):
+    """Когда автозапуска нет, скрипт обязан это назвать, а не упасть и не
+    промолчать.
+
+    Запасной путь установки без root — задание `@reboot` в cron. Но на
+    урезанных образах cron не стоит, и вызов `crontab -` там оборвал бы
+    скрипт чужим сообщением «command not found», уже после того как бот
+    запущен: снаружи это «установка сломалась», хотя бот работает.
+
+    Второй, худший исход — промолчать. Бот тогда живёт до первой
+    перезагрузки, и обнаружится это через недели, когда сервер перезагрузят
+    ночью, а заказы перестанут приходить.
+
+    Проверяется поведением: кусок скрипта выполняется настоящим bash с
+    подставленным PATH — сначала без `crontab`, потом с ним.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+    def _autostart_fallback(self):
+        text = (self.ROOT / "scripts" / "setup-user.sh").read_text()
+        start = text.index("    if command -v crontab")
+        end = text.index("\n    fi\n", start) + len("\n    fi\n")
+        return text[start:end]
+
+    def _run(self, with_cron):
+        with tempfile.TemporaryDirectory() as tmp:
+            binn = os.path.join(tmp, "bin")
+            os.mkdir(binn)
+            if with_cron:
+                stub = os.path.join(binn, "crontab")
+                with open(stub, "w") as fh:
+                    # Читать stdin только для `crontab -`: у `crontab -l`
+                    # его нет, и `cat` вычитывал бы stdin самого прогона —
+                    # первая версия заглушки на этом и повисла.
+                    fh.write('#!/bin/sh\n'
+                             '[ "$1" = - ] && cat >/dev/null\n'
+                             'exit 0\n')
+                os.chmod(stub, 0o755)
+            script = "\n".join([
+                "set -Eeuo pipefail",
+                f'export PATH={binn!r}:/bin:/usr/bin',
+                'say() { printf "%s\\n" "$*"; }',
+                f'RUNNER={tmp!r}/run-bot.sh',
+                f'DATA={tmp!r}',
+                'USER=tester',
+                'MODE=""',
+                self._autostart_fallback(),
+                'echo "MODE=$MODE"',
+            ])
+            return subprocess.run(["bash", "-c", script],
+                                  capture_output=True, text=True,
+                                  stdin=subprocess.DEVNULL, timeout=60)
+
+    def test_without_cron_it_warns_instead_of_dying(self):
+        r = self._run(with_cron=False)
+        self.assertEqual(r.returncode, 0,
+                         f"скрипт умер там, где cron просто нет: {r.stderr}")
+        self.assertIn("АВТОЗАПУСКА НЕТ", r.stdout,
+                      "автозапуска нет, а скрипт об этом не сказал")
+        self.assertIn("после перезагрузки сервера НЕ", r.stdout)
+        self.assertNotIn("MODE=cron", r.stdout,
+                         "объявил запуск через cron, которого нет")
+
+    def test_without_cron_it_says_how_to_start_the_bot_by_hand(self):
+        """Совет обязан быть выполнимым: правило проекта — не советовать
+        невозможного. Команду запуска называем целиком."""
+        r = self._run(with_cron=False)
+        self.assertIn("nohup", r.stdout)
+        self.assertIn("run-bot.sh", r.stdout)
+
+    def test_with_cron_it_uses_cron_and_still_names_the_catch(self):
+        r = self._run(with_cron=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("MODE=cron", r.stdout, "cron есть, а он им не воспользовался")
+        # cron поднимает после перезагрузки, но не после падения — и это
+        # слабее systemd, о чём сказать надо.
+        self.assertIn("сам не", r.stdout)
 
 
 if __name__ == "__main__":

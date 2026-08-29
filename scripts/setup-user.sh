@@ -220,11 +220,27 @@ RUNEOF
     chmod +x "$RUNNER"
     pkill -f "${START} main.py" 2>/dev/null || true
     nohup "$RUNNER" >/dev/null 2>&1 &
-    ( crontab -l 2>/dev/null | grep -v 'run-bot.sh'; echo "@reboot $RUNNER" ) | crontab -
-    MODE="cron"
-    say "⚠️  systemd для пользователя недоступен — бот запущен через cron."
-    say "    После перезагрузки поднимется, но при падении сам не"
-    say "    перезапустится. Логи: ${DATA}/bot.log"
+    # cron тоже может отсутствовать — на урезанных образах его нет. Тогда бот
+    # работает, но переживёт только до перезагрузки, и сказать это надо
+    # прямо: «настроил автозапуск» при отсутствующем cron было бы враньём.
+    if command -v crontab >/dev/null &&
+       ( crontab -l 2>/dev/null | grep -v 'run-bot.sh'
+         echo "@reboot $RUNNER" ) | crontab - 2>/dev/null; then
+        MODE="cron"
+        say "⚠️  systemd для пользователя недоступен — бот запущен через cron."
+        say "    После перезагрузки поднимется, но при падении сам не"
+        say "    перезапустится. Логи: ${DATA}/bot.log"
+    else
+        MODE="вручную"
+        say "⚠️  АВТОЗАПУСКА НЕТ: ни systemd для пользователя, ни cron."
+        say "    Бот сейчас работает, но после перезагрузки сервера НЕ"
+        say "    поднимется — его придётся запустить этой командой:"
+        say "        nohup $RUNNER >/dev/null 2>&1 &"
+        say "    Чтобы это чинилось само, попросите включить любое из двух:"
+        say "        loginctl enable-linger $USER"
+        say "        apt install cron"
+        say "    Логи: ${DATA}/bot.log"
+    fi
 fi
 
 # --- 7. Проверка ----------------------------------------------------------
