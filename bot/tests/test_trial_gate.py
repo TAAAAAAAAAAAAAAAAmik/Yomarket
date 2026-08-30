@@ -190,5 +190,51 @@ class ItIsAWeekAndTheDocumentsSaySo(unittest.TestCase):
                 self.assertNotIn("при первом запуске Бота", text)
 
 
+class TheTwoKindsOfSubscriptionAreNeverConfused(unittest.TestCase):
+    """В боте два разных «подписка», и путать их дорого.
+
+    Первое — ПЛАТНЫЙ доступ к боту и его функциям. Второе — подписка на
+    канал, которая всего лишь открывает бесплатную неделю и к оплате
+    отношения не имеет.
+
+    На этом запнулся сам владелец, читая экран «Канал для подписки»: он
+    прочитался как «канал, где продаётся подписка». Если сбивает того, кто
+    задумывал функцию, продавца собьёт тем более.
+    """
+
+    HANDLERS = pathlib.Path(storage.__file__).parent / "handlers"
+
+    def test_the_channel_setting_is_not_called_a_subscription(self):
+        src = (self.HANDLERS / "admin.py").read_text()
+        self.assertNotIn("Канал для подписки", src,
+                         "читается как «канал, где продаётся подписка»")
+
+    def test_the_trial_screen_says_it_is_free_access_to_the_bot(self):
+        src = (self.HANDLERS / "admin.py").read_text()
+        self.assertIn("не путать с", src,
+                      "экран не разводит платный доступ и бесплатную пробу")
+
+    def test_the_paywall_names_what_is_being_bought(self):
+        """«Нужна подписка» не отвечает на вопрос «подписка на что»."""
+        text = storage.CUSTOM_TEXTS["subscription"]["default"]
+        self.assertIn("боту", text)
+
+    def test_the_paywall_does_not_mention_any_channel(self):
+        """Канал к оплате отношения не имеет — упомянуть его здесь значит
+        пообещать, что подписка на канал откроет платные функции."""
+        text = storage.CUSTOM_TEXTS["subscription"]["default"]
+        self.assertNotIn("канал", text.lower())
+
+    def test_the_trial_offer_asks_for_the_channel_not_for_money(self):
+        import handlers.start as S
+        storage.set_trial_channel("@ch")
+        try:
+            text = S._trial_offer_text()
+        finally:
+            storage.set_trial_channel("")
+        self.assertIn("канал", text.lower())
+        self.assertNotIn("оплат", text.lower().replace("без оплаты", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

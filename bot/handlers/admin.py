@@ -963,9 +963,10 @@ async def prices_menu(callback: CallbackQuery, state: FSMContext) -> None:
     channel = get_trial_channel()
     body += ["", f"🎁 Пробный период: "
              + (f"<b>{trial} дн.</b>" if trial else "<b>выключен</b>")
-             + (f"  ·  за подписку на <code>{ui.esc(channel)}</code>"
+             + (f"  ·  открывается подпиской на канал "
+                f"<code>{ui.esc(channel)}</code>"
                 if channel and trial else
-                "  ·  <i>без условий</i>" if trial else "")]
+                "  ·  <i>выдаётся сразу, без условий</i>" if trial else "")]
     b.button(text="🎁 Пробный период", callback_data="admin:trial")
     b.button(text="⬅️ Назад", callback_data="admin:menu")
 
@@ -1071,7 +1072,7 @@ async def trial_start(callback: CallbackQuery, state: FSMContext) -> None:
     from storage import get_trial_channel
     channel = get_trial_channel()
     b = InlineKeyboardBuilder()
-    b.button(text="📣 Канал для подписки", callback_data="admin:trial_ch")
+    b.button(text="📣 Канал-условие", callback_data="admin:trial_ch")
     b.button(text="⬅️ К тарифам", callback_data="admin:prices")
     await callback.message.edit_text(ui.screen(
         "🎁 <b>Пробный период</b>",
@@ -1080,10 +1081,13 @@ async def trial_start(callback: CallbackQuery, state: FSMContext) -> None:
                         if channel else "<i>нет, выдаётся сразу</i>"),
          "",
          "Введи число дней. Ноль — выключить."],
-        footer="<i>Выдаётся один раз на человека при первом /start. Отметка "
-               "о выданной пробе переживает удаление данных: иначе "
-               "/forget_me становится способом брать её бесконечно. Это "
-               "оговорено в политике конфиденциальности.</i>"),
+        footer="<i>Это БЕСПЛАТНЫЙ доступ к боту на срок — не путать с "
+               "платной подпиской. Канал-условие к оплате отношения не "
+               "имеет: подписка на него лишь открывает бесплатную неделю.\n"
+               "Даётся один раз на человека. Отметка о выданной пробе "
+               "переживает удаление данных: иначе /forget_me становится "
+               "способом брать её бесконечно — это оговорено в политике "
+               "конфиденциальности.</i>"),
         reply_markup=ui.lay(b).as_markup())
     await callback.answer()
 
@@ -1103,9 +1107,9 @@ async def trial_channel_start(callback: CallbackQuery,
         b.button(text="🗑 Убрать условие", callback_data="admin:trial_ch_off")
     b.button(text="⬅️ Назад", callback_data="admin:trial")
     await callback.message.edit_text(ui.screen(
-        "📣 <b>Канал для пробного периода</b>",
+        "📣 <b>Канал-условие для бесплатной недели</b>",
         [f"Сейчас: <code>{ui.esc(cur)}</code>" if cur else
-         "Сейчас условия нет — неделя выдаётся сразу.",
+         "Сейчас условия нет — бесплатная неделя выдаётся сразу.",
          "",
          "Пришли <code>@имя_канала</code>.",
          "",
@@ -1164,7 +1168,7 @@ async def trial_channel_input(message: Message, state: FSMContext) -> None:
         body += ["", f"⚠️ <b>Канал боту не виден:</b> <code>{ui.esc(why)}</code>",
                  "",
                  "Добавь бота в канал администратором. Пока он не видит "
-                 "канал, проверить подписку нельзя — пробный период будет "
+                 "канал, проверить подписку на него нельзя — бесплатная неделя будет "
                  "выдаваться всем, а в журнал уйдёт причина."]
     await message.answer(ui.screen(
         "📣 <b>Канал сохранён</b>" if ok else "📣 <b>Сохранил, но не вижу</b>",
