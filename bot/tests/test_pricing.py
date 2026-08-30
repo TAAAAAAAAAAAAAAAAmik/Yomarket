@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import sys
 import time
 import unittest
@@ -266,6 +267,65 @@ class TheAdminCanSetAllOfIt(unittest.TestCase):
         self.assertIn("cmd_start", where)
         self.assertEqual(where - {"cmd_start"}, set(),
                          f"проба выдаётся не только из /start: {where}")
+
+
+class TheWeekIsTheShortestPaidTier(unittest.TestCase):
+    """Неделю добавили, чтобы после бесплатной пробы можно было купить
+    такой же срок, не решаясь сразу на месяц.
+
+    Два соседних смысла у одного слова: бесплатная неделя даётся один раз
+    за подписку на канал, платная — покупается сколько угодно раз.
+    """
+
+    def test_a_week_is_among_the_tiers(self):
+        self.assertIn(7, [days for days, _label in storage.PRICE_TIERS])
+
+    def test_it_is_the_shortest_one(self):
+        self.assertEqual(storage.PRICE_TIERS[0][0], 7)
+
+    def test_the_documents_list_it(self):
+        """Документ, перечисляющий не те сроки, что показывает бот, хуже
+        отсутствующего."""
+        docs = pathlib.Path(storage.__file__).parents[1] / "docs" / "legal"
+        for name in ("offer.md", "terms.md"):
+            with self.subTest(name):
+                self.assertIn("1 неделя", (docs / name).read_text())
+
+    def test_no_discount_is_claimed_on_the_week(self):
+        """Неделя дороже всех в пересчёте на день. Приписка «выгоднее» к
+        ней была бы враньём, которое клиент проверит за десять секунд."""
+        admin = storage._load_admin()
+        try:
+            for days, price in ((7, 390), (30, 990), (365, 7990)):
+                storage.set_price(days, price)
+            week = [ln for ln in storage.price_lines() if "неделя" in ln][0]
+            self.assertNotIn("−", week)
+            self.assertNotIn("%", week)
+        finally:
+            storage._save_admin(admin)
+
+    def test_a_longer_tier_still_shows_its_discount(self):
+        """Обратная сторона: скидка на длинных сроках не должна пропасть
+        из-за появления недели."""
+        admin = storage._load_admin()
+        try:
+            for days, price in ((7, 390), (30, 990), (365, 7990)):
+                storage.set_price(days, price)
+            year = [ln for ln in storage.price_lines() if "12" in ln][0]
+            self.assertIn("%", year)
+        finally:
+            storage._save_admin(admin)
+
+    def test_a_week_can_actually_be_granted(self):
+        """Тариф, который нельзя выдать, — строка на экране и больше
+        ничего."""
+        admin = storage._load_admin()
+        try:
+            storage.grant_subscription(4242, 7)
+            self.assertTrue(storage.has_active_subscription(4242))
+            self.assertLessEqual(storage.subscription_days_left(4242), 7)
+        finally:
+            storage._save_admin(admin)
 
 
 if __name__ == "__main__":
