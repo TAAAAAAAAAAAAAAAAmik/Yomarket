@@ -130,7 +130,8 @@ class TheDiscountIsOnlyClaimedWhereItExists(Admin):
 class TheTrialIsGivenOnceAndOnlyOnce(Admin):
 
     def test_a_new_seller_gets_the_trial(self):
-        self.assertEqual(storage.start_trial(7), 3)
+        self.assertEqual(storage.start_trial(7),
+                         storage.TRIAL_DAYS_DEFAULT)
         self.assertTrue(storage.has_active_subscription(7))
 
     def test_the_same_seller_does_not_get_it_twice(self):
@@ -162,6 +163,8 @@ class TheTrialIsGivenOnceAndOnlyOnce(Admin):
         storage.start_trial(7)
         self.assertFalse(storage.trial_used(7))
 
+        # Здесь число задано нарочно и со сроком по умолчанию не связано:
+        # проверяется, что право на пробу уцелело, а не сколько дней в ней.
         storage.set_trial_days(3)
         self.assertEqual(storage.start_trial(7), 3)
 
@@ -171,7 +174,8 @@ class TheTrialIsGivenOnceAndOnlyOnce(Admin):
 
     def test_a_seller_who_never_took_it_still_can_after_someone_else_did(self):
         storage.start_trial(7)
-        self.assertEqual(storage.start_trial(8), 3)
+        self.assertEqual(storage.start_trial(8),
+                         storage.TRIAL_DAYS_DEFAULT)
 
     def test_the_length_follows_the_setting(self):
         storage.set_trial_days(14)
@@ -207,7 +211,8 @@ class DeletingDataIsNotAWayToTakeTheTrialAgain(Admin):
     def test_someone_who_never_took_the_trial_is_not_marked_by_deletion(self):
         storage.purge_user(7)
         self.assertFalse(storage.trial_used(7))
-        self.assertEqual(storage.start_trial(7), 3)
+        self.assertEqual(storage.start_trial(7),
+                         storage.TRIAL_DAYS_DEFAULT)
 
     def test_the_documents_say_this_out_loud(self):
         # Данные, тайно оставленные после «полного удаления», — ложь в

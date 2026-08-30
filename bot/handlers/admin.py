@@ -41,6 +41,7 @@ class AdminState(StatesGroup):
     doc_url = State()
     tier_price = State()
     trial_days = State()
+    trial_channel = State()
     menu_label = State()
     header_emoji = State()
     edit_text = State()
@@ -958,8 +959,13 @@ async def prices_menu(callback: CallbackQuery, state: FSMContext) -> None:
                  callback_data=f"admin:tier:{days}")
 
     trial = get_trial_days()
+    from storage import get_trial_channel
+    channel = get_trial_channel()
     body += ["", f"🎁 Пробный период: "
-             + (f"<b>{trial} дн.</b>" if trial else "<b>выключен</b>")]
+             + (f"<b>{trial} дн.</b>" if trial else "<b>выключен</b>")
+             + (f"  ·  за подписку на <code>{ui.esc(channel)}</code>"
+                if channel and trial else
+                "  ·  <i>без условий</i>" if trial else "")]
     b.button(text="🎁 Пробный период", callback_data="admin:trial")
     b.button(text="⬅️ Назад", callback_data="admin:menu")
 
@@ -1062,11 +1068,17 @@ async def trial_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.trial_days)
     from storage import get_trial_days
     cur = get_trial_days()
+    from storage import get_trial_channel
+    channel = get_trial_channel()
     b = InlineKeyboardBuilder()
+    b.button(text="📣 Канал для подписки", callback_data="admin:trial_ch")
     b.button(text="⬅️ К тарифам", callback_data="admin:prices")
     await callback.message.edit_text(ui.screen(
         "🎁 <b>Пробный период</b>",
-        [f"Сейчас: <b>{cur} дн.</b>" if cur else "Сейчас: <b>выключен</b>", "",
+        [f"Сейчас: <b>{cur} дн.</b>" if cur else "Сейчас: <b>выключен</b>",
+         "Условие: " + (f"подписка на <code>{ui.esc(channel)}</code>"
+                        if channel else "<i>нет, выдаётся сразу</i>"),
+         "",
          "Введи число дней. Ноль — выключить."],
         footer="<i>Выдаётся один раз на человека при первом /start. Отметка "
                "о выданной пробе переживает удаление данных: иначе "
@@ -1074,6 +1086,89 @@ async def trial_start(callback: CallbackQuery, state: FSMContext) -> None:
                "оговорено в политике конфиденциальности.</i>"),
         reply_markup=ui.lay(b).as_markup())
     await callback.answer()
+
+
+@router.callback_query(F.data == "admin:trial_ch")
+async def trial_channel_start(callback: CallbackQuery,
+                              state: FSMContext) -> None:
+    """Канал, подпиской на который открывается пробный период."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    from storage import get_trial_channel
+    await state.set_state(AdminState.trial_channel)
+    cur = get_trial_channel()
+    b = InlineKeyboardBuilder()
+    if cur:
+        b.button(text="🗑 Убрать условие", callback_data="admin:trial_ch_off")
+    b.button(text="⬅️ Назад", callback_data="admin:trial")
+    await callback.message.edit_text(ui.screen(
+        "📣 <b>Канал для пробного периода</b>",
+        [f"Сейчас: <code>{ui.esc(cur)}</code>" if cur else
+         "Сейчас условия нет — неделя выдаётся сразу.",
+         "",
+         "Пришли <code>@имя_канала</code>.",
+         "",
+         "<b>Бота надо добавить в канал администратором</b> — иначе он не "
+         "может спросить у Telegram, подписан человек или нет."],
+        footer="<i>Если проверить не выйдет, пробный период всё равно "
+               "выдаётся, а в журнал уходит причина: отказывать продавцу "
+               "за нашу поломку — терять клиента, а не экономить.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:trial_ch_off")
+async def trial_channel_off(callback: CallbackQuery,
+                            state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    from storage import set_trial_channel
+    set_trial_channel("")
+    await state.clear()
+    await callback.answer("Условие убрано — неделя выдаётся сразу",
+                          show_alert=True)
+    await trial_start(callback, state)
+
+
+@router.message(AdminState.trial_channel)
+async def trial_channel_input(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    value = (message.text or "").strip()
+    if not value:
+        await message.answer("❌ Пусто. Пришли @имя_канала:")
+        return
+
+    # «Сохранил» — не доказательство: канал мог быть написан с опечаткой, а
+    # бота в него могли не добавить. Спрашиваем Telegram прямо сейчас.
+    from storage import set_trial_channel
+    ok, why = True, ""
+    try:
+        chat = await message.bot.get_chat(value)
+        title = getattr(chat, "title", "") or value
+    except Exception as e:                                  # noqa: BLE001
+        ok, why, title = False, str(e)[:150], value
+
+    set_trial_channel(value)
+    await state.clear()
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ К пробному периоду", callback_data="admin:trial")
+    body = [f"Канал: <code>{ui.esc(value)}</code>"]
+    if ok:
+        body += [f"Название: <b>{ui.esc(title)}</b>", "",
+                 "✅ Канал виден боту."]
+    else:
+        body += ["", f"⚠️ <b>Канал боту не виден:</b> <code>{ui.esc(why)}</code>",
+                 "",
+                 "Добавь бота в канал администратором. Пока он не видит "
+                 "канал, проверить подписку нельзя — пробный период будет "
+                 "выдаваться всем, а в журнал уйдёт причина."]
+    await message.answer(ui.screen(
+        "📣 <b>Канал сохранён</b>" if ok else "📣 <b>Сохранил, но не вижу</b>",
+        body), reply_markup=ui.lay(b).as_markup())
 
 
 @router.message(AdminState.trial_days)

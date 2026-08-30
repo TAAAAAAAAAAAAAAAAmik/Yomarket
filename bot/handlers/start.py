@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-30-keyboard"
+BOT_VERSION = "2026-08-30-trial-week"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -166,6 +166,85 @@ async def back_to_welcome(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+def _channel_url(channel: str) -> str:
+    """Ссылка на канал из того, что вписал владелец.
+
+    Числовой id ссылкой не сделать: `t.me/-100…` никуда не ведёт, а кнопка
+    с битым адресом роняет всю клавиатуру целиком — экран не придёт вовсе.
+    """
+    name = channel.strip().lstrip("@")
+    return f"https://t.me/{name}" if name and not name.lstrip("-").isdigit() else ""
+
+
+def _trial_kb() -> "InlineKeyboardMarkup":
+    from storage import get_trial_channel
+    b = InlineKeyboardBuilder()
+    url = _channel_url(get_trial_channel())
+    if url:
+        b.button(text="📣 Открыть канал", url=url)
+    b.button(text="✅ Я подписался", callback_data="trial:check")
+    return ui.lay(b).as_markup()
+
+
+def _trial_offer_text() -> str:
+    from storage import get_trial_days
+    return ui.screen(
+        "🎁 <b>Неделя бесплатно</b>",
+        [f"Полный доступ на <b>{get_trial_days()} дн.</b> — без оплаты и без "
+         "карты.",
+         "",
+         "Условие одно: подпишись на канал и нажми «Я подписался».",
+         "",
+         "<i>Даётся один раз. Отписаться потом можно — неделю это не "
+         "отнимет.</i>"])
+
+
+@router.callback_query(F.data == "trial:check")
+async def trial_check(callback: CallbackQuery, state: FSMContext) -> None:
+    """Проверить подписку и выдать неделю."""
+    import logs
+    import trialgate
+    from storage import get_support_contact, render_custom_text, trial_used
+
+    uid = callback.from_user.id
+    if trial_used(uid):
+        # Отметка не удаляется вместе с данными — иначе `/forget_me` стал бы
+        # способом брать неделю бесконечно.
+        await callback.answer("Пробный период уже брали — он даётся один раз",
+                              show_alert=True)
+        return
+
+    days, why = await trialgate.grant_for_subscription(callback.bot, uid)
+    if not days and not why:
+        await callback.answer(
+            "Подписки не вижу. Подпишись и нажми ещё раз", show_alert=True)
+        return
+    if not days:
+        # Проверка сорвалась И выдать не вышло — например, подписка уже
+        # действует. Молчать нельзя: кнопка нажата, ничего не случилось.
+        await callback.answer("Не вышло открыть пробный период — "
+                              f"напиши {get_support_contact()}",
+                              show_alert=True)
+        return
+
+    await logs.log_event(
+        callback.bot, "trial",
+        [f"Открыт пробный период: <b>{days} дн.</b>"]
+        + ([f"⚠️ Подписку проверить НЕ вышло: <code>{ui.esc(why)}</code>. "
+            "Выдано без проверки."] if why else ["Подписка на канал есть."]),
+        user=callback.from_user)
+    await callback.message.edit_text(ui.screen(
+        "🎁 <b>Неделя открыта</b>",
+        [f"Полный доступ на <b>{days} дн.</b>",
+         "",
+         "Цепляй магазин — и автоматика заработает сразу."]))
+    await callback.answer("Готово")
+    await callback.message.answer(render_custom_text("welcome"),
+                                  reply_markup=_hello_kb(),
+                                  disable_web_page_preview=True)
+    await state.set_state(AuthState.waiting_for_token)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -191,23 +270,33 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     # `start_trial` сам решает, положен ли он, и отвечает нулём, когда нет, —
     # тогда о пробном периоде не говорится ни слова. Обещание «три дня»
     # тому, кто их уже брал, — обещание невозможного.
-    days = start_trial(message.from_user.id)
-    # Журнал владельцу. Пробный период выдаётся один раз, поэтому его выдача
-    # и есть признак нового человека: отдельного счётчика заводить не надо.
     import logs
+    from storage import (get_trial_channel, get_trial_days, trial_used)
+
+    channel = get_trial_channel()
+    fresh = not trial_used(message.from_user.id)
     await logs.log_event(message.bot, "users",
                          ["Зашёл в бота впервые."
-                          if days else "Вернулся, магазин не подключён."],
+                          if fresh else "Вернулся, магазин не подключён."],
                          user=message.from_user)
-    if days:
-        await logs.log_event(message.bot, "trial",
-                             [f"Открыт пробный период: <b>{days} дн.</b>"],
-                             user=message.from_user)
-        await message.answer(ui.screen(
-            "🎁 <b>Пробный период открыт</b>",
-            [f"Полный доступ на <b>{days} дн.</b> — без оплаты.",
-             "",
-             "Цепляй магазин — и автоматика заработает сразу."]))
+
+    if channel and fresh and get_trial_days() > 0:
+        # Условие есть — значит и выдача по кнопке. Молча выдать неделю,
+        # обещав её за подписку, значит обесценить условие: продавец
+        # решит, что подписываться незачем, и будет прав.
+        await message.answer(_trial_offer_text(), reply_markup=_trial_kb())
+    else:
+        days = start_trial(message.from_user.id)
+        if days:
+            await logs.log_event(
+                message.bot, "trial",
+                [f"Открыт пробный период: <b>{days} дн.</b>"],
+                user=message.from_user)
+            await message.answer(ui.screen(
+                "🎁 <b>Пробный период открыт</b>",
+                [f"Полный доступ на <b>{days} дн.</b> — без оплаты.",
+                 "",
+                 "Цепляй магазин — и автоматика заработает сразу."]))
 
     # Состояние ставим сразу, хотя инструкции ещё не показали: если человек
     # уже знает, где брать токен, и вставит его не нажимая кнопку — форма

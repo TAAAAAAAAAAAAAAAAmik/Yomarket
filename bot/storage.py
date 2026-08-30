@@ -1582,7 +1582,29 @@ PRICE_TIERS: tuple[tuple[int, str], ...] = (
 
 # Пробный период. Ноль — выключен: тогда бот про него не заикается, а не
 # обещает «3 дня» и молчит в ответ.
-TRIAL_DAYS_DEFAULT = 3
+# Неделя, а не три дня: за три дня продавец успевает подключить магазин, но
+# не успевает увидеть, что автоматика приносит, — а платят именно за это.
+TRIAL_DAYS_DEFAULT = 7
+
+
+def get_trial_channel() -> str:
+    """Канал, подписка на который открывает пробный период. Пусто — условия нет.
+
+    Хранится строкой как есть: и `@name`, и `-100…` Telegram принимает
+    одинаково, а угадывать за владельца, что он вписал, значит однажды
+    угадать неверно.
+    """
+    return str(_load_admin().get("trial_channel") or "").strip()
+
+
+def set_trial_channel(value: str) -> None:
+    data = _load_admin()
+    value = str(value or "").strip()
+    if value:
+        data["trial_channel"] = value
+    else:
+        data.pop("trial_channel", None)
+    _save_admin(data)
 
 
 def get_prices() -> dict[int, int]:
