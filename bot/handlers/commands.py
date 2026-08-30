@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
@@ -22,6 +22,9 @@ from storage import get_token
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+# Подписи кнопок нужны фильтру на уровне модуля.
+from keyboards.reply import LABELS as _KB_LABELS  # noqa: E402
 
 
 class _Screen:
@@ -423,3 +426,57 @@ async def sub_order(callback) -> None:
         "💳 <b>Заявка на оплату</b>", body,
         footer=f"<i>Если ответа долго нет — {ui.esc(get_support_contact())}</i>"))
     await callback.answer("Заявка отправлена" if ok else "Напиши в поддержку")
+
+
+# --- Постоянная клавиатура --------------------------------------------------
+#
+# Нажатие приходит обычным текстом, поэтому ловится по подписи. Подписи и
+# маршруты лежат в одном списке (`keyboards/reply.py`): разъехавшись, они
+# дали бы кнопку, которая нажимается и молчит.
+
+
+@router.message(F.text.in_(_KB_LABELS))
+async def kb_tap(message: Message, state: FSMContext, **data) -> None:
+    from keyboards.reply import BY_LABEL
+    kind = BY_LABEL[(message.text or "").strip()]
+    handler = {
+        "orders": cmd_orders, "chats": cmd_chats,
+        "balance": cmd_balance, "stats": cmd_stats,
+    }.get(kind)
+    if handler is None:                     # «Меню»
+        from handlers.start import cmd_menu
+        await cmd_menu(message, state)
+        return
+    if kind == "chats":                     # у него другая подпись
+        await handler(message, state)
+        return
+    await handler(message, state, **data)
+
+
+@router.message(Command("keyboard"))
+async def cmd_keyboard(message: Message) -> None:
+    """Включить или убрать постоянную клавиатуру.
+
+    Кнопка, которую нельзя убрать, — не удобство, а навязанный интерфейс:
+    на маленьком экране клавиатура занимает треть переписки, и кому-то она
+    мешает больше, чем помогает.
+    """
+    from keyboards.reply import hide_keyboard, main_reply_keyboard
+    from storage import get_settings, save_settings
+
+    settings = get_settings(message.from_user.id)
+    on = not bool(settings.get("reply_keyboard", True))
+    settings["reply_keyboard"] = on
+    # Отметку «уже показывали» снимаем вместе с выключением: иначе
+    # включённая обратно клавиатура не приехала бы ни разу, и `/keyboard`
+    # отвечал бы «включена» при пустом поле ввода.
+    settings["reply_keyboard_shown"] = on
+    save_settings(message.from_user.id, settings)
+    await message.answer(
+        ui.screen("⌨️ <b>Клавиатура включена</b>" if on else
+                  "⌨️ <b>Клавиатура убрана</b>",
+                  ["Основные разделы — под полем ввода." if on else
+                   "Разделы остались в «Меню» и в командах.",
+                   "",
+                   "Переключить обратно — <code>/keyboard</code>."]),
+        reply_markup=main_reply_keyboard() if on else hide_keyboard())

@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-30-logs3"
+BOT_VERSION = "2026-08-30-keyboard"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -68,6 +68,38 @@ async def _send_menu(target: Message | CallbackQuery, user_id: int) -> None:
 
 
 PANEL_URL = "https://panel.yoomarket.net"
+
+
+async def _show_keyboard(message) -> None:
+    """Показать постоянную клавиатуру — один раз на продавца.
+
+    Постоянная клавиатура не исчезает сама: показанная однажды, она
+    остаётся под полем ввода навсегда. Слать её на каждый `/menu` значит
+    сыпать в переписку пустые сообщения ради того, что уже на экране.
+
+    Приложить её к самому меню нельзя: там inline-кнопки, а в одном
+    сообщении бывает только одна клавиатура. Поэтому отдельная строка — но
+    она не пустая, а объясняет, что появилось и как это убрать.
+
+    Только в ответ на СООБЩЕНИЕ: `edit_text` постоянную клавиатуру не
+    принимает вовсе.
+    """
+    from storage import get_settings, save_settings
+    settings = get_settings(message.from_user.id)
+    if not settings.get("reply_keyboard", True):
+        return                               # продавец её убрал
+    if settings.get("reply_keyboard_shown"):
+        return                               # уже под полем ввода
+    from keyboards.reply import main_reply_keyboard
+    try:
+        await message.answer(
+            "⌨️ Основные разделы теперь под полем ввода.\n"
+            "<i>Убрать или вернуть — <code>/keyboard</code>.</i>",
+            reply_markup=main_reply_keyboard())
+    except Exception:                        # noqa: BLE001
+        return                               # клавиатура — не повод падать
+    settings["reply_keyboard_shown"] = True
+    save_settings(message.from_user.id, settings)
 
 
 def _hello_kb() -> "InlineKeyboardMarkup":
@@ -210,6 +242,7 @@ async def cmd_menu(message: Message, state: FSMContext) -> None:
             reply_markup=_hello_kb())
         return
     await _send_menu(message, message.from_user.id)
+    await _show_keyboard(message)
 
 
 @router.message(Command("version"))

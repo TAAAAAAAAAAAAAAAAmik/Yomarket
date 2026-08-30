@@ -111,7 +111,13 @@ class CommandsEscapeForms:
     ) -> Any:
         state = data.get("state")
         text = getattr(event, "text", "") or ""
-        if state is not None and _COMMAND_RE.match(text):
+        # Нажатие на постоянную клавиатуру — это обычный текст, а не
+        # команда. Без этой оговорки недописанная форма съедала бы его
+        # ровно так же, как съедала команды: кнопка нажата, экран не
+        # открылся, и виновата будто бы кнопка.
+        from keyboards.reply import LABELS as _KB_LABELS
+        if state is not None and (_COMMAND_RE.match(text)
+                                  or text.strip() in _KB_LABELS):
             try:
                 current = await state.get_state()
             except Exception:                      # хранилище FSM недоступно

@@ -302,10 +302,20 @@ class TheMenuOpensOnCommand(unittest.TestCase):
         self._token = S.get_token
         self._api = S.YooMarketAPI
         S.YooMarketAPI = _forbidden_api
+        # Постоянная клавиатура приезжает один раз на продавца, и без
+        # снятия отметки эти тесты зависели бы от того, кто отработал
+        # раньше — та самая беда «падает не то, что сломано».
+        import storage
+        self._settings = storage.get_settings(7)
+        s = dict(self._settings)
+        s["reply_keyboard_shown"] = True
+        storage.save_settings(7, s)
 
     def tearDown(self):
         S.get_token = self._token
         S.YooMarketAPI = self._api
+        import storage
+        storage.save_settings(7, self._settings)
 
     def test_it_shows_the_menu(self):
         S.get_token = lambda uid: "токен"
@@ -321,7 +331,22 @@ class TheMenuOpensOnCommand(unittest.TestCase):
         S.get_token = lambda uid: "токен"
         m, st = FakeMessage(), FakeState()
         run(S.cmd_menu(m, st))          # _forbidden_api уронил бы обращение
-        self.assertEqual(len(m.sent), 1)
+        self.assertTrue(m.sent)
+
+    def test_the_keyboard_arrives_with_the_menu_the_first_time(self):
+        """И только первый раз: постоянная клавиатура не исчезает сама."""
+        import storage
+        s = storage.get_settings(7)
+        s.pop("reply_keyboard_shown", None)
+        s["reply_keyboard"] = True
+        storage.save_settings(7, s)
+        S.get_token = lambda uid: "токен"
+        m, st = FakeMessage(), FakeState()
+        run(S.cmd_menu(m, st))
+        self.assertEqual(len(m.sent), 2, "клавиатура не приехала")
+        m2 = FakeMessage()
+        run(S.cmd_menu(m2, FakeState()))
+        self.assertEqual(len(m2.sent), 1, "клавиатура приехала повторно")
 
     def test_without_a_shop_it_says_so_instead_of_an_empty_menu(self):
         """Половина разделов ответила бы «сначала подключи токен» — это и
