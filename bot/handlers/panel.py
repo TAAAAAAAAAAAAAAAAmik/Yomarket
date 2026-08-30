@@ -38,15 +38,15 @@ class PanelState(StatesGroup):
 def _status_text(creds: dict | None, has_token: bool = False) -> str:
     if not creds:
         return ("🔒 <b>Панель YooMarket</b>\n\n"
-                "Вы <b>не авторизованы</b> в панели продавца.\n\n"
-                "Вход по вашей почте: придёт код, введёте его здесь.\n"
+                "Ты <b>не авторизован</b> в панели продавца.\n\n"
+                "Вход по твоей почте: придёт код, введёшь его здесь.\n"
                 "<i>Пароль не нужен.</i>")
     login = creds.get("login", "")
     login_part = f"\n👤 Логин: <b>{login}</b>" if login else ""
     return (
         f"✅ <b>Панель YooMarket</b>\n"
-        f"Вы <b>авторизованы</b> в панели продавца.{login_part}\n\n"
-        f"<i>Если автоматизация не работает — обновите вход.</i>"
+        f"Ты <b>авторизован</b> в панели продавца.{login_part}\n\n"
+        f"<i>Если автоматизация не работает — обнови вход.</i>"
     )
 
 
@@ -144,7 +144,7 @@ async def _finish_login(
         await status_msg.edit_text(
             "⚠️ <b>Вход выполнен, но API панели не принял куки.</b>\n\n"
             f"Проверка:\n<code>{api_detail}</code>\n\n"
-            "Создание товаров может не работать — пришлите этот текст разработчику."
+            "Создание товаров может не работать — пришли этот текст разработчику."
         )
 
     creds = get_panel_creds(uid)
@@ -184,7 +184,7 @@ async def panel_check(callback: CallbackQuery) -> None:
     creds = get_panel_creds(callback.from_user.id)
     if not creds or not creds.get("cookies"):
         await callback.message.edit_text(
-            "❌ Нет сохранённых куков. Войдите заново.",
+            "❌ Нет сохранённых куков. Войди заново.",
             reply_markup=_menu_kb(None),
         )
         return
@@ -200,7 +200,7 @@ async def panel_check(callback: CallbackQuery) -> None:
         await callback.message.answer("✅ Сессия <b>активна</b> — всё работает!")
     else:
         await callback.message.answer(
-            "⚠️ Сессия <b>истекла</b>.\n\nВойдите заново по email — придёт код."
+            "⚠️ Сессия <b>истекла</b>.\n\nВойди заново по email — придёт код."
         )
     await _refresh_menu(callback)
 
@@ -229,7 +229,7 @@ async def panel_token_login(callback: CallbackQuery) -> None:
         await status_msg.edit_text(
             "⚠️ <b>Автоматический вход не сработал.</b>\n\n"
             "Панель использует отдельную авторизацию.\n"
-            "Попробуйте войти через email или вставить cookies вручную."
+            "Попробуй войти через email или вставить cookies вручную."
         )
 
     creds = get_panel_creds(uid)
@@ -246,7 +246,7 @@ async def panel_email_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PanelState.waiting_email)
     await callback.message.edit_text(
         "📧 <b>Вход по коду</b>\n\n"
-        "Введите <b>email</b> от аккаунта YooMarket — на него придёт код:\n\n"
+        "Введи <b>email</b> от аккаунта YooMarket — на него придёт код:\n\n"
         "<i>Пример: mail@example.com</i>",
         reply_markup=_cancel_kb(),
     )
@@ -257,7 +257,7 @@ async def panel_email_start(callback: CallbackQuery, state: FSMContext) -> None:
 async def panel_email_input(message: Message, state: FSMContext) -> None:
     email = (message.text or "").strip()
     if not email or "@" not in email:
-        await message.answer("❌ Введите корректный email адрес")
+        await message.answer("❌ Введи корректный email адрес")
         return
 
     uid = message.from_user.id
@@ -292,7 +292,7 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
         ui.lay(b)
-        await message.answer("Выберите действие:", reply_markup=b.as_markup())
+        await message.answer("Выбери действие:", reply_markup=b.as_markup())
         return
 
     _login_sessions[uid] = http
@@ -301,7 +301,7 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
     await state.set_state(PanelState.waiting_code)
     await status_msg.edit_text(
         "✅ <b>Код отправлен на почту!</b>\n\n"
-        "Введите <b>код из письма</b>:",
+        "Введи <b>код из письма</b>:",
         reply_markup=_cancel_kb(),
     )
 
@@ -315,7 +315,7 @@ async def panel_email_input(message: Message, state: FSMContext) -> None:
 async def panel_code_input(message: Message, state: FSMContext) -> None:
     code = (message.text or "").strip()
     if not code:
-        await message.answer("❌ Введите код из письма")
+        await message.answer("❌ Введи код из письма")
         return
 
     uid = message.from_user.id
@@ -323,7 +323,7 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
     if not entry:
         await state.clear()
         await message.answer(
-            "❌ Сессия входа истекла. Начните заново.",
+            "❌ Сессия входа истекла. Начни заново.",
             reply_markup=_cancel_kb("panel:menu"),
         )
         return
@@ -333,7 +333,7 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
     try:
         ok, result = await asyncio.wait_for(http.verify_code(code), timeout=60)
     except asyncio.TimeoutError:
-        ok, result = False, "Превышено время ожидания. Попробуйте ещё раз."
+        ok, result = False, "Превышено время ожидания. Попробуй ещё раз."
     except Exception as e:
         ok, result = False, f"Ошибка запроса: {str(e)[:200]}"
 
@@ -353,7 +353,7 @@ async def panel_code_input(message: Message, state: FSMContext) -> None:
         b.button(text="🔁 Попробовать снова", callback_data="panel:sms_start")
         b.button(text="↩️ Назад", callback_data="panel:menu")
         ui.lay(b)
-        await message.answer("Выберите действие:", reply_markup=b.as_markup())
+        await message.answer("Выбери действие:", reply_markup=b.as_markup())
         return
 
     await _finish_login(message, status_msg, uid, email, result,
@@ -371,17 +371,17 @@ async def panel_cookies_start(callback: CallbackQuery, state: FSMContext) -> Non
     await callback.message.edit_text(
         "🍪 <b>Вставить cookies вручную</b>\n\n"
         "<b>С компьютера (проще):</b>\n"
-        "1. Зайдите на <b>panel.yoomarket.net</b> и войдите\n"
-        "2. Нажмите F12 → вкладка <b>Console</b>\n"
-        "3. Введите <code>document.cookie</code> → Enter\n"
-        "4. Скопируйте результат и отправьте сюда\n\n"
+        "1. Зайди на <b>panel.yoomarket.net</b> и войди\n"
+        "2. Жми F12 → вкладка <b>Console</b>\n"
+        "3. Введи <code>document.cookie</code> → Enter\n"
+        "4. Скопируй результат и отправь сюда\n\n"
         "<b>С телефона (Chrome):</b>\n"
-        "1. Войдите на <b>panel.yoomarket.net</b>\n"
-        "2. В адресной строке введите:\n"
+        "1. Войди на <b>panel.yoomarket.net</b>\n"
+        "2. В адресной строке введи:\n"
         "<code>javascript:copy(document.cookie)</code>\n"
-        "3. Нажмите Enter — cookies скопируются в буфер\n"
-        "4. Вставьте сюда\n\n"
-        "<i>Или просто введите строку вида: key=value; key2=value2</i>",
+        "3. Жми Enter — cookies скопируются в буфер\n"
+        "4. Вставь сюда\n\n"
+        "<i>Или просто введи строку вида: key=value; key2=value2</i>",
         reply_markup=_cancel_kb(),
     )
     await callback.answer()
@@ -412,7 +412,7 @@ async def panel_cookies_save(message: Message, state: FSMContext) -> None:
         save_panel_creds(uid, {"login": "", "cookies": cookies})
         await status_msg.edit_text(
             "⚠️ Cookies сохранены, но проверка дала неоднозначный результат.\n"
-            "Попробуйте запустить авто-функцию — если работает, всё в порядке."
+            "Попробуй запустить авто-функцию — если работает, всё в порядке."
         )
 
     creds = get_panel_creds(uid)

@@ -109,14 +109,14 @@ async def ns_login(message: Message) -> None:
     if not got:
         await message.answer(
             "🔑 <b>Доступ к ns.gifts</b>\n\n"
-            "Пришлите одной командой, каждое поле со своей строки:\n\n"
+            "Пришли одной командой, каждое поле со своей строки:\n\n"
             "<code>/ns_login\n"
             "user_id: 1234\n"
-            "login: ваш_логин\n"
-            "password: ваш_пароль\n"
+            "login: твой_логин\n"
+            "password: твой_пароль\n"
             "api_secret: ключ-из-письма-оператора</code>\n\n"
             "Порядок и написание любые — понимаю и «секрет», и «пароль».\n"
-            "Ваше сообщение удалю сразу после разбора.")
+            "Твоё сообщение удалю сразу после разбора.")
         return
 
     save_ns_creds(message.from_user.id, got)
@@ -142,7 +142,7 @@ def _creds_or_hint(uid: int) -> tuple[dict, str]:
     left = _have(creds)
     if left:
         return {}, (f"⚠️ Не задано: <b>{', '.join(left)}</b>\n"
-                    f"Заполните командой <code>/ns_login</code>.")
+                    f"Заполни командой <code>/ns_login</code>.")
     return creds, ""
 
 
@@ -214,7 +214,7 @@ async def _stock_report(target, uid: int, needle: str) -> None:
     if not found:
         lines += [f"❌ По слову «{html.escape(needle)}» ничего не нашлось.",
                   "",
-                  "Попробуйте другое слово или посмотрите весь каталог."]
+                  "Попробуй другое слово или посмотри весь каталог."]
         await say("\n".join(lines))
         return
 
@@ -241,7 +241,7 @@ async def _stock_report(target, uid: int, needle: str) -> None:
             lines.append("   поля заказа: <i>категория их не описала</i>")
     if len(found) > 12:
         lines.append("")
-        lines.append(f"…и ещё {len(found) - 12}. Уточните слово поиска.")
+        lines.append(f"…и ещё {len(found) - 12}. Уточни слово поиска.")
     await say("\n".join(lines)[:4000])
 
 
@@ -281,7 +281,7 @@ def _creds_text(creds: dict) -> str:
             lines.append(f"✅ {label}: <code>{html.escape(got)}</code>")
     lines.append("")
     if left:
-        lines.append("Заполните оставшееся — по кнопке на каждое поле или "
+        lines.append("Заполни оставшееся — по кнопке на каждое поле или "
                      "всё сразу одной вставкой.")
     else:
         lines.append("Всё на месте. «🧪 Проверить вход» спросит баланс — "
@@ -336,7 +336,7 @@ async def ns_set_field(callback: CallbackQuery, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="⬅️ Отмена", callback_data="ns:creds")
     await callback.message.edit_text(
-        f"✏️ <b>{label}</b>\n\n{hint}\n\nПришлите значение одним сообщением.",
+        f"✏️ <b>{label}</b>\n\n{hint}\n\nПришли значение одним сообщением.",
         reply_markup=b.as_markup())
     await callback.answer()
 
@@ -369,10 +369,10 @@ async def ns_bulk_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="⬅️ Отмена", callback_data="ns:creds")
     await callback.message.edit_text(
         "📋 <b>Всё сразу</b>\n\n"
-        "Пришлите одним сообщением, каждое поле со своей строки:\n\n"
+        "Пришли одним сообщением, каждое поле со своей строки:\n\n"
         "<code>user_id: 1234\n"
-        "login: ваш_логин\n"
-        "password: ваш_пароль\n"
+        "login: твой_логин\n"
+        "password: твой_пароль\n"
         "api_secret: ключ-от-оператора</code>\n\n"
         "Порядок и написание любые — понимаю и «пароль», и «секрет». "
         "Сообщение удалю сразу после разбора.",
@@ -438,7 +438,7 @@ async def ns_stock_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     b.adjust(2, 1, 1)
     await callback.message.edit_text(
         "📦 <b>Каталог поставщика</b>\n\n"
-        "Выберите слово поиска или пришлите своё одним сообщением.\n\n"
+        "Выбери слово поиска или пришли своё одним сообщением.\n\n"
         "<i>Только чтение: показывает service_id, цену, остаток и поля, "
         "которые требует заказ. Ничего не покупает.</i>",
         reply_markup=b.as_markup())

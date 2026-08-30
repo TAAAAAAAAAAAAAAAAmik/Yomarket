@@ -143,7 +143,7 @@ async def sub_start(callback: CallbackQuery, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="admin:menu")
     await callback.message.edit_text(
-        "🎫 <b>Выдать подписку</b>\n\nВведите <b>ID пользователя</b>:",
+        "🎫 <b>Выдать подписку</b>\n\nВведи <b>ID пользователя</b>:",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -157,7 +157,7 @@ async def sub_user_input(message: Message, state: FSMContext) -> None:
     try:
         target = int((message.text or "").strip())
     except ValueError:
-        await message.answer("❌ ID должен быть числом. Введите ещё раз:")
+        await message.answer("❌ ID должен быть числом. Введи ещё раз:")
         return
     await state.update_data(sub_target=target)
     await state.set_state(AdminState.sub_days)
@@ -168,7 +168,7 @@ async def sub_user_input(message: Message, state: FSMContext) -> None:
     b.adjust(2, 2, 1)
     await message.answer(
         f"🎫 Пользователь <code>{target}</code>\n\n"
-        "Выберите срок или введите число дней:",
+        "Выбери срок или введи число дней:",
         reply_markup=b.as_markup(),
     )
 
@@ -195,7 +195,7 @@ async def sub_days_input(message: Message, state: FSMContext) -> None:
         if days <= 0 or days > 3650:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число дней (1–3650):")
+        await message.answer("❌ Введи число дней (1–3650):")
         return
     await _do_grant(message, state, days, message.from_user.id, message.bot)
 
@@ -205,7 +205,7 @@ async def _do_grant(msg, state: FSMContext, days: int, admin_id: int, bot: Bot) 
     target = data.get("sub_target")
     await state.clear()
     if not target:
-        await msg.answer("❌ Потеряна цель. Начните заново.")
+        await msg.answer("❌ Потеряна цель. Начни заново.")
         return
     grant_subscription(target, days, by=admin_id)
     left = subscription_days_left(target)
@@ -284,7 +284,7 @@ async def block_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.block_user)
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="admin:blacklist")
-    await callback.message.edit_text("🚫 Введите ID для блокировки:",
+    await callback.message.edit_text("🚫 Введи ID для блокировки:",
                                      reply_markup=b.as_markup())
     await callback.answer()
 
@@ -315,7 +315,7 @@ async def unblock_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.unblock_user)
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="admin:blacklist")
-    await callback.message.edit_text("➖ Введите ID для разблокировки:",
+    await callback.message.edit_text("➖ Введи ID для разблокировки:",
                                      reply_markup=b.as_markup())
     await callback.answer()
 
@@ -370,7 +370,7 @@ async def broadcast_start(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data="admin:menu")
     await callback.message.edit_text(
         "📢 <b>Рассылка</b>\n\n"
-        "Отправьте сообщение (текст, фото или видео с подписью) — "
+        "Отправь сообщение (текст, фото или видео с подписью) — "
         "оно будет разослано всем пользователям бота.",
         reply_markup=b.as_markup(),
     )
@@ -436,7 +436,7 @@ async def add_admin_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.add_admin)
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="admin:admins")
-    await callback.message.edit_text("👑 Введите ID нового админа:",
+    await callback.message.edit_text("👑 Введи ID нового админа:",
                                      reply_markup=b.as_markup())
     await callback.answer()
 
@@ -458,7 +458,7 @@ async def add_admin_input(message: Message, state: FSMContext) -> None:
     await message.answer(f"👑 <code>{target}</code> теперь админ.",
                          reply_markup=b.as_markup())
     try:
-        await message.bot.send_message(target, "👑 Вам выдали права админа бота! /admin")
+        await message.bot.send_message(target, "👑 Тебе выдали права админа бота! /admin")
     except Exception:
         pass
 
@@ -471,7 +471,7 @@ async def rm_admin_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.remove_admin)
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="admin:admins")
-    await callback.message.edit_text("➖ Введите ID админа для снятия:",
+    await callback.message.edit_text("➖ Введи ID админа для снятия:",
                                      reply_markup=b.as_markup())
     await callback.answer()
 
@@ -511,7 +511,7 @@ async def appearance_menu(callback: CallbackQuery, state: FSMContext) -> None:
                    if he else "🔣 Кастом-эмодзи шапки: <b>нет</b>")
     text = (
         "🎨 <b>Оформление</b>\n\n"
-        "Настройте подписи кнопок главного меню (эмодзи + текст) и "
+        "Настрой подписи кнопок главного меню (эмодзи + текст) и "
         "кастом-эмодзи в шапке.\n\n"
         f"{header_line}\n\n"
         "ℹ️ <i>Цвет кнопок Telegram менять не даёт — «покрасить» можно "
@@ -551,7 +551,7 @@ async def label_start(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data="admin:appearance")
     await callback.message.edit_text(
         f"✏️ <b>Кнопка меню</b>\n\nТекущая: <b>{cur}</b>\n\n"
-        "Отправьте новую подпись (эмодзи + текст).\n"
+        "Отправь новую подпись (эмодзи + текст).\n"
         "Пример: <code>🟢 Мои товары</code>\n\n"
         "<i>Цветные кружки для «покраски»: 🔴🟢🟡🔵🟣🟠⚫⚪🟤</i>",
         reply_markup=b.as_markup(),
@@ -600,7 +600,7 @@ async def header_emoji_start(callback: CallbackQuery, state: FSMContext) -> None
     b.button(text="❌ Отмена", callback_data="admin:appearance")
     await callback.message.edit_text(
         "🔣 <b>Кастом-эмодзи в шапку меню</b>\n\n"
-        "Отправьте сообщение, в котором есть <b>кастом-эмодзи</b> "
+        "Отправь сообщение, в котором есть <b>кастом-эмодзи</b> "
         "(премиум/из набора). Бот запомнит первый и поставит его в заголовок "
         "«Главное меню».\n\n"
         "<i>Обычные эмодзи тоже подойдут — возьму первый символ.</i>",
@@ -631,7 +631,7 @@ async def header_emoji_save(message: Message, state: FSMContext) -> None:
         set_header_emoji(emoji_id, fallback)
         await message.answer(
             f"✅ Кастом-эмодзи сохранён (запасной символ: {fallback}).\n"
-            "Откройте /start — увидите его в шапке меню.",
+            "Открой /start — увидишь его в шапке меню.",
             reply_markup=b.as_markup())
     else:
         # кастомного эмодзи нет — берём в заголовок первый обычный значок
@@ -644,7 +644,7 @@ async def header_emoji_save(message: Message, state: FSMContext) -> None:
                 reply_markup=b.as_markup())
         else:
             await message.answer(
-                "❌ Не нашёл эмодзи в сообщении. Пришлите сообщение с эмодзи.",
+                "❌ Не нашёл эмодзи в сообщении. Пришли сообщение с эмодзи.",
                 reply_markup=b.as_markup())
 
 
@@ -681,7 +681,7 @@ async def texts_menu(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="⬅️ Назад", callback_data="admin:menu")
     await callback.message.edit_text(
         "📝 <b>Тексты сообщений</b>\n\n"
-        "Измените тексты, которые бот шлёт пользователям. "
+        "Измени тексты, которые бот шлёт пользователям. "
         "Можно вставлять <b>кастом-эмодзи</b> и форматирование "
         "(жирный, курсив) — бот сохранит как есть.\n\n"
         "✏️ = изменён, ○ = стандартный",
@@ -706,7 +706,7 @@ async def text_view(callback: CallbackQuery, state: FSMContext) -> None:
     if meta.get("vars"):
         vars_line = ("\n\n🔤 Доступные подстановки: "
                      + ", ".join(f"<code>{v}</code>" for v in meta["vars"])
-                     + "\n<i>Вставьте их в текст — бот подставит значения.</i>")
+                     + "\n<i>Вставь их в текст — бот подставит значения.</i>")
     b = InlineKeyboardBuilder()
     b.button(text="✏️ Изменить", callback_data=f"admin:txtedit:{key}")
     if is_custom_text_set(key):
@@ -750,7 +750,7 @@ async def text_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data=f"admin:txt:{key}")
     await callback.message.edit_text(
         f"✏️ <b>{meta['title']}</b>\n\n"
-        "Отправьте новый текст сообщением. Можно использовать "
+        "Отправь новый текст сообщением. Можно использовать "
         "<b>кастом-эмодзи</b>, жирный, курсив и переносы строк.{}".format(vars_line),
         reply_markup=b.as_markup(),
     )
@@ -766,12 +766,12 @@ async def text_edit_save(message: Message, state: FSMContext) -> None:
     key = data.get("text_key")
     await state.clear()
     if not key or key not in CUSTOM_TEXTS:
-        await message.answer("❌ Потерян ключ текста. Начните заново.")
+        await message.answer("❌ Потерян ключ текста. Начни заново.")
         return
     # html_text сохраняет и разметку, и кастомные эмодзи как <tg-emoji>
     html = message.html_text if message.text else ""
     if not html.strip():
-        await message.answer("❌ Пустой текст. Пришлите текст сообщением.")
+        await message.answer("❌ Пустой текст. Пришли текст сообщением.")
         return
     set_custom_text(key, html)
     b = InlineKeyboardBuilder()
@@ -864,7 +864,7 @@ async def docs_set_start(callback: CallbackQuery, state: FSMContext) -> None:
         f"📄 <b>{title}</b>",
         [f"Сейчас: <code>{_esc(cur)}</code>" if cur else "Сейчас: не задана",
          "",
-         "Пришлите ссылку на документ одним сообщением."],
+         "Пришли ссылку на документ одним сообщением."],
         footer="<i>Адрес должен начинаться с http:// или https:// — другие "
                "Telegram в кнопке не принимает, и экран не отправится.</i>"),
         reply_markup=ui.lay(b).as_markup())
@@ -889,7 +889,7 @@ async def docs_set_input(message: Message, state: FSMContext) -> None:
     if not url.lower().startswith(("http://", "https://")):
         await message.answer(
             "❌ Ссылка должна начинаться с <code>http://</code> или "
-            "<code>https://</code>.\n\nПришлите ещё раз:")
+            "<code>https://</code>.\n\nПришли ещё раз:")
         return
 
     from storage import set_policy_link
@@ -992,7 +992,7 @@ async def tier_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(ui.screen(
         f"💰 <b>{label}</b>",
         [f"Сейчас: <b>{cur} ₽</b>" if cur else "Сейчас: тариф не задан", "",
-         "Введите цену в рублях числом."],
+         "Введи цену в рублях числом."],
         footer="<i>Ноль убирает тариф: «0 ₽» на экране читается как "
                "«бесплатно», а это обещание, за которое спросят.</i>"),
         reply_markup=ui.lay(b).as_markup())
@@ -1011,7 +1011,7 @@ async def tier_input(message: Message, state: FSMContext) -> None:
     try:
         price = int((message.text or "").strip().replace(" ", ""))
     except ValueError:
-        await message.answer("❌ Нужно число в рублях. Введите ещё раз:")
+        await message.answer("❌ Нужно число в рублях. Введи ещё раз:")
         return
     if price < 0:
         await message.answer("❌ Цена не может быть отрицательной. Ещё раз:")
@@ -1062,7 +1062,7 @@ async def trial_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(ui.screen(
         "🎁 <b>Пробный период</b>",
         [f"Сейчас: <b>{cur} дн.</b>" if cur else "Сейчас: <b>выключен</b>", "",
-         "Введите число дней. Ноль — выключить."],
+         "Введи число дней. Ноль — выключить."],
         footer="<i>Выдаётся один раз на человека при первом /start. Отметка "
                "о выданной пробе переживает удаление данных: иначе "
                "/forget_me становится способом брать её бесконечно. Это "
@@ -1079,7 +1079,7 @@ async def trial_input(message: Message, state: FSMContext) -> None:
     try:
         days = int((message.text or "").strip())
     except ValueError:
-        await message.answer("❌ Нужно число дней. Введите ещё раз:")
+        await message.answer("❌ Нужно число дней. Введи ещё раз:")
         return
     if days < 0:
         await message.answer("❌ Отрицательного срока не бывает. Ещё раз:")

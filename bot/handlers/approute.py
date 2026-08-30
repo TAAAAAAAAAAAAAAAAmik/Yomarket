@@ -109,7 +109,7 @@ def _creds_or_hint(uid: int) -> tuple[dict, str]:
     creds = get_ar_creds(uid)
     if _missing(creds):
         return {}, ("⚠️ Ключ AppRoute не задан.\n"
-                    "Введите его командой <code>/apr_login</code> или кнопкой "
+                    "Введи его командой <code>/apr_login</code> или кнопкой "
                     "«🔑 Поставщик AppRoute» в разделе AutoRoblox.")
     return creds, ""
 
@@ -132,13 +132,13 @@ async def apr_login(message: Message) -> None:
     if not got:
         await message.answer(
             "🔑 <b>Ключ AppRoute</b>\n\n"
-            "Пришлите одной командой:\n\n"
-            "<code>/apr_login ваш_ключ</code>\n\n"
+            "Пришли одной командой:\n\n"
+            "<code>/apr_login твой_ключ</code>\n\n"
             "Ключ берётся в кабинете: approute.io/dashboard — "
             "международный, approute.ru/dashboard — российский. "
-            "Если кабинет российский, добавьте второй строкой "
+            "Если кабинет российский, добавь второй строкой "
             "<code>регион: ru</code>.\n\n"
-            "Ваше сообщение удалю сразу после разбора.")
+            "Твоё сообщение удалю сразу после разбора.")
         return
 
     save_ar_creds(message.from_user.id, got)
@@ -252,7 +252,7 @@ async def _item_text(creds: dict, service_id: str, item_id: str) -> str:
         return f"❌ {html.escape(str(data)[:600])}"
     if not isinstance(data, dict) or not data:
         return ("🤷 Поставщик ответил пусто. Это не «нет такого номинала» и "
-                "не «есть» — проверьте идентификаторы по "
+                "не «есть» — проверь идентификаторы по "
                 "<code>/apr_stock robux</code>.")
     stock = data.get("inStock")
     lines = [
@@ -324,7 +324,7 @@ async def _order_probe_report(target, creds: dict, item_id: str = "",
         lines.append("Товар спрошен заведомо несуществующий — "
                      "покупать было нечего.")
     else:
-        lines.append("⚠️ Спрошен <b>ваш</b> товар: защита осталась одна — "
+        lines.append("⚠️ Спрошен <b>твой</b> товар: защита осталась одна — "
                      "<code>checkOnly</code>, а её поведение на живом сервере "
                      "здесь ещё не проверялось.")
     lines.append("")
@@ -490,7 +490,7 @@ def _accounts(data) -> list[dict]:
     Отдельно от печати нарочно. Здесь когда-то жила `_positive_amount`,
     которая искала числа регулярным выражением **в собственном же готовом
     отчёте**, — тот самый разбор своей прозы вместо данных, из-за которого
-    в `CLAUDE.md` записано «факты собирайте в dict». Стоило поменять формат
+    в `CLAUDE.md` записано «факты собирай в dict». Стоило поменять формат
     строки, и «есть ли деньги» начало отвечать наугад.
 
     `amount` равен `None`, когда сумму не разобрать: это «неизвестно», а не
@@ -585,7 +585,7 @@ async def _balance_text(creds: dict) -> tuple[bool, str]:
         # покупателями потом.
         body += ("\n\n⚠️ <b>Выдавать не на что.</b> Пока на счетах ноль, "
                  "автовыдача остановится на первом же оплаченном заказе — "
-                 "пополните кабинет AppRoute.")
+                 "пополни кабинет AppRoute.")
     return True, body
 
 
@@ -656,7 +656,7 @@ async def _catalog_report(target, uid: int, needle: str) -> None:
     if not found:
         lines += [f"❌ По слову «{html.escape(needle)}» ничего не нашлось.",
                   "",
-                  "Попробуйте другое слово или посмотрите весь каталог."]
+                  "Попробуй другое слово или посмотри весь каталог."]
         await say("\n".join(lines))
         return
 
@@ -666,7 +666,7 @@ async def _catalog_report(target, uid: int, needle: str) -> None:
         lines += _product_lines(product)
     if len(found) > _MAX_PRODUCTS:
         lines.append("")
-        lines.append(f"…и ещё {len(found) - _MAX_PRODUCTS}. Уточните слово поиска.")
+        lines.append(f"…и ещё {len(found) - _MAX_PRODUCTS}. Уточни слово поиска.")
     await say("\n".join(lines)[:4000])
 
 
@@ -780,7 +780,7 @@ def _creds_text(creds: dict) -> str:
     else:
         lines.append("Ключ берётся в кабинете: <b>approute.io/dashboard</b> "
                      "(международный) или <b>approute.ru/dashboard</b> "
-                     "(российский). Если не знаете, какой выбрать, — вводите "
+                     "(российский). Если не знаете, какой выбрать, — вводи "
                      "ключ и жмите «🔎 Что отвечает сервер»: он спросит оба "
                      "и покажет, где ключ приняли.")
     lines.append("")
@@ -793,7 +793,7 @@ def _creds_text(creds: dict) -> str:
     else:
         lines.append("⚠️ <i>Ключ ляжет в базу <b>в открытом виде</b>: на "
                      "сервере не задана переменная <code>SECRET_KEY</code>. "
-                     "Задайте её — шифрование включится само при следующем "
+                     "Задай её — шифрование включится само при следующем "
                      "сохранении. Сообщение с ключом удаляю в любом случае.</i>")
     lines.append("<i>Прежний поставщик ns.gifts никуда не делся: его каталог "
                  "открывается командой /ns_stock — на случай сравнения цены.</i>")
@@ -841,11 +841,11 @@ async def apr_set_key(callback: CallbackQuery, state: FSMContext) -> None:
         "✏️ <b>API-ключ AppRoute</b>\n\n"
         "Кабинет → <b>Dashboard</b> → раздел с ключами. Длинная строка; "
         "в примерах поставщика она выглядит как <code>sk_live_…</code>, "
-        "но выдают и другого вида — присылайте как есть.\n\n"
+        "но выдают и другого вида — присылай как есть.\n\n"
         "⚠️ Временный ключ (на 48 часов) и постоянный — <b>разные</b> ключи. "
         "Если проверка не проходит, стоит попробовать второй: у них разные "
         "правила доступа.\n\n"
-        "Пришлите ключ одним сообщением — удалю сразу после разбора.",
+        "Пришли ключ одним сообщением — удалю сразу после разбора.",
         reply_markup=b.as_markup())
     await callback.answer()
 
@@ -909,12 +909,12 @@ async def _login_verdict(creds: dict) -> str:
         # прямо честнее, чем советовать вписывать адрес туда, где проверки
         # нет вовсе.
         if seen_ok and not (data.get("allowlist") or []):
-            lines.append("Белый список у вас пуст — значит доступ не ограничен "
-                         "по адресу. Если решите его включить, вписывать надо "
+            lines.append("Белый список у тебя пуст — значит доступ не ограничен "
+                         "по адресу. Если решишь его включить, вписывать надо "
                          "именно этот адрес.")
         elif not data.get("allowlistMatches", True):
-            lines.append("⚠️ Этого адреса <b>нет</b> в вашем белом списке — "
-                         "добавьте его в кабинете, иначе ключ работать не будет.")
+            lines.append("⚠️ Этого адреса <b>нет</b> в твоём белом списке — "
+                         "добавь его в кабинете, иначе ключ работать не будет.")
     if not ok:
         lines.append("\nЧто смотреть дальше: «🔎 Что отвечает сервер» — "
                      "сырой ответ обоих кабинетов.")
@@ -940,7 +940,7 @@ async def apr_proxy_prompt(callback: CallbackQuery, state: FSMContext) -> None:
         "🌐 <b>Прокси для запросов к AppRoute</b>\n\n"
         "Нужен, если у поставщика включён белый список адресов: туда "
         "вписывается адрес <b>прокси</b>, а не сервера.\n\n"
-        "Пришлите одной строкой:\n"
+        "Пришли одной строкой:\n"
         "<code>http://логин:пароль@адрес:порт</code>\n"
         "<code>socks5://логин:пароль@адрес:порт</code>\n\n"
         "⚠️ Адрес у прокси должен быть <b>постоянным</b>. Дешёвые прокси "
@@ -977,8 +977,8 @@ async def apr_proxy_input(message: Message, state: FSMContext) -> None:
         return
     save_ar_creds(message.from_user.id, {"proxy": value})
     await _show_creds(message, message.from_user.id,
-                      "✅ Прокси сохранён. Проверьте «🪪 Наш IP у поставщика»: "
-                      "там должен появиться адрес прокси — его и вписывайте "
+                      "✅ Прокси сохранён. Проверь «🪪 Наш IP у поставщика»: "
+                      "там должен появиться адрес прокси — его и вписывай "
                       "в белый список.")
 
 
@@ -1015,7 +1015,7 @@ async def _proxy_verdict(creds: dict) -> str:
         return f"⚠️ {html.escape(got['problem'])}"
     if not got["ip"]:
         return ("❌ Через этот прокси не удалось выйти наружу ни разу.\n"
-                "Проверьте строку: адрес, порт, логин и пароль.")
+                "Проверь строку: адрес, порт, логин и пароль.")
     if got["same_as_direct"]:
         # «Прокси задан» и «запросы идут через прокси» — разные утверждения.
         return (f"❌ Прокси не применяется: адрес такой же, как без него "
@@ -1031,7 +1031,7 @@ async def _proxy_verdict(creds: dict) -> str:
             f"<code>{html.escape(got['ip'])}</code>\n"
             f"Без прокси мы выходим с <code>{html.escape(got['direct'])}</code> "
             f"— значит прокси действительно работает.\n\n"
-            f"Вписывайте в белый список <code>{html.escape(got['ip'])}</code>.\n"
+            f"Вписывай в белый список <code>{html.escape(got['ip'])}</code>.\n"
             f"<i>Три запроса — это выборка, а не доказательство: прокси может "
             f"менять адрес раз в час или на новую сессию. Окончательно "
             f"подтвердит только принятый ключ.</i>")
@@ -1170,7 +1170,7 @@ async def apr_stock_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     b.adjust(2, 1, 1)
     await callback.message.edit_text(
         "📦 <b>Каталог поставщика</b>\n\n"
-        "Выберите слово поиска или пришлите своё одним сообщением.\n\n"
+        "Выбери слово поиска или пришли своё одним сообщением.\n\n"
         "<i>Только чтение: показывает serviceId, itemId, цену и поля, "
         "которые требует заказ. Ничего не покупает.</i>",
         reply_markup=b.as_markup())

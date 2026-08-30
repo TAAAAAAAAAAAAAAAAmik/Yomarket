@@ -201,7 +201,7 @@ def _refusal_ru(det: dict) -> str:
                 f"маркетплейс отказал, и правильно сделал")
     if needs_work(real):
         return ("маркетплейс отказал, хотя заказ был оплачен — похоже, "
-                "через бота этот заказ в работу не взять, нажмите в панели")
+                "через бота этот заказ в работу не взять, жми в панели")
     if real:
         return f"маркетплейс отказал ({status_ru(real)}): {_esc(why)}"
     return f"маркетплейс отказал: {_esc(why)}"
@@ -331,7 +331,7 @@ def refused_statuses(uid: int, action: str) -> list[str]:
 
     Список наблюдений, а не догадок: пополняется только настоящим отказом.
     Нужен, чтобы не предлагать кнопку, которая заведомо не сработает, —
-    «не советуйте невозможного» относится и к кнопкам, не только к тексту.
+    «не советуй невозможного» относится и к кнопкам, не только к тексту.
     """
     from storage import get_settings
     seen = (get_settings(uid).get("action_refusals") or {}).get(action)
@@ -452,7 +452,7 @@ async def handle_order_action(
                 "неё маркетплейс ещё не получил. Скорее всего он и не даст "
                 "подтвердить.\n\n"
                 "<i>Если оплата только что прошла, бот мог ещё не увидеть "
-                "её: проверьте «Детали заказа».</i>",
+                "её: проверь «Детали заказа».</i>",
                 reply_markup=b.as_markup())
             await callback.answer()
             return
@@ -500,7 +500,7 @@ async def orders_search_start(callback: CallbackQuery, state: FSMContext) -> Non
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="menu:orders")
     await callback.message.edit_text(
-        "🔍 <b>Поиск по заказам</b>\n\nВведите имя покупателя, название товара или сумму:",
+        "🔍 <b>Поиск по заказам</b>\n\nВведи имя покупателя, название товара или сумму:",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -728,11 +728,11 @@ async def order_debug(message: Message, api: YooMarketAPI) -> None:
     Только чтение: ничего не нажимает и ничего не меняет.
     """
     if not api:
-        await message.answer("⚠️ Нет токена — отправьте /start")
+        await message.answer("⚠️ Нет токена — отправь /start")
         return
     parts = (message.text or "").split()
     if len(parts) < 2:
-        await message.answer("Укажите номер: <code>/order_debug 1218314</code>")
+        await message.answer("Укажи номер: <code>/order_debug 1218314</code>")
         return
     oid = parts[1].lstrip("#")
     status = await message.answer("⏳ Читаю заказ…")
@@ -863,7 +863,7 @@ async def orders_debug(message: Message, api: YooMarketAPI) -> None:
     это будет видно сразу, а не растворится в «—».
     """
     if not api:
-        await message.answer("⚠️ Нет токена — отправьте /start")
+        await message.answer("⚠️ Нет токена — отправь /start")
         return
     status = await message.answer("⏳ Читаю заказы…")
     try:

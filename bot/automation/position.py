@@ -354,7 +354,7 @@ def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
             watch["alarmed"] = True
             v.lines.append(
                 f"❔ Не нахожу этот товар в списке уже {watch['misses']} проверок "
-                f"подряд — проверьте адрес страницы или название.")
+                f"подряд — проверь адрес страницы или название.")
         return v
 
     if watch.get("misses") or watch.get("alarmed"):
@@ -393,14 +393,14 @@ def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
     if pp.get("undercut_notify", True) and v.cheapest is not None and v.price:
         if v.cheapest < v.price:
             line = (f"💰 Дешевле у конкурента: <b>{v.cheapest:.0f} ₽</b> "
-                    f"против ваших {v.price:.0f} ₽")
+                    f"против твоих {v.price:.0f} ₽")
             if (v.cheapest_above is not None
                     and v.cheapest_above != v.cheapest):
-                line += f"; выше вас — от {v.cheapest_above:.0f} ₽"
+                line += f"; выше тебя — от {v.cheapest_above:.0f} ₽"
             v.lines.append(line)
     floor = float(watch.get("min_price") or 0)
     if floor and v.cheapest is not None and v.cheapest < floor:
-        v.lines.append(f"⚠️ Цена на витрине упала ниже вашего порога "
+        v.lines.append(f"⚠️ Цена на витрине упала ниже твоего порога "
                        f"{floor:.0f} ₽ — сейчас {v.cheapest:.0f} ₽")
 
     # --- should we pay? ------------------------------------------------------
@@ -419,7 +419,7 @@ def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
         # купить просмотр, который сработает не нам. Меряем только по стоящим
         # выше: дешёвый лот ниже по списку за эту позицию не борется, и считать
         # его конкурентом значит заблокировать поднятия навсегда.
-        v.reason = (f"выше вас есть дешевле на {v.price - rival:.0f} ₽ "
+        v.reason = (f"выше тебя есть дешевле на {v.price - rival:.0f} ₽ "
                     f"(порог {guard:.0f}) — поднятие не окупится")
         v.lines.append(f"⛔ Не поднимаю: {v.reason}")
         return v
@@ -445,7 +445,7 @@ def evaluate(watch: dict, offers: list[dict], *, shop: str = "",
             # показывало ноль. Предел, который нельзя применить, обязан
             # останавливать, а не притворяться, что он есть.
             v.reason = ("задан дневной бюджет, но цена поднятия неизвестна — "
-                        "выберите тариф: Объявления → ⭐ Премиум → ⚙️ Тариф")
+                        "выбери тариф: Объявления → ⭐ Премиум → ⚙️ Тариф")
             v.lines.append(f"⛔ Не поднимаю: {v.reason}")
             return v
         spent = spent_today(pp, now)

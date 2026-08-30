@@ -158,7 +158,7 @@ async def create_ad_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         "➕ <b>Новый товар</b>\n\n"
         + _step_header("title")
-        + "\n\nПришлите название товара — то, что увидит покупатель на "
+        + "\n\nПришли название товара — то, что увидит покупатель на "
           "витрине.",
         reply_markup=b.as_markup(),
     )
@@ -182,12 +182,12 @@ async def create_ad_back(callback: CallbackQuery, state: FSMContext) -> None:
            "quantity": data.get("quantity")}.get(step)
     await state.set_state(getattr(CreateAdState, step))
     hint = {
-        "title": "Пришлите название товара.",
-        "price": "Пришлите цену в рублях, одним числом.",
-        "description": "Пришлите описание. Ссылки панель не примет.",
+        "title": "Пришли название товара.",
+        "price": "Пришли цену в рублях, одним числом.",
+        "description": "Пришли описание. Ссылки панель не примет.",
         "quantity": "Сколько штук в наличии? Одним числом.",
     }[step]
-    было = (f"\n\nСейчас: <b>{html.escape(str(was))}</b> — пришлите новое "
+    было = (f"\n\nСейчас: <b>{html.escape(str(was))}</b> — пришли новое "
             f"значение, чтобы заменить." if was not in (None, "") else "")
     extra = ([("1️⃣ Пропустить — одна штука", "create_ad:qty:1")]
              if step == "quantity" else [])
@@ -220,7 +220,7 @@ async def ad_title(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ Название: <b>{html.escape(title)}</b>\n\n"
         + _step_header("price")
-        + "\n\nПришлите цену в рублях, одним числом.",
+        + "\n\nПришли цену в рублях, одним числом.",
         reply_markup=_step_kb("price"),
     )
 
@@ -245,7 +245,7 @@ async def ad_price(message: Message, state: FSMContext) -> None:
     if exact != price:
         await message.answer(
             f"⚠️ Копейки панель не принимает: беру <b>{price} ₽</b> "
-            f"вместо {exact:g}. Если нужно дороже — пришлите другое число.")
+            f"вместо {exact:g}. Если нужно дороже — пришли другое число.")
     data = await state.get_data()
     await state.update_data(price=price)
     if data.get("editing"):
@@ -256,7 +256,7 @@ async def ad_price(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ Цена: <b>{price} ₽</b>\n\n"
         + _step_header("description")
-        + "\n\nПришлите описание. Ссылки панель не примет — кроме "
+        + "\n\nПришли описание. Ссылки панель не примет — кроме "
           "видеосервисов и дисков из её белого списка.",
         reply_markup=_step_kb("description"),
     )
@@ -283,7 +283,7 @@ async def ad_description(message: Message, state: FSMContext) -> None:
             f"<code>{html.escape(found)}</code>\n\n"
             f"Разрешены только: {', '.join(PANEL_LINK_ALLOWED[:6])} и подобные "
             f"видеосервисы и диски.\n\n"
-            f"Уберите ссылку и пришлите описание ещё раз.")
+            f"Убери ссылку и пришли описание ещё раз.")
         return
     data = await state.get_data()
     await state.update_data(description=desc)
@@ -294,7 +294,7 @@ async def ad_description(message: Message, state: FSMContext) -> None:
     await state.set_state(CreateAdState.quantity)
     await message.answer(
         _step_header("quantity")
-        + "\n\nСколько штук в наличии? Одним числом — или пропустите, "
+        + "\n\nСколько штук в наличии? Одним числом — или пропусти, "
           "тогда будет одна.",
         reply_markup=_step_kb(
             "quantity", [("1️⃣ Пропустить — одна штука", "create_ad:qty:1")]),
@@ -340,7 +340,7 @@ async def _ask_photo(msg, state: FSMContext, edit: bool) -> None:
     await state.set_state(CreateAdState.photo)
     text = (
         _step_header("photo")
-        + "\n\nПришлите фото товара — картинкой, не файлом.\n\n"
+        + "\n\nПришли фото товара — картинкой, не файлом.\n\n"
           "<i>Панель требует картинку: без неё объявление не создать, и "
           "пропустить этот шаг нельзя.</i>"
     )
@@ -362,7 +362,7 @@ async def ad_photo(message: Message, state: FSMContext) -> None:
     try:
         await message.bot.download(photo, destination=path)
     except Exception as e:
-        await message.answer(f"❌ Не удалось скачать фото: {str(e)[:100]}\nПопробуйте ещё раз.")
+        await message.answer(f"❌ Не удалось скачать фото: {str(e)[:100]}\nПопробуй ещё раз.")
         return
     await state.update_data(photo_path=path)
     await _show_preview(message, state, edit=False)
@@ -370,7 +370,7 @@ async def ad_photo(message: Message, state: FSMContext) -> None:
 
 @router.message(CreateAdState.photo)
 async def ad_photo_not_photo(message: Message) -> None:
-    await message.answer("📷 Отправьте фото — именно изображением, а не файлом. "
+    await message.answer("📷 Отправь фото — именно изображением, а не файлом. "
                          "Без него товар создать нельзя.")
 
 
@@ -544,7 +544,7 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
         await callback.message.edit_text(
             "❌ <b>Не удалось создать товар</b>\n\n"
             "Integration API не поддерживает создание товаров.\n\n"
-            "💡 Войдите в <b>Панель продавца</b> через email — бот будет создавать товары через неё.\n\n"
+            "💡 Войди в <b>Панель продавца</b> через email — бот будет создавать товары через неё.\n\n"
             "<b>Настройки → Панель продавца → Войти через email</b>",
             reply_markup=b.as_markup(),
         )
@@ -677,7 +677,7 @@ async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
                 f"component: <code>{f.get('component','?')}</code>\n"
                 f"связь: <code>{f.get('relationship','—')}</code>\n"
                 f"Запросы:\n<code>{trace[:400]}</code>\n\n"
-                f"Пришлите этот текст разработчику.",
+                f"Пришли этот текст разработчику.",
                 reply_markup=b.as_markup(),
             )
             return
@@ -743,8 +743,8 @@ async def _render_select(msg, state: FSMContext, edit: bool = True) -> None:
     b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="menu:ads"))
 
     text = (
-        f"📋 Выберите <b>{label}</b> (всего: {len(view)}):\n"
-        f"<i>Не нашли нужное? Напишите название сообщением — я поищу.</i>"
+        f"📋 Выбери <b>{label}</b> (всего: {len(view)}):\n"
+        f"<i>Не нашли нужное? Напиши название сообщением — я поищу.</i>"
     )
     sent = None
     try:
@@ -818,7 +818,7 @@ async def select_search(message: Message, state: FSMContext) -> None:
             filtered = [o for o in base if ql in str(o.get("label", "")).lower()] or remote
 
     if not filtered:
-        await message.answer(f"🔍 По запросу «{q}» ничего не найдено. Попробуйте иначе.")
+        await message.answer(f"🔍 По запросу «{q}» ничего не найдено. Попробуй иначе.")
         return
 
     await state.update_data(
@@ -857,7 +857,7 @@ async def choose_select_option(callback: CallbackQuery, state: FSMContext) -> No
     attr = data.get("current_attr")
     options = data.get("current_view") or data.get("current_options") or []
     if not attr:
-        await callback.answer("Сессия создания истекла — начните заново", show_alert=True)
+        await callback.answer("Сессия создания истекла — начни заново", show_alert=True)
         return
     try:
         idx = int(callback.data.split(":")[1])
@@ -892,7 +892,7 @@ _MAX_REFUSED_ROUNDS = 3
 def _what_to_do(values: dict, fields: list, is_expired: bool) -> str:
     """Строка «что делать» — только там, где нам правда есть что сказать.
 
-    Совет наугад хуже молчания: «попробуйте ещё раз» на отказе по полю
+    Совет наугад хуже молчания: «попробуй ещё раз» на отказе по полю
     отправляет продавца делать бессмысленное. Поэтому советы здесь ровно на
     те случаи, где причина известна и поправима руками; на остальных
     возвращается пустая строка, и экран честно ограничивается тем, что
@@ -1026,7 +1026,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
 
     creds = get_panel_creds(uid)
     if not creds or not creds.get("cookies"):
-        await msg.edit_text("❌ Куки панели не найдены — войдите снова.")
+        await msg.edit_text("❌ Куки панели не найдены — войди снова.")
         return
 
     status_msg = await msg.edit_text(
@@ -1068,7 +1068,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
         ok, result_msg = False, (
             "⏱ <b>Панель не ответила за 42 секунд.</b>\n\n"
             "Сессия истекла или сервер YooMarket недоступен.\n\n"
-            "Войдите в панель снова или создайте товар вручную."
+            "Войди в панель снова или создай товар вручную."
         )
 
     if ok:
@@ -1111,8 +1111,8 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
                 # и здесь остаются два честных шага по порядку.
                 pub_note = (
                     "\n\n📦 <b>На модерацию пока не отправлен.</b>"
-                    "\n1. Добавьте остатки — без них публиковать нечего."
-                    "\n2. Нажмите «🚀 На модерацию»."
+                    "\n1. Добавь остатки — без них публиковать нечего."
+                    "\n2. Жми «🚀 На модерацию»."
                     f"\n\n<i>Панель ответила: "
                     f"{html.escape(str(pub_msg)[:150])}</i>"
                 )
@@ -1151,7 +1151,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
         await state.clear()
 
     # ── Ошибка — строим правильный набор кнопок ─────────────────────────────
-    is_expired = any(w in result_msg for w in ("истекла", "Сессия", "войдите снова", "Войдите"))
+    is_expired = any(w in result_msg for w in ("истекла", "Сессия", "войди снова", "Войди"))
     is_found = "✅ Ресурс" in result_msg  # creation-fields нашли, но POST не прошёл
 
     b = InlineKeyboardBuilder()
@@ -1208,7 +1208,7 @@ async def publish_item(callback: CallbackQuery) -> None:
     uid = callback.from_user.id
     creds = get_panel_creds(uid)
     if not creds or not creds.get("cookies"):
-        await callback.answer("❌ Нет сессии панели — войдите снова", show_alert=True)
+        await callback.answer("❌ Нет сессии панели — войди снова", show_alert=True)
         return
 
     await callback.answer("⏳ Публикую...")
@@ -1285,7 +1285,7 @@ async def templates_list(callback: CallbackQuery) -> None:
     b.button(text="❌ Отмена", callback_data="menu:ads")
     ui.lay(b)
     await callback.message.edit_text(
-        "📋 <b>Шаблоны товаров</b>\n\nВыберите шаблон:",
+        "📋 <b>Шаблоны товаров</b>\n\nВыбери шаблон:",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -1317,5 +1317,5 @@ async def use_template(callback: CallbackQuery, state: FSMContext) -> None:
     # Молчаливая пропажа фото выглядела бы как забывчивость шаблона: поля
     # на месте, картинки нет, и почему — непонятно.
     await callback.answer(
-        "Фото шаблона не найдено — приложите заново" if lost else "",
+        "Фото шаблона не найдено — приложи заново" if lost else "",
         show_alert=lost)

@@ -140,7 +140,7 @@ class AddingAWatch(FlowCase):
         self.run_(S.pos_url_save(msg, FakeState()))
         self.assertEqual(len(self.watches()), 1)
         said = "\n".join(msg.sent)
-        self.assertIn("вашего товара среди них нет", said)
+        self.assertIn("твоего товара среди них нет", said)
         self.assertIn("Другой магазин", said)      # what we looked for
         self.assertIn("Спайк", said)               # who was actually there
 
@@ -340,7 +340,7 @@ class AddingFromOwnListings(FlowCase):
         self.patch(P_, "panel_list_items_sync", lambda c: (True, []))
         cb = self.pick()
         self.assertEqual(self.watches()[0]["item_id"], "")
-        self.assertTrue(any("привяжите вручную" in t for t in cb.message.sent))
+        self.assertTrue(any("привяжи вручную" in t for t in cb.message.sent))
 
     def test_when_no_page_has_it_the_manual_route_is_offered(self):
         self.patch(M, "fetch_listing",

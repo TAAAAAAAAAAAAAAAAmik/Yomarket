@@ -47,11 +47,11 @@ async def _render_menu(msg, uid: int) -> None:
     packs = _packs(uid)
     lines = ["📦 <b>Паки объявлений</b>\n"]
     if packs:
-        lines.append("Соберите объявления в пак и поднимайте разом:")
+        lines.append("Собери объявления в пак и поднимай разом:")
         for name, ids in packs.items():
             lines.append(f"• <b>{name}</b> — {len(ids)} шт.")
     else:
-        lines.append("Паков пока нет. Создайте первый.")
+        lines.append("Паков пока нет. Создай первый.")
     b = InlineKeyboardBuilder()
     for i, name in enumerate(_pack_names(uid)):
         b.button(text=f"📦 {name[:24]}", callback_data=f"pack:view:{i}")
@@ -68,7 +68,7 @@ async def pack_new(callback: CallbackQuery, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="packs:menu")
     await callback.message.edit_text(
-        "➕ <b>Новый пак</b>\n\nВведите название пака:",
+        "➕ <b>Новый пак</b>\n\nВведи название пака:",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -93,7 +93,7 @@ async def pack_new_name(message: Message, state: FSMContext) -> None:
     b.button(text="📦 К паку", callback_data=f"pack:view:{len(packs)-1}")
     b.button(text="⬅️ Паки", callback_data="packs:menu")
     b.adjust(2)
-    await message.answer(f"✅ Пак «{name}» создан. Добавьте в него объявления.",
+    await message.answer(f"✅ Пак «{name}» создан. Добавь в него объявления.",
                          reply_markup=b.as_markup())
 
 
@@ -176,7 +176,7 @@ async def pack_schedule(callback: CallbackQuery) -> None:
         return
     ids = _packs(uid).get(name, [])
     if not ids:
-        await callback.answer("Пак пуст — сначала добавьте объявления",
+        await callback.answer("Пак пуст — сначала добавь объявления",
                               show_alert=True)
         return
 
@@ -197,7 +197,7 @@ async def pack_schedule(callback: CallbackQuery) -> None:
                     f"теперь поднимается этот.")
         head.append("")
     head.append(f"Товаров в паке: <b>{len(ids)}</b>")
-    head.append("Состав берётся из пака на каждом запуске — добавите товар, "
+    head.append("Состав берётся из пака на каждом запуске — добавишь товар, "
                 "и он начнёт подниматься сам.")
     head.append("")
     head.append(
@@ -251,7 +251,7 @@ async def pack_add_list(callback: CallbackQuery, api: YooMarketAPI) -> None:
     b.button(text="✅ Готово", callback_data=f"pack:view:{idx}")
     b.adjust(1)
     await callback.message.edit_text(
-        f"📦 <b>{name}</b> — отметьте объявления для пака:",
+        f"📦 <b>{name}</b> — отметь объявления для пака:",
         reply_markup=b.as_markup(),
     )
 
@@ -348,7 +348,7 @@ async def pack_bump_ask(callback: CallbackQuery) -> None:
 
     if not get_panel_creds(uid):
         await callback.answer(
-            "Продвижение идёт через панель — сначала войдите в неё: "
+            "Продвижение идёт через панель — сначала войди в неё: "
             "Настройки → 🌐 Панель продавца", show_alert=True)
         return
 
@@ -359,7 +359,7 @@ async def pack_bump_ask(callback: CallbackQuery) -> None:
         b.button(text="⬅️ К паку", callback_data=f"pack:view:{idx}")
         ui.lay(b)
         await callback.message.edit_text(
-            "⚙️ <b>Сначала выберите тариф</b>\n\n"
+            "⚙️ <b>Сначала выбери тариф</b>\n\n"
             "«Премиум» требует услугу, срок и способ оплаты — сроки стоят "
             "по-разному, поэтому бот не подставляет их сам.",
             reply_markup=b.as_markup())

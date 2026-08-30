@@ -265,7 +265,7 @@ class TheCompetitionThatMatters(unittest.TestCase):
         v = P.evaluate(self.w(undercut_guard=20), self.page, shop="Спайк",
                        pp=self.pp, now=self.now)
         self.assertFalse(v.promote)
-        self.assertIn("выше вас", v.reason)
+        self.assertIn("выше тебя", v.reason)
 
     def test_first_place_has_nothing_above_it_to_measure_against(self):
         page = offers(("Аккаунт с виртами", 270, "Спайк"),

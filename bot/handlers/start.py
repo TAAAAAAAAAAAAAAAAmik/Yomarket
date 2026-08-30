@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-29-storage-truth"
+BOT_VERSION = "2026-08-30-na-ty"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -58,7 +58,7 @@ async def _send_menu(target: Message | CallbackQuery, user_id: int) -> None:
     # отправку целиком, и продавец после подключения не видит меню вообще.
     name = ui.esc(get_shop_name(user_id) or "Магазин")
     text = (f"🏪 <b>{name}</b>\n\n{menu_header_html()} <b>Главное меню</b>\n"
-            "Выберите раздел:")
+            "Выбирай, куда идём:")
     kb = main_menu_keyboard(is_admin_user=is_admin(user_id))
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=kb)
@@ -70,14 +70,26 @@ async def _send_menu(target: Message | CallbackQuery, user_id: int) -> None:
 PANEL_URL = "https://panel.yoomarket.net"
 
 
-def _welcome_kb(back: bool = False) -> "InlineKeyboardMarkup":
-    """Кнопки под приветствием.
+def _hello_kb() -> "InlineKeyboardMarkup":
+    """Кнопка под приветствием — одна.
 
-    До этого под первым экраном не было ни одной кнопки: человек читал
-    инструкцию и должен был сам догадаться скопировать ссылку из текста,
-    сходить в браузер и вернуться. Кнопка-ссылка убирает из этой цепочки
-    три шага, а «Не нахожу токен» — единственная причина, по которой на
-    первом экране застревают.
+    Раньше приветствие сразу заканчивалось шагом 1: как достать токен из
+    панели. Но человек на этом экране ещё не решил подключаться — он читает
+    инструкцию к тому, чего не собирался делать, и закрывает бота. Сначала
+    «что я умею», и только по нажатию — «как это включить».
+    """
+    b = InlineKeyboardBuilder()
+    b.button(text="🔌 Подключить магазин", callback_data="start:connect")
+    return ui.lay(b).as_markup()
+
+
+def _welcome_kb(back: bool = False) -> "InlineKeyboardMarkup":
+    """Кнопки под шагом 1 — подключением магазина.
+
+    До этого под экраном не было ни одной кнопки: человек читал инструкцию
+    и должен был сам догадаться скопировать ссылку из текста, сходить в
+    браузер и вернуться. Кнопка-ссылка убирает из этой цепочки три шага, а
+    «Не нахожу токен» — единственная причина, по которой здесь застревают.
     """
     b = InlineKeyboardBuilder()
     b.button(text="🌐 Открыть панель", url=PANEL_URL)
@@ -87,6 +99,17 @@ def _welcome_kb(back: bool = False) -> "InlineKeyboardMarkup":
     else:
         b.button(text="❓ Не нахожу токен", callback_data="start:token_help")
     return ui.lay(b).as_markup()
+
+
+@router.callback_query(F.data == "start:connect")
+async def start_connect(callback: CallbackQuery, state: FSMContext) -> None:
+    """Показать шаг 1 — как достать токен."""
+    from storage import render_custom_text
+    await state.set_state(AuthState.waiting_for_token)
+    await callback.message.edit_text(
+        render_custom_text("connect"), reply_markup=_welcome_kb(),
+        disable_web_page_preview=True)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "start:token_help")
@@ -106,7 +129,7 @@ async def back_to_welcome(callback: CallbackQuery, state: FSMContext) -> None:
     from storage import render_custom_text
     await state.set_state(AuthState.waiting_for_token)
     await callback.message.edit_text(
-        render_custom_text("welcome"), reply_markup=_welcome_kb(),
+        render_custom_text("connect"), reply_markup=_welcome_kb(),
         disable_web_page_preview=True)
     await callback.answer()
 
@@ -142,13 +165,14 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
             "🎁 <b>Пробный период открыт</b>",
             [f"Полный доступ на <b>{days} дн.</b> — без оплаты.",
              "",
-             "Подключите магазин, и автоматика заработает сразу."]))
+             "Цепляй магазин — и автоматика заработает сразу."]))
 
+    # Состояние ставим сразу, хотя инструкции ещё не показали: если человек
+    # уже знает, где брать токен, и вставит его не нажимая кнопку — форма
+    # обязана его принять, а не промолчать.
     await state.set_state(AuthState.waiting_for_token)
-    # В приветствии есть ссылка на панель, и превью к ней завалило бы собой
-    # сами шаги подключения.
     await message.answer(render_custom_text("welcome"),
-                         reply_markup=_welcome_kb(),
+                         reply_markup=_hello_kb(),
                          disable_web_page_preview=True)
 
 
@@ -198,7 +222,7 @@ async def cmd_version(message: Message) -> None:
     # 3. Лежит ли прямо сейчас токен ИМЕННО этого продавца
     has_token = bool(storage.get_token(uid))
     accounts = storage.get_accounts(uid)
-    token_line = (f"🔑 Ваш токен: {'✅ сохранён' if has_token else '❌ нет'}"
+    token_line = (f"🔑 Твой токен: {'✅ сохранён' if has_token else '❌ нет'}"
                   f"  ({len(accounts)} аккаунт(ов))")
     panel = storage.get_panel_creds(uid)
     panel_line = f"🌐 Куки панели: {'✅ есть' if panel and panel.get('cookies') else '❌ нет'}"
@@ -213,14 +237,14 @@ async def cmd_version(message: Message) -> None:
         seed_line = "🔐 Seed-фраза TON: ✅ зашифрована"
     else:
         seed_line = ("🔐 Seed-фраза TON: ⚠️ <b>в открытом виде</b> — "
-                     "задайте SECRET_KEY в переменных окружения")
+                     "задай SECRET_KEY в переменных окружения")
 
     # Время видно только внутри «Настроек», а зависит от него многое: час
     # итогов дня, окно ночного режима, граница суток в статистике. Вопрос
     # «какое время в боте» не должен требовать хождения по экранам.
     import localtime as _lt
     _s = storage.get_settings(uid)
-    time_line = (f"🕐 Ваше время: <b>{_lt.now(_s).strftime('%d.%m %H:%M')}</b>"
+    time_line = (f"🕐 Твоё время: <b>{_lt.now(_s).strftime('%d.%m %H:%M')}</b>"
                  f" · {_lt.offset_label(_s)}")
 
     uptime = int((_time.time() - STARTED_AT) / 60)
@@ -250,7 +274,7 @@ async def cmd_version(message: Message) -> None:
         f"🤖 <b>Версия:</b> <code>{BOT_VERSION}</code>\n"
         f"🆔 Процесс: <code>{INSTANCE_ID}</code> · PID {os.getpid()} · "
         f"работает {uptime} мин\n"
-        f"<i>Вызовите /version 4–5 раз. Если метка процесса меняется — "
+        f"<i>Вызови /version раз пять подряд. Если метка процесса меняется — "
         f"запущено несколько ботов на одном токене, и все уведомления "
         f"приходят по столько же раз.</i>\n\n"
         + "\n".join(storage_lines)
@@ -322,9 +346,9 @@ def _hidden_note(hidden: bool) -> str:
     Сказать «удалено» там, где удалить не вышло, — ровно та ложь, из-за
     которой продавец оставит ключ от своего магазина висеть в переписке.
     """
-    return ("<i>🔒 Сообщение с токеном удалено из переписки.</i>" if hidden else
-            "<i>⚠️ Сообщение с токеном удалить не получилось — сотрите его "
-            "вручную: оно остаётся в истории чата.</i>")
+    return ("<i>🔒 Сообщение с токеном я убрал из переписки.</i>" if hidden else
+            "<i>⚠️ Сообщение с токеном стереть не вышло — сотри его сам, "
+            "иначе оно так и останется висеть в переписке.</i>")
 
 
 async def _hide_token(message: Message) -> bool:
@@ -345,7 +369,7 @@ async def _hide_token(message: Message) -> bool:
         return False
 
 
-_WAIT = ui.screen("🔑 <b>Подключаю магазин</b>",
+_WAIT = ui.screen("🔑 <b>Цепляю магазин</b>",
                   ["⏳ Спрашиваю Юмаркет, признаёт ли он этот токен…"])
 
 
@@ -367,7 +391,7 @@ def _retry_kb(again: bool = False) -> InlineKeyboardMarkup:
 async def process_token(message: Message, state: FSMContext, **data) -> None:
     token = (message.text or "").strip()
     if not token:
-        await message.answer("❌ Пустое сообщение. Пришлите токен одной строкой:",
+        await message.answer("❌ Пустое сообщение. Пришли токен одной строкой:",
                              reply_markup=_retry_kb())
         return
 
@@ -390,7 +414,7 @@ async def retry_token(callback: CallbackQuery, state: FSMContext, **data) -> Non
     """
     token = str((await state.get_data()).get("token") or "")
     if not token:
-        await callback.answer("Токен уже не сохранён — пришлите его снова",
+        await callback.answer("Токен я уже не помню — пришли его ещё раз",
                               show_alert=True)
         return
     await _edit(callback.message, _WAIT)
@@ -416,11 +440,11 @@ async def _connect(uid: int, token: str, wait: Message, state: FSMContext,
         # это экран, спорящий сам с собой. Что делать дальше, зависит от
         # того, в токене ли дело.
         if ours:
-            nxt = "Пришлите токен ещё раз — я жду его здесь же."
+            nxt = "Пришли токен ещё раз — жду прямо здесь."
             await state.update_data(token=None)
         else:
-            nxt = ("Токен я запомнил — нажмите «Повторить» через пару минут. "
-                   "Заново копировать его из панели не нужно.")
+            nxt = ("Токен я запомнил — жми «Повторить» через пару минут. "
+                   "Заново копировать его из панели не надо.")
             await state.update_data(token=token)
         await _edit(wait, ui.screen(
             f"⚠️ <b>{why}</b>", [what, "", nxt],
@@ -473,4 +497,4 @@ async def back_to_main(callback: CallbackQuery) -> None:
 async def cmd_logout(message: Message, state: FSMContext) -> None:
     await state.clear()
     delete_token(message.from_user.id)
-    await message.answer("🚪 Вы вышли. Для входа — /start")
+    await message.answer("🚪 Вышел. Обратно — /start")

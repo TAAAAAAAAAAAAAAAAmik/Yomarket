@@ -147,7 +147,7 @@ async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.message.edit_text(
         f"📦 <b>Товары по категориям</b>\n\n"
         f"Всего товаров: <b>{len(ads)}</b>\n"
-        f"Категорий: <b>{len(ordered)}</b>\n\nВыберите категорию:",
+        f"Категорий: <b>{len(ordered)}</b>\n\nВыбери категорию:",
         reply_markup=b.as_markup())
     await callback.answer()
 
@@ -159,7 +159,7 @@ async def list_category_items(callback: CallbackQuery, api: YooMarketAPI) -> Non
         idx = int(callback.data.split(":", 1)[1])
         wanted = names_cache[idx]
     except (ValueError, IndexError):
-        await callback.answer("Список устарел — обновите категории",
+        await callback.answer("Список устарел — обнови категории",
                               show_alert=True)
         return
     await _render_ads(callback, api, category=wanted)
@@ -339,7 +339,7 @@ async def edit_title_start(callback: CallbackQuery, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data=f"pitem:{item_id}")
     await callback.message.edit_text(
-        f"✏️ Товар #{item_id} — введите новое название (макс. 32 символа):",
+        f"✏️ Товар #{item_id} — введи новое название (макс. 32 символа):",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -452,7 +452,7 @@ async def _toggle(callback: CallbackQuery, public: bool,
             await callback.message.edit_text(
                 f"📦 <b>Нельзя опубликовать — нет остатков</b>\n\n"
                 f"Товар #{item_id}: {note}.\n\n"
-                f"Сначала добавьте позиции, потом публикуйте.",
+                f"Сначала добавь позиции, потом публикуй.",
                 reply_markup=b.as_markup(),
             )
             return
@@ -597,9 +597,9 @@ async def item_stock_start(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data=f"pitem:{item_id}")
     await callback.message.edit_text(
         "📦 <b>Добавить остатки</b>\n\n"
-        "<b>Авто-выдача</b> — пришлите позиции, <b>по одной в строке</b>:\n"
+        "<b>Авто-выдача</b> — пришли позиции, <b>по одной в строке</b>:\n"
         "<code>KEY-1111\nKEY-2222\nKEY-3333</code>\n\n"
-        "<b>Авто-выбор</b> — пришлите просто число, на сколько пополнить:\n"
+        "<b>Авто-выбор</b> — пришли просто число, на сколько пополнить:\n"
         "<code>500</code>\n\n"
         "<i>Тип товара определю сам.</i>",
         reply_markup=b.as_markup(),
@@ -612,7 +612,7 @@ async def item_stock_save(message: Message, state: FSMContext,
                           api: YooMarketAPI) -> None:
     text = (message.text or "").strip()
     if not text:
-        await message.answer("❌ Пришлите позиции или число")
+        await message.answer("❌ Пришли позиции или число")
         return
     if not api:
         await state.clear()
@@ -866,7 +866,7 @@ async def items_debug(message: Message) -> None:
     """
     creds = get_panel_creds(message.from_user.id)
     if not creds or not creds.get("cookies"):
-        await message.answer("⚠️ Нет сессии панели — войдите в «Панель продавца»")
+        await message.answer("⚠️ Нет сессии панели — войди в «Панель продавца»")
         return
 
     import json as _json
@@ -930,8 +930,8 @@ async def scan_page(message: Message) -> None:  # noqa: C901
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer(
-            "Укажите страницу панели, например:\n<code>/scan /support</code>\n\n"
-            "Адрес возьмите из строки браузера, когда открыт нужный чат.")
+            "Укажи страницу панели, например:\n<code>/scan /support</code>\n\n"
+            "Адрес возьми из строки браузера, когда открыт нужный чат.")
         return
     page_path = parts[1].strip()
     # Принимаем и адрес целиком, скопированный из строки браузера, не только путь
@@ -941,7 +941,7 @@ async def scan_page(message: Message) -> None:  # noqa: C901
 
     creds = get_panel_creds(message.from_user.id)
     if not creds or not creds.get("cookies"):
-        await message.answer("⚠️ Нет сессии панели — войдите в «Панель продавца»")
+        await message.answer("⚠️ Нет сессии панели — войди в «Панель продавца»")
         return
 
     import html as _html
@@ -1031,7 +1031,7 @@ async def panel_debug(message: Message) -> None:
     """
     creds = get_panel_creds(message.from_user.id)
     if not creds or not creds.get("cookies"):
-        await message.answer("⚠️ Нет сессии панели — войдите в «Панель продавца»")
+        await message.answer("⚠️ Нет сессии панели — войди в «Панель продавца»")
         return
 
     import html as _html
@@ -1136,7 +1136,7 @@ async def promo_debug(message: Message) -> None:
     """
     creds = get_panel_creds(message.from_user.id)
     if not creds or not creds.get("cookies"):
-        await message.answer("⚠️ Нет сессии панели — войдите в «Панель продавца»")
+        await message.answer("⚠️ Нет сессии панели — войди в «Панель продавца»")
         return
 
     import html as _html
@@ -1334,7 +1334,7 @@ async def pos_raw(message: Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer(
-            "Укажите страницу витрины:\n"
+            "Укажи страницу витрины:\n"
             "<code>/pos_raw https://yoomarket.net/categories/...</code>")
         return
     shop = get_shop_name(message.from_user.id) or ""
@@ -1529,7 +1529,7 @@ async def pos_api(message: Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer(
-            "Укажите страницу витрины:\n"
+            "Укажи страницу витрины:\n"
             "<code>/pos_api https://yoomarket.net/categories/...</code>")
         return
     shop = get_shop_name(message.from_user.id) or ""
@@ -1709,7 +1709,7 @@ async def pos_find(message: Message) -> None:
                   "Наш магазин в списке ЕСТЬ → номера витрины и API из разных "
                   "пространств, ищем по магазину.",
                   "Наш магазин в списке НЕТ → либо на витрине он назван иначе "
-                  "(сравните имена выше с «магазин в боте»), либо слова "
+                  "(сравни имена выше с «магазин в боте»), либо слова "
                   "поиска слишком общие и мы глубже в выдаче."]
     text = _html.escape("\n".join(lines))
     await status.edit_text(f"<code>{text[:3800]}</code>")
@@ -1741,8 +1741,8 @@ async def _pos_debug_watches(message: Message) -> None:
     ws = watches(pp)
     if not ws:
         await message.answer(
-            "Наблюдений нет. Добавьте товар в «Объявления» → «Премиум "
-            "продвижение» → «По позиции», либо укажите адрес:\n"
+            "Наблюдений нет. Добавь товар в «Объявления» → «Премиум "
+            "продвижение» → «По позиции», либо укажи адрес:\n"
             "<code>/pos_debug https://yoomarket.net/...</code>")
         return
 
@@ -1853,12 +1853,12 @@ async def chat_send_probe(message: Message) -> None:
     """
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Укажите номер чата: <code>/chat_send_probe 1076867</code>")
+        await message.answer("Укажи номер чата: <code>/chat_send_probe 1076867</code>")
         return
     chat_id = parts[1].strip().rstrip("/").split("/")[-1]
     creds = get_panel_creds(message.from_user.id)
     if not creds or not creds.get("cookies"):
-        await message.answer("⚠️ Нет сессии панели — войдите в «Панель продавца»")
+        await message.answer("⚠️ Нет сессии панели — войди в «Панель продавца»")
         return
     import html as _html
     from automation.panel import panel_chat_probe_sync
@@ -1891,7 +1891,7 @@ async def withdraw_debug(message: Message) -> None:
     """
     creds = get_panel_creds(message.from_user.id)
     if not creds or not creds.get("cookies"):
-        await message.answer("⚠️ Нет сессии панели — войдите в «Панель продавца»")
+        await message.answer("⚠️ Нет сессии панели — войди в «Панель продавца»")
         return
 
     import html as _html

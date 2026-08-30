@@ -234,7 +234,7 @@ async def set_reply_msg(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AutoState.waiting_reply_msg)
     cur = get_settings(callback.from_user.id)["auto_reply"].get("message", "")
     await callback.message.edit_text(
-        f"✏️ Текст ответа на <b>новый заказ</b>:\nТекущий: <i>{cur}</i>\n\nВведите новый:",
+        f"✏️ Текст ответа на <b>новый заказ</b>:\nТекущий: <i>{cur}</i>\n\nВведи новый:",
         reply_markup=_cancel_kb()
     )
     await callback.answer()
@@ -255,7 +255,7 @@ async def set_confirmed_msg(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AutoState.waiting_confirmed_msg)
     cur = get_settings(callback.from_user.id)["auto_events"]["on_confirmed"].get("message", "")
     await callback.message.edit_text(
-        f"✏️ Текст ответа при <b>подтверждении заказа</b>:\nТекущий: <i>{cur}</i>\n\nВведите новый:",
+        f"✏️ Текст ответа при <b>подтверждении заказа</b>:\nТекущий: <i>{cur}</i>\n\nВведи новый:",
         reply_markup=_cancel_kb()
     )
     await callback.answer()
@@ -276,7 +276,7 @@ async def set_refunded_msg(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AutoState.waiting_refunded_msg)
     cur = get_settings(callback.from_user.id)["auto_events"]["on_refunded"].get("message", "")
     await callback.message.edit_text(
-        f"✏️ Текст ответа при <b>возврате</b>:\nТекущий: <i>{cur}</i>\n\nВведите новый:",
+        f"✏️ Текст ответа при <b>возврате</b>:\nТекущий: <i>{cur}</i>\n\nВведи новый:",
         reply_markup=_cancel_kb()
     )
     await callback.answer()
@@ -297,7 +297,7 @@ async def add_rule_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AutoState.waiting_rule_keyword)
     await callback.message.edit_text(
         "🎮 <b>Правило по игре/категории</b>\n\n"
-        "Шаг 1/2: Введите ключевое слово (название игры или категории):\n"
+        "Шаг 1/2: Введи ключевое слово (название игры или категории):\n"
         "Пример: <code>Roblox</code>, <code>Minecraft</code>, <code>Steam Gift</code>",
         reply_markup=_cancel_kb()
     )
@@ -310,7 +310,7 @@ async def rule_keyword(message: Message, state: FSMContext) -> None:
     await state.set_state(AutoState.waiting_rule_message)
     await message.answer(
         f"🎮 Правило для: <b>{message.text}</b>\n\n"
-        f"Шаг 2/2: Введите текст авто-ответа для этой категории:",
+        f"Шаг 2/2: Введи текст авто-ответа для этой категории:",
         reply_markup=_cancel_kb()
     )
 
@@ -370,7 +370,7 @@ async def set_confirm_hours(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AutoState.waiting_confirm_hours)
     cur = get_settings(callback.from_user.id).get("auto_confirm", {}).get("hours", 24)
     await callback.message.edit_text(
-        f"⏱ Через сколько часов подтверждать заказ?\n\nТекущее: <b>{cur} ч</b>\n\nВведите число (1–72):",
+        f"⏱ Через сколько часов подтверждать заказ?\n\nТекущее: <b>{cur} ч</b>\n\nВведи число (1–72):",
         reply_markup=_cancel_kb(),
     )
     await callback.answer()
@@ -383,7 +383,7 @@ async def save_confirm_hours(message: Message, state: FSMContext) -> None:
         if not 1 <= hours <= 72:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число от 1 до 72")
+        await message.answer("❌ Введи число от 1 до 72")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -447,10 +447,10 @@ async def set_refund_scope(callback: CallbackQuery) -> None:
         "Сейчас бот возвращает деньги только за заказы, которые сам не смог "
         "выдать: покупатель не прислал ник для звёзд. Про такой заказ точно "
         "известно, что товар не ушёл.\n\n"
-        "Про остальные бот <b>не знает, выдали вы товар или нет</b>. Если "
+        "Про остальные бот <b>не знает, выдал ты товар или нет</b>. Если "
         "выдали вручную и забыли подтвердить — возврат отдаст покупателю и "
         "товар, и деньги.\n\n"
-        "Включайте, если выдаёте только через бота.",
+        "Включай, если выдаёте только через бота.",
         reply_markup=b.as_markup())
     await callback.answer()
 
@@ -471,7 +471,7 @@ async def set_refund_hours(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         f"⏱ Через сколько часов возвращать деньги за зависший заказ?\n\n"
         f"Текущее: <b>{cur} ч</b>\n\n"
-        f"Введите число (1–168). Меньше суток ставить не советую: покупатель "
+        f"Введи число (1–168). Меньше суток ставить не советую: покупатель "
         f"может просто спать.",
         reply_markup=_cancel_kb())
     await callback.answer()
@@ -484,7 +484,7 @@ async def save_refund_hours(message: Message, state: FSMContext) -> None:
         if not 1 <= hours <= 168:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число от 1 до 168")
+        await message.answer("❌ Введи число от 1 до 168")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -501,7 +501,7 @@ async def set_refund_cap(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         f"⛔ Сколько возвратов в сутки бот может сделать сам?\n\n"
         f"Сейчас: <b>{cur}</b>\n\n"
-        f"Введите число (1–50). Потолок нужен на случай, если что-то пойдёт "
+        f"Введи число (1–50). Потолок нужен на случай, если что-то пойдёт "
         f"не так: без него одна ошибка вернёт деньги по всем заказам разом.",
         reply_markup=_cancel_kb())
     await callback.answer()
@@ -514,7 +514,7 @@ async def save_refund_cap(message: Message, state: FSMContext) -> None:
         if not 1 <= cap <= 50:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число от 1 до 50")
+        await message.answer("❌ Введи число от 1 до 50")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -544,7 +544,7 @@ async def set_bump_times(callback: CallbackQuery, state: FSMContext) -> None:
     cur = ", ".join(s.get("bump_schedule", {}).get("times", []))
     await callback.message.edit_text(
         f"⏰ <b>Время автоподнятия</b>\n\nТекущее: <b>{cur or 'не задано'}</b>\n\n"
-        "Введите время через запятую (формат ЧЧ:ММ):\n"
+        "Введи время через запятую (формат ЧЧ:ММ):\n"
         "Пример: <code>09:00, 15:00, 21:00</code>",
         reply_markup=_cancel_kb(),
     )
@@ -563,7 +563,7 @@ async def save_bump_times(message: Message, state: FSMContext) -> None:
             if 0 <= h <= 23 and 0 <= m <= 59:
                 valid.append(f"{h:02d}:{m:02d}")
     if not valid:
-        await message.answer("❌ Введите время в формате ЧЧ:ММ, например: <code>09:00, 21:00</code>")
+        await message.answer("❌ Введи время в формате ЧЧ:ММ, например: <code>09:00, 21:00</code>")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -580,7 +580,7 @@ async def set_bump_price(callback: CallbackQuery, state: FSMContext) -> None:
     cur = get_settings(callback.from_user.id).get("bump_schedule", {}).get("price_per_bump", 0)
     await callback.message.edit_text(
         f"💵 <b>Цена одного поднятия</b>\n\nТекущая: <b>{cur} ₽</b>\n\n"
-        "Введите стоимость поднятия в ₽ (0 — бесплатно). "
+        "Введи стоимость поднятия в ₽ (0 — бесплатно). "
         "Нужно для учёта потолка трат.",
         reply_markup=_cancel_kb(),
     )
@@ -594,7 +594,7 @@ async def save_bump_price(message: Message, state: FSMContext) -> None:
         if price < 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число, например: <b>5</b>")
+        await message.answer("❌ Введи число, например: <b>5</b>")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -610,7 +610,7 @@ async def set_bump_ceiling(callback: CallbackQuery, state: FSMContext) -> None:
     cur = get_settings(callback.from_user.id).get("bump_schedule", {}).get("daily_ceiling", 0)
     await callback.message.edit_text(
         f"⛔ <b>Потолок трат на поднятия</b>\n\nТекущий: <b>{cur or 'без лимита'} ₽/день</b>\n\n"
-        "Введите максимум ₽ в день на поднятия (0 — без лимита). "
+        "Введи максимум ₽ в день на поднятия (0 — без лимита). "
         "При достижении бот перестанет поднимать до следующего дня.",
         reply_markup=_cancel_kb(),
     )
@@ -624,7 +624,7 @@ async def save_bump_ceiling(message: Message, state: FSMContext) -> None:
         if ceil < 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число, например: <b>100</b>")
+        await message.answer("❌ Введи число, например: <b>100</b>")
         return
     await state.clear()
     s = get_settings(message.from_user.id)

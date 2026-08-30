@@ -208,6 +208,76 @@ class TheFirstScreenHasSomethingToPress(unittest.TestCase):
         self.assertTrue(any("подключению" in t.lower() for t in kb), kb)
 
 
+class TheGreetingSellsBeforeItInstructs(unittest.TestCase):
+    """Шаг 1 показывается по кнопке, а не сразу в приветствии.
+
+    Раньше приветствие заканчивалось инструкцией «зайди в панель, открой
+    Интеграции, создай токен». Человек на первом экране ещё не решил
+    подключаться — он читает инструкцию к тому, чего не собирался делать.
+    Сначала «что я умею», и только по нажатию — «как это включить».
+
+    Состояние ожидания токена при этом ставится сразу: тот, кто уже знает,
+    где брать токен, вставит его не нажимая кнопку, и форма обязана его
+    принять, а не промолчать.
+    """
+
+    def setUp(self):
+        self._token = S.get_token
+        self._save = S.save_token
+        S.get_token = lambda uid: ""
+        storage.CUSTOM_TEXTS  # тексты берутся отсюда, подмены не нужно
+
+    def tearDown(self):
+        S.get_token = self._token
+        S.save_token = self._save
+
+    def _start(self):
+        m, st = FakeMessage(), FakeState()
+        run(S.cmd_start(m, st))
+        # Пробный период может занять первое сообщение — приветствие
+        # последнее в любом случае.
+        return m.sent[-1], st
+
+    def test_the_greeting_does_not_start_with_homework(self):
+        said, _ = self._start()
+        self.assertNotIn("Интеграции", said.now,
+                         "инструкция про токен показана до согласия подключаться")
+        self.assertNotIn("Создать токен", said.now)
+
+    def test_the_greeting_offers_to_connect(self):
+        said, _ = self._start()
+        kb = texts(said.markup)
+        self.assertEqual(len(kb), 1, f"кнопок должно быть одна, а их {kb}")
+        self.assertIn("одключ", kb[0])
+
+    def test_a_token_pasted_without_pressing_anything_is_still_caught(self):
+        """Кто уже знает, где брать токен, кнопку не нажмёт."""
+        _, st = self._start()
+        self.assertIsNotNone(st.state, "форма не ждёт токен — вставленный "
+                                       "токен уйдёт в никуда")
+
+    def test_pressing_connect_shows_the_first_step(self):
+        cb = type("CB", (), {})()
+        cb.message = Sent("приветствие")
+        cb.from_user = type("U", (), {"id": 7})()
+        cb.answer = lambda *a, **k: asyncio.sleep(0)
+        st = FakeState()
+        run(S.start_connect(cb, st))
+        self.assertIn("Интеграции", cb.message.now)
+        self.assertIn("Шаг 1", cb.message.now)
+        kb = texts(cb.message.markup)
+        self.assertTrue(any("панел" in t.lower() for t in kb), kb)
+        self.assertTrue(any("токен" in t.lower() for t in kb), kb)
+
+    def test_the_two_screens_are_separately_editable_by_the_owner(self):
+        """Владелец правит тексты в админ-панели. Склеенный экран нельзя
+        было разделить — приходилось править приветствие целиком."""
+        self.assertIn("welcome", storage.CUSTOM_TEXTS)
+        self.assertIn("connect", storage.CUSTOM_TEXTS)
+        self.assertNotEqual(storage.CUSTOM_TEXTS["welcome"]["default"],
+                            storage.CUSTOM_TEXTS["connect"]["default"])
+
+
 class ReadingTheHelpDoesNotCancelTheRegistration(unittest.TestCase):
     """Экран помощи открывается посреди ожидания токена.
 
@@ -271,13 +341,13 @@ class TheTokenDoesNotStayInTheChat(unittest.TestCase):
         m = FakeMessage("secret-token", deletable=False)
         run(S.process_token(m, FakeState()))
         said = " ".join(s.now for s in m.sent)
-        self.assertIn("сотрите его вручную", said)
-        self.assertNotIn("удалено из переписки", said)
+        self.assertIn("сотри его сам", said)
+        self.assertNotIn("убрал из переписки", said)
 
     def test_a_successful_deletion_is_reported(self):
         m = FakeMessage("secret-token")
         run(S.process_token(m, FakeState()))
-        self.assertIn("удалено из переписки", " ".join(s.now for s in m.sent))
+        self.assertIn("убрал из переписки", " ".join(s.now for s in m.sent))
 
     def test_the_token_is_never_echoed_back_to_the_screen(self):
         m = FakeMessage("secret-token")
@@ -318,7 +388,7 @@ class OneScreenInsteadOfAPileOfMessages(unittest.TestCase):
         FakeAPI.refusal = "HTTP 401"
         m = FakeMessage("bad")
         run(S.process_token(m, FakeState()))
-        self.assertIn("ещё раз — я жду", m.sent[0].now)
+        self.assertIn("ещё раз — жду", m.sent[0].now)
         self.assertNotIn("через пару минут", m.sent[0].now)
 
     def test_the_refusal_screen_offers_a_way_forward(self):

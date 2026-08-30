@@ -248,7 +248,7 @@ class TheScreensSellWithNumbersNotAdjectives(unittest.TestCase):
 
     def test_the_menu_says_what_the_plugins_do(self):
         got = self.menu(self.settings(delivered=0, enabled=False))
-        self.assertIn("не ждут вас", got)
+        self.assertIn("не ждут тебя", got)
 
     def test_the_shop_is_not_only_about_codes(self):
         """Гифт-карты — не весь товар: у бота есть и звёзды Telegram, и

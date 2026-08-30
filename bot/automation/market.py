@@ -1513,7 +1513,7 @@ def fetch_offers_sync(url: str, *, max_pages: int = 1,
             f"на странице не нашёл список предложений. "
             f"HTML {len(html)}б, JSON-блоков: {len(_json_blobs(html))}, "
             f"списков в них: 0, карточек в разметке: 0. "
-            f"Пришлите вывод /pos_raw для этого адреса — покажет, где данные.")
+            f"Пришли вывод /pos_raw для этого адреса — покажет, где данные.")
 
     all_rows = list(rows)
     seen = {_signature(rows)}

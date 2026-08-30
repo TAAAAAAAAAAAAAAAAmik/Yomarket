@@ -447,7 +447,7 @@ def _make_panel_requests_session(cookie_string: str):
     return session
 
 
-_PANEL_EXPIRED = ("сессия панели истекла — войдите заново: "
+_PANEL_EXPIRED = ("сессия панели истекла — войди заново: "
                   "Настройки → 🌐 Панель продавца")
 
 
@@ -473,7 +473,7 @@ def _panel_expired(r) -> str:
     if code in (301, 302, 303, 307, 308):
         dest = str((getattr(r, "headers", None) or {}).get("Location") or "")
         # Куда угодно, кроме логина, — это не про сессию, и врать не надо:
-        # совет «войдите заново» тому, кто и так внутри, хуже молчания.
+        # совет «войди заново» тому, кто и так внутри, хуже молчания.
         if not dest or "login" in dest.lower() or "auth" in dest.lower():
             return _PANEL_EXPIRED
     return ""
@@ -1825,7 +1825,7 @@ def panel_bump_item_sync(
         if missing:
             return False, (
                 f"«{a.get('name') or key}»: не выбран тариф ({', '.join(map(str, missing))}). "
-                f"Откройте «⭐ Премиум продвижение» → «⚙️ Тариф»."
+                f"Открой «⭐ Премиум продвижение» → «⚙️ Тариф»."
             )
 
         payload = {"resources": str(item_id)}
@@ -1894,7 +1894,7 @@ def panel_bump_all_sync(
         wanted = {str(i) for i in only_ids}
         items = [it for it in items if str(it.get("id")) in wanted]
         if not items:
-            return 0, ("ℹ️ Выбранных товаров нет в панели — обновите выбор "
+            return 0, ("ℹ️ Выбранных товаров нет в панели — обнови выбор "
                        "в «Премиум продвижении»")
 
     count = 0
@@ -2304,7 +2304,7 @@ def panel_withdraw_sync(
     if not confirm:
         return False, "вывод не подтверждён"
     if not values:
-        return False, "не заданы поля вывода — сначала настройте способ и сумму"
+        return False, "не заданы поля вывода — сначала настрой способ и сумму"
     if not action_key:
         return False, "не известен ключ действия вывода"
 
@@ -2495,7 +2495,7 @@ def panel_chat_send_sync(
     подтвердить доступ нечем, и функция так и говорит, а не пытается угадать.
     """
     if not chat_token:
-        return False, ("нет токена чата — войдите в панель заново, чтобы бот "
+        return False, ("нет токена чата — войди в панель заново, чтобы бот "
                        "получил его (кнопка «Войти по email»)")
 
     import requests as _rq
@@ -2537,7 +2537,7 @@ def panel_chat_send_sync(
                 break                      # this url is wrong, next url
             last = f"{r.status_code}: {r.text[:100]}"
             if r.status_code in (401, 403):
-                return False, ("токен чата не подошёл (401). Войдите в панель "
+                return False, ("токен чата не подошёл (401). Войди в панель "
                                "заново, чтобы бот обновил токен.")
     return False, f"не удалось отправить: {last or 'адрес не найден'}"
 
@@ -3156,7 +3156,7 @@ def panel_create_product_sync(
             return False, (
                 "⚠️ <b>Панель не принимает сохранённые куки</b> "
                 f"(401 на <code>{res}/creation-fields</code>).\n\n"
-                "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
+                "Зайди в <b>Настройки → Панель продавца</b> и войди снова через email."
             )
         if cf_resp.status_code == 403:
             # Нет прав на ЭТОТ раздел — сессия жива, ищем дальше
@@ -3352,7 +3352,7 @@ def panel_create_product_sync(
             return False, (
                 "⚠️ <b>Панель не принимает сохранённые куки</b> "
                 f"(401 на POST <code>{res}</code>).\n\n"
-                "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова."
+                "Зайди в <b>Настройки → Панель продавца</b> и войди снова."
             )
         if post_resp.status_code == 403:
             debug.append(f"POST {res}: 403 нет доступа")
@@ -3567,7 +3567,7 @@ class PanelSession:
             elif status in (401, 403):
                 return False, (
                     "⚠️ <b>Сессия в панели истекла.</b>\n\n"
-                    "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
+                    "Зайди в <b>Настройки → Панель продавца</b> и войди снова через email."
                 )
 
         debug.append(f"Ресурсы из navigation: {resources or '(не найдено)'}")
@@ -3595,7 +3595,7 @@ class PanelSession:
             if cf_status == 401:
                 return False, (
                     "⚠️ <b>Сессия в панели истекла.</b>\n\n"
-                    "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
+                    "Зайди в <b>Настройки → Панель продавца</b> и войди снова через email."
                 )
             if cf_status == 403:
                 debug.append(f"{res}: 403 нет доступа")
@@ -3682,7 +3682,7 @@ class PanelSession:
             elif post_status in (401, 403):
                 return False, (
                     "⚠️ <b>Сессия в панели истекла.</b>\n\n"
-                    "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова."
+                    "Зайди в <b>Настройки → Панель продавца</b> и войди снова."
                 )
             else:
                 debug.append(f"POST {res}: {post_status} → {text[:80]}")
@@ -4018,7 +4018,7 @@ def panel_shop_balance_sync(cookie_string: str, shop_id: str = "",
                 return False, (
                     f"в панели {len(ids)} магазина ({found}), а какой из них "
                     f"«{shop_name or '—'}» — непонятно. Показывать чужой "
-                    f"баланс нельзя. Проверьте /accounts_debug.")
+                    f"баланс нельзя. Проверь /accounts_debug.")
 
     tried = []
     for sid in ids[:5]:

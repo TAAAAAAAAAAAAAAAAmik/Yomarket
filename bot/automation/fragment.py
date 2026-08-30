@@ -85,7 +85,7 @@ def proxy_problem(proxy: str) -> str:
         except ImportError:
             return ("для socks5 нужен пакет PySocks — он добавлен в "
                     "requirements.txt, но этот бот собран без него. "
-                    "Пока возьмите адрес вида http://…")
+                    "Пока возьми адрес вида http://…")
     return ""
 
 
@@ -474,7 +474,7 @@ def buy_stars_sync(
                 break
     if not h:
         return False, ("Не удалось прочитать hash со страницы "
-                       "fragment.com/stars/buy — проверьте куки Fragment")
+                       "fragment.com/stars/buy — проверь куки Fragment")
 
     # 3. Получатель. Написания перебираются, как в разделе 3.
     search: dict = {}
@@ -486,7 +486,7 @@ def buy_stars_sync(
             break
     if not recipient:
         err = search.get("error") or search.get("error_message") or "не найден"
-        return False, f"@{username}: {err}. Проверьте username и cookies."
+        return False, f"@{username}: {err}. Проверь username и cookies."
 
     # 4. Заявка → req_id.
     init = post("initBuyStarsRequest", {"recipient": recipient,
@@ -506,7 +506,7 @@ def buy_stars_sync(
                 "прокси — ответ тот же).\n\n"
                 "Остался один невыполненный пункт: на fragment.com/my/profile "
                 "стоит «Identity Verified», а «Wallet Verified» нет. "
-                "Проверьте кошелёк там и повторите.")
+                "Проверь кошелёк там и повтори.")
         return False, f"initBuyStarsRequest не дал req_id: {err}"
 
     # 5. Кошелёк: сырой адрес для `account`, обычный — для seqno.
@@ -515,7 +515,7 @@ def buy_stars_sync(
         raw_addr = wallet.address.to_string(False)
         bounce_addr = wallet.address.to_string(True, True, True)
     except Exception as e:
-        return False, f"Ошибка кошелька (проверьте seed-фразу): {str(e)[:80]}"
+        return False, f"Ошибка кошелька (проверь seed-фразу): {str(e)[:80]}"
 
     account = json.dumps({"address": raw_addr, "chain": MAINNET_CHAIN})
     device = json.dumps({
@@ -558,7 +558,7 @@ def buy_stars_sync(
     except Exception as e:
         return False, f"Ошибка сборки транзакции: {str(e)[:100]}"
     if not _send_boc(boc):
-        return False, "TonCenter отклонил транзакцию (проверьте баланс кошелька)"
+        return False, "TonCenter отклонил транзакцию (проверь баланс кошелька)"
 
     # Деньги ушли. Дальше любой провал означает «заплатили и не получили»,
     # и повторять покупку нельзя — заплатим дважды. Документ об этом молчит,
@@ -591,13 +591,13 @@ def buy_stars_sync(
         return False, (
             f"⚠️ TON ушёл ({amount_nano / 1_000_000_000:.4f}), но Fragment "
             f"не засчитал оплату: {str(cerr)[:80]}. Повтор не делаю — "
-            "заплатили бы дважды. Проверьте начисление на fragment.com и "
-            "выдайте вручную, если звёзд нет.")
+            "заплатили бы дважды. Проверь начисление на fragment.com и "
+            "выдай вручную, если звёзд нет.")
 
     tail = ""
     if len(messages) > 1:
         tail = (f"\n⚠️ Fragment попросил ещё {len(messages) - 1} перевод(а) — "
-                "оплачен только первый, как в документации. Проверьте, "
+                "оплачен только первый, как в документации. Проверь, "
                 "начислились ли звёзды.")
     if wait_confirm and not landed:
         # Fragment оплату засчитал, а кошелёк движения за отведённое время не
@@ -606,7 +606,7 @@ def buy_stars_sync(
         return True, (
             f"✅ {quantity}⭐ отправлены на @{username}{tail}\n"
             f"⚠️ Подтверждения в сети за {SEQNO_MAX_WAIT_SECS} с не увидел — "
-            f"перевод отправлен и Fragment его засчитал, но проверьте "
+            f"перевод отправлен и Fragment его засчитал, но проверь "
             f"начисление на fragment.com.")
     if wait_confirm:
         return True, (f"✅ {quantity}⭐ отправлены на @{username} "
@@ -904,8 +904,8 @@ def profile_facts_sync(cookies: dict) -> list[str]:
     if seen.get("Identity Verified") and not seen.get("Wallet Verified"):
         out.append("  ⚠️ Личность проверена, а кошелёк — нет. Из всего, что "
                    "мы видели, это единственное невыполненное условие. "
-                   "Проверьте кошелёк на fragment.com/my/profile и "
-                   "повторите — фактом это станет только после удавшейся "
+                   "Проверь кошелёк на fragment.com/my/profile и "
+                   "повтори — фактом это станет только после удавшейся "
                    "покупки.")
     return out
 
@@ -1026,7 +1026,7 @@ def page_rewrites_cookies_sync(cookies: dict, proxy: str = "") -> list[str]:
     if overwritten:
         out.append("⚠️ Подмена кук: заявку на покупку Fragment принимает "
                    "только от вошедшего, а поиск получателя проходит и без "
-                   "входа. Бот возвращает ваши куки на место сразу после "
+                   "входа. Бот возвращает твои куки на место сразу после "
                    "чтения страницы.")
     else:
         out.append("Версия про подмену кук этой пробой не подтвердилась.")
@@ -1126,7 +1126,7 @@ def probe_session_sync(cookies: dict) -> list[str]:
             wrong.append(f"в {name} лежит значение от {looks}")
     if wrong:
         out.append("⚠️ Значения попали не в свои поля: " + "; ".join(wrong)
-                   + ". Введите их заново по одному.")
+                   + ". Введи их заново по одному.")
     else:
         # Формат опознаётся не всегда — например, у значения непривычного
         # вида. Соотношение длин остаётся вторым, более грубым признаком.
@@ -1226,7 +1226,7 @@ def probe_recipient_sync(cookies: dict, username: str, quantity: int = 50,
     found = search.get("found") if isinstance(search.get("found"), dict) else {}
     out.append(f"✅ @{nick} — найден (написание «{used}»)")
     if found.get("myself"):
-        out.append("⚠️ Это ваш собственный аккаунт — покупку себе Fragment "
+        out.append("⚠️ Это твой собственный аккаунт — покупку себе Fragment "
                    "может разрешать иначе, чем чужому.")
     out.append(f"recipient: {len(recipient)} знаков")
 
@@ -1294,7 +1294,7 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
             # видела личный раздел, а через полчаса — гостевую страницу с
             # теми же куками. Пока это не сказано вслух, продавец ищет
             # причину в боте.
-            out.append("  Куки Fragment истекли. Снимите их заново — они "
+            out.append("  Куки Fragment истекли. Сними их заново — они "
                        "живут недолго, и вчерашние уже не годятся.")
     wallet = wallet_on_page_sync(cookies)
     out.append("Кошелёк на странице Fragment: "
@@ -1420,7 +1420,7 @@ def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
                 out.append(f"  recipient длиной {len(recipient)}: "
                            f"«{recipient[:24]}…»")
                 if isinstance(found, dict) and found.get("myself"):
-                    out.append("  ⚠️ myself: это ваш собственный аккаунт")
+                    out.append("  ⚠️ myself: это твой собственный аккаунт")
             try:
                 resp = call(session, in_query, h, "initBuyStarsRequest",
                             {"recipient": recipient, "quantity": quantity})
@@ -1807,8 +1807,8 @@ def _probe_cookie_roles(cookies: dict, username: str,
     # что сравнивать. Догадка сюда не пишется.
     if len(marks) > 1 and marks[1] == marks[0] and "stel_ton_token" in cookies:
         out.append("  ↑ без stel_ton_token не изменилось ничего — эта кука "
-                   "сейчас не работает. Подключите TON-кошелёк на "
-                   "fragment.com заново и снимите её ещё раз.")
+                   "сейчас не работает. Подключи TON-кошелёк на "
+                   "fragment.com заново и сними её ещё раз.")
     return out
 
 
@@ -1889,7 +1889,7 @@ def _probe_control(cookies: dict, username: str, quantity: int,
     if not recipient:
         return [f"  поиск — {str(search.get('error') or search)[:60]}",
                 "  Ни один ник не нашёлся: " + ", ".join(f"@{n}" for n in tried),
-                "  Задайте живой ник третьим словом — лучше всего свой второй "
+                "  Задай живой ник третьим словом — лучше всего свой второй "
                 "аккаунт: /stars_probe NO0RD 50 второйник"]
 
     out: list[str] = []
@@ -1912,7 +1912,7 @@ def _probe_control(cookies: dict, username: str, quantity: int,
         # Нашли снова себя — сравнивать не с чем, и говорить «дело не в
         # себе» нельзя: это и есть «себе».
         out.append(f"  ❌ {str(init.get('error') or init)[:70]}")
-        out.append("  Но это снова ваш же аккаунт — версия «нельзя покупать "
+        out.append("  Но это снова твой же аккаунт — версия «нельзя покупать "
                    "себе» так и осталась непроверенной.")
     else:
         out.append(f"  ❌ {str(init.get('error') or init)[:70]}")
@@ -2075,7 +2075,7 @@ def check_fragment_session_sync(cookies: dict,
         return False, {
             "message": "Куки Fragment больше не действуют — страница "
                        "отдаётся как гостю.",
-            "how": ("Обновите куки: «🔑 Данные Fragment» → «🍪 Cookies» — "
+            "how": ("Обнови куки: «🔑 Данные Fragment» → «🍪 Cookies» — "
                     "там написано, как достать их с телефона."),
             "report": report,
         }

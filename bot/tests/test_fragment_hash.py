@@ -1033,11 +1033,11 @@ class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
         page = ('<html>Connect TON<script>var x = "/api?hash=' + REAL_HASH
                 + '";</script></html>')
         got = "\n".join(self._probe(page=page)[0])
-        self.assertIn("Снимите их заново", got)
+        self.assertIn("Сними их заново", got)
 
     def test_a_live_session_is_not_told_to_re_take_the_cookies(self):
         got = "\n".join(self._probe()[0])
-        self.assertNotIn("Снимите их заново", got)
+        self.assertNotIn("Сними их заново", got)
 
     def test_it_says_whether_a_wallet_is_linked(self):
         got = "\n".join(self._probe(page=PAGE + self.ADDR)[0])
@@ -1090,7 +1090,7 @@ class TheBuyProbeShowsWhetherWeAreEvenAllowedToBuy(Case):
         """`myself: True` в ответе поиска — это не деталь: покупка себе и
         покупка чужому могут разрешаться по-разному."""
         got = "\n".join(self._probe(myself=True)[0])
-        self.assertIn("myself: это ваш собственный аккаунт", got)
+        self.assertIn("myself: это твой собственный аккаунт", got)
 
 
 class TheControlRequestTellsTheTwoRefusalsApart(Case):
@@ -2198,7 +2198,7 @@ class CheckingOneNickOnDemand(Case):
 
     def test_ones_own_account_is_flagged(self):
         got = "\n".join(self._check(myself=True)[0])
-        self.assertIn("ваш собственный аккаунт", got)
+        self.assertIn("твой собственный аккаунт", got)
 
     def test_someone_elses_account_is_not(self):
         got = "\n".join(self._check(myself=False)[0])

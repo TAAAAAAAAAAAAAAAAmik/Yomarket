@@ -233,7 +233,7 @@ def _other_account_hint(uid: int) -> str:
     active = get_active_account(uid) or "текущий"
     return (f"\n<i>Сейчас активен аккаунт «{_esc(active)}». Вход в панель "
             f"есть у: {_esc(', '.join(others))}. У каждого магазина своя "
-            f"панель — войдите ещё раз, уже под этим.</i>")
+            f"панель — войди ещё раз, уже под этим.</i>")
 
 
 def _parse_check(data: dict) -> tuple[str, str, str | None]:
@@ -352,7 +352,7 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.message.edit_text("⏳ Загружаю баланс...")
     if not api:
         await callback.message.edit_text(
-            "❌ Нужен API-токен. Отправьте /start и введите токен.",
+            "❌ Нужен API-токен. Отправь /start и введи токен.",
             reply_markup=back_keyboard())
         await callback.answer()
         return
@@ -407,7 +407,7 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
         lines.append(f"<b>Панель:</b> {'вход есть' if has_panel else '❌ вход не выполнен'}"
                      + (f" — {_esc(panel_err)[:200]}" if panel_err else ""))
         if not has_panel:
-            lines.append("<i>Баланс есть только в панели. Войдите: "
+            lines.append("<i>Баланс есть только в панели. Войди: "
                          "«Настройки» → «Панель продавца».</i>")
             lines.append(_other_account_hint(callback.from_user.id))
         await callback.message.edit_text("\n".join(lines), reply_markup=_kb())
@@ -438,7 +438,7 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
         if raw is not None:
             text += f"Ответ API <code>/check</code>:\n<code>{str(raw)[:400]}</code>"
         else:
-            text += "API не ответил. Проверьте токен и попробуйте снова."
+            text += "API не ответил. Проверь токен и попробуй снова."
         kb = _kb()
 
     await callback.message.edit_text(text, reply_markup=kb)
@@ -487,7 +487,7 @@ async def _ask_amount(message, uid: int, api: YooMarketAPI,
         # `shop_balance` отдаёт строку уже со знаком рубля. Второй здесь
         # давал «586226 ₽ ₽».
         f"💸 <b>Вывод средств</b>\n\nДоступно: <b>{bal_str}</b>\n\n"
-        "Пришлите сумму в ₽ или нажмите «Вывести всё»:",
+        "Пришли сумму в ₽ или жми «Вывести всё»:",
         reply_markup=b.as_markup())
 
 
@@ -518,7 +518,7 @@ async def withdraw_all(callback: CallbackQuery, state: FSMContext,
     uid = callback.from_user.id
     if not _payout_ready(uid):
         await callback.message.edit_text(
-            "💸 <b>Вывод средств</b>\n\nСначала настройте способ выплаты.",
+            "💸 <b>Вывод средств</b>\n\nСначала настрой способ выплаты.",
             reply_markup=_setup_first_kb())
         await callback.answer()
         return
@@ -551,7 +551,7 @@ async def threshold_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         f"🔔 <b>Порог уведомления о балансе</b>\n\n"
         f"Сейчас: {'включено, ' + str(cur) + ' ₽' if on else 'выключено'}\n\n"
-        f"Пришлите сумму — бот напишет, когда баланс её достигнет, "
+        f"Пришли сумму — бот напишет, когда баланс её достигнет, "
         f"чтобы вовремя вывести средства.",
         reply_markup=b.as_markup())
     await callback.answer()
@@ -575,7 +575,7 @@ async def threshold_save(message: Message, state: FSMContext) -> None:
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите сумму числом, например: <b>1000</b>")
+        await message.answer("❌ Введи сумму числом, например: <b>1000</b>")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -621,7 +621,7 @@ def _auto_text(s: dict) -> str:
         lines.append(f"Потолок одной выплаты: {_RUB(float(lim['max']))} ₽")
     if aw.get("last_result"):
         lines.append(f"\nПоследнее: {_esc(aw['last_result'])}")
-    lines.append("\n<i>Автоматического вывода нет: заявку отправляете вы.</i>")
+    lines.append("\n<i>Автоматического вывода нет: заявку отправляешь ты.</i>")
     return "\n".join(lines)
 
 
@@ -705,7 +705,7 @@ async def wd_pick_balance(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         bl = balances[int(callback.data.split(":")[-1])]
     except (ValueError, IndexError):
-        await callback.answer("Список устарел, начните заново", show_alert=True)
+        await callback.answer("Список устарел, начни заново", show_alert=True)
         return
     await callback.answer("⏳")
     await callback.message.edit_text("⏳ Читаю форму вывода...")
@@ -732,7 +732,7 @@ async def wd_pick_balance(callback: CallbackQuery, state: FSMContext) -> None:
     b.adjust(1)
     await callback.message.edit_text(
         "💸 <b>Способ вывода</b>\n\n"
-        "Выберите, куда выводить средства:",
+        "Выбери, куда выводить средства:",
         reply_markup=b.as_markup())
 
 
@@ -744,7 +744,7 @@ async def wd_pick_system(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         sysopt = systems[int(callback.data.split(":")[-1])]
     except (ValueError, IndexError):
-        await callback.answer("Начните заново", show_alert=True)
+        await callback.answer("Начни заново", show_alert=True)
         return
     await callback.answer(str(sysopt["label"])[:60])
     await callback.message.edit_text("⏳ Уточняю, какие нужны реквизиты...")
@@ -867,7 +867,7 @@ async def _wd_ask_next(message, state: FSMContext) -> None:
                      f"По запросу «{_esc(query)}» ничего нет ({total} всего).\n")
         elif total > len(clipped):
             head += f"Показаны первые {len(clipped)} из {total}.\n"
-        await message.edit_text(head + "Выберите:", reply_markup=b.as_markup())
+        await message.edit_text(head + "Выбери:", reply_markup=b.as_markup())
     else:
         await state.set_state(WithdrawState.waiting_req_value)
         b = InlineKeyboardBuilder()
@@ -878,7 +878,7 @@ async def _wd_ask_next(message, state: FSMContext) -> None:
         ph = f.get("placeholder")
         await message.edit_text(
             f"✍️ <b>{label}</b>{hint}\n\n"
-            f"Пришлите значение{f' ({_esc(ph)})' if ph else ''}:",
+            f"Пришли значение{f' ({_esc(ph)})' if ph else ''}:",
             reply_markup=b.as_markup())
 
 
@@ -892,7 +892,7 @@ async def wd_find(callback: CallbackQuery, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="↩️ Весь список", callback_data="wd:findoff")
     await callback.message.edit_text(
-        "🔎 Введите часть названия — например «яндекс»:",
+        "🔎 Введи часть названия — например «яндекс»:",
         reply_markup=b.as_markup())
     await callback.answer()
 
@@ -919,7 +919,7 @@ async def wd_pick_option(callback: CallbackQuery, state: FSMContext) -> None:
     queue = data.get("wd_queue") or []
     qi = data.get("wd_qi", 0)
     if qi >= len(queue):
-        await callback.answer("Начните заново", show_alert=True)
+        await callback.answer("Начни заново", show_alert=True)
         return
     f = queue[qi]
     try:
@@ -952,12 +952,12 @@ async def wd_req_value(message: Message, state: FSMContext) -> None:
     qi = data.get("wd_qi", 0)
     if qi >= len(queue):
         await state.clear()
-        await message.answer("Начните заново: «Настроить вывод».")
+        await message.answer("Начни заново: «Настроить вывод».")
         return
     f = queue[qi]
     raw = (message.text or "").strip()
     if not raw:
-        await message.answer("❌ Пришлите значение или нажмите «Пропустить».")
+        await message.answer("❌ Пришли значение или жми «Пропустить».")
         return
     # В числовых полях только цифры; текстовые оставляем как набрали
     if str(f.get("component", "")).startswith("number") or f.get("attribute") in (
@@ -1007,13 +1007,13 @@ async def wd_manual_start(callback: CallbackQuery, state: FSMContext) -> None:
     s = get_settings(callback.from_user.id)
     aw = s.get("auto_withdraw", {})
     if not (aw.get("panel_balance_id") and aw.get("panel_values")):
-        await callback.answer("Сначала настройте способ вывода", show_alert=True)
+        await callback.answer("Сначала настрой способ вывода", show_alert=True)
         return
     await state.set_state(WithdrawState.waiting_panel_amount)
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="balance:auto")
     await callback.message.edit_text(
-        "💸 <b>Сумма вывода</b>\n\nПришлите сумму в ₽:",
+        "💸 <b>Сумма вывода</b>\n\nПришли сумму в ₽:",
         reply_markup=b.as_markup())
     await callback.answer()
 
@@ -1031,12 +1031,12 @@ async def _confirm_payout(message, uid: int, amount: int) -> None:
     b.adjust(1)
     send = getattr(message, "edit_text", None) or message.answer
     await send(
-        f"⚠️ <b>Подтвердите вывод</b>\n\n"
+        f"⚠️ <b>Подтверди вывод</b>\n\n"
         # Разряды именно здесь важнее всего: экран последний перед деньгами,
         # и «5862 ₽» от «58620 ₽» без пробела отличаются одним взглядом.
         f"Сумма: <b>{_RUB(amount)} ₽</b>\n"
         f"Реквизиты: {_esc(masked) or '—'}\n\n"
-        f"Заявка уйдёт в панель. Проверьте реквизиты — ошибку не отменить.",
+        f"Заявка уйдёт в панель. Проверь реквизиты — ошибку не отменить.",
         reply_markup=b.as_markup())
 
 
@@ -1048,7 +1048,7 @@ async def wd_manual_amount(message: Message, state: FSMContext) -> None:
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите сумму числом, например: <b>500</b>")
+        await message.answer("❌ Введи сумму числом, например: <b>500</b>")
         return
     await state.clear()
     await _confirm_payout(message, message.from_user.id, amount)
@@ -1106,11 +1106,11 @@ async def _payout_readback(uid: int, since: float) -> str:
         events, source, perr = await events_for(uid, force=True)
     except Exception as e:
         return ("\n\n<i>Журнал панели перечитать не удалось "
-                f"({_esc(str(e)[:60])}) — проверьте раздел выплат сами.</i>")
+                f"({_esc(str(e)[:60])}) — проверь раздел выплат сам.</i>")
     if source != "panel":
         return ("\n\n<i>Журнал панели недоступен"
                 + (f" ({_esc(perr[:60])})" if perr else "")
-                + " — заявку проверьте в панели сами.</i>")
+                + " — заявку проверь в панели сам.</i>")
     fresh = [e for e in events
              if e.get("kind") == "payout" and float(e.get("ts") or 0) >= since]
     if fresh:
@@ -1170,7 +1170,7 @@ async def active_withdrawals(callback: CallbackQuery, api: YooMarketAPI) -> None
         text = "📋 <b>Активные выводы</b>\n\nНет выводов в обработке."
     else:
         text = ("📋 <b>Активные выводы</b>\n\n"
-                "API не отдаёт список выводов. Смотрите статус в панели "
+                "API не отдаёт список выводов. Смотри статус в панели "
                 "или в «Истории выводов» бота.")
     await callback.message.edit_text(text, reply_markup=b.as_markup())
 

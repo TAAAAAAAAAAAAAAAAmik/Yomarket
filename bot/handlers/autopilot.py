@@ -53,7 +53,7 @@ def _no_showcase_url(s: dict) -> tuple[str, str]:
         быть список слежений, а не адрес витрины."""
     from automation.position import watches
     if not watches(dict(s.get("promo_position", {}))):
-        return "добавьте товар для наблюдения", "pos:add"
+        return "добавь товар для наблюдения", "pos:add"
     return "", ""
 
 
@@ -372,7 +372,7 @@ def _autopilot_text(s: dict) -> str:
         lines += [
             "",
             "Пока ничего не включено.",
-            "Нажмите <b>✅ Рекомендуемое</b> — бот настроится сам "
+            "Жми <b>✅ Рекомендуемое</b> — бот настроится сам "
             "и не потратит ни рубля.",
         ]
     else:
@@ -400,7 +400,7 @@ def _autopilot_text(s: dict) -> str:
         lines.append("")
         lines.append(
             "⚠️ Два режима продвижения сразу — «Премиум» купится чаще и "
-            "дороже, чем нужно. Оставьте один."
+            "дороже, чем нужно. Оставь один."
         )
 
     if any(is_on(s, a) for a in AUTOMATIONS if a.get("costs")):

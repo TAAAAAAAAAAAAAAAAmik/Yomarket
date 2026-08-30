@@ -168,7 +168,7 @@ async def set_rem_hours(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(NotifState.waiting_reminder_hours)
     cur = get_settings(callback.from_user.id).get("reminders", {}).get("hours", 24)
     await callback.message.edit_text(
-        f"⏰ Через сколько часов напоминать?\nТекущее: <b>{cur} ч</b>\n\nВведите число (1–72):",
+        f"⏰ Через сколько часов напоминать?\nТекущее: <b>{cur} ч</b>\n\nВведи число (1–72):",
         reply_markup=_cancel_kb(),
     )
     await callback.answer()
@@ -181,7 +181,7 @@ async def save_rem_hours(message: Message, state: FSMContext) -> None:
         if not 1 <= hours <= 72:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число от 1 до 72")
+        await message.answer("❌ Введи число от 1 до 72")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -209,7 +209,7 @@ async def set_balance_threshold(callback: CallbackQuery, state: FSMContext) -> N
     await state.set_state(NotifState.waiting_balance_threshold)
     cur = get_settings(callback.from_user.id).get("balance_notify", {}).get("threshold", 1000)
     await callback.message.edit_text(
-        f"💰 Порог уведомления о балансе (сейчас: <b>{cur} ₽</b>)\n\nВведите сумму:",
+        f"💰 Порог уведомления о балансе (сейчас: <b>{cur} ₽</b>)\n\nВведи сумму:",
         reply_markup=_cancel_kb(),
     )
     await callback.answer()
@@ -222,7 +222,7 @@ async def save_balance_threshold(message: Message, state: FSMContext) -> None:
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите положительное число")
+        await message.answer("❌ Введи положительное число")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -250,7 +250,7 @@ async def set_report_hour(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(NotifState.waiting_report_hour)
     cur = get_settings(callback.from_user.id).get("daily_report", {}).get("hour", 20)
     await callback.message.edit_text(
-        f"🕐 В какой час отправлять отчёт? (сейчас: <b>{cur}:00</b>)\n\nВведите час (0–23):",
+        f"🕐 В какой час отправлять отчёт? (сейчас: <b>{cur}:00</b>)\n\nВведи час (0–23):",
         reply_markup=_cancel_kb(),
     )
     await callback.answer()
@@ -263,7 +263,7 @@ async def save_report_hour(message: Message, state: FSMContext) -> None:
         if not 0 <= hour <= 23:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число от 0 до 23")
+        await message.answer("❌ Введи число от 0 до 23")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -327,8 +327,8 @@ async def bl_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="notif:blacklist")
     await callback.message.edit_text(
-        "⛔ Введите имя покупателя:\n\n"
-        "<i>Укажите точно так, как отображается в уведомлениях о заказах</i>",
+        "⛔ Введи имя покупателя:\n\n"
+        "<i>Укажи точно так, как отображается в уведомлениях о заказах</i>",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -338,7 +338,7 @@ async def bl_add_start(callback: CallbackQuery, state: FSMContext) -> None:
 async def bl_add_save(message: Message, state: FSMContext) -> None:
     name = (message.text or "").strip()
     if not name:
-        await message.answer("❌ Введите имя")
+        await message.answer("❌ Введи имя")
         return
     await state.clear()
     s = get_settings(message.from_user.id)

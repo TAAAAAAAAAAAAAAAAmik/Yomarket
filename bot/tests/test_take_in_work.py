@@ -486,7 +486,7 @@ class TheDiagnosticShowsFactsNotGuesses(unittest.TestCase):
 
     def test_without_a_number_it_asks_for_one(self):
         got = self.report(self.Api(), text="/order_debug")
-        self.assertIn("Укажите номер", got)
+        self.assertIn("Укажи номер", got)
 
     def test_the_recorded_refusal_is_in_the_report(self):
         self.settings["known_order_details"]["1218314"]["work_error"] = \

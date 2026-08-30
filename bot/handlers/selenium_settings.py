@@ -274,7 +274,7 @@ def _sched_text(s: dict) -> str:
                      f"потрачено {float(bs.get('spent_total', 0) or 0):.0f} ₽")
     lines += [
         "",
-        "Запускает продвижение каждый день в указанные часы — без вашего "
+        "Запускает продвижение каждый день в указанные часы — без твоего "
         "участия.",
         "<i>Время по серверу. Слот отрабатывает один раз в сутки; если бот был "
         "выключен дольше 35 минут после слота, он пропускается, а не "
@@ -315,11 +315,11 @@ async def sched_toggle(callback: CallbackQuery) -> None:
                                         "last_runs": {}})
     turning_on = not bs.get("enabled", False)
     if turning_on and not (bs.get("times") or []):
-        await callback.answer("Сначала задайте время", show_alert=True)
+        await callback.answer("Сначала задай время", show_alert=True)
         return
     if turning_on and not promo_params(s):
         await callback.answer(
-            "Сначала выберите тариф «Премиум» — иначе поднять не получится",
+            "Сначала выбери тариф «Премиум» — иначе поднять не получится",
             show_alert=True)
         return
     bs["enabled"] = turning_on
@@ -336,7 +336,7 @@ async def sched_times_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         f"🕐 <b>Время авто-продвижения</b>\n\n"
         f"Сейчас: {cur or 'не задано'}\n\n"
-        f"Пришлите время через запятую, например:\n"
+        f"Пришли время через запятую, например:\n"
         f"<code>09:00, 15:00, 21:00</code>\n\n"
         f"<i>Каждый день в эти часы бот поднимет выбранные товары.</i>",
         reply_markup=_cancel_kb("sched:menu"))
@@ -398,7 +398,7 @@ async def sched_ceiling_start(callback: CallbackQuery, state: FSMContext) -> Non
     await callback.message.edit_text(
         f"💰 <b>Потолок трат в день</b>\n\n"
         f"Сейчас: {f'{float(cur):.0f} ₽' if cur else 'не задан'}\n\n"
-        f"Пришлите сумму в рублях. Когда за сутки потрачено больше — "
+        f"Пришли сумму в рублях. Когда за сутки потрачено больше — "
         f"расписание пропускает запуск.\n\n"
         f"<i>0 — без ограничения.</i>",
         reply_markup=_cancel_kb("sched:menu"))
@@ -413,7 +413,7 @@ async def sched_ceiling_save(message: Message, state: FSMContext) -> None:
         if amount < 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число, например: <b>300</b>")
+        await message.answer("❌ Введи число, например: <b>300</b>")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -519,12 +519,12 @@ def _pos_text(s: dict) -> str:
             lines.append(row)
     else:
         lines.append("")
-        lines.append("Пока ничего не отслеживается. Добавьте товар: пришлите "
+        lines.append("Пока ничего не отслеживается. Добавь товар: пришли "
                      "адрес страницы, где виден <b>список предложений</b> — "
                      "именно по нему считается место.")
     lines.append("")
     lines.append("<i>Позиции нет в API — бот читает публичную витрину и ищет "
-                 "в списке ваш магазин.</i>")
+                 "в списке твой магазин.</i>")
     return "\n".join(lines)
 
 
@@ -605,7 +605,7 @@ async def pos_toggle(callback: CallbackQuery) -> None:
     s, pp, ws = _pos_settings(callback.from_user.id)
     turning_on = not pp.get("enabled", False)
     if turning_on and not ws:
-        await callback.answer("Сначала добавьте товар для наблюдения",
+        await callback.answer("Сначала добавь товар для наблюдения",
                               show_alert=True)
         return
     pp["enabled"] = turning_on
@@ -625,7 +625,7 @@ async def pos_auto(callback: CallbackQuery) -> None:
     if pp["auto_promote"] and not promo_params(s):
         await callback.answer(
             "Включено, но тариф «Премиум» не выбран — поднять не смогу. "
-            "Настройте тариф в «Премиум продвижении».", show_alert=True)
+            "Настрой тариф в «Премиум продвижении».", show_alert=True)
     else:
         await callback.answer(
             "Буду поднимать автоматически — каждое поднятие платное"
@@ -751,11 +751,11 @@ async def pos_add_all(callback: CallbackQuery) -> None:
     from automation.position import MAX_WATCHES, new_watch, watches
 
     uid = callback.from_user.id
-    await callback.answer("⏳ Загружаю ваши товары…")
+    await callback.answer("⏳ Загружаю твои товары…")
     ads = await _my_ads(uid, reload=True)
     if not ads:
         await _pos_edit(callback.message,
-                        "❌ Не получил список ваших объявлений. Проверьте "
+                        "❌ Не получил список твоих объявлений. Проверь "
                         "токен (/start).", _cancel_kb("pos:add"))
         return
 
@@ -809,16 +809,16 @@ async def pos_add_all(callback: CallbackQuery) -> None:
         # списке они выглядели одинаково, и делать с ним было нечего.
         groups = [
             ("no-section", "Не понял раздел витрины",
-             "Добавьте по одному: бот покажет каталог, и раздел выбирается "
+             "Добавь по одному: бот покажет каталог, и раздел выбирается "
              "кнопками."),
-            ("partial", "Раздел большой, до вас не дочитал",
+            ("partial", "Раздел большой, до тебя не дочитал",
              "Список слишком длинный, чтобы просмотреть его целиком. "
-             "Укажите раздел поуже — каталогом или ссылкой."),
+             "Укажи раздел поуже — каталогом или ссылкой."),
             ("not-here", "Раздел прочитан весь, товара в нём нет",
              "Значит это не тот раздел, либо товар снят с публикации. "
              "Каталогом решается."),
             ("unread", "Не удалось прочитать страницу раздела",
-             "Витрина не ответила. Попробуйте позже."),
+             "Витрина не ответила. Попробуй позже."),
         ]
         for code, head, advice in groups:
             got = [t for t, why in missed if why == code]
@@ -840,8 +840,8 @@ async def pos_add_url(callback: CallbackQuery, state: FSMContext) -> None:
     await _pos_edit(
         callback.message,
         "🔗 <b>Какую страницу смотреть</b>\n\n"
-        "Откройте свой товар так, как его видит покупатель — на странице, где "
-        "виден <b>список предложений</b> от разных продавцов — и пришлите её "
+        "Открой свой товар так, как его видит покупатель — на странице, где "
+        "виден <b>список предложений</b> от разных продавцов — и пришли её "
         "адрес.\n\n"
         "<i>Место считается именно по этому списку.</i>",
         _cancel_kb("pos:menu"))
@@ -914,13 +914,13 @@ def _from_reference(ad: dict, names: dict) -> str:
 
 @router.callback_query(F.data == "pos:addlist")
 async def pos_add_list(callback: CallbackQuery) -> None:
-    await callback.answer("⏳ Загружаю ваши товары...")
+    await callback.answer("⏳ Загружаю твои товары...")
     ads = await _my_ads(callback.from_user.id, reload=True)
     if not ads:
         await _pos_edit(
             callback.message,
-            "❌ Не получил список ваших объявлений. Проверьте токен "
-            "(/start) или добавьте наблюдение по адресу.",
+            "❌ Не получил список твоих объявлений. Проверь токен "
+            "(/start) или добавь наблюдение по адресу.",
             _cancel_kb("pos:add"))
         return
     from automation.position import MAX_WATCHES, watches
@@ -936,7 +936,7 @@ async def pos_add_list(callback: CallbackQuery) -> None:
     await _pos_edit(
         callback.message,
         f"📦 <b>За каким товаром следить</b>\n\n"
-        f"Ваших объявлений: <b>{len(ads)}</b>"
+        f"Твоих объявлений: <b>{len(ads)}</b>"
         + (f", уже под наблюдением: {len(known & {a['id'] for a in ads})}"
            if known else "")
         + f"\nМожно добавить ещё {MAX_WATCHES - len(known)}.\n\n"
@@ -1060,7 +1060,7 @@ async def pos_add_pick(callback: CallbackQuery) -> None:
         return
     ads = await _my_ads(callback.from_user.id)
     if idx >= len(ads):
-        await callback.answer("Список устарел — откройте заново", show_alert=True)
+        await callback.answer("Список устарел — открой заново", show_alert=True)
         return
     ad = ads[idx]
 
@@ -1106,7 +1106,7 @@ async def pos_add_pick(callback: CallbackQuery) -> None:
             callback.message,
             f"❔ <b>{_esc(ad['title'][:40])}</b>\n\n{why}\n\n"
             f"Проще всего — указать раздел кнопками: бот покажет каталог "
-            f"витрины, вы выберете игру и раздел.",
+            f"витрины, ты выберешь игру и раздел.",
             b.as_markup())
         return
 
@@ -1170,7 +1170,7 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
     parent = callback.data[len("pos:cat:"):]
     ad = _PENDING_AD.get(callback.from_user.id)
     if not ad:
-        await callback.answer("Начните заново — выберите товар", show_alert=True)
+        await callback.answer("Начни заново — выбери товар", show_alert=True)
         await _pos_screen(callback)
         return
     path = _walk_to(callback.from_user.id, parent)
@@ -1260,7 +1260,7 @@ async def pos_pick_category(callback: CallbackQuery) -> None:
         head = (f"Внутри «{name}»: {len(rows)} раздел(ов)." if rows
                 else f"Внутри «{name}» разделов нет — можно взять его целиком.")
     else:
-        head = "Выберите игру или категорию."
+        head = "Выбери игру или категорию."
     await _pos_edit(
         callback.message,
         f"📂 <b>{'Раздел' if parent else 'Игра или категория'}</b>\n\n"
@@ -1279,7 +1279,7 @@ async def pos_category_chosen(callback: CallbackQuery) -> None:
 
     ad = _PENDING_AD.get(callback.from_user.id)
     if not ad:
-        await callback.answer("Начните заново — выберите товар", show_alert=True)
+        await callback.answer("Начни заново — выбери товар", show_alert=True)
         await _pos_screen(callback)
         return
     picked = callback.data[len("pos:catpick:"):]
@@ -1313,7 +1313,7 @@ async def pos_category_chosen(callback: CallbackQuery) -> None:
         # Раньше здесь молча получался адрес всего каталога, и дальше бот
         # искал товар в чужой категории.
         await _pos_edit(callback.message,
-                        "❔ Не понял, какой раздел выбран — начните с каталога "
+                        "❔ Не понял, какой раздел выбран — начни с каталога "
                         "заново.", b.as_markup())
         await callback.answer()
         return
@@ -1408,7 +1408,7 @@ async def _bind_panel_item(uid: int, idx: int, title: str) -> str:
         hit = next((i for i in res
                     if want and want[:24] in _norm(i.get("title"))), None)
     if hit is None:
-        return ("⚠️ В панели такого товара не нашёл — привяжите вручную "
+        return ("⚠️ В панели такого товара не нашёл — привяжи вручную "
                 "кнопкой «🔗 Привязать товар»")
     s = get_settings(uid)
     ws = watches(s.setdefault("promo_position", {}))
@@ -1424,7 +1424,7 @@ async def pos_url_save(message: Message, state: FSMContext) -> None:
 
     url = (message.text or "").strip()
     if not url.lower().startswith("http"):
-        await message.answer("❌ Пришлите полный адрес, начиная с https://")
+        await message.answer("❌ Пришли полный адрес, начиная с https://")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -1531,11 +1531,11 @@ async def _pos_probe(uid: int, idx: int, message=None) -> str:
         if not mine:
             seen = ", ".join(dict.fromkeys(
                 o["seller"] for o in offers[:6] if o["seller"])) or "—"
-            return (f"⚠️ Нашёл {len(offers)} предложений, но вашего товара "
+            return (f"⚠️ Нашёл {len(offers)} предложений, но твоего товара "
                     f"среди них нет.\n\nМагазин в боте: «{_esc(shop) or '—'}»; "
                     f"продавцы в списке: {_esc(seen)}; "
-                    f"ваших объявлений известно: {len(ad_ids)}.\n\n"
-                    f"Если товар лежит глубже — пришлите адрес с фильтром, "
+                    f"твоих объявлений известно: {len(ad_ids)}.\n\n"
+                    f"Если товар лежит глубже — пришли адрес с фильтром, "
                     f"который его сужает, иначе бот дочитывает не весь список.")
     w["title"] = mine["title"] or w.get("title") or ""
     # Номер витрины, сохранённый ради повторного поиска этой строки, — НЕ
@@ -1545,7 +1545,7 @@ async def _pos_probe(uid: int, idx: int, message=None) -> str:
         w["market_id"] = str(mine["id"])
     w["last_pos"] = int(mine["pos"])
     save_settings(uid, s)
-    return (f"✅ Нашёл вас на <b>{mine['pos']}-м месте</b> из {len(offers)}"
+    return (f"✅ Нашёл тебя на <b>{mine['pos']}-м месте</b> из {len(offers)}"
             + (f", цена {float(mine['price']):.0f} ₽" if mine.get("price") else ""))
 
 
@@ -1588,13 +1588,13 @@ def _watch_text(s: dict, idx: int, note: str = "") -> str:
         lines.append(f"Товар в панели: <code>{_esc(w['item_id'])}</code>")
     else:
         lines.append("Товар в панели: <b>не привязан</b> — "
-                     "поднимать нечего, привяжите")
+                     "поднимать нечего, привяжи")
     if w.get("promos_today"):
         lines.append(f"Поднятий сегодня: <b>{w['promos_today']}</b>")
     if w.get("alarmed"):
         lines.append("")
         lines.append("⚠️ Товар не находится на странице несколько проверок "
-                     "подряд — проверьте адрес.")
+                     "подряд — проверь адрес.")
     if note:
         lines.append("")
         lines.append(note)
@@ -1743,22 +1743,22 @@ async def _pos_report(uid: int, idx: int) -> str:
             w["title"] = mine["title"]
         save_settings(uid, s)
         verdict = "🟢 в пределах порога" if mine["pos"] <= thr else "🔴 ниже порога"
-        lines.append(f"Ваше место: <b>{mine['pos']}</b> "
+        lines.append(f"Твоё место: <b>{mine['pos']}</b> "
                      f"(порог {thr}) — {verdict}")
         if mine["price"]:
-            lines.append(f"Ваша цена: <b>{float(mine['price']):.0f} ₽</b>")
+            lines.append(f"Твоя цена: <b>{float(mine['price']):.0f} ₽</b>")
     elif res.get("complete"):
         # Выдача прочитана целиком, и нас в ней нет — это факт о выдаче, а не о
         # том, докуда добрался бот.
-        lines.append(f"❔ Вашего товара нет в этом списке целиком "
-                     f"(магазин «{_esc(shop) or '—'}»). Проверьте, что адрес "
+        lines.append(f"❔ Твоего товара нет в этом списке целиком "
+                     f"(магазин «{_esc(shop) or '—'}»). Проверь, что адрес "
                      f"ведёт в ту же категорию и с тем же поиском, где товар "
-                     f"виден вам.")
+                     f"виден тебе.")
     else:
         lines.append(f"❔ Не нашёл в первых {len(offers)}"
                      + (f" из {total}" if total else "")
                      + f" (магазин «{_esc(shop) or '—'}»). Товар лежит глубже — "
-                       f"сузьте адрес фильтром, чтобы место считалось точнее "
+                       f"сузь адрес фильтром, чтобы место считалось точнее "
                        f"и быстрее.")
     others = [o for o in offers if not mine or o["pos"] != mine["pos"]]
     low = cheapest(others or offers)
@@ -1790,7 +1790,7 @@ async def pos_check_all(callback: CallbackQuery) -> None:
         rep = await _pos_report(callback.from_user.id, i)
         head = (w.get("title") or "").strip() or _short_url(w.get("url", ""))
         first = next((l for l in rep.split("\n")
-                      if "Ваше место" in l or "Не нашёл" in l or l.startswith("❌")),
+                      if "Твоё место" in l or "Не нашёл" in l or l.startswith("❌")),
                      "—")
         out.append(f"{i + 1}. <b>{_esc(head[:28])}</b>\n   {first}")
     s = get_settings(callback.from_user.id)
@@ -1850,7 +1850,7 @@ async def pos_watch_item(callback: CallbackQuery) -> None:
     await _pos_edit(
         callback.message,
         "🔗 <b>Какой товар поднимать</b>\n\n"
-        "Выберите объявление из панели — именно его бот оплатит и поднимет, "
+        "Выбери объявление из панели — именно его бот оплатит и поднимет, "
         "когда позиция упадёт ниже порога.",
         b.as_markup())
 
@@ -1866,7 +1866,7 @@ async def pos_watch_item_set(callback: CallbackQuery) -> None:
     items = _ITEMS_CACHE.get(callback.from_user.id) or []
     got = _watch_at(callback.from_user.id, f"x:{idx}")
     if not got or j >= len(items):
-        await callback.answer("Список устарел — откройте заново", show_alert=True)
+        await callback.answer("Список устарел — открой заново", show_alert=True)
         return
     s, _pp, ws, idx = got
     ws[idx]["item_id"] = items[j]["id"]
@@ -1908,7 +1908,7 @@ async def pos_watch_mode(callback: CallbackQuery) -> None:
     said = {None: "Как у магазина", True: "Поднимать автоматически",
             False: "Только сигнал"}[w["auto_promote"]]
     if w["auto_promote"] and not promo_params(s):
-        said = "Поднимать — но сначала выберите тариф «Премиум»"
+        said = "Поднимать — но сначала выбери тариф «Премиум»"
     await callback.answer(said, show_alert=bool(w["auto_promote"]
                                                 and not promo_params(s)))
     await _pos_edit(callback.message, _watch_text(s, idx), _watch_kb(s, idx))
@@ -1929,9 +1929,9 @@ async def pos_watch_interval_start(callback: CallbackQuery,
         f"⏱ <b>Как часто проверять этот товар</b>\n\n"
         f"Сейчас: каждые <b>{watch_interval_hours(ws[idx], pp):g} ч</b>"
         + ("" if ws[idx].get("interval_hours") else " (как у магазина)")
-        + f"\n\nПришлите число часов — от {MIN_INTERVAL_HOURS:g} до 168. "
+        + f"\n\nПришли число часов — от {MIN_INTERVAL_HOURS:g} до 168. "
           f"Чтобы вернуться к общему значению ({interval_hours(pp):g} ч), "
-          f"отправьте <code>-</code>.\n\n"
+          f"отправь <code>-</code>.\n\n"
           f"<i>Чаще, чем раз в полчаса, проверять бессмысленно: фоновый цикл "
           f"просыпается именно с такой частотой.</i>")
 
@@ -1981,7 +1981,7 @@ async def pos_threshold_start(callback: CallbackQuery, state: FSMContext) -> Non
         callback, state, SeleniumState.waiting_pos_threshold, idx,
         f"🎯 <b>Порог места</b>\n\nСейчас: не ниже "
         f"<b>{int(ws[idx].get('max_position') or 3)}</b>-го\n\n"
-        f"Пришлите число от 1 до 100. Как только товар окажется ниже этого "
+        f"Пришли число от 1 до 100. Как только товар окажется ниже этого "
         f"места в списке — бот сработает.")
 
 
@@ -2021,9 +2021,9 @@ async def pos_guard_start(callback: CallbackQuery, state: FSMContext) -> None:
         f"Сейчас: {f'{cur:.0f} ₽' if cur else 'не ограничено'}\n\n"
         f"Поднятие платное, и оно бессмысленно, когда рядом стоит тот же товар "
         f"заметно дешевле: покупатель всё равно уйдёт к нему.\n\n"
-        f"Пришлите, на сколько рублей конкурент может быть дешевле, чтобы "
+        f"Пришли, на сколько рублей конкурент может быть дешевле, чтобы "
         f"поднятие всё ещё имело смысл. Больше этой разницы — бот не платит, "
-        f"а предупредит вас.\n\n"
+        f"а предупредит тебя.\n\n"
         f"<i>0 — снять ограничение.</i>")
 
 
@@ -2060,7 +2060,7 @@ async def pos_price_start(callback: CallbackQuery, state: FSMContext) -> None:
         callback, state, SeleniumState.waiting_pos_price, idx,
         f"⚠️ <b>Сигнал по цене</b>\n\n"
         f"Сейчас: {f'{cur:.0f} ₽' if cur else 'не задан'}\n\n"
-        f"Пришлите цену: если на витрине кто-то опустится ниже неё, бот "
+        f"Пришли цену: если на витрине кто-то опустится ниже неё, бот "
         f"сообщит — это повод пересмотреть свою.\n\n"
         f"<i>0 — выключить сигнал.</i>")
 
@@ -2096,7 +2096,7 @@ async def pos_interval_start(callback: CallbackQuery, state: FSMContext) -> None
     await _pos_edit(
         callback.message,
         f"⏱ <b>Как часто проверять позицию</b>\n\nСейчас: {cur} ч\n\n"
-        f"Пришлите число часов (можно дробное: 0.5 — каждые полчаса).",
+        f"Пришли число часов (можно дробное: 0.5 — каждые полчаса).",
         _cancel_kb("pos:menu"))
     await callback.answer()
 
@@ -2126,7 +2126,7 @@ async def pos_cooldown_start(callback: CallbackQuery, state: FSMContext) -> None
         callback.message,
         f"⏸ <b>Пауза между поднятиями</b>\n\nСейчас: {cur} ч\n\n"
         f"Товар, упавший вниз, остаётся внизу — без паузы бот платил бы за "
-        f"него на каждой проверке. Пришлите, сколько часов ждать после "
+        f"него на каждой проверке. Пришли, сколько часов ждать после "
         f"поднятия, прежде чем поднимать этот же товар снова.",
         _cancel_kb("pos:menu"))
     await callback.answer()
@@ -2160,7 +2160,7 @@ async def pos_limit_start(callback: CallbackQuery, state: FSMContext) -> None:
         f"Сейчас: {cur if cur else 'без лимита'}"
         + (f" (до {cur * price} ₽ на товар в день)" if cur and price else "")
         + "\n\nСколько раз за сутки бот может оплатить поднятие <b>одного</b> "
-          "товара. Пришлите число.\n\n<i>0 — без лимита (не советую).</i>",
+          "товара. Пришли число.\n\n<i>0 — без лимита (не советую).</i>",
         _cancel_kb("pos:menu"))
     await callback.answer()
 
@@ -2202,7 +2202,7 @@ async def pos_budget_start(callback: CallbackQuery, state: FSMContext) -> None:
         + "\n\nПотолок на <b>все</b> отслеживаемые товары вместе: как только "
           "сумма за сутки упрётся в него, бот перестанет платить и просто "
           "предупредит. Счёт обнуляется в полночь.\n\n"
-          "Пришлите сумму в рублях.\n\n<i>0 — снять ограничение.</i>",
+          "Пришли сумму в рублях.\n\n<i>0 — снять ограничение.</i>",
         _cancel_kb("pos:menu"))
     await callback.answer()
 
@@ -2323,8 +2323,8 @@ async def _promo_step(user_id: int, send, state: FSMContext,
             await send(
                 f"⚠️ Панель не отдала варианты для поля "
                 f"<b>{_esc(f['label'])}</b> (<code>{_esc(f['attribute'])}</code>).\n\n"
-                f"Пришлите значение сообщением — его видно в панели: откройте "
-                f"«Премиум» у объявления и посмотрите, что стоит в этом поле.\n\n"
+                f"Пришли значение сообщением — его видно в панели: открой "
+                f"«Премиум» у объявления и посмотри, что стоит в этом поле.\n\n"
                 f"<code>{info[:300]}</code>",
                 b.as_markup())
             return
@@ -2425,7 +2425,7 @@ async def _promo_items_screen(callback: CallbackQuery, reload: bool = False) -> 
         f"Выбрано: <b>{n}</b> из {len(items)}"
         + (cost or "")
         + "\n\n<i>Если не выбрано ничего — продвигаются все товары, и платится "
-          "за каждый. Отметьте только те позиции, которые нужно держать "
+          "за каждый. Отметь только те позиции, которые нужно держать "
           "наверху.</i>",
         reply_markup=b.as_markup())
 
@@ -2449,7 +2449,7 @@ async def promo_item_toggle(callback: CallbackQuery) -> None:
     try:
         it = items[int(callback.data.split(":")[-1])]
     except (ValueError, IndexError):
-        await callback.answer("Список устарел — обновите", show_alert=True)
+        await callback.answer("Список устарел — обнови", show_alert=True)
         return
     s = get_settings(uid)
     ab = s.setdefault("auto_bump", {})
@@ -2494,7 +2494,7 @@ async def promo_item_none(callback: CallbackQuery) -> None:
     s.setdefault("auto_bump", {})["only_items"] = (
         [items[0]["id"]] if items else [])
     save_settings(uid, s)
-    await callback.answer("Оставил один товар — снимите и его, если нужно")
+    await callback.answer("Оставил один товар — сними и его, если нужно")
     await _promo_items_screen(callback)
 
 
@@ -2523,7 +2523,7 @@ async def promo_pick(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     spec = data.get("promo_spec")
     if not spec:
-        await callback.answer("Начните заново: «⚙️ Тариф»", show_alert=True)
+        await callback.answer("Начни заново: «⚙️ Тариф»", show_alert=True)
         return
     picked = data.get("promo_picked") or {}
     field = spec["fields"][step]
@@ -2541,14 +2541,14 @@ async def promo_manual_value(message: Message, state: FSMContext) -> None:
     описывать отказалась, и пойти дальше по оставшимся шагам."""
     raw = (message.text or "").strip()
     if not raw:
-        await message.answer("❌ Пришлите значение поля")
+        await message.answer("❌ Пришли значение поля")
         return
     data = await state.get_data()
     spec = data.get("promo_spec")
     step = data.get("promo_step")
     if not spec or step is None:
         await state.clear()
-        await message.answer("Начните заново: «⚙️ Тариф»")
+        await message.answer("Начни заново: «⚙️ Тариф»")
         return
     field = spec["fields"][step]
     value = int(raw) if raw.isdigit() else raw
@@ -2586,7 +2586,7 @@ async def bump_set_interval(callback: CallbackQuery, state: FSMContext) -> None:
     cur = get_settings(callback.from_user.id).get("auto_bump", {}).get("interval_hours", 24)
     await state.set_state(SeleniumState.waiting_bump_interval)
     await callback.message.edit_text(
-        f"⏱ <b>Интервал поднятия</b>\n\nТекущий: {cur} ч\n\nВведите количество часов (например: 6, 12, 24):",
+        f"⏱ <b>Интервал поднятия</b>\n\nТекущий: {cur} ч\n\nВведи количество часов (например: 6, 12, 24):",
         reply_markup=_cancel_kb("selenium:bump:menu"),
     )
     await callback.answer()
@@ -2599,7 +2599,7 @@ async def bump_save_interval(message: Message, state: FSMContext) -> None:
         if hours < 1:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите целое число часов, например: 24")
+        await message.answer("❌ Введи целое число часов, например: 24")
         return
     s = get_settings(message.from_user.id)
     s["auto_bump"]["interval_hours"] = hours
@@ -2619,7 +2619,7 @@ async def run_bump(callback: CallbackQuery, api: YooMarketAPI) -> None:
         b.button(text="⬅️ Назад", callback_data="selenium:bump:menu")
         ui.lay(b)
         await callback.message.edit_text(
-            "⚙️ <b>Сначала выберите тариф</b>\n\n"
+            "⚙️ <b>Сначала выбери тариф</b>\n\n"
             "«Премиум» требует услугу, срок и способ оплаты. Каждый срок стоит "
             "по-разному, поэтому я не подставляю их сам.",
             reply_markup=b.as_markup())
@@ -2845,7 +2845,7 @@ async def restore_interval(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SeleniumState.waiting_restore_interval)
     await callback.message.edit_text(
         f"⏱ <b>Как часто проверять</b>\n\nСейчас: {cur} ч\n\n"
-        f"Пришлите число часов (1, 3, 6, 12, 24). Можно дробное: 0.5 — "
+        f"Пришли число часов (1, 3, 6, 12, 24). Можно дробное: 0.5 — "
         f"каждые полчаса.",
         reply_markup=_cancel_kb("selenium:restore:menu"))
     await callback.answer()
@@ -2978,7 +2978,7 @@ async def restore_preview(callback: CallbackQuery, api: YooMarketAPI) -> None:
         for row in rep["unknown"][:8]:
             body.append(f"   • {_esc(row['title'])[:32]} — "
                         f"<code>{_esc(row['status'])}</code>")
-        body.append("<i>Пришлите мне этот статус, если такие объявления "
+        body.append("<i>Пришли мне этот статус, если такие объявления "
                     "должны восстанавливаться.</i>")
     body.append("")
     body.append(f"<i>Статусы в аккаунте: {_esc(', '.join(rep['statuses'][:10]))}</i>")

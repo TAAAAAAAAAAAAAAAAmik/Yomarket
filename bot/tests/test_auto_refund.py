@@ -192,7 +192,7 @@ class TheScreenSaysWhatItWillDo(unittest.TestCase):
         import inspect
         from handlers import auto_settings as A
         src = inspect.getsource(A.set_refund_scope)
-        self.assertIn("не знает, выдали вы товар или нет", src)
+        self.assertIn("не знает, выдал ты товар или нет", src)
 
     def test_switching_back_needs_no_warning(self):
         import inspect

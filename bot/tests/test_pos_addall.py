@@ -131,7 +131,7 @@ class ADeepListIsNotAWrongSection(BulkAdd):
     def test_an_unfinished_read_says_so(self):
         text = self.run_with({t["title"]: ("", ["u"], "partial")
                               for t in self.ADS})
-        self.assertIn("до вас не дочитал", text)
+        self.assertIn("до тебя не дочитал", text)
 
     def test_it_does_not_claim_the_item_is_absent(self):
         text = self.run_with({t["title"]: ("", ["u"], "partial")

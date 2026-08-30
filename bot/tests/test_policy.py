@@ -136,7 +136,7 @@ class AnEmptyScreenExplainsItselfInsteadOfLookingBroken(Store):
     def test_the_consent_wording_is_always_there(self):
         for setup in (lambda: None, self.set_all):
             setup()
-            self.assertIn("соглашаетесь", P.policy_text())
+            self.assertIn("принимаешь", P.policy_text())
 
     def test_the_owner_is_told_where_to_fix_it(self):
         self.assertIn("Админ-панель", P.policy_text(for_admin=True))

@@ -117,9 +117,9 @@ async def cmd_forget_me(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(ui.screen(
         "🗑 <b>Удалить мои данные</b>", list(_PURGE_WARNING),
-        footer="<i>Бот не может отозвать выданный ему токен на стороне "
-               "Юмаркета и вывести деньги с кошелька TON — это остаётся за "
-               "вами. Сделайте это после удаления.</i>"),
+        footer="<i>Отозвать выданный мне токен на стороне Юмаркета и "
+               "вывести деньги с кошелька TON я не могу — это остаётся "
+               "на тебе. Сделай это сразу после удаления.</i>"),
         reply_markup=_purge_kb())
 
 
@@ -128,9 +128,9 @@ async def forget_me(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.message.edit_text(ui.screen(
         "🗑 <b>Удалить мои данные</b>", list(_PURGE_WARNING),
-        footer="<i>Бот не может отозвать выданный ему токен на стороне "
-               "Юмаркета и вывести деньги с кошелька TON — это остаётся за "
-               "вами. Сделайте это после удаления.</i>"),
+        footer="<i>Отозвать выданный мне токен на стороне Юмаркета и "
+               "вывести деньги с кошелька TON я не могу — это остаётся "
+               "на тебе. Сделай это сразу после удаления.</i>"),
         reply_markup=_purge_kb())
     await callback.answer()
 
@@ -158,12 +158,12 @@ async def purge_confirmed(callback: CallbackQuery, state: FSMContext,
     body = ([f"Стёрто записей: <b>{sum(report.values())}</b>",
              "", *(f"• {name}: {n}" for name, n in sorted(report.items()))]
             if report else
-            ["Стирать было нечего — данных о вас в боте не осталось."])
+            ["Стирать было нечего — твоих данных в боте уже нет."])
     b = InlineKeyboardBuilder()
     b.button(text="🚀 Начать заново", callback_data="menu:main")
     await callback.message.edit_text(ui.screen(
         "✅ <b>Данные удалены</b>", body,
-        footer="<i>Отзовите выданный боту токен в панели Юмаркета — этого "
-               "он за вас сделать не может.</i>"),
+        footer="<i>Отзови выданный боту токен в панели Юмаркета — этого он "
+               "за тебя сделать не может.</i>"),
         reply_markup=ui.lay(b).as_markup())
     await callback.answer()

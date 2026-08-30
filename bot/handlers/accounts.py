@@ -55,9 +55,9 @@ async def _render_menu(msg, user_id: int, edit: bool = True) -> None:
     b = InlineKeyboardBuilder()
     lines = ["👥 <b>Аккаунты YooMarket</b>\n"]
     if not accounts:
-        lines.append("Нет добавленных аккаунтов. Отправьте /start и введите токен.")
+        lines.append("Нет добавленных аккаунтов. Отправь /start и введи токен.")
     else:
-        lines.append("Нажмите на аккаунт, чтобы переключиться:\n")
+        lines.append("Жми на аккаунт, чтобы переключиться:\n")
         # Название аккаунта ничего не говорит о том, какой магазин открывает его
         # токен, поэтому выбор был угадыванием — а промах здесь и есть та причина,
         # по которой панель и токен начинают показывать разные магазины.
@@ -195,7 +195,7 @@ async def add_account_start(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data="acc:menu")
     await callback.message.edit_text(
         "➕ <b>Новый аккаунт</b>\n\n"
-        "Введите название (например: «Магазин 2»):",
+        "Введи название (например: «Магазин 2»):",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -208,7 +208,7 @@ async def add_account_name(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Название не может быть пустым:")
         return
     if name in get_accounts(message.from_user.id):
-        await message.answer("❌ Аккаунт с таким названием уже есть. Введите другое:")
+        await message.answer("❌ Аккаунт с таким названием уже есть. Введи другое:")
         return
     await state.update_data(acc_name=name)
     await state.set_state(AccountState.waiting_token)
@@ -216,7 +216,7 @@ async def add_account_name(message: Message, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data="acc:menu")
     await message.answer(
         f"✅ Название: <b>{name}</b>\n\n"
-        "Теперь отправьте <b>API токен</b> этого магазина:\n"
+        "Теперь отправь <b>API токен</b> этого магазина:\n"
         "<i>Мой магазин → Интеграции → API токен</i>",
         reply_markup=b.as_markup(),
     )
@@ -240,7 +240,7 @@ async def add_account_token(message: Message, state: FSMContext, **data) -> None
         info = await api.check()
     except Exception as e:
         await status.edit_text(
-            f"❌ Токен не подошёл: <code>{str(e)[:150]}</code>\n\nОтправьте другой токен:"
+            f"❌ Токен не подошёл: <code>{str(e)[:150]}</code>\n\nОтправь другой токен:"
         )
         return
     finally:

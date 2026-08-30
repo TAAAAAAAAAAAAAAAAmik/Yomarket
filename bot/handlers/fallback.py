@@ -41,7 +41,7 @@ async def unhandled_callback(callback: CallbackQuery) -> None:
             # старый код» выглядят одинаково, а различаются только этим.
             f"Версия бота: <code>{BOT_VERSION}</code>\n\n"
             "Обычно так бывает с кнопкой из старого сообщения — бот обновился, "
-            "а сообщение осталось прежним. Откройте раздел заново.",
+            "а сообщение осталось прежним. Открой раздел заново.",
             reply_markup=b.as_markup())
     except Exception as e:
         logger.warning("could not report unhandled callback: %s", e)

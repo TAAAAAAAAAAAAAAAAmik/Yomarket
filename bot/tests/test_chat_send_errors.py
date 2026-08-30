@@ -125,7 +125,7 @@ class AFailedSendTellsTheTruth(unittest.TestCase):
 
     def test_an_ordinary_failure_still_asks_for_a_manual_answer(self):
         _s, notes = self._run("connection reset by peer")
-        self.assertIn("ответьте вручную", notes[0])
+        self.assertIn("ответь вручную", notes[0])
 
     def test_the_failure_is_recorded_as_a_reason_for_silence(self):
         """Экран «Почему молчит» должен знать и про этот случай."""

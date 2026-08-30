@@ -948,7 +948,7 @@ def match_denomination(catalog, gift: GiftCard, region: str, value: float,
         if len(have) != 1:
             return None, (f"в названии заказа номинал «{want:g}» без меры, "
                           f"а в регионе {region} их несколько: "
-                          f"{', '.join(have)}. Допишите меру в название"), ""
+                          f"{', '.join(have)}. Допиши меру в название"), ""
         unit = have[0]
         how = f"мера одна в регионе {region}"
 
@@ -1111,7 +1111,7 @@ def order_reference(slug: str, order_id: str) -> str:
 TEMPLATE_FIELDS = {
     "{номинал}": "номинал: «AED 50», «USD 10»",
     "{регион}": "регион кода: US, TR, AE…",
-    "{цена}": "ваша цена в рублях",
+    "{цена}": "твоя цена в рублях",
     "{карта}": "название карты: Apple, Xbox…",
 }
 

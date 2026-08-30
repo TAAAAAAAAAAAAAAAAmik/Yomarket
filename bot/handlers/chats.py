@@ -58,7 +58,7 @@ def _send_error(e: Exception) -> str:
         return ("💬 В этом чате нет активного заказа, поэтому ответить через "
                 "бота нельзя — так устроено API Юмаркета.\n\n"
                 "Это чат поддержки/модерации или заказ уже закрыт. "
-                "Ответьте прямо в панели: panel.yoomarket.net")
+                "Ответь прямо в панели: panel.yoomarket.net")
     return f"❌ Не отправилось: {_esc(s[:200])}"
 
 
@@ -97,7 +97,7 @@ def _format_messages(messages: list[dict]) -> str:
         text = str(msg.get("text") or msg.get("message") or "—")
         cut = len(text) > _ONE_MSG_LIMIT
         if sender_type in ("shop", "seller") or msg.get("is_mine"):
-            prefix = "🏪 <b>Вы</b>"
+            prefix = "🏪 <b>Ты</b>"
         elif sender_type == "system":
             prefix = "⚙️ <i>Система</i>"
         else:
@@ -423,7 +423,7 @@ async def chats_well_known(callback: CallbackQuery, state: FSMContext) -> None:
     ui.lay(b)
     await callback.message.edit_text(
         f"{meta['icon']} <b>{meta['title']}</b>\n\n"
-        "Такой чат ещё не добавлен. Пришлите его номер или ссылку — "
+        "Такой чат ещё не добавлен. Пришли его номер или ссылку — "
         "он есть в адресе чата в панели:\n"
         "<code>panel.yoomarket.net/chats/<b>1076867</b></code>\n\n"
         f"<i>Название подставлю сам: «{meta['label']}».</i>",
@@ -464,7 +464,7 @@ def _legend(orders: list[dict], details: dict) -> str:
         problem += mark == MARK_PROBLEM
         waiting += mark == MARK_WAITING
     if not problem and not waiting:
-        return "Все отвечены. Выберите чат:"
+        return "Все отвечены. Выбери чат:"
     parts = []
     if problem:
         parts.append(f"{MARK_PROBLEM} требует внимания: <b>{problem}</b>")
@@ -547,7 +547,7 @@ async def init_reply(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await _safe_edit(
         callback,
-        f"✉️ Напишите сообщение "
+        f"✉️ Напиши сообщение "
         + (f"покупателю <b>{_esc(who)}</b>:" if who and who != "—"
            else f"в чат #{_esc(chat_id)}:"),
         builder.as_markup())
@@ -660,7 +660,7 @@ async def watch_chat(message: Message, api: YooMarketAPI) -> None:
             f"🛟 <b>Отслеживаемые чаты</b>\n\n{body}\n\n"
             f"Добавить: <code>/watch_chat 1076867 Поддержка</code>\n"
             f"Убрать: <code>/unwatch_chat 1076867</code>\n\n"
-            f"<i>Номер возьмите из адреса чата в панели: "
+            f"<i>Номер возьми из адреса чата в панели: "
             f"panel.yoomarket.net/chats/<b>1076867</b></i>")
         return
 
@@ -673,7 +673,7 @@ async def watch_chat(message: Message, api: YooMarketAPI) -> None:
 async def unwatch_chat(message: Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Укажите номер: <code>/unwatch_chat 1076867</code>")
+        await message.answer("Укажи номер: <code>/unwatch_chat 1076867</code>")
         return
     chat_id = parts[1].strip()
     settings = get_settings(message.from_user.id)
@@ -727,7 +727,7 @@ async def wchats_add(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data="wchats:list")
     await callback.message.edit_text(
         "➕ <b>Добавить чат</b>\n\n"
-        "Пришлите номер чата или ссылку на него, можно с названием:\n"
+        "Пришли номер чата или ссылку на него, можно с названием:\n"
         "<code>1076867 Поддержка</code>\n"
         "<code>https://panel.yoomarket.net/chats/1076867</code>",
         reply_markup=b.as_markup())
@@ -745,7 +745,7 @@ async def wchats_add_save(message: Message, state: FSMContext,
     await state.clear()
     parts = (message.text or "").split(maxsplit=1)
     if not parts:
-        await message.answer("❌ Пришлите номер чата")
+        await message.answer("❌ Пришли номер чата")
         return
     chat_id = parts[0].strip().rstrip("/").split("/")[-1]
     label = (parts[1].strip() if len(parts) > 1 else "") or preset or "Поддержка"
@@ -799,7 +799,7 @@ async def support_reply_init(callback: CallbackQuery, state: FSMContext) -> None
         await callback.message.edit_text(
             "🔑 <b>Нужен вход в панель</b>\n\n"
             "Ответ в поддержку идёт через панель, а для этого боту нужен токен, "
-            "который выдаётся при входе по email. Войдите заново — токен "
+            "который выдаётся при входе по email. Войди заново — токен "
             "сохранится, и ответы заработают.",
             reply_markup=b.as_markup())
         await callback.answer()
@@ -809,7 +809,7 @@ async def support_reply_init(callback: CallbackQuery, state: FSMContext) -> None
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data=f"wchat:{cid}")
     await callback.message.edit_text(
-        f"✉️ Напишите ответ в чат #{_esc(cid)}:", reply_markup=b.as_markup())
+        f"✉️ Напиши ответ в чат #{_esc(cid)}:", reply_markup=b.as_markup())
     await callback.answer()
 
 
@@ -903,7 +903,7 @@ async def wchat_history(callback: CallbackQuery, api: YooMarketAPI) -> None:
             sender = sender.get("type") or sender.get("role") or ""
         mine = bool(msg.get("is_mine") or msg.get("is_own")) or str(sender).lower() in (
             "me", "self", "own", "shop", "seller")
-        who = "🟢 Вы" if mine else f"🛟 {label}"
+        who = "🟢 Ты" if mine else f"🛟 {label}"
         when = _fmt_msg_time(msg.get("created_at") or msg.get("date"),
                              get_settings(callback.from_user.id))
         await callback.message.answer(
@@ -1021,7 +1021,7 @@ async def chat_debug(message: Message, api: YooMarketAPI) -> None:
         sample = ", ".join(list(det)[:5]) or "нет"
         await message.answer(
             f"💬 <b>Проверка чата</b>  <code>{BOT_VERSION}</code>\n\n"
-            f"Отправьте <code>/chat_debug НОМЕР</code>.\n"
+            f"Отправь <code>/chat_debug НОМЕР</code>.\n"
             f"Известные заказы: <code>{_esc(sample)}</code>")
         return
 
@@ -1031,7 +1031,7 @@ async def chat_debug(message: Message, api: YooMarketAPI) -> None:
              f"Чат для запроса: <code>{_esc(real_id)}</code>",
              f"Известно о заказе: {'да' if det else 'нет'}"]
     if not api:
-        lines.append("❌ Нет токена — отправьте /start")
+        lines.append("❌ Нет токена — отправь /start")
         await message.answer("\n".join(lines))
         return
     lines += await _chain_report(message.from_user.id, api, str(arg),
@@ -1147,7 +1147,7 @@ async def _chain_report(uid: int, api: YooMarketAPI, order_id: str,
     if refusal:
         when = _lt.fmt(float(refusal.get("ts", 0) or 0), s)
         out.append(f"5️⃣ 🔴 Маркетплейс уже отказал в этот чат ({when}): "
-                   f"по заказу нет активных сделок. Ни бот, ни вы вручную "
+                   f"по заказу нет активных сделок. Ни бот, ни ты вручную "
                    f"туда не напишете")
     elif closed:
         out.append("5️⃣ 🟡 Заказ закрыт. По закрытым сделкам маркетплейс "

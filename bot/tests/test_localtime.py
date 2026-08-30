@@ -211,7 +211,7 @@ class TheClockIsVisibleWithoutHuntingForIt(unittest.TestCase):
         import inspect
         from handlers import start as S
         src = inspect.getsource(S.cmd_version)
-        self.assertIn("Ваше время", src)
+        self.assertIn("Твоё время", src)
         self.assertIn("offset_label", src)
 
     def test_the_line_actually_reaches_the_message(self):

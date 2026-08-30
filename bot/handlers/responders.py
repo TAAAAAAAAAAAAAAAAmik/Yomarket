@@ -88,7 +88,7 @@ async def _load_all_ads(api, uid: int = 0) -> list[dict]:
     _LAST_ADS_ERROR.pop(uid, None)
     ads: list[dict] = []
     if api is None:
-        _LAST_ADS_ERROR[uid] = "нет токена — отправьте /start"
+        _LAST_ADS_ERROR[uid] = "нет токена — отправь /start"
         return ads
     cursor = None
     while True:
@@ -183,13 +183,13 @@ async def show_categories(callback: CallbackQuery, api) -> None:
     elif not seen:
         # Категорий в ответе API нет — шаг с категориями просто пропускаем.
         n = _title_buttons(builder, ads)
-        text = (head + f"Товаров: <b>{n}</b>. Выберите, для какого настроить "
+        text = (head + f"Товаров: <b>{n}</b>. Выбери, для какого настроить "
                 "ответ:")
     else:
         for cat in seen:
             builder.button(text=f"{_cat_emoji(cat)} {cat}",
                            callback_data=f"resp:cat:{_key(cat)}")
-        text = (head + f"Объявлений: <b>{len(ads)}</b>. Выберите категорию:")
+        text = (head + f"Объявлений: <b>{len(ads)}</b>. Выбери категорию:")
 
     builder.button(text="⬅️ Автоответы", callback_data="ar:menu")
     ui.lay(builder)
@@ -224,11 +224,11 @@ async def show_games(callback: CallbackQuery, api) -> None:
 
     if n:
         text = (f"{_cat_emoji(cat_full)} <b>{_esc(cat_full)}</b>\n\n"
-                f"Товаров: <b>{n}</b>. Выберите, для какого настроить ответ:")
+                f"Товаров: <b>{n}</b>. Выбери, для какого настроить ответ:")
     else:
         # Категория пришла из старой кнопки, а витрина с тех пор изменилась.
         text = ("📭 <b>В этой категории товаров нет</b>\n\n"
-                "Похоже, список изменился — вернитесь и выберите заново.")
+                "Похоже, список изменился — вернись и выбери заново.")
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
@@ -295,7 +295,7 @@ async def add_responder_start(callback: CallbackQuery, state: FSMContext, api) -
     builder = InlineKeyboardBuilder()
     builder.button(text="❌ Отмена", callback_data=f"resp:game:{title_key}")
     await callback.message.edit_text(
-        f"✏️ Напишите автоответчик для <b>{full_title}</b>:",
+        f"✏️ Напиши автоответчик для <b>{full_title}</b>:",
         reply_markup=builder.as_markup(),
     )
     await callback.answer()
@@ -316,7 +316,7 @@ async def edit_responder_start(callback: CallbackQuery, state: FSMContext, api) 
     builder = InlineKeyboardBuilder()
     builder.button(text="❌ Отмена", callback_data=f"resp:game:{title_key}")
     await callback.message.edit_text(
-        f"✏️ Напишите автоответчик для <b>{full_title}</b>:",
+        f"✏️ Напиши автоответчик для <b>{full_title}</b>:",
         reply_markup=builder.as_markup(),
     )
     await callback.answer()
@@ -393,7 +393,7 @@ async def reedit_responder(callback: CallbackQuery, state: FSMContext) -> None:
     builder = InlineKeyboardBuilder()
     builder.button(text="❌ Отмена", callback_data=f"resp:game:{title_key}")
     await callback.message.edit_text(
-        f"✏️ Напишите автоответчик для <b>{full_title}</b>:",
+        f"✏️ Напиши автоответчик для <b>{full_title}</b>:",
         reply_markup=builder.as_markup(),
     )
     await callback.answer()
@@ -508,7 +508,7 @@ def _ar_text(conf: dict, s: dict | None = None) -> str:
 
     if on and not live and not fb.get("on"):
         lines += ["", "⚠️ <i>Отвечать нечем: нет ни одного правила. "
-                      "Возьмите готовый набор — это одно нажатие.</i>"]
+                      "Возьми готовый набор — это одно нажатие.</i>"]
 
     when = ("только вне рабочего времени "
             f"({int(conf.get('from_hour', 22)):02d}:00–"
@@ -564,7 +564,7 @@ async def ar_toggle(callback: CallbackQuery) -> None:
     if conf["enabled"] and not live and not (conf.get("fallback") or {}).get("on"):
         # Включить и промолчать — худший вариант: продавец уверен, что
         # покупателям отвечают. Сразу ведём туда, где это чинится.
-        await callback.answer("Включено, но правил нет — выберите набор",
+        await callback.answer("Включено, но правил нет — выбери набор",
                               show_alert=True)
         return await ar_templates(callback)
     await callback.answer("🟢 Включено" if conf["enabled"] else "🔴 Выключено")
@@ -733,7 +733,7 @@ async def ar_add_kw(message: Message, state: FSMContext) -> None:
     await state.set_state(AutoReplyState.text)
     await message.answer(
         f"🔑 Слова: <b>{_esc(', '.join(words))}</b>\n\n"
-        f"Шаг 2 из 2. Напишите ответ покупателю.\n\n"
+        f"Шаг 2 из 2. Напиши ответ покупателю.\n\n"
         f"Можно подставлять: <code>{ar.HINT}</code>",
         reply_markup=_cancel())
 
@@ -802,7 +802,7 @@ async def ar_edit_text(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         f"✏️ <b>Текст ответа</b>\n\n"
         f"<blockquote>{_esc(rule.get('text', ''))}</blockquote>\n"
-        f"Напишите новый. Подстановки: <code>{ar.HINT}</code>",
+        f"Напиши новый. Подстановки: <code>{ar.HINT}</code>",
         reply_markup=_cancel(f"ar:r:{rid}"))
     await callback.answer()
 
@@ -848,7 +848,7 @@ async def ar_fb_text(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         f"💬 <b>Запасной ответ</b>\n\nОтправляется, когда ни одно правило не "
         f"совпало.\n\nСейчас:\n<blockquote>{_esc(cur)}</blockquote>\n"
-        f"Напишите новый. Подстановки: <code>{ar.HINT}</code>",
+        f"Напиши новый. Подстановки: <code>{ar.HINT}</code>",
         reply_markup=_cancel())
     await callback.answer()
 
@@ -909,7 +909,7 @@ def _opts_text(conf: dict) -> str:
         f"🔢 Не больше <b>{int(conf.get('max_per_order', 3))}</b> автоответов на заказ",
         "",
         f"🚨 Отвечать на жалобы: {_sw(bool(conf.get('reply_to_complaints')))}",
-        "<i>По умолчанию выключено: на «верните деньги» шаблон только злит, "
+        "<i>По умолчанию выключено: на «верни деньги» шаблон только злит, "
         "тут нужен живой ответ.</i>",
     ])
 
@@ -960,7 +960,7 @@ async def ar_set_cd(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(
         f"⏸ <b>Пауза между автоответами</b>\n\nСейчас: <b>{cur} мин</b>\n\n"
         "Сколько минут молчать после ответа в этот же чат, чтобы бот не "
-        "отвечал на каждое «ок». Введите число (0–1440):",
+        "отвечал на каждое «ок». Введи число (0–1440):",
         reply_markup=_cancel("ar:opts"))
     await callback.answer()
 
@@ -972,7 +972,7 @@ async def ar_save_cd(message: Message, state: FSMContext) -> None:
         if not 0 <= value <= 1440:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число от 0 до 1440")
+        await message.answer("❌ Введи число от 0 до 1440")
         return
     await state.clear()
     s, conf = _conf(message.from_user.id)
@@ -989,8 +989,8 @@ async def ar_set_cap(callback: CallbackQuery, state: FSMContext) -> None:
               .get("max_per_order", 3))
     await callback.message.edit_text(
         f"🔢 <b>Лимит автоответов на заказ</b>\n\nСейчас: <b>{cur}</b>\n\n"
-        "После этого бот замолкает и ждёт вас — переписку должен вести "
-        "человек. Введите число (0 — без лимита):",
+        "После этого бот замолкает и ждёт тебя — переписку должен вести "
+        "человек. Введи число (0 — без лимита):",
         reply_markup=_cancel("ar:opts"))
     await callback.answer()
 
@@ -1002,7 +1002,7 @@ async def ar_save_cap(message: Message, state: FSMContext) -> None:
         if not 0 <= value <= 50:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число от 0 до 50")
+        await message.answer("❌ Введи число от 0 до 50")
         return
     await state.clear()
     s, conf = _conf(message.from_user.id)
@@ -1020,7 +1020,7 @@ async def ar_set_hours(callback: CallbackQuery, state: FSMContext) -> None:
         f"🌙 <b>Нерабочее время</b>\n\nСейчас: "
         f"<b>{int(conf.get('from_hour', 22)):02d}:00 — "
         f"{int(conf.get('to_hour', 9)):02d}:00</b>\n\n"
-        "Введите два часа через дефис, например <code>22-9</code>:",
+        "Введи два часа через дефис, например <code>22-9</code>:",
         reply_markup=_cancel("ar:opts"))
     await callback.answer()
 
@@ -1047,7 +1047,7 @@ async def ar_save_hours(message: Message, state: FSMContext) -> None:
 async def ar_test(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AutoReplyState.test)
     await callback.message.edit_text(
-        "🧪 <b>Проверка</b>\n\nНапишите сообщение так, как его написал бы "
+        "🧪 <b>Проверка</b>\n\nНапиши сообщение так, как его написал бы "
         "покупатель. Покажу, какое правило сработает, что именно уйдёт в чат "
         "и отправится ли вообще.\n\n"
         "<i>Ничего никому не отправляется — это черновой прогон.</i>",
@@ -1072,7 +1072,7 @@ async def ar_test_run(message: Message, state: FSMContext) -> None:
     if not rule:
         lines.append("\n🔇 <b>Ответа нет</b> — ни одно слово не совпало, "
                      "запасной ответ выключен.")
-        lines.append("Добавьте правило или включите запасной ответ.")
+        lines.append("Добавь правило или включи запасной ответ.")
     else:
         # Данные берём из последнего реального заказа — так видно, как
         # подстановки выглядят на живом тексте, а не на «{товар}».
@@ -1173,7 +1173,7 @@ async def ar_why(callback: CallbackQuery) -> None:
         lines.append("🔴 Чаты ещё ни разу не читались")
         lines.append("   <i>Фоновый опрос запускается после /start, у чатов "
                      "он свой и идёт раз в несколько секунд. Если так и "
-                     "осталось — перезапустите бота.</i>")
+                     "осталось — перезапусти бота.</i>")
 
     skip = conf.get("last_skip") or {}
     if skip:

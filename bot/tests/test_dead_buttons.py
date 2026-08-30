@@ -249,7 +249,7 @@ class WithdrawingMoney(Patched):
         self.patch(M, "shop_balance", _fake_balance(1500.0, "1 500"))
         cb = CB("balance:withdraw_all")
         asyncio.run(BL.withdraw_all(cb, FSM(), None))
-        self.assertIn("Подтвердите", cb.message.last)
+        self.assertIn("Подтверди", cb.message.last)
         self.assertIn("wd:go:1500", callbacks(cb.message.kbs[-1]))
 
     def test_an_empty_balance_is_not_offered_for_withdrawal(self):

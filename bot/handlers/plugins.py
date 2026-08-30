@@ -74,8 +74,8 @@ def _parse_cookies(text: str) -> dict:
 # Повторять покупку нельзя — деньги могли уйти. Один текст на оба ручных
 # пути, чтобы совет не разошёлся с тем, что бот делает сам.
 _DO_NOT_REPEAT = (
-    "Повторять не следует: деньги могли уйти. Проверьте на fragment.com, "
-    "начислены ли звёзды, и выдавайте заново, только если их нет."
+    "Повторять не следует: деньги могли уйти. Проверь на fragment.com, "
+    "начислены ли звёзды, и выдавай заново, только если их нет."
 )
 
 
@@ -402,12 +402,12 @@ async def stars_creds(callback: CallbackQuery, state: FSMContext) -> None:
         lines.append(f"\n<i>Ещё сохранено cookies: {len(extra)}</i>")
     lines.append("")
     if missing or not has_m:
-        lines.append("Заполните по одному — каждая кнопка спрашивает "
+        lines.append("Заполни по одному — каждая кнопка спрашивает "
                      "что-то одно.")
     else:
-        lines.append("Всё на месте. Проверьте вход кнопкой ниже.")
+        lines.append("Всё на месте. Проверь вход кнопкой ниже.")
     lines.append("")
-    lines.append("⚠️ <b>Это доступ к вашему TON-кошельку и Fragment.</b> "
+    lines.append("⚠️ <b>Это доступ к твоему TON-кошельку и Fragment.</b> "
                  "Данные хранятся только у бота, в чат не выводятся. "
                  "Сообщения с секретами удаляются автоматически.")
     await callback.message.edit_text(
@@ -421,10 +421,10 @@ async def stars_creds(callback: CallbackQuery, state: FSMContext) -> None:
 _PHONE_HELP = (
     "📱 <b>Если компьютера нет</b>\n"
     "<i>Лучше снимать куки на компьютере: Fragment привязывает сессию не "
-    "только к куке, но и к тому, чем вы представились. Бот ходит "
+    "только к куке, но и к тому, чем ты представился. Бот ходит "
     "десктопным <code>Mozilla/5.0</code>, и сессия, выданная телефону, ему "
     "может не подойти. Если сняли с телефона и «Access denied» не уходит — "
-    "проверьте /fragment_debug: он пробует три разных User-Agent и "
+    "проверь /fragment_debug: он пробует три разных User-Agent и "
     "показывает, какой из них Fragment признаёт.</i>\n\n"
     "Нужны инструменты разработчика — они есть в мобильных браузерах:\n"
     "• <b>Kiwi Browser</b> (Android) — меню → «Инструменты разработчика»\n"
@@ -441,7 +441,7 @@ _COOKIE_HELP = {
     "stel_token": ("Основной токен сессии Fragment.\n\n"
                    "F12 → вкладка <b>Application</b> (в Firefox — "
                    "<b>Хранилище</b>) → Cookies → <code>https://fragment.com</code> "
-                   "→ строка <code>stel_token</code> → скопируйте <b>Value</b>."),
+                   "→ строка <code>stel_token</code> → скопируй <b>Value</b>."),
     "stel_ssid": ("Идентификатор сессии.\n\n"
                   "Там же: Application → Cookies → fragment.com → "
                   "<code>stel_ssid</code> → Value."),
@@ -475,9 +475,9 @@ async def stars_set_one_cookie_prompt(callback: CallbackQuery,
     await callback.message.edit_text(
         f"{label}\n\n"
         + (f"Сейчас: <b>задан</b> ({len(str(have))} символов)\n\n" if have else "")
-        + _COOKIE_HELP.get(name, "Пришлите значение этой cookie.")
+        + _COOKIE_HELP.get(name, "Пришли значение этой cookie.")
         + "\n\n" + _PHONE_HELP
-        + "\n\nПришлите <b>только значение</b> — без названия и без "
+        + "\n\nПришли <b>только значение</b> — без названия и без "
           "<code>=</code>. Сообщение сразу удалится.",
         reply_markup=_cancel_kb("plugins:stars:creds"),
     )
@@ -523,7 +523,7 @@ async def stars_set_one_cookie_input(message: Message,
     if looks and looks != name:
         moved = (f"\n\n↪️ Это значение похоже на <b>{looks}</b>, а не на "
                  f"<b>{name}</b> — сохранил его как {looks}. "
-                 f"Проверьте, что в остальные поля попало своё.")
+                 f"Проверь, что в остальные поля попало своё.")
         name = looks
     cookies[name] = raw
     save_fragment_creds(message.from_user.id, {"cookies": cookies})
@@ -534,7 +534,7 @@ async def stars_set_one_cookie_input(message: Message,
     await message.answer(
         f"✅ Сохранено: <b>{name}</b>" + moved
         + (f"\n\nОсталось заполнить: {', '.join(left)}" if left
-           else "\n\nВсё готово — проверьте вход кнопкой «🧪 Проверить вход»."),
+           else "\n\nВсё готово — проверь вход кнопкой «🧪 Проверить вход»."),
         reply_markup=_creds_kb(not left and bool(creds.get("mnemonic")), cookies),
     )
 
@@ -544,11 +544,11 @@ async def stars_set_cookies_prompt(callback: CallbackQuery, state: FSMContext) -
     await state.set_state(PluginState.stars_set_cookies)
     await callback.message.edit_text(
         "🍪 <b>Cookies Fragment — все три одной вставкой</b>\n\n"
-        "1. Войдите на <b>fragment.com</b> через TON-кошелёк\n"
-        "2. F12 → вкладка <b>Network</b> → обновите страницу → щёлкните "
+        "1. Войди на <b>fragment.com</b> через TON-кошелёк\n"
+        "2. F12 → вкладка <b>Network</b> → обнови страницу → щёлкни "
         "любой запрос к <code>fragment.com</code>\n"
         "3. <b>Request Headers</b> → строка <code>Cookie:</code> → "
-        "скопируйте <b>всё значение</b> и пришлите сюда\n\n"
+        "скопируй <b>всё значение</b> и пришли сюда\n\n"
         "Годится и «Copy as cURL» целиком — разберу сам.\n\n"
         "<i>Так приходят и <b>stel_token</b> с <b>stel_ssid</b>: в "
         "<code>document.cookie</code> их нет, они HttpOnly, и именно из-за "
@@ -585,7 +585,7 @@ async def stars_set_cookies_input(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ Разобрал {len(cookies)} cookie."
         + (f"\n\n⚠️ Не хватает: {', '.join(left)} — их не бывает в "
-           f"<code>document.cookie</code>, задайте по одной."
+           f"<code>document.cookie</code>, задай по одной."
            if left else ""),
         reply_markup=_creds_kb(
             not left and bool(creds.get("mnemonic")), existing),
@@ -597,9 +597,9 @@ async def stars_set_mnemonic_prompt(callback: CallbackQuery, state: FSMContext) 
     await state.set_state(PluginState.stars_set_mnemonic)
     await callback.message.edit_text(
         "🔐 <b>Seed-фраза TON-кошелька</b>\n\n"
-        "Пришлите <b>24 слова</b> через пробел — это кошелёк, с которого "
+        "Пришли <b>24 слова</b> через пробел — это кошелёк, с которого "
         "будут оплачиваться звёзды.\n\n"
-        "⚠️ Держите на нём ровно столько TON, сколько нужно для продаж. "
+        "⚠️ Держи на нём ровно столько TON, сколько нужно для продаж. "
         "Сообщение будет немедленно удалено.",
         reply_markup=_cancel_kb("plugins:stars:creds"),
     )
@@ -616,7 +616,7 @@ async def stars_set_mnemonic_input(message: Message, state: FSMContext) -> None:
         pass
     if len(words) not in (12, 24):
         await message.answer(
-            "❌ Нужно 24 слова (или 12). Проверьте seed-фразу.",
+            "❌ Нужно 24 слова (или 12). Проверь seed-фразу.",
             reply_markup=_creds_kb(False, (get_fragment_creds(
                 message.from_user.id) or {}).get("cookies")))
         return
@@ -637,7 +637,7 @@ async def stars_set_mnemonic_input(message: Message, state: FSMContext) -> None:
     creds = get_fragment_creds(message.from_user.id) or {}
     await message.answer(
         f"✅ Кошелёк сохранён.\n💼 Адрес: <code>{addr}</code>\n\n"
-        "Пополните его TON для оплаты звёзд.",
+        "Пополни его TON для оплаты звёзд.",
         reply_markup=_creds_kb(
             bool(creds.get("cookies") and creds.get("mnemonic")),
             creds.get("cookies")),
@@ -696,8 +696,8 @@ async def stars_check_creds(callback: CallbackQuery) -> None:
                              "оплату только с того, который к нему подключён — "
                              "отсюда «Access denied» при покупке.")
             elif not on_page:
-                lines.append("⚠️ Подключите TON-кошелёк на fragment.com и "
-                             "заново скопируйте куку "
+                lines.append("⚠️ Подключи TON-кошелёк на fragment.com и "
+                             "заново скопируй куку "
                              "<code>stel_ton_token</code> — без неё покупка "
                              "запрещена, даже когда вход через Telegram есть.")
             wallets = "\n".join(lines)
@@ -815,7 +815,7 @@ async def stars_probe(message: Message) -> None:
 
     parts = (message.text or "").split()
     if len(parts) < 2:
-        await message.answer("Укажите ник: <code>/stars_probe NO0RD</code>")
+        await message.answer("Укажи ник: <code>/stars_probe NO0RD</code>")
         return
     username = parts[1].lstrip("@")
     try:
@@ -869,10 +869,10 @@ async def stars_set_hash_prompt(callback: CallbackQuery, state: FSMContext) -> N
           "<b>бот возьмёт именно его</b> и страницу читать не станет.\n\n"
           "Это и есть способ подставить хеш из браузера, где покупка "
           "проходит: F12 → вкладка <b>Network</b> → на fragment.com "
-          "нажмите покупку → найдите запрос <code>api?…</code> → "
-          "скопируйте значение после <code>hash=</code>. На Android "
+          "жми покупку → найди запрос <code>api?…</code> → "
+          "скопируй значение после <code>hash=</code>. На Android "
           "инструменты разработчика есть в <b>Kiwi Browser</b>.\n\n"
-          "Хеш живёт столько же, сколько сессия: протухнет — очистите поле "
+          "Хеш живёт столько же, сколько сессия: протухнет — очисти поле "
           "и бот снова начнёт брать его сам.",
         reply_markup=_cancel_kb("plugins:stars:creds"),
     )
@@ -900,7 +900,7 @@ async def stars_set_hash_input(message: Message, state: FSMContext) -> None:
     ready = (all(cookies.get(n) for n, _l in FRAGMENT_COOKIES)
              and bool(creds.get("mnemonic")))
     await message.answer(
-        f"✅ api-hash сохранён.\n\nПроверьте вход кнопкой «🧪 Проверить вход».",
+        f"✅ api-hash сохранён.\n\nПроверь вход кнопкой «🧪 Проверить вход».",
         reply_markup=_creds_kb(ready, cookies))
 
 
@@ -915,7 +915,7 @@ async def stars_set_proxy_prompt(callback: CallbackQuery,
     await callback.message.edit_text(
         "🌐 <b>Прокси для Fragment</b>\n\n"
         f"Сейчас: <code>{html.escape(cur)}</code>\n\n"
-        "Fragment выдаёт сессию браузеру на вашем адресе, а бот живёт в "
+        "Fragment выдаёт сессию браузеру на твоём адресе, а бот живёт в "
         "дата-центре. Похоже, из-за этого куки у бота «протухают» за "
         "полчаса, а покупка отказывает с первой секунды. Прокси с обычным "
         "домашним или мобильным адресом это проверяет и, если версия верна, "
@@ -923,7 +923,7 @@ async def stars_set_proxy_prompt(callback: CallbackQuery,
         "Формат:\n"
         "<code>http://логин:пароль@хост:порт</code>\n"
         "<code>socks5://логин:пароль@хост:порт</code>\n\n"
-        "Отправьте <code>-</code>, чтобы убрать прокси.\n\n"
+        "Отправь <code>-</code>, чтобы убрать прокси.\n\n"
         "⚠️ Логин и пароль нигде не показываются — в отчётах видны только "
         "хост и порт.",
         reply_markup=_cancel_kb("plugins:stars:creds"),
@@ -967,7 +967,7 @@ async def stars_set_proxy_input(message: Message, state: FSMContext) -> None:
     save_fragment_creds(uid, {"proxy": raw})
     await message.answer(
         f"✅ Прокси сохранён: <code>{html.escape(proxy_label(raw))}</code>\n\n"
-        "Проверьте командой /stars_probe — в первой строке отчёта будет "
+        "Проверь командой /stars_probe — в первой строке отчёта будет "
         "видно, с какого адреса бот выходит наружу.",
         reply_markup=_creds_kb(ready, cookies))
 
@@ -1022,7 +1022,7 @@ async def stars_set_keyword_prompt(callback: CallbackQuery, state: FSMContext) -
     await callback.message.edit_text(
         f"🔍 Ключевое слово в заголовке заказа (сейчас: <code>{cur}</code>)\n\n"
         "Заказы, чей заголовок содержит это слово, будут обрабатываться "
-        "автовыдачей звёзд. Введите слово:",
+        "автовыдачей звёзд. Введи слово:",
         reply_markup=_cancel_kb("plugins:stars:settings"),
     )
     await callback.answer()
@@ -1049,7 +1049,7 @@ async def stars_set_amount_prompt(callback: CallbackQuery, state: FSMContext) ->
     await state.set_state(PluginState.stars_set_amount)
     cur = get_settings(callback.from_user.id)["plugins"]["auto_stars"].get("amount", 50)
     await callback.message.edit_text(
-        f"⭐ Кол-во звёзд (сейчас: <b>{cur}</b>)\n\nВведите число:",
+        f"⭐ Кол-во звёзд (сейчас: <b>{cur}</b>)\n\nВведи число:",
         reply_markup=_cancel_kb("plugins:stars:settings"),
     )
     await callback.answer()
@@ -1062,7 +1062,7 @@ async def stars_set_amount_input(message: Message, state: FSMContext) -> None:
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите целое положительное число:")
+        await message.answer("❌ Введи целое положительное число:")
         return
     uid = message.from_user.id
     settings = get_settings(uid)
@@ -1076,7 +1076,7 @@ async def stars_set_amount_input(message: Message, state: FSMContext) -> None:
 async def stars_set_note_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PluginState.stars_set_note)
     await callback.message.edit_text(
-        "📝 Введите заметку для покупателя:",
+        "📝 Введи заметку для покупателя:",
         reply_markup=_cancel_kb("plugins:stars:settings"),
     )
     await callback.answer()
@@ -1098,7 +1098,7 @@ async def stars_whois_prompt(callback: CallbackQuery, state: FSMContext) -> None
     await state.set_state(PluginState.stars_whois)
     await callback.message.edit_text(
         "🔎 <b>Проверить ник</b>\n\n"
-        "Введите @username получателя — проверю, находит ли его Fragment и "
+        "Введи @username получателя — проверю, находит ли его Fragment и "
         "примет ли на него заявку.\n\n"
         "<i>Ничего не оплачивается: деньги уходят только при отправке "
         "подписанной транзакции, а до неё здесь дело не доходит.</i>",
@@ -1144,7 +1144,7 @@ async def stars_whois_input(message: Message, state: FSMContext) -> None:
 async def stars_manual_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PluginState.stars_manual_buyer)
     await callback.message.edit_text(
-        "🚀 <b>Ручная выдача звёзд</b>\n\nВведите @username или Telegram ID покупателя:",
+        "🚀 <b>Ручная выдача звёзд</b>\n\nВведи @username или Telegram ID покупателя:",
         reply_markup=_cancel_kb("plugins:auto_stars"),
     )
     await callback.answer()
@@ -1157,7 +1157,7 @@ async def stars_manual_buyer_input(message: Message, state: FSMContext) -> None:
     default_amount = p.get("amount", 50)
     await state.set_state(PluginState.stars_manual_amount)
     await message.answer(
-        f"⭐ Кол-во звёзд (по умолчанию: {default_amount}):\n\nВведите число или отправьте 0 для значения по умолчанию:"
+        f"⭐ Кол-во звёзд (по умолчанию: {default_amount}):\n\nВведи число или отправь 0 для значения по умолчанию:"
     )
 
 
@@ -1173,7 +1173,7 @@ async def stars_manual_amount_input(message: Message, state: FSMContext) -> None
         if amount < 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите корректное число.")
+        await message.answer("❌ Введи корректное число.")
         return
 
     status = await message.answer(
@@ -1297,7 +1297,7 @@ async def stars_retry(callback: CallbackQuery) -> None:
         return
     creds = get_fragment_creds(uid) or {}
     if not creds.get("cookies") or not creds.get("mnemonic"):
-        await callback.answer("Сначала заполните «🔑 Данные Fragment»",
+        await callback.answer("Сначала заполни «🔑 Данные Fragment»",
                               show_alert=True)
         return
 
@@ -1405,7 +1405,7 @@ def _profit_text(p: dict) -> str:
                           f"звезду (по {len(known)} заказам с известной "
                           f"суммой).</i>"]
     lines += ["", "<i>Расход в рублях бот не считает: курс TON он не знает, а "
-                  "выдумывать его нельзя. Сравните TON с тем, во сколько "
+                  "выдумывать его нельзя. Сравни TON с тем, во сколько "
                   "обошлось пополнение кошелька.</i>"]
     return "\n".join(lines)
 
@@ -1455,7 +1455,7 @@ async def stars_balance(callback: CallbackQuery) -> None:
         ton = res["ton"]
         # грубая оценка: ~0.0155 TON за звезду (можно уточнить)
         approx_stars = int(ton / 0.016) if ton > 0 else 0
-        warn = "\n\n⚠️ <b>Мало TON — пополните кошелёк!</b>" if ton < 1 else ""
+        warn = "\n\n⚠️ <b>Мало TON — пополни кошелёк!</b>" if ton < 1 else ""
         text = (
             "💰 <b>Баланс TON-кошелька</b>\n\n"
             f"💎 <b>{ton:.4f} TON</b>\n"
@@ -1545,7 +1545,7 @@ def _replies_text(p: dict) -> str:
         if fields != "—":
             lines.append(f"<code>{html.escape(fields)}</code>")
         lines.append("")
-    lines.append("<i>Нажмите, чтобы заменить. Пустое сообщение вернёт "
+    lines.append("<i>Жми, чтобы заменить. Пустое сообщение вернёт "
                  "стандартный текст.</i>")
     return "\n".join(lines)
 
@@ -1589,8 +1589,8 @@ async def stars_reply_edit(callback: CallbackQuery, state: FSMContext) -> None:
         f"Сейчас{' (свой)' if own else ' (стандартный)'}:\n"
         f"<i>{html.escape(own or STARS_TEXTS.get(key, ''))}</i>"
         + hint
-        + "\n\nПришлите новый текст. Чтобы вернуть стандартный — "
-          "отправьте <code>-</code>.",
+        + "\n\nПришли новый текст. Чтобы вернуть стандартный — "
+          "отправь <code>-</code>.",
         reply_markup=_cancel_kb("plugins:stars:replies"))
     await callback.answer()
 
@@ -1640,7 +1640,7 @@ def _roblox_text(settings: dict, shop_name: str = "") -> str:
         f"🎮 <b>Roblox — Robux{name_part}</b>",
         "",
         "⚠️ <b>На живом заказе выдача ещё не проверялась.</b> Первые "
-        "покупки посмотрите глазами: бот пишет о каждой, и об удачной, и "
+        "покупки посмотри глазами: бот пишет о каждой, и об удачной, и "
         "о несостоявшейся.",
         "",
         "<b>Что здесь выдаётся.</b> У поставщика Robux бывают только "
@@ -1744,8 +1744,8 @@ def _roblox_settings_text(settings: dict) -> str:
     else:
         lines.append("🔤 Слово-опознаватель: <i>не задано</i> — узнаём заказ "
                      "по словам «robux», «робукс», «roblox»")
-        lines.append("   ⚠️ Если у вас есть товары вида «Roblox аккаунт», "
-                     "задайте слово: иначе они тоже попадут в выдачу Robux.")
+        lines.append("   ⚠️ Если у тебя есть товары вида «Roblox аккаунт», "
+                     "задай слово: иначе они тоже попадут в выдачу Robux.")
     lines.append(f"📝 Заметка: <i>{html.escape(note)}</i>")
 
     from automation.robux import DEFAULT_AD_TEXT, DEFAULT_AD_TITLE
@@ -1859,9 +1859,9 @@ async def roblox_set_keyword_prompt(callback: CallbackQuery, state: FSMContext) 
     await callback.message.edit_text(
         f"🔤 <b>Слово-опознаватель</b>\n\nСейчас: <code>{html.escape(cur)}</code>\n\n"
         f"Без него заказ узнаётся по словам «robux», «робукс», «roblox». "
-        f"Это удобно, но если у вас продаются ещё и аккаунты Roblox, они "
+        f"Это удобно, но если у тебя продаются ещё и аккаунты Roblox, они "
         f"попадут в ту же выдачу.\n\n"
-        f"Пришлите своё слово — тогда в работу пойдут <b>только</b> заказы "
+        f"Пришли своё слово — тогда в работу пойдут <b>только</b> заказы "
         f"с ним. Точка «.» очистит настройку.",
         reply_markup=_cancel_kb("plugins:roblox:settings"),
     )
@@ -1894,10 +1894,10 @@ async def roblox_manual_prompt(callback: CallbackQuery, state: FSMContext) -> No
     await state.set_state(PluginState.roblox_manual_order)
     await callback.message.edit_text(
         "🚀 <b>Выдать Robux вручную</b>\n\n"
-        "Пришлите <b>номер заказа</b> — бот подберёт номинал, купит код и "
+        "Пришли <b>номер заказа</b> — бот подберёт номинал, купит код и "
         "отправит его в чат этого заказа.\n\n"
-        "Тумблер и слово-опознаватель при этом не проверяются: раз вы "
-        "назвали заказ сами, значит он ваш. А вот оплату бот проверит — "
+        "Тумблер и слово-опознаватель при этом не проверяются: раз ты "
+        "назвал заказ сам, значит он твой. А вот оплату бот проверит — "
         "по неоплаченному выдавать нельзя.\n\n"
         "Покупка пойдёт тем же путём, что и автоматическая: сухой прогон, "
         "покупка, запись кода, отправка. Отчёт придёт сюда.",
@@ -1931,7 +1931,7 @@ async def roblox_manual_order_input(message: Message, state: FSMContext) -> None
         # продавца ждать отчёт, который придёт отказом.
         await message.answer(
             "❌ Ключ AppRoute не задан — покупать не на что.\n\n"
-            "Задайте его кнопкой «🔑 Поставщик AppRoute» и поставьте заказ "
+            "Задай его кнопкой «🔑 Поставщик AppRoute» и поставь заказ "
             "в очередь снова.",
             reply_markup=_roblox_keyboard(settings))
         return
@@ -2165,7 +2165,7 @@ async def roblox_region_pick(callback: CallbackQuery, state: FSMContext) -> None
     lines = [f"🏷 <b>Номиналы · регион {region}</b>"
              + (f" · <i>{age}</i>" if age else ""), "", f"Это {what}.", "",
              "Цены рядом — <b>закупочные, в долларах</b>. Свою цену в рублях "
-             "назначите на следующем шаге: курс боту брать неоткуда, и "
+             "назначишь на следующем шаге: курс боту брать неоткуда, и "
              "выдумывать его он не станет."]
     await callback.message.edit_text("\n".join(lines)[:4000],
                                      reply_markup=b.as_markup())
@@ -2181,7 +2181,7 @@ async def roblox_den_pick(callback: CallbackQuery, state: FSMContext) -> None:
         # Список номиналов живёт в состоянии формы, и оно теряется при
         # перезапуске бота. Молча промолчать нельзя: продавец нажал кнопку и
         # ждёт ответа.
-        await callback.answer("Список устарел — откройте регионы заново",
+        await callback.answer("Список устарел — открой регионы заново",
                               show_alert=True)
         return
     await state.set_state(PluginState.roblox_ads_rate)
@@ -2192,9 +2192,9 @@ async def roblox_den_pick(callback: CallbackQuery, state: FSMContext) -> None:
         f"🏷 <b>{html.escape(title)}</b> · регион "
         f"{html.escape(str(data.get('ar_region') or ''))}\n\n"
         f"Закупка: ${row['price']:.2f}\n\n"
-        f"Назовите цену в рублях, за которую продаёте — одним числом.\n\n"
+        f"Назови цену в рублях, за которую продаёшь — одним числом.\n\n"
         f"Дальше откроется обычное создание объявления: название и описание "
-        f"подставлю по вашим заготовкам, а количество, фото и категорию "
+        f"подставлю по твоим заготовкам, а количество, фото и категорию "
         f"мастер спросит сам.",
         reply_markup=_cancel_kb("plugins:roblox:make_ads"))
     await callback.answer()
@@ -2283,7 +2283,7 @@ async def roblox_den_price(message: Message, state: FSMContext) -> None:
         f"Название: <code>{html.escape(ad_title)}</code>\n"
         f"Регион уйдёт в описание отдельной строкой — оттуда его потом "
         f"читает выдача.\n\n"
-        f"Сколько таких кодов выставляем? Введите число или пропустите — "
+        f"Сколько таких кодов выставляем? Введи число или пропусти — "
         f"но тогда объявление продастся один раз и уйдёт с витрины.",
         reply_markup=b.as_markup())
 
@@ -2300,7 +2300,7 @@ def _template_help(what: str, now: str, default: str) -> str:
     for mark, about in TEMPLATE_FIELDS.items():
         lines.append(f"   <code>{html.escape(mark)}</code> — {about}")
     lines += ["",
-              "Пришлите свой вариант одним сообщением. Точка «.» вернёт наш.",
+              "Пришли свой вариант одним сообщением. Точка «.» вернёт наш.",
               "",
               "<i>Регион бот допишет отдельной строкой сам — у Юмаркета "
               "выбора региона нет, и из описания его потом читает выдача.</i>"]
@@ -2360,7 +2360,7 @@ async def roblox_set_ad_text_input(message: Message, state: FSMContext) -> None:
             await message.answer(
                 f"❌ Панель не примет описание со ссылкой: "
                 f"<code>{html.escape(found)}</code>\n\n"
-                f"Уберите ссылку и пришлите заготовку ещё раз.")
+                f"Убери ссылку и пришли заготовку ещё раз.")
             return
     settings["plugins"]["auto_roblox"]["ad_text"] = value
     save_settings(uid, settings)
@@ -2373,7 +2373,7 @@ async def roblox_set_ad_text_input(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "plugins:roblox:set_note")
 async def roblox_set_note_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PluginState.roblox_set_note)
-    await callback.message.edit_text("📝 Введите заметку для покупателя:", reply_markup=_cancel_kb("plugins:roblox:settings"))
+    await callback.message.edit_text("📝 Введи заметку для покупателя:", reply_markup=_cancel_kb("plugins:roblox:settings"))
     await callback.answer()
 
 
@@ -2539,8 +2539,8 @@ def _gift_card_text(settings: dict, gift) -> str:
         words = ", ".join(gift.words[:4])
         lines.append(f"🔤 Слово-опознаватель: <i>не задано</i> — узнаём заказ "
                      f"по словам: {html.escape(words)}")
-        lines.append("   ⚠️ Если у вас есть товары вида «аккаунт» с тем же "
-                     "словом, задайте своё: иначе они тоже попадут в выдачу.")
+        lines.append("   ⚠️ Если у тебя есть товары вида «аккаунт» с тем же "
+                     "словом, задай своё: иначе они тоже попадут в выдачу.")
     if note:
         lines.append(f"📝 Заметка покупателю: <i>{html.escape(note)}</i>")
     return screen(
@@ -2721,11 +2721,11 @@ async def gifts_dry_run(callback: CallbackQuery, state: FSMContext) -> None:
                               show_alert=True)
         return
     if not panel or not panel.get("cookies"):
-        await callback.answer("Нужен вход в панель — оттуда берутся ваши товары",
+        await callback.answer("Нужен вход в панель — оттуда берутся твои товары",
                               show_alert=True)
         return
 
-    await callback.answer("⏳ Смотрю ваши товары…")
+    await callback.answer("⏳ Смотрю твои товары…")
     await callback.message.edit_text("⏳ Читаю витрину и каталог…")
     loop = asyncio.get_event_loop()
     try:
@@ -2757,7 +2757,7 @@ async def gifts_dry_run(callback: CallbackQuery, state: FSMContext) -> None:
             "читается при выдаче. Проверка отвечает «узнаю, и номинал такой "
             "у поставщика есть» — не «выдам наверняка».</i>")
     await callback.message.edit_text(
-        screen("🧪 <b>Проверка на ваших товарах</b>",
+        screen("🧪 <b>Проверка на твоих товарах</b>",
                _dry_run_lines(dry_run(titles, catalog, settings)),
                footer=note + (f"\n<i>{html.escape(age)}</i>" if age else "")),
         reply_markup=_gift_cards_keyboard(settings))
@@ -2823,7 +2823,7 @@ async def gifts_add(callback: CallbackQuery, state: FSMContext) -> None:
                      f"{html.escape(gift.pitch)}"
                      if gift.pitch else
                      f"{gift.emoji} <b>{html.escape(gift.title)}</b>")
-    lines += ["", "Нажмите карту — откроется её экран, там же включается "
+    lines += ["", "Жми карту — откроется её экран, там же включается "
                   "автовыдача."]
     await callback.message.edit_text("\n".join(lines)[:4000],
                                      reply_markup=builder.as_markup())
@@ -2864,7 +2864,7 @@ async def gift_toggle(callback: CallbackQuery) -> None:
         creds = get_ar_creds(uid) or {}
         if not creds.get("api_key"):
             await callback.answer(
-                "Сначала задайте ключ AppRoute: 🔑 Поставщик AppRoute. "
+                "Сначала задай ключ AppRoute: 🔑 Поставщик AppRoute. "
                 "Без него покупать не на что.", show_alert=True)
             return
     conf["enabled"] = not conf.get("enabled")
@@ -2891,7 +2891,7 @@ async def gift_cfg(callback: CallbackQuery, state: FSMContext) -> None:
 # все карты: состояний в этом боте уже девяносто три, и заводить по четыре
 # на каждую из двадцати пяти карт значит утроить их число на ровном месте.
 _GIFT_FIELDS = {
-    "region": ("🌐 Введите регион кода — две буквы, как у поставщика "
+    "region": ("🌐 Введи регион кода — две буквы, как у поставщика "
                "(US, TR, AE…).\n\nМожно оставить пустым: тогда бот возьмёт "
                "регион из описания товара, где сам его и пишет.", "region"),
     # Название «слово-опознаватель» продавцы понимают по-разному: одни
@@ -2905,7 +2905,7 @@ _GIFT_FIELDS = {
            "   ✅ «Эпл гифт карта 10$» — заберёт\n"
            "   ❌ «Apple Gift Card 10$» — пропустит, слова нет\n\n"
            "Пока слово не задано, бот узнаёт заказ по обычным написаниям "
-           "названия карты. Задавать своё стоит, только если у вас есть "
+           "названия карты. Задавать своё стоит, только если у тебя есть "
            "другие товары с тем же словом — скажем, аккаунты, — и они "
            "попадают в выдачу по ошибке.\n\n"
            "Точка «.» очистит настройку.", "keyword"),
@@ -2919,11 +2919,11 @@ _GIFT_FIELDS = {
               "поломку.\n\n"
               "Точка «.» очистит — тогда бот молчит до самого кода.",
               "greeting"),
-    "note": ("📝 Введите заметку — она уйдёт покупателю вместе с кодом.",
+    "note": ("📝 Введи заметку — она уйдёт покупателю вместе с кодом.",
              "note"),
-    "adtitle": ("🏷 Введите заготовку названия товара.\n\nПодстановки: "
+    "adtitle": ("🏷 Введи заготовку названия товара.\n\nПодстановки: "
                 "{номинал}, {регион}, {цена}, {карта}", "ad_title"),
-    "adtext": ("📄 Введите заготовку описания товара.\n\nПодстановки: "
+    "adtext": ("📄 Введи заготовку описания товара.\n\nПодстановки: "
                "{номинал}, {регион}, {цена}, {карта}\n\n⚠️ Ссылки панель не "
                "принимает — отказ придёт на последнем шаге мастера.",
                "ad_text"),
@@ -2956,7 +2956,7 @@ async def gift_field_input(message: Message, state: FSMContext) -> None:
     await state.clear()
     allowed = {name for _prompt, name in _GIFT_FIELDS.values()}
     if not gift or field not in allowed:
-        await message.answer("Экран устарел — откройте карту заново.")
+        await message.answer("Экран устарел — открой карту заново.")
         return
     value = (message.text or "").strip()
     if field == "region":
@@ -3024,7 +3024,7 @@ async def gift_manual_prompt(callback: CallbackQuery, state: FSMContext) -> None
     await state.update_data(gc_slug=gift.slug)
     await callback.message.edit_text(
         f"🚀 <b>Выдать вручную — {html.escape(gift.title)}</b>\n\n"
-        f"Введите номер заказа. Бот проверит оплату, подберёт номинал и "
+        f"Введи номер заказа. Бот проверит оплату, подберёт номинал и "
         f"купит код на ближайшем проходе — и отчитается в любом случае, "
         f"и если получится, и если нет.",
         reply_markup=_cancel_kb(f"plugins:gc:{gift.slug}"))
@@ -3039,7 +3039,7 @@ async def gift_manual_input(message: Message, state: FSMContext) -> None:
     gift = card(data.get("gc_slug") or "")
     await state.clear()
     if not gift:
-        await message.answer("Экран устарел — откройте карту заново.")
+        await message.answer("Экран устарел — открой карту заново.")
         return
     order_id = (message.text or "").strip()
     if not order_id:
@@ -3241,7 +3241,7 @@ async def gift_make_nominals(callback: CallbackQuery, state: FSMContext) -> None
         f"{html.escape(region)}</b>" + (f" · <i>{age}</i>" if age else "")
         + "\n\n"
         f"Цены рядом — <b>закупочные, в долларах</b>. Свою цену в рублях "
-        f"назначите на следующем шаге: курс боту брать неоткуда, и "
+        f"назначишь на следующем шаге: курс боту брать неоткуда, и "
         f"выдумывать его он не станет.", reply_markup=b.as_markup())
 
 
@@ -3257,7 +3257,7 @@ async def gift_make_price(callback: CallbackQuery, state: FSMContext) -> None:
     if not gift or not row:
         # Список живёт в состоянии формы, а оно теряется при перезапуске
         # бота. Промолчать нельзя: продавец нажал и ждёт ответа.
-        await callback.answer("Список устарел — откройте регионы заново",
+        await callback.answer("Список устарел — открой регионы заново",
                               show_alert=True)
         return
     await state.set_state(PluginState.gc_price)
@@ -3267,9 +3267,9 @@ async def gift_make_price(callback: CallbackQuery, state: FSMContext) -> None:
         f"{html.escape(gift.title)} · "
         f"{html.escape(str(data.get('gc_region') or ''))}\n\n"
         f"Закупка: ${row['price']:.2f}\n\n"
-        f"Назовите цену в рублях, за которую продаёте — одним числом.\n\n"
+        f"Назови цену в рублях, за которую продаёшь — одним числом.\n\n"
         f"Дальше откроется обычное создание объявления: название и описание "
-        f"подставлю по вашим заготовкам, а количество, фото и раздел мастер "
+        f"подставлю по твоим заготовкам, а количество, фото и раздел мастер "
         f"спросит сам.",
         reply_markup=_cancel_kb(f"plugins:gc:{gift.slug}:make"))
     await callback.answer()
@@ -3323,7 +3323,7 @@ async def gift_make_handoff(message: Message, state: FSMContext) -> None:
         f"Название: <code>{html.escape(ad_title)}</code>\n"
         f"Регион уйдёт в описание отдельной строкой — оттуда его читает "
         f"выдача.\n\n"
-        f"Сколько таких кодов выставляем? Введите число или пропустите — "
+        f"Сколько таких кодов выставляем? Введи число или пропусти — "
         f"но тогда объявление продастся один раз и уйдёт с витрины.",
         reply_markup=b.as_markup())
 
@@ -3360,11 +3360,11 @@ def _plugins_menu_text(settings: dict, shop_name: str = "") -> str:
 
     return screen("🧩 <b>Плагины</b>", [
         "Покупатель оплатил — бот сам купил товар у поставщика и отправил "
-        "его в чат заказа. Без вас.",
+        "его в чат заказа. Без тебя.",
         "",
         "🎁 Гифт-карты: Apple, Xbox, Steam, PlayStation, Roblox, Amazon…",
         "⭐ Telegram Stars — свой плагин, с кошельком TON",
-        "🌙 Ночью и в выходные заказы не ждут вас",
+        "🌙 Ночью и в выходные заказы не ждут тебя",
         "⏱ Ни поставщика, ни ручного копирования",
         "🆕 Плагины прибавляются — новые появятся здесь же",
     ], subtitle=shop_name)

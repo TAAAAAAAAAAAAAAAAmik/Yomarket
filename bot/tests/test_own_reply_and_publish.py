@@ -88,7 +88,7 @@ class MyOwnReplyIsNotABuyerMessage(unittest.TestCase):
     def test_a_hand_written_reply_is_shown_as_mine(self):
         notes = self._run(by_hand=True)
         self.assertEqual(len(notes), 1, notes)
-        self.assertIn("ВЫ ОТВЕТИЛИ", notes[0])
+        self.assertIn("ТЫ ОТВЕТИЛ", notes[0])
         self.assertIn("Ключ отправлю", notes[0])
 
     def test_an_autoreply_echo_stays_silent(self):
