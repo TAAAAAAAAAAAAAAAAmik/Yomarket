@@ -269,7 +269,8 @@ async def cmd_log_here(message: Message) -> None:
     from aiogram.utils.keyboard import InlineKeyboardBuilder
 
     import logs
-    from storage import get_log_target, is_admin, set_log_topic
+    from storage import (clear_log_topic, get_log_target, is_admin,
+                         set_log_topic)
 
     # Кто это. При анонимной отправке — «от имени группы» — Telegram НЕ
     # называет человека: вместо него приходит служебный GroupAnonymousBot,
@@ -310,21 +311,48 @@ async def cmd_log_here(message: Message) -> None:
     want = parts[1].strip().lower() if len(parts) > 1 else ""
     known = {k for k, _t, _h in logs.KINDS}
 
+    # Второе слово — «off»: отвязать этот вид, не трогая остальные.
+    # «Ошибся темой» иначе лечилось бы выключением журнала целиком, то есть
+    # потерей четырёх правильных привязок из-за одной неправильной.
+    off = len(parts) > 2 and parts[2].strip().lower() in ("off", "выкл", "-")
+    if want and want in known and off:
+        had = clear_log_topic(want)
+        await message.answer(ui.screen(
+            "📋 <b>Отвязал</b>" if had else "📋 <b>Нечего отвязывать</b>",
+            [f"<b>{logs.KIND_TITLES[want]}</b> "
+             + ("больше никуда не пишется." if had else "и не был привязан."),
+             "",
+             "Остальные виды не тронуты — <code>/log_here</code> покажет."]))
+        return
+
     if want and want in known:
-        set_log_topic(want, chat, thread)
+        was = get_log_target().get("chat") or 0
+        dropped = set_log_topic(want, chat, thread)
         where = f"тема <code>{thread}</code>" if thread else "общий поток"
         # «Привязал» — не доказательство. Пишем пробную запись и говорим,
         # дошла ли она: тема могла быть закрыта, а права отобраны.
         ok = await logs.log_event(
             message.bot, want,
             ["<i>проверка связи — так будут выглядеть записи</i>"])
+        body = [f"<b>{logs.KIND_TITLES[want]}</b> → {where}",
+                "",
+                "Пробная запись отправлена — она выше." if ok else
+                "Пробная запись не отправилась. Причина в личке у владельца."]
+        if dropped:
+            # Номер темы принадлежит своей группе. Промолчать о том, что
+            # журнал переехал целиком, значит оставить владельца с четырьмя
+            # привязками, указывающими в никуда.
+            names = ", ".join(logs.KIND_TITLES.get(k, k) for k in dropped)
+            body += ["", f"⚠️ <b>Журнал переехал сюда из группы "
+                         f"<code>{was}</code>.</b>",
+                     f"Слетели привязки: {names} — их номера тем "
+                     f"принадлежали прежней группе и здесь ничего не значат.",
+                     "",
+                     "Привяжи их заново в нужных темах, либо вернись в "
+                     "прежнюю группу и повтори там."]
         await message.answer(ui.screen(
             "📋 <b>Тема привязана</b>" if ok else
-            "⚠️ <b>Привязал, но запись не прошла</b>",
-            [f"<b>{logs.KIND_TITLES[want]}</b> → {where}",
-             "",
-             "Пробная запись отправлена — она выше." if ok else
-             "Пробная запись не отправилась. Причина в личке у владельца."]))
+            "⚠️ <b>Привязал, но запись не прошла</b>", body))
         return
 
     target = get_log_target()
@@ -349,7 +377,9 @@ async def cmd_log_here(message: Message) -> None:
         "📋 <b>Журнал в группу</b>", body,
         footer="<i>Зайди в нужную тему и напиши там "
                "<code>/log_here вид</code> — например "
-               "<code>/log_here trial</code>.</i>"),
+               "<code>/log_here trial</code>.\n"
+               "Ошибся темой — просто повтори в правильной. Отвязать "
+               "совсем: <code>/log_here trial off</code>.</i>"),
         reply_markup=ui.lay(b).as_markup())
 
 

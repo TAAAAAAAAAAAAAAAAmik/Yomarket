@@ -1118,22 +1118,51 @@ def get_log_target() -> dict:
     }
 
 
-def set_log_topic(kind: str, chat_id: int, thread_id: int | None) -> None:
-    """Привязать вид события к теме.
+def set_log_topic(kind: str, chat_id: int, thread_id: int | None) -> list[str]:
+    """Привязать вид события к теме. Вернуть виды, слетевшие при смене группы.
 
     Группа задаётся здесь же: отдельной команды «запомни группу» нет
     намеренно — она позволила бы привязать темы к одной группе, а писать в
     другую, и разошлось бы это молча.
+
+    Отсюда же и главная осторожность. Номер темы принадлежит СВОЕЙ группе:
+    в другой он означает другую тему или не означает ничего. Поэтому
+    команда, выполненная в чужом чате, не «добавляет ещё одну группу», а
+    переносит журнал целиком — и прежние привязки надо снять, иначе четыре
+    из пяти видов молча уйдут в никуда. Список снятых возвращается, чтобы
+    экран сказал о нём вслух, а не поставил владельца перед фактом.
     """
     data = _load_admin()
-    data["log_chat"] = int(chat_id)
+    old_chat = int(data.get("log_chat") or 0)
     topics = dict(data.get("log_topics") or {})
+    dropped: list[str] = []
+    if old_chat and int(chat_id) != old_chat:
+        dropped = sorted(k for k in topics if k != kind)
+        topics = {}
+    data["log_chat"] = int(chat_id)
     if thread_id:
         topics[kind] = int(thread_id)
     else:
         topics.pop(kind, None)             # общий поток группы, не тема
     data["log_topics"] = topics
     _save_admin(data)
+    return dropped
+
+
+def clear_log_topic(kind: str) -> bool:
+    """Отвязать один вид, не трогая остальные. Отвечает, было ли что снимать.
+
+    Без этого «ошибся темой» лечилось бы выключением журнала целиком — то
+    есть потерей четырёх правильных привязок из-за одной неправильной.
+    """
+    data = _load_admin()
+    topics = dict(data.get("log_topics") or {})
+    if kind not in topics:
+        return False
+    topics.pop(kind)
+    data["log_topics"] = topics
+    _save_admin(data)
+    return True
 
 
 def clear_log_target() -> None:

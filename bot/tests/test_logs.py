@@ -304,5 +304,60 @@ class BindingNeverAnswersWithSilence(unittest.TestCase):
         self.assertIn("не прошла", said[0])
 
 
+class AWrongBindingIsUndoableWithoutLosingTheRest(Bench):
+    """«Сделал не в том чате» обязано чиниться, и не ценой остального.
+
+    Номер темы принадлежит СВОЕЙ группе: в другой он означает другую тему
+    или не означает ничего. Поэтому команда, выполненная в чужом чате, не
+    добавляет вторую группу, а переносит журнал целиком — и четыре
+    оставшиеся привязки начинают указывать в никуда. Молча это делать
+    нельзя: снаружи журнал просто перестанет писаться, причём частично.
+    """
+
+    def test_repeating_in_the_right_topic_overwrites(self):
+        """Самая частая отмена: ошибся темой — повтори в нужной."""
+        storage.set_log_topic("trial", -100111, 5)
+        storage.set_log_topic("trial", -100111, 9)
+        self.assertEqual(storage.get_log_target()["topics"]["trial"], 9)
+
+    def test_one_kind_can_be_unbound_alone(self):
+        """Иначе одна ошибка стоила бы четырёх правильных привязок."""
+        storage.set_log_topic("trial", -100111, 5)
+        storage.set_log_topic("users", -100111, 6)
+        self.assertTrue(storage.clear_log_topic("trial"))
+        left = storage.get_log_target()["topics"]
+        self.assertNotIn("trial", left)
+        self.assertEqual(left.get("users"), 6)
+
+    def test_unbinding_something_unbound_says_so(self):
+        self.assertFalse(storage.clear_log_topic("payment"))
+
+    def test_binding_in_another_chat_drops_the_stale_ones(self):
+        """Оставить их — значит писать номера тем одной группы в другую."""
+        storage.set_log_topic("trial", -100111, 5)
+        storage.set_log_topic("users", -100111, 6)
+        dropped = storage.set_log_topic("payment", -100222, 7)
+        self.assertEqual(dropped, ["trial", "users"])
+        target = storage.get_log_target()
+        self.assertEqual(target["chat"], -100222)
+        self.assertEqual(target["topics"], {"payment": 7})
+
+    def test_the_move_is_reported_not_done_silently(self):
+        """Тихий переезд оставил бы владельца с журналом, который пишет
+        только одну тему из пяти, — и без единого слова о причине."""
+        storage.set_log_topic("trial", -100111, 5)
+        self.assertEqual(storage.set_log_topic("users", -100222, 7), ["trial"])
+
+    def test_rebinding_in_the_same_chat_drops_nothing(self):
+        """Обычная работа не должна выглядеть как переезд."""
+        storage.set_log_topic("trial", -100111, 5)
+        self.assertEqual(storage.set_log_topic("users", -100111, 6), [])
+        self.assertEqual(len(storage.get_log_target()["topics"]), 2)
+
+    def test_the_first_binding_ever_drops_nothing(self):
+        storage.clear_log_target()
+        self.assertEqual(storage.set_log_topic("trial", -100111, 5), [])
+
+
 if __name__ == "__main__":
     unittest.main()
