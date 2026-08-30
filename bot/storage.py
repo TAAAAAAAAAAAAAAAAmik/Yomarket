@@ -361,8 +361,20 @@ def _write_blob(key: str, data: dict) -> None:
     if not _USE_DB:
         path = _BLOBS[key]
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
+        # Не `open(path, "w")`: он обнуляет файл ДО записи, и процесс,
+        # убитый посередине (перезагрузка, нехватка памяти, `systemctl
+        # restart` в неудачный миг), оставляет обрезанный JSON. Это не
+        # «половина настроек», а ноль: файл перестаёт разбираться целиком,
+        # и продавец теряет токен, правила автоответа и цены разом.
+        # Пишем рядом и подменяем одним движением — `os.replace` в пределах
+        # одной файловой системы атомарен. fsync до подмены: без него
+        # переименование может доехать до диска раньше содержимого.
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
         return
     raw = json.dumps(data, ensure_ascii=False)
     with _db_lock:
