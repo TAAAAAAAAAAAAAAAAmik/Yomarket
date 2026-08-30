@@ -224,5 +224,85 @@ class EveryTopicInTheGroupHasAKind(unittest.TestCase):
                 self.assertIn(kind, written, f"в тему «{title}» никто не пишет")
 
 
+class BindingNeverAnswersWithSilence(unittest.TestCase):
+    """`/log_here` в группе не ответил вовсе — и это выглядело как «команды
+    не существует».
+
+    Причина была другая: сообщение отправлено «от имени группы». При такой
+    отправке Telegram не называет человека — вместо него приходит служебный
+    аккаунт, проверка прав не проходит, и обработчик выходил молча. Владелец
+    в этот момент чинит не то: перезапускает бота, проверяет версию, ищет
+    опечатку в команде.
+    """
+
+    def setUp(self):
+        self._admin = dict(storage._load_admin())
+
+    def tearDown(self):
+        storage._save_admin(self._admin)
+
+    def _say(self, sender_chat=None, uid=storage.OWNER_ID, args=""):
+        from handlers import commands as C
+
+        said = []
+
+        class Chat:
+            id = -1002222
+
+        class Msg:
+            text = f"/log_here {args}".strip()
+            chat = Chat()
+            message_thread_id = 5
+            bot = None
+
+            def __init__(self):
+                self.from_user = type("U", (), {"id": uid})()
+                self.sender_chat = sender_chat
+
+            async def answer(self, text, **kw):
+                said.append(text)
+
+        run(C.cmd_log_here(Msg()))
+        return said
+
+    def test_an_anonymous_sender_is_told_why(self):
+        said = self._say(sender_chat=object(), args="users")
+        self.assertTrue(said, "бот промолчал — снаружи это «команды нет»")
+        self.assertIn("от имени группы", said[0])
+
+    def test_an_anonymous_sender_is_told_how_to_fix_it(self):
+        """Совет обязан быть выполнимым: правило проекта — не советовать
+        невозможного."""
+        said = self._say(sender_chat=object(), args="users")
+        self.assertIn("анонимн", said[0].lower())
+
+    def test_an_anonymous_sender_binds_nothing(self):
+        """Прав мы не проверили — значит и привязывать нельзя."""
+        storage.clear_log_target()
+        self._say(sender_chat=object(), args="users")
+        self.assertEqual(storage.get_log_target()["chat"], 0)
+
+    def test_a_stranger_is_told_and_shown_their_id(self):
+        """Владелец мог писать с другого аккаунта — без номера он этого не
+        поймёт."""
+        said = self._say(uid=999123)
+        self.assertTrue(said, "бот промолчал")
+        self.assertIn("999123", said[0])
+
+    def test_an_admin_binds_and_gets_an_answer(self):
+        storage.clear_log_target()
+        said = self._say(args="users")
+        self.assertTrue(said)
+        self.assertEqual(storage.get_log_target()["topics"].get("users"), 5)
+
+    def test_the_answer_says_whether_the_test_record_arrived(self):
+        """«Привязал» — не доказательство: тема могла быть закрыта."""
+        storage.clear_log_target()
+        said = self._say(args="users")
+        # Бота в заглушке нет, значит пробная запись не уйдёт — и об этом
+        # обязано быть сказано, а не «готово».
+        self.assertIn("не прошла", said[0])
+
+
 if __name__ == "__main__":
     unittest.main()

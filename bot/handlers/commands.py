@@ -271,8 +271,33 @@ async def cmd_log_here(message: Message) -> None:
     import logs
     from storage import get_log_target, is_admin, set_log_topic
 
-    if not is_admin(message.from_user.id):
-        return                              # чужим о журнале знать незачем
+    # Кто это. При анонимной отправке — «от имени группы» — Telegram НЕ
+    # называет человека: вместо него приходит служебный GroupAnonymousBot,
+    # и проверить права не по чему. Молча выйти здесь нельзя: снаружи это
+    # неотличимо от «команды не существует», а причина совсем другая.
+    anon = getattr(message, "sender_chat", None)
+    if anon is not None:
+        await message.answer(ui.screen(
+            "🕶 <b>Не вижу, кто ты</b>",
+            ["Сообщение отправлено <b>от имени группы</b>, а в этом случае "
+             "Telegram не называет человека — вместо него приходит "
+             "служебный аккаунт.",
+             "",
+             "Отправь ещё раз от себя. Переключатель — кружок справа от "
+             "поля ввода; если его нет, сними «Оставаться анонимным» в "
+             "своих правах администратора группы."]))
+        return
+
+    uid = message.from_user.id if message.from_user else 0
+    if not is_admin(uid):
+        # Тоже говорим вслух: если владелец завёл группу и пишет туда с
+        # другого аккаунта, тишина отправит его чинить не то.
+        await message.answer(ui.screen(
+            "🔒 <b>Журналом распоряжается админ бота</b>",
+            [f"Твой номер: <code>{uid}</code> — среди админов его нет.",
+             "",
+             "Админы добавляются в «👑 Админ-панель» в личке с ботом."]))
+        return
 
     chat = getattr(message.chat, "id", 0)
     thread = getattr(message, "message_thread_id", None)
