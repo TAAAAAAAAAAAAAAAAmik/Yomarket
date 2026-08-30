@@ -255,10 +255,13 @@ class TheGreetingSellsBeforeItInstructs(unittest.TestCase):
         self.assertNotIn("Создать токен", said.now)
 
     def test_the_greeting_offers_to_connect(self):
+        """Приветствие стало витриной — кнопок несколько. Но подключение
+        среди них главное и стоит первым: остальные ведут читать, а эта —
+        работать."""
         said, _ = self._start()
         kb = texts(said.markup)
-        self.assertEqual(len(kb), 1, f"кнопок должно быть одна, а их {kb}")
-        self.assertIn("одключ", kb[0])
+        self.assertIn("одключ", kb[0], f"подключение не первое: {kb}")
+        self.assertLessEqual(len(kb), 5, f"витрина превратилась в список: {kb}")
 
     def test_a_token_pasted_without_pressing_anything_is_still_caught(self):
         """Кто уже знает, где брать токен, кнопку не нажмёт."""

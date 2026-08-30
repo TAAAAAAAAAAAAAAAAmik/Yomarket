@@ -250,13 +250,18 @@ class TheAdminCanSetAllOfIt(unittest.TestCase):
         src = (Path(__file__).resolve().parents[1] / "main.py").read_text()
         self.assertIn("price_lines", src)
 
-    def test_the_trial_is_handed_out_by_start_and_not_by_some_other_screen(self):
+    def test_the_trial_is_handed_out_only_by_its_own_buttons(self):
         """Проверяется ФУНКЦИЯ, а не наличие строки в файле.
 
         Первая версия этого теста искала «start_trial» по всему файлу — и
         прошла бы, когда выдача пробы по ошибке оказалась в экране помощи
-        «❓ Не нахожу токен» вместо `/start`. Там она падала с NameError на
-        каждое нажатие, а тест бы этого не заметил.
+        «❓ Не нахожу токен». Там она падала с NameError на каждое нажатие,
+        а тест бы этого не заметил.
+
+        Раньше проба выдавалась молча из `/start`. Теперь их две — три дня
+        без условий и неделя за подписку, — и обе даются по нажатию: молчаливая
+        выдача обесценивала условие, а выбор между сроками делала за
+        человека. Значит и мест выдачи ровно два, по кнопке на каждое.
         """
         import ast
         src = (Path(__file__).resolve().parents[1]
@@ -264,9 +269,8 @@ class TheAdminCanSetAllOfIt(unittest.TestCase):
         where = {n.name for n in ast.walk(ast.parse(src))
                  if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
                  and "start_trial" in ast.dump(n)}
-        self.assertIn("cmd_start", where)
-        self.assertEqual(where - {"cmd_start"}, set(),
-                         f"проба выдаётся не только из /start: {where}")
+        self.assertEqual(where, {"trial_free"},
+                         f"проба выдаётся не только своей кнопкой: {where}")
 
 
 class TheWeekIsTheShortestPaidTier(unittest.TestCase):

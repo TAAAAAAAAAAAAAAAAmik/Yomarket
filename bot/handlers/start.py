@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-30-week-tier"
+BOT_VERSION = "2026-08-30-showcase"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -102,17 +102,35 @@ async def _show_keyboard(message) -> None:
     save_settings(message.from_user.id, settings)
 
 
-def _hello_kb() -> "InlineKeyboardMarkup":
-    """Кнопка под приветствием — одна.
+def _hello_kb(uid: int = 0) -> "InlineKeyboardMarkup":
+    """Кнопки под приветствием.
 
     Раньше приветствие сразу заканчивалось шагом 1: как достать токен из
     панели. Но человек на этом экране ещё не решил подключаться — он читает
     инструкцию к тому, чего не собирался делать, и закрывает бота. Сначала
     «что я умею», и только по нажатию — «как это включить».
+
+    Кнопки проб показываются, только пока проба положена. Кнопка «3 дня»
+    тому, кто их уже брал, — обещание невозможного: нажатие ответит
+    отказом, и виноватым будет выглядеть бот.
     """
+    from storage import (get_trial_days, get_trial_free_days,
+                         get_trial_channel, trial_used)
     b = InlineKeyboardBuilder()
     b.button(text="🔌 Подключить магазин", callback_data="start:connect")
-    return ui.lay(b).as_markup()
+    solo = {"start:connect"}
+    if uid and not trial_used(uid):
+        free_days = get_trial_free_days()
+        long_days = get_trial_days()
+        if free_days > 0:
+            b.button(text=f"🎁 {free_days} дня доступа",
+                     callback_data="trial:free")
+        if long_days > 0 and get_trial_channel():
+            b.button(text=f"📣 {long_days} дней за подписку",
+                     callback_data="trial:offer")
+    b.button(text="💳 Тарифы", callback_data="menu:prices")
+    b.button(text="🧡 Поддержка", callback_data="menu:help")
+    return ui.lay(b, solo=solo).as_markup()
 
 
 def _welcome_kb(back: bool = False) -> "InlineKeyboardMarkup":
@@ -183,7 +201,25 @@ def _trial_kb() -> "InlineKeyboardMarkup":
     if url:
         b.button(text="📣 Открыть канал", url=url)
     b.button(text="✅ Я подписался", callback_data="trial:check")
+    b.button(text="⬅️ Назад", callback_data="start:hello")
     return ui.lay(b).as_markup()
+
+
+def _welcome_text() -> str:
+    """Приветствие с настоящими числами: сроки проб и цена.
+
+    Числа берутся из настроек, а не пишутся в тексте: владелец меняет их в
+    админке, и приветствие, обещающее прежние, — то же враньё, только на
+    первом экране.
+    """
+    from storage import (get_prices, get_bot_price, get_trial_days,
+                         get_trial_free_days, render_custom_text)
+    prices = [p for p in get_prices().values() if p] or (
+        [get_bot_price()] if get_bot_price() else [])
+    price = f" — от {min(prices)} ₽" if prices else ""
+    return render_custom_text("welcome", цена=price,
+                              проба=get_trial_free_days(),
+                              неделя=get_trial_days())
 
 
 def _trial_offer_text() -> str:
@@ -197,6 +233,107 @@ def _trial_offer_text() -> str:
          "",
          "<i>Даётся один раз. Отписаться потом можно — неделю это не "
          "отнимет.</i>"])
+
+
+@router.callback_query(F.data == "trial:offer")
+async def trial_offer(callback: CallbackQuery, state: FSMContext) -> None:
+    """Показать канал и кнопку проверки.
+
+    Без этого экрана «7 дней за подписку» вела прямо на проверку: не
+    подписан — получи отказ и ищи канал сам. Ссылку надо дать до отказа, а
+    не вместо него.
+    """
+    from storage import trial_used
+    if trial_used(callback.from_user.id):
+        await callback.answer("Пробный период уже брали — он даётся один раз",
+                              show_alert=True)
+        return
+    await callback.message.edit_text(_trial_offer_text(),
+                                     reply_markup=_trial_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "trial:free")
+async def trial_free(callback: CallbackQuery, state: FSMContext) -> None:
+    """Короткая проба — без условий, по одному нажатию.
+
+    Отметка «уже брал» у обеих проб одна: взял три дня — неделя за подписку
+    уже не положена. Сказать об этом надо ДО выдачи, а не после: человек,
+    узнавший постфактум, что нажатием лишил себя четырёх дней, будет прав
+    в своём недовольстве.
+    """
+    import logs
+    from storage import get_trial_free_days, start_trial, trial_used
+
+    uid = callback.from_user.id
+    if trial_used(uid):
+        await callback.answer("Пробный период уже брали — он даётся один раз",
+                              show_alert=True)
+        return
+    days = start_trial(uid, get_trial_free_days())
+    if not days:
+        # Проба выключена владельцем или подписка уже действует. Молчать
+        # нельзя: кнопка нажата, ничего не произошло.
+        await callback.answer("Сейчас пробный период не выдаётся",
+                              show_alert=True)
+        return
+    await logs.log_event(callback.bot, "trial",
+                         [f"Открыт пробный период: <b>{days} дн.</b>",
+                          "Без условий, по кнопке."],
+                         user=callback.from_user)
+    await callback.message.edit_text(ui.screen(
+        f"🎁 <b>{days} дня доступа открыты</b>",
+        ["Полный доступ — без оплаты.",
+         "",
+         "Цепляй магазин, и автоматика заработает сразу."]),
+        reply_markup=_hello_kb(uid))
+    await callback.answer("Готово")
+    await state.set_state(AuthState.waiting_for_token)
+
+
+@router.callback_query(F.data == "menu:prices")
+async def show_prices(callback: CallbackQuery) -> None:
+    """Тарифы с первого экрана — до подключения магазина."""
+    from storage import get_support_contact, price_lines
+    rows = price_lines()
+    b = InlineKeyboardBuilder()
+    b.button(text="💳 Прошу счёт", callback_data="sub:order")
+    b.button(text="⬅️ Назад", callback_data="start:hello")
+    await callback.message.edit_text(ui.screen(
+        "💳 <b>Тарифы</b>",
+        rows or ["<i>Цены пока не назначены — напиши, договоримся.</i>"],
+        footer=f"<i>Оплата вне бота. Вопросы — {ui.esc(get_support_contact())}"
+               "</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:help")
+async def show_help(callback: CallbackQuery) -> None:
+    from storage import get_support_contact
+    contact = get_support_contact()
+    b = InlineKeyboardBuilder()
+    if contact.startswith("@"):
+        b.button(text=f"✍️ Написать {contact}",
+                 url=f"https://t.me/{contact[1:]}")
+    b.button(text="📄 Документы и условия", callback_data="menu:policy")
+    b.button(text="⬅️ Назад", callback_data="start:hello")
+    await callback.message.edit_text(ui.screen(
+        "🧡 <b>Поддержка</b>",
+        [f"Пиши сюда: {ui.esc(contact)}",
+         "",
+         "Если что-то не работает, приложи <code>/version</code> — с ним "
+         "отвечу сразу, без встречных вопросов."]),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "start:hello")
+async def back_to_hello(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        _welcome_text(), reply_markup=_hello_kb(callback.from_user.id),
+        disable_web_page_preview=True)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "trial:check")
@@ -239,10 +376,11 @@ async def trial_check(callback: CallbackQuery, state: FSMContext) -> None:
          "",
          "Цепляй магазин — и автоматика заработает сразу."]))
     await callback.answer("Готово")
-    await callback.message.answer(render_custom_text("welcome"),
-                                  reply_markup=_hello_kb(),
+    await callback.message.answer(_welcome_text(),
+                                  reply_markup=_hello_kb(callback.from_user.id),
                                   disable_web_page_preview=True)
     await state.set_state(AuthState.waiting_for_token)
+
 
 
 @router.message(CommandStart())
@@ -263,47 +401,25 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         await _send_menu(message, message.from_user.id)
         return
 
-    from storage import render_custom_text, start_trial
-
-    # Пробный период — при первом заходе, до просьбы прислать токен: человек
-    # должен увидеть, что доступ у него уже есть, а не гадать, дадут ли.
-    # `start_trial` сам решает, положен ли он, и отвечает нулём, когда нет, —
-    # тогда о пробном периоде не говорится ни слова. Обещание «три дня»
-    # тому, кто их уже брал, — обещание невозможного.
+    # Пробный период больше не выдаётся молча: обе пробы — кнопки на самой
+    # витрине. Тихая выдача обесценивала условие («подпишись — дадим
+    # неделю»), потому что доступ и так уже был, а выбор между тремя днями
+    # и неделей делал за человека бот.
     import logs
-    from storage import (get_trial_channel, get_trial_days, trial_used)
+    from storage import trial_used
 
-    channel = get_trial_channel()
-    fresh = not trial_used(message.from_user.id)
     await logs.log_event(message.bot, "users",
                          ["Зашёл в бота впервые."
-                          if fresh else "Вернулся, магазин не подключён."],
+                          if not trial_used(message.from_user.id) else
+                          "Вернулся, магазин не подключён."],
                          user=message.from_user)
-
-    if channel and fresh and get_trial_days() > 0:
-        # Условие есть — значит и выдача по кнопке. Молча выдать неделю,
-        # обещав её за подписку, значит обесценить условие: продавец
-        # решит, что подписываться незачем, и будет прав.
-        await message.answer(_trial_offer_text(), reply_markup=_trial_kb())
-    else:
-        days = start_trial(message.from_user.id)
-        if days:
-            await logs.log_event(
-                message.bot, "trial",
-                [f"Открыт пробный период: <b>{days} дн.</b>"],
-                user=message.from_user)
-            await message.answer(ui.screen(
-                "🎁 <b>Пробный период открыт</b>",
-                [f"Полный доступ на <b>{days} дн.</b> — без оплаты.",
-                 "",
-                 "Цепляй магазин — и автоматика заработает сразу."]))
 
     # Состояние ставим сразу, хотя инструкции ещё не показали: если человек
     # уже знает, где брать токен, и вставит его не нажимая кнопку — форма
     # обязана его принять, а не промолчать.
     await state.set_state(AuthState.waiting_for_token)
-    await message.answer(render_custom_text("welcome"),
-                         reply_markup=_hello_kb(),
+    await message.answer(_welcome_text(),
+                         reply_markup=_hello_kb(message.from_user.id),
                          disable_web_page_preview=True)
 
 
