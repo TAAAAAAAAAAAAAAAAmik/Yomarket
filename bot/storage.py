@@ -1098,6 +1098,68 @@ POLICY_DOCS: tuple[tuple[str, str], ...] = (
 # лежит здесь же, рядом со ссылками на документы. Значение по умолчанию —
 # тот же адрес, что назван в правовых документах: два разных контакта в
 # документах и на экране поддержки означали бы, что один из них неверный.
+# --- Журнал событий в группу владельца --------------------------------------
+#
+# Группа и темы принадлежат владельцу бота, а не продавцу, поэтому лежат в
+# общем хранилище рядом с контактом поддержки и ссылками на документы.
+#
+# Номер темы хранится ОТДЕЛЬНО от номера группы намеренно: тему можно
+# удалить, не трогая группу, и тогда запись должна уйти в общий поток, а не
+# пропасть. Слитый воедино адрес такого различить бы не дал.
+
+
+def get_log_target() -> dict:
+    """Куда писать журнал: {"chat": id, "topics": {вид: номер темы}}."""
+    data = _load_admin()
+    return {
+        "chat": data.get("log_chat") or 0,
+        "topics": dict(data.get("log_topics") or {}),
+        "error": str(data.get("log_error") or ""),
+    }
+
+
+def set_log_topic(kind: str, chat_id: int, thread_id: int | None) -> None:
+    """Привязать вид события к теме.
+
+    Группа задаётся здесь же: отдельной команды «запомни группу» нет
+    намеренно — она позволила бы привязать темы к одной группе, а писать в
+    другую, и разошлось бы это молча.
+    """
+    data = _load_admin()
+    data["log_chat"] = int(chat_id)
+    topics = dict(data.get("log_topics") or {})
+    if thread_id:
+        topics[kind] = int(thread_id)
+    else:
+        topics.pop(kind, None)             # общий поток группы, не тема
+    data["log_topics"] = topics
+    _save_admin(data)
+
+
+def clear_log_target() -> None:
+    """Выключить журнал целиком. Без этого «перестань писать» делалось бы
+    удалением бота из группы, то есть наугад."""
+    data = _load_admin()
+    data.pop("log_chat", None)
+    data.pop("log_topics", None)
+    data.pop("log_error", None)
+    _save_admin(data)
+
+
+def note_log_error(why: str) -> None:
+    """Запомнить последнюю беду журнала — её показывает /log_here.
+
+    Пустая строка стирает отметку: журнал, починившийся сам, не должен
+    вечно показывать старую жалобу.
+    """
+    data = _load_admin()
+    if why:
+        data["log_error"] = str(why)[:300]
+    else:
+        data.pop("log_error", None)
+    _save_admin(data)
+
+
 SUPPORT_DEFAULT = "@YoMhelp"
 
 

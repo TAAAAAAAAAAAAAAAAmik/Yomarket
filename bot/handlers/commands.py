@@ -255,3 +255,111 @@ async def cmd_pubg(message: Message) -> None:
          "только номиналов поставщика — угадывать их нельзя, промах здесь "
          "означает купленный не тот товар.</i>"]),
         reply_markup=ui.lay(b).as_markup())
+
+
+# --- Журнал в группу --------------------------------------------------------
+#
+# Номер группы и номер темы нигде не показываются: их не «узнают», а
+# приносят — командой, запущенной в нужной теме. Просить владельца найти
+# `-1002…` и `message_thread_id` руками значит просить его ошибиться.
+
+@router.message(Command("log_here"))
+async def cmd_log_here(message: Message) -> None:
+    """Привязать эту тему к виду событий. Без слова — показать, что есть."""
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+    import logs
+    from storage import get_log_target, is_admin, set_log_topic
+
+    if not is_admin(message.from_user.id):
+        return                              # чужим о журнале знать незачем
+
+    chat = getattr(message.chat, "id", 0)
+    thread = getattr(message, "message_thread_id", None)
+    parts = (message.text or "").split()
+    want = parts[1].strip().lower() if len(parts) > 1 else ""
+    known = {k for k, _t, _h in logs.KINDS}
+
+    if want and want in known:
+        set_log_topic(want, chat, thread)
+        where = f"тема <code>{thread}</code>" if thread else "общий поток"
+        # «Привязал» — не доказательство. Пишем пробную запись и говорим,
+        # дошла ли она: тема могла быть закрыта, а права отобраны.
+        ok = await logs.log_event(
+            message.bot, want,
+            ["<i>проверка связи — так будут выглядеть записи</i>"])
+        await message.answer(ui.screen(
+            "📋 <b>Тема привязана</b>" if ok else
+            "⚠️ <b>Привязал, но запись не прошла</b>",
+            [f"<b>{logs.KIND_TITLES[want]}</b> → {where}",
+             "",
+             "Пробная запись отправлена — она выше." if ok else
+             "Пробная запись не отправилась. Причина в личке у владельца."]))
+        return
+
+    target = get_log_target()
+    topics = target.get("topics") or {}
+    rows = []
+    for kind, title, hint in logs.KINDS:
+        bound = topics.get(kind)
+        rows.append(("✅" if bound else "—")
+                    + f" <code>{kind}</code> · {title}"
+                    + (f"  (тема {bound})" if bound else "")
+                    + f"\n     <i>{hint}</i>")
+    body = [f"Группа: <code>{target.get('chat') or 'не задана'}</code>", ""]
+    body += rows
+    if want:
+        body = [f"⚠️ Вида «{ui.esc(want)}» нет. Возможные — ниже.", ""] + body
+    if target.get("error"):
+        body += ["", f"❗ Последняя беда: <code>{ui.esc(target['error'])}</code>"]
+
+    b = InlineKeyboardBuilder()
+    b.button(text="🗑 Выключить журнал", callback_data="log:off")
+    await message.answer(ui.screen(
+        "📋 <b>Журнал в группу</b>", body,
+        footer="<i>Зайди в нужную тему и напиши там "
+               "<code>/log_here вид</code> — например "
+               "<code>/log_here trial</code>.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+
+
+@router.callback_query(lambda c: c.data == "log:off")
+async def log_off(callback) -> None:
+    from storage import clear_log_target, is_admin
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Только для админов", show_alert=True)
+        return
+    clear_log_target()
+    await callback.message.edit_text(ui.screen(
+        "📋 <b>Журнал выключен</b>",
+        ["Записи в группу больше не идут.",
+         "",
+         "Включить обратно — <code>/log_here вид</code> в нужной теме."]))
+    await callback.answer()
+
+
+@router.callback_query(lambda c: c.data == "sub:order")
+async def sub_order(callback) -> None:
+    """«Прошу счёт» — заявка владельцу.
+
+    Раньше экран подписки просто советовал написать владельцу. Половина не
+    писала: искать, кому именно, — отдельное усилие в момент, когда бот
+    только что отказал. Здесь усилие ровно одно — нажать кнопку, а найти
+    человека уже задача владельца, у которого в группе появилась заявка.
+    """
+    import logs
+    from storage import get_support_contact, price_lines
+
+    ok = await logs.log_event(callback.bot, "order",
+                              ["Просит выставить счёт на подписку."],
+                              user=callback.from_user)
+    rows = price_lines()
+    body = ["Заявка ушла владельцу — он напишет сюда же." if ok else
+            "Заявку записать не вышло, поэтому напиши напрямую: "
+            f"{ui.esc(get_support_contact())}"]
+    if rows:
+        body += ["", *rows]
+    await callback.message.answer(ui.screen(
+        "💳 <b>Заявка на оплату</b>", body,
+        footer=f"<i>Если ответа долго нет — {ui.esc(get_support_contact())}</i>"))
+    await callback.answer("Заявка отправлена" if ok else "Напиши в поддержку")

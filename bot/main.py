@@ -62,10 +62,19 @@ class AccessMiddleware:
                     msg = render_custom_text("subscription", price=price_line)
                     try:
                         from aiogram.types import CallbackQuery as _CQ, Message as _Msg
+                        # Кнопка «прошу счёт»: без неё продавец, упёршийся
+                        # в подписку, должен сам догадаться написать
+                        # владельцу — и половина не догадывается, а просто
+                        # уходит. Нажатие попадает в журнал, в тему «Ордер
+                        # на оплату», вместе с номером человека.
+                        from aiogram.utils.keyboard import InlineKeyboardBuilder
+                        kb = InlineKeyboardBuilder()
+                        kb.button(text="💳 Прошу счёт", callback_data="sub:order")
                         if isinstance(event, _CQ):
                             await event.answer("🔒 Нужна подписка", show_alert=True)
                         elif isinstance(event, _Msg):
-                            await event.answer(msg)
+                            await event.answer(msg,
+                                               reply_markup=kb.as_markup())
                     except Exception:
                         pass
                     return

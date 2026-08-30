@@ -48,6 +48,7 @@ class Sent:
     def __init__(self, text, markup=None):
         self.text, self.markup = text, markup
         self.edits: list[tuple[str, object]] = []
+        self.bot = None
 
     async def edit_text(self, text, reply_markup=None, **kw):
         self.edits.append((text, reply_markup))
@@ -65,6 +66,9 @@ class FakeMessage:
         self.sent: list[Sent] = []
         self.deleted = False
         self._deletable = deletable
+        # У настоящего Message бот есть всегда — через него уходит журнал
+        # событий владельцу.
+        self.bot = None
 
     async def answer(self, text, reply_markup=None, **kw):
         s = Sent(text, reply_markup)

@@ -209,6 +209,11 @@ async def _do_grant(msg, state: FSMContext, days: int, admin_id: int, bot: Bot) 
         return
     grant_subscription(target, days, by=admin_id)
     left = subscription_days_left(target)
+    import logs
+    await logs.log_event(msg.bot, "payment",
+                         [f"Выдано <b>{days} дн.</b> — осталось {left} дн.",
+                          f"Кто выдал: <code>{admin_id}</code>"],
+                         user=target)
     b = InlineKeyboardBuilder()
     b.button(text="🎫 Ещё подписку", callback_data="admin:sub")
     b.button(text="⬅️ Админ-панель", callback_data="admin:menu")

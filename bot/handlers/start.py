@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-30-commands"
+BOT_VERSION = "2026-08-30-logs"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -160,7 +160,17 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     # тогда о пробном периоде не говорится ни слова. Обещание «три дня»
     # тому, кто их уже брал, — обещание невозможного.
     days = start_trial(message.from_user.id)
+    # Журнал владельцу. Пробный период выдаётся один раз, поэтому его выдача
+    # и есть признак нового человека: отдельного счётчика заводить не надо.
+    import logs
+    await logs.log_event(message.bot, "users",
+                         ["Зашёл в бота впервые."
+                          if days else "Вернулся, магазин не подключён."],
+                         user=message.from_user)
     if days:
+        await logs.log_event(message.bot, "trial",
+                             [f"Открыт пробный период: <b>{days} дн.</b>"],
+                             user=message.from_user)
         await message.answer(ui.screen(
             "🎁 <b>Пробный период открыт</b>",
             [f"Полный доступ на <b>{days} дн.</b> — без оплаты.",
@@ -485,6 +495,13 @@ async def _connect(uid: int, token: str, wait: Message, state: FSMContext,
 
     name, balance = _extract_shop(info)
     save_shop_name(uid, name)
+
+    # В журнал уходит НАЗВАНИЕ магазина, а не токен: токен здесь под рукой,
+    # и записать его было бы проще всего — поэтому оговорка нужна прямо тут.
+    import logs
+    await logs.log_event(wait.bot, "account",
+                         [f"Подключил магазин: <b>{ui.esc(name)}</b>"],
+                         user=uid)
 
     if task_manager:
         task_manager.start_for_user(uid)
