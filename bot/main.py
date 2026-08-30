@@ -20,7 +20,7 @@ from aiogram.types import TelegramObject
 from config import BOT_TOKEN
 from api.yoomarket import YooMarketAPI
 from storage import get_token
-from handlers import accounts, admin, ads, approute, auto_settings, autopilot, balance, chats, create_ad, fallback, notifications, nsgifts, orders, packs, panel, panel_items, plugins, policy, prices, responders, selenium_settings, settings, start, stats
+from handlers import accounts, admin, ads, approute, auto_settings, autopilot, balance, chats, commands, create_ad, fallback, notifications, nsgifts, orders, packs, panel, panel_items, plugins, policy, prices, responders, selenium_settings, settings, start, stats
 from tasks import TaskManager
 
 logging.basicConfig(
@@ -458,6 +458,10 @@ async def main() -> None:
     dp.include_router(stats.router)
     dp.include_router(panel.router)
     dp.include_router(policy.router)
+    # Команды-ярлыки. Позже разделов намеренно: их обработчики
+    # вызываются отсюда напрямую, и роутер нужен только ради имён
+    # команд, которых больше нигде нет.
+    dp.include_router(commands.router)
     # Последним: ловит нажатия, которые не разобрал никто. Без него такое
     # нажатие молча пропадает, и это неотличимо от сломанной кнопки.
     dp.include_router(fallback.router)

@@ -1094,6 +1094,26 @@ POLICY_DOCS: tuple[tuple[str, str], ...] = (
 )
 
 
+# Контакт поддержки. Принадлежит владельцу бота, а не продавцу, поэтому
+# лежит здесь же, рядом со ссылками на документы. Значение по умолчанию —
+# тот же адрес, что назван в правовых документах: два разных контакта в
+# документах и на экране поддержки означали бы, что один из них неверный.
+SUPPORT_DEFAULT = "@YoMhelp"
+
+
+def get_support_contact() -> str:
+    """Куда писать продавцу. Пустое значение в хранилище не считается за
+    ответ: экран поддержки без контакта — это экран, которого нет."""
+    saved = str(_load_admin().get("support") or "").strip()
+    return saved or SUPPORT_DEFAULT
+
+
+def set_support_contact(contact: str) -> None:
+    data = _load_admin()
+    data["support"] = str(contact or "").strip()
+    _save_admin(data)
+
+
 def get_policy_links() -> dict:
     """{ключ документа: ссылка}. Незаданные ключи отсутствуют, а не пусты.
 
