@@ -795,5 +795,101 @@ class AMissingCronIsSaidOutLoudNotDiedOn(unittest.TestCase):
         self.assertIn("сам не", r.stdout)
 
 
+class ARepeatRunNeverStopsToAskAQuestion(unittest.TestCase):
+    """Повторный запуск установки обязан проходить без человека.
+
+    `scripts/setup-user.sh` объявлен повторно запускаемым — им же
+    обновляются. Но `uv venv` на существующем окружении спрашивает
+    «заменить?» и ЖДЁТ ответа: на uv 0.8 это было предупреждением, на 0.12
+    стало вопросом. Скрипт, запущенный без клавиатуры — по расписанию, через
+    `ssh -n`, из другого скрипта, — завис бы там навсегда, и снаружи это
+    «обновление не проходит», без единой строчки о причине.
+
+    Второй случай тот же вопрос закрывает неправильно: если запрошена ДРУГАЯ
+    версия Python, сохранять старое окружение нельзя — `uv pip install`
+    поставил бы пакеты в окружение прежней версии, молча и не туда.
+
+    Проверяется исполнением: кусок скрипта вынимается и выполняется
+    настоящим bash со ЗАКРЫТЫМ вводом.
+    """
+
+    ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+    def _block(self):
+        text = (self.ROOT / "scripts" / "setup-user.sh").read_text()
+        start = text.index("VENV_ARG=--clear")
+        tail = '|| die "не создалось окружение под Python $PYVER"'
+        end = text.index(tail, start) + len(tail)
+        return text[start:end]
+
+    def _run(self, tmp, pyver="3.12"):
+        script = "\n".join([
+            "set -Eeuo pipefail",
+            'say(){ printf "%s\\n" "$*"; }',
+            'die(){ printf "%s\\n" "$*" >&2; exit 1; }',
+            'uv(){ echo "uv $*" >> "$REPO/../uv.calls"; }',
+            f'REPO={tmp!r}/repo',
+            f'PYVER={pyver!r}',
+            self._block(),
+            'echo ДОШЛИ-ДО-КОНЦА',
+        ])
+        return subprocess.run(["bash", "-c", script], capture_output=True,
+                              text=True, stdin=subprocess.DEVNULL, timeout=60)
+
+    def _calls(self, tmp):
+        path = os.path.join(tmp, "uv.calls")
+        if not os.path.exists(path):
+            return ""
+        with open(path) as fh:
+            return fh.read()
+
+    def _fake_venv(self, tmp, version):
+        """Окружение с питоном заданной версии — как после прошлой установки."""
+        binn = os.path.join(tmp, "repo", ".venv", "bin")
+        os.makedirs(binn, exist_ok=True)
+        py = os.path.join(binn, "python")
+        with open(py, "w") as fh:
+            fh.write("#!/bin/sh\n"
+                     f'echo "{version}"\n')
+        os.chmod(py, 0o755)
+
+    def test_it_does_not_wait_for_an_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "repo"))
+            self._fake_venv(tmp, "3.12")
+            r = self._run(tmp)
+            self.assertIn("ДОШЛИ-ДО-КОНЦА", r.stdout,
+                          f"застряли на вопросе. stderr: {r.stderr}")
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_an_existing_environment_of_the_right_version_is_kept(self):
+        """Пересоздавать его — это заново качать все зависимости на каждом
+        обновлении, минуты вместо секунд."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "repo"))
+            self._fake_venv(tmp, "3.12")
+            self._run(tmp)
+            self.assertIn("--allow-existing", self._calls(tmp))
+            self.assertNotIn("--clear", self._calls(tmp))
+
+    def test_an_environment_of_the_wrong_version_is_rebuilt(self):
+        """Иначе пакеты поставились бы в окружение прежней версии — молча."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "repo"))
+            self._fake_venv(tmp, "3.10")
+            r = self._run(tmp, pyver="3.12")
+            self.assertIn("--clear", self._calls(tmp))
+            self.assertNotIn("--allow-existing", self._calls(tmp))
+            self.assertIn("пересоздаю", r.stdout,
+                          "пересобрал окружение и не сказал об этом")
+
+    def test_a_first_install_just_builds_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "repo"))
+            r = self._run(tmp)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("--clear", self._calls(tmp))
+
+
 if __name__ == "__main__":
     unittest.main()

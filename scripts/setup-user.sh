@@ -114,7 +114,24 @@ fi
 
 # --- 4. Зависимости -------------------------------------------------------
 step "Окружение и зависимости"
-uv venv --python "$PYVER" "$REPO/.venv" >/dev/null \
+# На повторном запуске uv спрашивает «окружение уже есть, заменить?» и ЖДЁТ
+# ответа. Скрипт объявлен повторно запускаемым, а значит может идти без
+# человека у клавиатуры — и там он завис бы навсегда. (На uv 0.8 это было
+# ещё предупреждением, на 0.12 стало вопросом; поймано живым обновлением
+# 30.08.) Поэтому решаем сами, а не спрашиваем:
+#   версия та же  → --allow-existing, окружение и пакеты остаются целы;
+#   версия другая → --clear, иначе `uv pip install` ставил бы пакеты в
+#                   окружение СТАРОЙ версии, молча и не туда.
+VENV_ARG=--clear
+if [ -x "$REPO/.venv/bin/python" ]; then
+    HAVE_PY="$("$REPO/.venv/bin/python" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)"
+    if [ "$HAVE_PY" = "$PYVER" ]; then
+        VENV_ARG=--allow-existing
+    else
+        say "окружение собрано под Python ${HAVE_PY:-неизвестно}, нужен $PYVER — пересоздаю"
+    fi
+fi
+uv venv --python "$PYVER" "$VENV_ARG" "$REPO/.venv" >/dev/null </dev/null \
     || die "не создалось окружение под Python $PYVER"
 if ! uv pip install --python "$REPO/.venv/bin/python" \
         -q -r "$REPO/bot/requirements.txt"; then
