@@ -119,6 +119,12 @@ class FakeAPI:
     shop: str = "Мой магазин"
 
 
+def _forbidden_api(*a, **kw):
+    """Маркетплейс, которого не должно быть. Меню — это кнопки из хранилища,
+    и поход в сеть за ними означал бы, что при лежащем API меню не открыть."""
+    raise AssertionError("меню полезло в маркетплейс")
+
+
 def texts(markup) -> list[str]:
     return [] if markup is None else [b.text for row in markup.inline_keyboard
                                       for b in row]
@@ -276,6 +282,80 @@ class TheGreetingSellsBeforeItInstructs(unittest.TestCase):
         self.assertIn("connect", storage.CUSTOM_TEXTS)
         self.assertNotEqual(storage.CUSTOM_TEXTS["welcome"]["default"],
                             storage.CUSTOM_TEXTS["connect"]["default"])
+
+
+class TheMenuOpensOnCommand(unittest.TestCase):
+    """`/menu` открывает меню без похода в маркетплейс.
+
+    Кнопка «⬅️ Назад» есть не на каждом экране, и из глубины настроек
+    возвращаться было нечем, кроме `/start`. А `/start` для этого не годится:
+    он спрашивает у маркетплейса название магазина — то есть ждёт сеть там,
+    где от бота ждут мгновенной кнопки, и молчит, если маркетплейс не
+    ответил.
+    """
+
+    def setUp(self):
+        self._token = S.get_token
+        self._api = S.YooMarketAPI
+        S.YooMarketAPI = _forbidden_api
+
+    def tearDown(self):
+        S.get_token = self._token
+        S.YooMarketAPI = self._api
+
+    def test_it_shows_the_menu(self):
+        S.get_token = lambda uid: "токен"
+        m, st = FakeMessage(), FakeState()
+        run(S.cmd_menu(m, st))
+        self.assertEqual(len(m.sent), 1)
+        self.assertIn("меню", m.sent[0].now.lower())
+        self.assertIsNotNone(m.sent[0].markup, "меню без кнопок — не меню")
+
+    def test_it_does_not_go_to_the_marketplace(self):
+        """Меню обязано открыться и при лежащем маркетплейсе: это кнопки,
+        а не отчёт о магазине."""
+        S.get_token = lambda uid: "токен"
+        m, st = FakeMessage(), FakeState()
+        run(S.cmd_menu(m, st))          # _forbidden_api уронил бы обращение
+        self.assertEqual(len(m.sent), 1)
+
+    def test_without_a_shop_it_says_so_instead_of_an_empty_menu(self):
+        """Половина разделов ответила бы «сначала подключи токен» — это и
+        есть та бодрая пустота, которой в боте быть не должно."""
+        S.get_token = lambda uid: ""
+        m, st = FakeMessage(), FakeState()
+        run(S.cmd_menu(m, st))
+        self.assertIn("не подключён", m.sent[0].now)
+        self.assertIn("одключ", " ".join(texts(m.sent[0].markup)))
+
+    def test_without_a_shop_it_waits_for_a_token(self):
+        """Продавец может просто прислать токен в ответ — форма должна его
+        поймать, как и после /start."""
+        S.get_token = lambda uid: ""
+        m, st = FakeMessage(), FakeState()
+        run(S.cmd_menu(m, st))
+        self.assertIsNotNone(st.state)
+
+    def test_the_command_name_is_not_taken_twice(self):
+        """Две команды с одним именем — не ошибка, а тишина: побеждает
+        роутер, подключённый раньше в main.py."""
+        import ast
+        import pathlib
+        root = pathlib.Path(S.__file__).resolve().parent
+        found = []
+        for path in sorted(root.glob("*.py")):
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                for dec in getattr(node, "decorator_list", []):
+                    for sub in ast.walk(dec):
+                        if (isinstance(sub, ast.Call)
+                                and isinstance(sub.func, ast.Name)
+                                and sub.func.id == "Command"):
+                            for arg in sub.args:
+                                if (isinstance(arg, ast.Constant)
+                                        and arg.value == "menu"):
+                                    found.append(f"{path.name}:{node.name}")
+        self.assertEqual(len(found), 1, f"/menu объявлена дважды: {found}")
 
 
 class ReadingTheHelpDoesNotCancelTheRegistration(unittest.TestCase):

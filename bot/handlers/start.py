@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-30-na-ty"
+BOT_VERSION = "2026-08-30-menu"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -174,6 +174,32 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await message.answer(render_custom_text("welcome"),
                          reply_markup=_hello_kb(),
                          disable_web_page_preview=True)
+
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message, state: FSMContext) -> None:
+    """Главное меню по команде.
+
+    Кнопка «⬅️ Назад» есть не на каждом экране, и из глубины настроек
+    возвращаться было нечем, кроме `/start`. А `/start` для этого не годится:
+    он идёт в маркетплейс за названием магазина, то есть ждёт сеть там, где
+    от бота ждут мгновенной кнопки, и молчит, если маркетплейс не ответил.
+
+    Состояние чистить не надо: брошенную форму закрывает middleware
+    `CommandsEscapeForms` — он срабатывает на любую команду и раньше
+    фильтров.
+    """
+    if not get_token(message.from_user.id):
+        # Меню без подключённого магазина — пустая витрина: половина
+        # разделов ответит «сначала подключи токен». Говорим это сразу и
+        # даём ту же кнопку, что и в приветствии.
+        await state.set_state(AuthState.waiting_for_token)
+        await message.answer(ui.screen(
+            "🔌 <b>Магазин ещё не подключён</b>",
+            ["Открывать пока нечего. Подключим — и меню появится."]),
+            reply_markup=_hello_kb())
+        return
+    await _send_menu(message, message.from_user.id)
 
 
 @router.message(Command("version"))
