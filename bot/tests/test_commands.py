@@ -206,11 +206,17 @@ class SupportHasSomewhereToWrite(unittest.TestCase):
         self.assertIn(storage.get_support_contact(),
                       (docs / "privacy.md").read_text())
 
-    def test_the_screen_asks_for_what_makes_an_answer_possible(self):
+    def test_the_screen_carries_what_makes_an_answer_possible(self):
+        """Раньше экран просил прислать `/version`. Команда стала
+        служебной — просить её значит советовать невозможное, — поэтому код
+        сборки печатается прямо здесь. Без него первый вопрос поддержки
+        будет «а какая у тебя версия», и починка начнётся с угадывания."""
+        from handlers.start import BOT_VERSION
         m = FakeMessage()
         run(C.cmd_help(m))
         said = m.sent[0].text
-        self.assertIn("/version", said)
+        self.assertIn(BOT_VERSION, said)
+        self.assertNotIn("/version", said)
         self.assertIn(storage.get_support_contact(), said)
 
 

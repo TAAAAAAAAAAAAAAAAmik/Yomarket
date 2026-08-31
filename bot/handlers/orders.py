@@ -233,7 +233,9 @@ def _why_not_in_work(s: dict, status: str, oid: str) -> str:
         return _refusal_ru(det)
     if det.get("work_skip"):
         return _esc(str(det["work_skip"]))
-    return "должен взять в работу на ближайшем проходе — иначе /version"
+    # Совет «посмотри /version» продавцу больше не годится: команда
+    # служебная. Сказать надо то же самое, но его словами.
+    return ("должен взять в работу на ближайшем проходе — если не взял, напиши в поддержку")
 
 
 @router.callback_query(OrderCallback.filter(F.action == "view"))

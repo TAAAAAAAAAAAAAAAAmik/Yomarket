@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-31-quiet-forms"
+BOT_VERSION = "2026-08-31-hidden-cmds"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -389,12 +389,16 @@ async def show_help(callback: CallbackQuery) -> None:
                  url=f"https://t.me/{contact[1:]}")
     b.button(text="📄 Документы и условия", callback_data="menu:policy:help")
     b.button(text="⬅️ Назад", callback_data="start:hello")
+    # Код сборки печатается сам, а не добывается командой: `/version`
+    # заодно рассказывал, из чего бот собран и где живёт, — продавцу это
+    # ни к чему. Здесь ровно то, что нужно поддержке.
     await callback.message.edit_text(ui.screen(
         "🧡 <b>Поддержка</b>",
         [f"Пиши сюда: {ui.esc(contact)}",
          "",
-         "Если что-то не работает, приложи <code>/version</code> — с ним "
-         "отвечу сразу, без встречных вопросов."]),
+         f"Код сборки: <code>{BOT_VERSION}</code>",
+         "<i>Приложи его к вопросу — с ним отвечу сразу, без встречных "
+         "вопросов.</i>"]),
         reply_markup=ui.lay(b).as_markup())
     await callback.answer()
 

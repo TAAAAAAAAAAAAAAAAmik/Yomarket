@@ -130,6 +130,106 @@ class AccessMiddleware:
 _COMMAND_RE = re.compile(r"^/[a-zA-Z0-9_]{1,32}(@[A-Za-z0-9_]+)?(\s|$)")
 
 
+class HideSystemCommands:
+    """Служебные команды — не для клиента.
+
+    `/version` печатал PostgreSQL, Redis, PID процесса, путь к каталогу
+    данных и имена переменных окружения; `*_debug` печатают сырые ответы
+    маркетплейса и панели. Продавец купил подписку на сервис, а не
+    экскурсию по серверу, и знать, из чего бот собран, ему незачем.
+
+    Диагностика никуда не девается — она нужна владельцу, и без неё
+    «не работает» неотличимо от «не задеплоено», — просто перестаёт быть
+    общедоступной.
+
+    Скрыто здесь значит скрыто: на чужую команду бот отвечает ровно то же,
+    что на несуществующую. «Эта команда не для тебя» рассказывало бы о
+    существовании скрытой части — то есть делало бы ровно то, чего мы
+    избегаем.
+
+    Стоит ПЕРЕД `CommandsEscapeForms`: иначе несуществующая команда сначала
+    закрыла бы продавцу наполовину заполненную форму, а потом получила бы
+    ответ «такой команды нет». Форму терять не за что.
+    """
+
+    UNKNOWN = ("🤷 Такой команды нет.\n\n"
+               "Что я умею — /menu. Если что-то не так — /help.")
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        from commandlist import is_public
+        from storage import is_admin
+        text = getattr(event, "text", "") or ""
+        user = data.get("event_from_user")
+        if (_COMMAND_RE.match(text) and user
+                and not is_public(text) and not is_admin(user.id)):
+            try:
+                await event.answer(self.UNKNOWN)
+            except Exception:
+                pass
+            return None
+        return await handler(event, data)
+
+
+async def publish_commands(bot) -> None:
+    """Список команд в кнопке «☰ Меню»: клиенту — свой, владельцу — весь.
+
+    Пока список задавали руками в BotFather, он был один на всех, и
+    служебные команды висели у каждого продавца на виду. Теперь его ставит
+    сам бот при запуске, и разъехаться с кодом он не может.
+
+    Обещать в меню то, что скрыто, нельзя, но и наоборот тоже: владельцу
+    нужен полный список, иначе диагностику придётся помнить наизусть.
+    Ошибка здесь не должна ронять запуск — меню это удобство, а не работа.
+    """
+    from aiogram.types import (BotCommand, BotCommandScopeChat,
+                               BotCommandScopeDefault)
+    from commandlist import MENU
+    from storage import OWNER_ID
+
+    # Именно область по умолчанию: список, набитый руками в BotFather,
+    # лежит в ней, и заменить его можно только ею. Область «личные чаты»
+    # накрыла бы личные, а в группах остался бы прежний перечень со всей
+    # диагностикой.
+    try:
+        await bot.set_my_commands(
+            [BotCommand(command=name, description=desc) for name, desc in MENU],
+            scope=BotCommandScopeDefault())
+    except Exception as e:                        # noqa: BLE001
+        logger.warning("список команд не обновился: %s", e)
+        return
+    if not OWNER_ID:
+        return
+    try:
+        await bot.set_my_commands(
+            [BotCommand(command=name, description=desc)
+             for name, desc in MENU + _OWNER_MENU],
+            scope=BotCommandScopeChat(chat_id=OWNER_ID))
+    except Exception as e:                        # noqa: BLE001
+        logger.warning("список команд владельца не обновился: %s", e)
+
+
+# Диагностика владельца в его собственном меню. Перечислена руками, а не
+# собрана из всех скрытых: их полсотни, и меню из полусотни строк — свалка,
+# а не меню.
+_OWNER_MENU: tuple[tuple[str, str], ...] = (
+    ("version", "Версия, хранилище, приём обновлений"),
+    ("admin", "Админ-панель"),
+    ("log_here", "Привязать журнал к этой теме"),
+    ("chat_debug", "Разбор цепочки по чату заказа"),
+    ("order_debug", "Разбор одного заказа"),
+    ("stats_debug", "Откуда взяты цифры статистики"),
+    ("panel_debug", "Разделы панели"),
+    ("fragment_debug", "Сессия Fragment"),
+    ("apr_debug", "Сырой ответ AppRoute"),
+    ("apr_whoami", "Каким IP нас видит AppRoute"),
+)
+
+
 class CommandsEscapeForms:
     """Команда работает всегда, даже если на экране висит незаконченная форма.
 
@@ -504,13 +604,17 @@ async def main() -> None:
     task_manager = TaskManager(bot)
     dp["task_manager"] = task_manager
 
-    # Внешний и первый: он должен отработать до фильтров состояний, иначе
-    # брошенная форма перехватит команду раньше, чем мы успеем вмешаться.
-    dp.message.outer_middleware(CommandsEscapeForms())
     # Раньше всех: отметка «мы что-то получили» нужна и тогда, когда
-    # сообщение никому не досталось.
+    # сообщение никому не досталось, — в том числе когда его отвергли
+    # два следующих middleware. Иначе `/health` объявит бота глухим.
     dp.message.outer_middleware(NoticeUpdates())
     dp.callback_query.outer_middleware(NoticeUpdates())
+    # Перед закрытием форм: несуществующая команда не должна стоить
+    # продавцу наполовину заполненной формы.
+    dp.message.outer_middleware(HideSystemCommands())
+    # Внешний: он должен отработать до фильтров состояний, иначе
+    # брошенная форма перехватит команду раньше, чем мы успеем вмешаться.
+    dp.message.outer_middleware(CommandsEscapeForms())
     dp.message.middleware(AccessMiddleware())
     dp.callback_query.middleware(AccessMiddleware())
     dp.message.middleware(YooMarketMiddleware())
@@ -556,6 +660,7 @@ async def main() -> None:
     # До опроса: с вебхуком на токене getUpdates не работает вовсе, и бот
     # будет молчать, не подавая никаких признаков поломки.
     await clear_webhook(bot)
+    await publish_commands(bot)
     await _start_health_server()  # для Koyeb/Render/Fly (health-check по $PORT)
     try:
         await task_manager.start_all()

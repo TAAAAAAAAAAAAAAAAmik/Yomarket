@@ -208,19 +208,18 @@ async def cmd_help(message: Message) -> None:
                  url=f"https://t.me/{contact[1:]}")
     b.button(text="📄 Документы и условия", callback_data="menu:policy")
     b.button(text="⬅️ В меню", callback_data="menu:main")
+    from handlers.start import BOT_VERSION
     await message.answer(ui.screen(
         "🧡 <b>Поддержка</b>",
         [f"Пиши сюда: {ui.esc(contact)}",
          "",
          "<b>Что приложить к вопросу</b>",
-         "• <code>/version</code> — версия и что бот про себя знает",
+         f"• код сборки: <code>{BOT_VERSION}</code>",
          "• номер заказа, если беда с конкретным заказом",
          "• что ты сделал и что увидел вместо ожидаемого",
          "",
          "<i>С этим отвечу сразу. Без этого придётся сначала спрашивать "
-         "то же самое, а время идёт.</i>"],
-        footer="<i>Если бот молчит на команды — <code>/version</code> "
-               "покажет, слышит ли он Telegram вообще.</i>"),
+         "то же самое, а время идёт.</i>"]),
         reply_markup=ui.lay(b).as_markup())
 
 
