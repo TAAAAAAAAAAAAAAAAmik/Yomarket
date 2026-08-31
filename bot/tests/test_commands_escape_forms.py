@@ -26,19 +26,32 @@ import main as M                                  # noqa: E402
 
 
 class FakeState:
-    def __init__(self, current=None, broken=False):
+    def __init__(self, current=None, broken=False, data=None,
+                 data_broken=False):
         self.current = current
         self.broken = broken
+        # Отдельно от `broken`: состояние может читаться, а данные — нет.
+        # Со сломанным `get_state` до чтения данных дело не доходит вовсе,
+        # и проверка «что если данные не прочитались» проверяла бы не тот
+        # `except`.
+        self.data_broken = data_broken
         self.cleared = False
+        self.data = dict(data or {})
 
     async def get_state(self):
         if self.broken:
             raise RuntimeError("хранилище FSM недоступно")
         return self.current
 
+    async def get_data(self):
+        if self.broken or self.data_broken:
+            raise RuntimeError("хранилище FSM недоступно")
+        return dict(self.data)
+
     async def clear(self):
         self.cleared = True
         self.current = None
+        self.data = {}
 
 
 class FakeMessage:
@@ -82,8 +95,10 @@ class ACommandGetsThrough(Bench):
 
     def test_the_seller_is_told_the_form_was_dropped(self):
         """Наполовину заполненная форма, исчезнувшая молча, удивляет не
-        меньше, чем неработающая команда."""
-        state = FakeState("CreateAdState:waiting_photo")
+        меньше, чем неработающая команда. «Наполовину заполненная» — это
+        буквально: в форме уже лежит введённое."""
+        state = FakeState("CreateAdState:waiting_photo",
+                          data={"title": "1000 Robux", "price": 990})
         msg, _got, _r = self.run_it("/order_debug 1218314", state)
         self.assertTrue(any("форма закрыта" in t for t in msg.said), msg.said)
 
@@ -222,6 +237,75 @@ class TheFormsItRescuesFrom(unittest.TestCase):
                                     path.read_text(encoding="utf-8")))
         self.assertGreater(found, 50, found)
 
+
+class TheBotDoesNotAnnounceFormsNobodyOpened(Bench):
+    """«↩️ Незаконченная форма закрыта» на КАЖДУЮ команду подряд.
+
+    Живая переписка 31.08: `/admin` → строка про форму, `/menu` → «магазин
+    не подключён», `/orders` → снова строка про форму, `/orders` → снова.
+    Замкнутый круг, и заводит его сам бот: экран «магазин ещё не подключён»
+    взводит ожидание токена (чтобы вставленный токен не пропал), а
+    следующая команда честно докладывает, что закрыла эту форму. Продавец
+    формы не открывал и ничего в неё не вводил — ему сообщают о событии,
+    которого для него не было.
+
+    Правило то же, что и было записано, только теперь оно выполняется
+    буквально: сообщают о пропаже НАПОЛОВИНУ ЗАПОЛНЕННОЙ формы. Пустая
+    закрывается молча — терять в ней нечего.
+
+    Ожидание токена молчит всегда, даже когда в нём лежит запомненный после
+    сорвавшейся проверки токен: эту форму взводит сам бот, на приветствии и
+    на каждом экране «магазин не подключён», а не продавец.
+    """
+
+    def test_an_empty_form_closes_without_a_word(self):
+        state = FakeState("AutoState:waiting_confirm_hours")
+        msg, _got, reached = self.run_it("/orders", state)
+        self.assertEqual(msg.said, [], "доложили о форме, куда ничего не ввели")
+        self.assertTrue(state.cleared, "форма осталась висеть")
+        self.assertTrue(reached, "команда не дошла до обработчика")
+
+    def test_the_token_wait_never_says_anything(self):
+        """Её взводит бот — на приветствии и на «магазин не подключён»."""
+        state = FakeState("AuthState:waiting_for_token")
+        msg, _got, reached = self.run_it("/orders", state)
+        self.assertEqual(msg.said, [])
+        self.assertTrue(reached)
+
+    def test_not_even_with_a_token_remembered_from_a_failed_attempt(self):
+        """`retry_token` кладёт токен в форму, чтобы предложить повтор. По
+        общему правилу «есть данные — доложи» круг вернулся бы: у продавца
+        без магазина ожидание токена взводится каждой командой."""
+        state = FakeState("AuthState:waiting_for_token",
+                          data={"token": "wli-QQ1"})
+        msg, _got, reached = self.run_it("/menu", state)
+        self.assertEqual(msg.said, [])
+        self.assertTrue(reached)
+
+    def test_a_command_after_the_no_shop_screen_is_answered_once(self):
+        """Ровно то, что на скриншоте: на команду приходит ОДИН ответ —
+        самой команды, а не два."""
+        state = FakeState("AuthState:waiting_for_token")
+        msg, _got, _r = self.run_it("/admin", state)
+        self.assertEqual(len(msg.said), 0)
+
+    def test_a_half_filled_form_still_says_so(self):
+        """Обратная сторона: у мастера объявления введены название и цена —
+        молча потерять их нельзя."""
+        state = FakeState("CreateAdState:waiting_photo",
+                          data={"title": "1000 Robux", "price": 990})
+        msg, _got, _r = self.run_it("/version", state)
+        self.assertTrue(any("форма закрыта" in t for t in msg.said), msg.said)
+
+    def test_unreadable_form_data_is_not_guessed_to_be_filled(self):
+        """Состояние прочиталось, данные — нет. Доложить «форма закрыта»
+        значит выдумать, что в ней что-то было; форму при этом всё равно
+        надо закрыть, иначе команда снова достанется ей."""
+        state = FakeState("CreateAdState:waiting_photo", data_broken=True)
+        msg, _got, reached = self.run_it("/version", state)
+        self.assertEqual(msg.said, [])
+        self.assertTrue(state.cleared, "форма осталась висеть")
+        self.assertTrue(reached)
 
 if __name__ == "__main__":
     unittest.main()
