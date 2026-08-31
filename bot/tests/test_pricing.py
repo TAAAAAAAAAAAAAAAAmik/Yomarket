@@ -52,7 +52,7 @@ class Admin(unittest.TestCase):
         storage.is_owner = self._owner
 
     def set_all(self):
-        for days, price in ((30, 990), (90, 2490), (180, 4490), (365, 7900)):
+        for days, price in ((30, 990), (180, 4490), (365, 7900)):
             storage.set_price(days, price)
 
 
@@ -66,7 +66,7 @@ class PricesAreShownByTerm(Admin):
     def test_every_term_that_was_set_is_offered(self):
         self.set_all()
         shown = "\n".join(storage.price_lines())
-        for label in ("1 месяц", "3 месяца", "6 месяцев", "12 месяцев"):
+        for label in ("1 месяц", "6 месяцев", "12 месяцев"):
             self.assertIn(label, shown)
 
     def test_a_term_without_a_price_is_simply_absent(self):
@@ -74,7 +74,7 @@ class PricesAreShownByTerm(Admin):
         storage.set_price(365, 7900)
         shown = "\n".join(storage.price_lines())
         self.assertIn("1 месяц", shown)
-        self.assertNotIn("3 месяца", shown)
+        self.assertNotIn("6 месяцев", shown)
 
     def test_zero_removes_a_term_rather_than_pricing_it_at_nothing(self):
         storage.set_price(30, 990)
@@ -87,8 +87,8 @@ class PricesAreShownByTerm(Admin):
 
     def test_rubbish_in_storage_does_not_crash_the_screen(self):
         # Хранилище — правимый JSON.
-        self.admin["prices"] = {"30": "дёшево", "90": 2490}
-        self.assertEqual(storage.get_prices(), {90: 2490})
+        self.admin["prices"] = {"30": "дёшево", "180": 4490}
+        self.assertEqual(storage.get_prices(), {180: 4490})
 
     def test_the_old_single_price_still_works_for_installs_that_had_one(self):
         self.admin["bot_price"] = 500
@@ -103,17 +103,17 @@ class TheDiscountIsOnlyClaimedWhereItExists(Admin):
         self.assertIn("−", year)
 
     def test_a_term_with_no_saving_is_not_advertised_as_one(self):
-        # 3 месяца по цене трёх месяцев — это не скидка.
+        # Полгода по цене шести месяцев — это не скидка.
         storage.set_price(30, 1000)
-        storage.set_price(90, 3000)
-        quarter = [l for l in storage.price_lines() if "3 месяца" in l][0]
-        self.assertNotIn("−", quarter)
+        storage.set_price(180, 6000)
+        half = [l for l in storage.price_lines() if "6 месяцев" in l][0]
+        self.assertNotIn("−", half)
 
     def test_a_term_that_costs_more_is_not_advertised_as_a_saving(self):
         storage.set_price(30, 1000)
-        storage.set_price(90, 3600)
-        quarter = [l for l in storage.price_lines() if "3 месяца" in l][0]
-        self.assertNotIn("−", quarter)
+        storage.set_price(180, 7200)
+        half = [l for l in storage.price_lines() if "6 месяцев" in l][0]
+        self.assertNotIn("−", half)
 
     def test_the_monthly_term_never_advertises_a_discount_against_itself(self):
         self.set_all()
@@ -296,6 +296,42 @@ class TwoWeeksIsTheEntryTier(unittest.TestCase):
             with self.subTest(name):
                 self.assertIn("2 недели", (docs / name).read_text())
 
+    def test_the_three_month_term_is_gone(self):
+        """Снят решением владельца 31.08: между месяцем и полугодием он
+        ничего не добавлял. Вернувшийся тариф — это срок, который бот снова
+        начнёт продавать, и заметит это не он, а покупатель."""
+        self.assertNotIn(90, [days for days, _l in storage.PRICE_TIERS])
+        self.assertNotIn("3 месяца", [l for _d, l in storage.PRICE_TIERS])
+
+    def test_a_price_left_over_from_it_is_shown_to_nobody(self):
+        """Цена за снятый срок могла остаться в хранилище с прошлого раза.
+        Показать её значит продать то, чего в списке нет."""
+        admin = storage._load_admin()
+        try:
+            data = storage._load_admin()
+            data["prices"] = {"90": 2490, "30": 449}
+            storage._save_admin(data)
+            self.assertEqual(storage.get_prices(), {30: 449},
+                             "снятый срок вернулся из хранилища")
+            self.assertNotIn("3 месяца", "\n".join(storage.price_lines()))
+        finally:
+            storage._save_admin(admin)
+
+    def test_the_documents_do_not_offer_a_term_the_bot_does_not_sell(self):
+        """Трёхмесячный тариф снят. Документ, продолжающий его перечислять,
+        — обещание, которого бот не выполнит: сроки в оферте и в коде
+        расходятся молча, а сошлются на документ."""
+        docs = pathlib.Path(storage.__file__).parents[1] / "docs" / "legal"
+        labels = [label for _days, label in storage.PRICE_TIERS]
+        for name in ("offer.md", "terms.md"):
+            line = [ln for ln in (docs / name).read_text().splitlines()
+                    if "Доступные варианты подписки" in ln][0]
+            for gone in ("3 месяца", "3 месяцев", ", 3,"):
+                with self.subTest(name=name, gone=gone):
+                    self.assertNotIn(gone, line)
+            with self.subTest(name=name):
+                self.assertIn("12 месяцев", line, labels)
+
     def test_no_discount_is_claimed_on_the_week(self):
         """Неделя дороже всех в пересчёте на день. Приписка «выгоднее» к
         ней была бы враньём, которое клиент проверит за десять секунд."""
@@ -421,6 +457,80 @@ class TheAccessScreenShowsOnlyRealPrices(Admin):
         self.assertIn("sub:order", data)
         self.assertNotIn("Бесплатно", cb.text)
 
+
+class TheOwnerSeesTheNumberHisClientsSee(Admin):
+    """«Почему на витрине от 499, я же ставил 249?»
+
+    Приветствие рекламирует самый дешёвый ЗАДАННЫЙ тариф, а экран тарифов
+    показывал только список сроков — числа «от N ₽» на нём не было нигде.
+    Владелец шёл искать его в коде, а лежало оно в его же настройках.
+
+    Причин ровно две, и вторая тихая: пока ни один тариф не задан, витрину
+    занимает СТАРАЯ единая цена, оставшаяся с тех времён, когда тариф был
+    один. Сроки при этом стоят пустыми, и связь между «○ не задан» и «от
+    499 ₽» ниоткуда не видна.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import handlers.admin as A
+        self.A = A
+        self._is_admin = A.is_admin
+        A.is_admin = lambda uid: True
+
+    def tearDown(self):
+        self.A.is_admin = self._is_admin
+        super().tearDown()
+
+    def _open(self):
+        import asyncio
+
+        class Cb:
+            def __init__(s):
+                s.from_user = type("U", (), {"id": 1})()
+                s.message = s
+                s.text = ""
+
+            async def edit_text(s, text, reply_markup=None, **k):
+                s.text = text
+
+            async def answer(s, *a, **k):
+                return None
+
+        class St:
+            async def clear(s):
+                return None
+
+        cb = Cb()
+        asyncio.run(self.A.prices_menu(cb, St()))
+        return cb.text
+
+    def test_it_names_the_price_the_showcase_advertises(self):
+        storage.set_price(14, 249)
+        storage.set_price(30, 449)
+        self.assertIn("от 249 ₽", self._open())
+
+    def test_the_old_single_price_is_named_as_the_reason(self):
+        """Самый дорогой случай: тарифы пустые, а витрина берёт цену из
+        настройки, о которой владелец давно забыл."""
+        storage.set_bot_price(499)
+        text = self._open()
+        self.assertIn("от 499 ₽", text)
+        self.assertIn("старая единая цена", text)
+
+    def test_a_set_tier_wins_over_the_old_price(self):
+        """Иначе совет «задай тарифы» не работал бы, а экран продолжал бы
+        показывать старое число."""
+        storage.set_bot_price(499)
+        storage.set_price(14, 249)
+        text = self._open()
+        self.assertIn("от 249 ₽", text)
+        self.assertNotIn("499", text)
+
+    def test_with_nothing_set_it_says_so_instead_of_inventing_a_number(self):
+        text = self._open()
+        self.assertIn("не показывается", text)
+        self.assertNotIn("от 0 ₽", text)
 
 if __name__ == "__main__":
     unittest.main()

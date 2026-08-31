@@ -978,9 +978,23 @@ async def prices_menu(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="🎁 Пробный период", callback_data="admin:trial")
     b.button(text="⬅️ Назад", callback_data="admin:menu")
 
+    # Приветствие рекламирует «от N ₽» — самый дешёвый ЗАДАННЫЙ тариф. Не
+    # видя этого числа здесь, владелец ищет его в коде: «почему от 499, я
+    # же ставил 249». Причина всегда одна из двух, и обе названы вслух.
+    from storage import get_bot_price
     shown = price_lines()
-    footer = ("<i>Клиент увидит:</i>\n" + "\n".join(shown)) if shown else (
-        "<i>Ни одного тарифа не задано — клиенту цена не показывается вовсе.</i>")
+    tiers = [p for p in prices.values() if p]
+    old_price = get_bot_price()
+    if tiers:
+        head = f"<i>На витрине:</i> <b>Подписка — от {min(tiers)} ₽</b>"
+    elif old_price:
+        head = (f"<i>На витрине:</i> <b>Подписка — от {old_price} ₽</b>\n"
+                "⚠️ <i>Это старая единая цена, а не тариф: ни один тариф "
+                "выше не задан. Задай их — и она перестанет показываться.</i>")
+    else:
+        head = "<i>На витрине цена не показывается вовсе.</i>"
+    footer = head + (("\n\n<i>На экране «Получить доступ»:</i>\n"
+                      + "\n".join(shown)) if shown else "")
     await callback.message.edit_text(
         ui.screen("💰 <b>Тарифы</b>", body, footer=footer),
         reply_markup=ui.lay(b).as_markup())

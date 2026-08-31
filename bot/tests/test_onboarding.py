@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import sys
 import unittest
@@ -706,6 +707,87 @@ class TheFormIsStillWiredToTheHandler(unittest.TestCase):
         self.assertIn("back_to_welcome", names)
         self.assertIn("retry_token", names)
 
+
+class TheGreetingNamesEverythingTheBotDoes(unittest.TestCase):
+    """Приветствие — единственное место, где человек узнаёт, за что платит.
+
+    Оно перечисляло шесть строк из полутора десятков функций: про слежение
+    за позицией, создание товаров, паки, автопилот и тринадцать гифт-карт
+    там не было ни слова. Продавец платил за то, о чём не знал, — а чаще
+    не платил.
+
+    Список карт при этом берётся из реестра, а не переписан прозой: включат
+    четырнадцатую — приветствие про неё промолчало бы, и заметить это было
+    бы нечем.
+    """
+
+    def test_no_placeholder_survives_into_the_seller_s_screen(self):
+        """Незамещённое «{карты}» на первом экране — это не опечатка, это
+        сломанный бот в глазах того, кто видит его впервые."""
+        for key in ("welcome", "sub_granted"):
+            with self.subTest(key):
+                text = storage.render_custom_text(
+                    key, цена="", проба=3, неделя=7, всего=10, days=30, left=30)
+                self.assertNotIn("{", text)
+
+    def test_the_card_list_is_read_from_the_registry(self):
+        from automation import giftcards as G
+        extra = dataclasses.replace(G.CARDS[0], slug="nosuch",
+                                    title="Такой карты нет")
+        saved = G.CARDS
+        try:
+            G.CARDS = saved + (extra,)
+            text = storage.render_custom_text("welcome", цена="", проба=3,
+                                              неделя=7, всего=10)
+            self.assertIn("Такой карты нет", text)
+            self.assertIn(str(len(saved) + 1), text)
+        finally:
+            G.CARDS = saved
+
+    def test_the_caller_can_override_the_automatic_substitution(self):
+        """Список подставляется во все тексты сам. Но подстановка сверху не
+        должна затирать переданное: экран, которому нужен свой перечень,
+        тихо получил бы общий."""
+        text = storage.render_custom_text("welcome", цена="", проба=3,
+                                          неделя=7, всего=10,
+                                          карты="только Apple")
+        self.assertIn("только Apple", text)
+
+    def test_every_card_that_is_offered_is_named(self):
+        from automation.giftcards import cards
+        text = storage.render_custom_text("welcome", цена="", проба=3,
+                                          неделя=7, всего=10)
+        for c in cards():
+            with self.subTest(c.slug):
+                self.assertIn(c.title, text)
+
+    def test_the_big_selling_points_are_all_there(self):
+        """Не проверка прозы: каждая строка — отдельная функция бота, и
+        пропажа любой означает, что за неё перестали продавать."""
+        text = storage.render_custom_text("welcome", цена="", проба=3,
+                                          неделя=7, всего=10).lower()
+        for what in ("позици",         # слежение за позицией на витрине
+                     "премиум",        # продвижение
+                     "пак",            # поднятие пака
+                     "восстановлю",    # авто-восстановление снятых
+                     "выложу",         # создание товара
+                     "гифт-карт",      # плагины выдачи
+                     "stars",          # звёзды
+                     "автопилот",      # включить всё одной кнопкой
+                     "магазин",        # несколько магазинов
+                     "отзыв",          # отзывы
+                     "жалоб",          # жалобы и споры
+                     "баланс"):        # порог баланса
+            with self.subTest(what):
+                self.assertIn(what, text)
+
+    def test_it_still_fits_into_one_telegram_message(self):
+        """4096 знаков — предел Telegram. Приветствие, не влезшее в
+        сообщение, не показывается вовсе: это не «обрежется», это тишина
+        на первом экране."""
+        text = storage.render_custom_text("welcome", цена=" — от 249 ₽",
+                                          проба=3, неделя=7, всего=10)
+        self.assertLess(len(text), 4096)
 
 if __name__ == "__main__":
     unittest.main()
