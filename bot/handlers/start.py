@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-31-hello-839"
+BOT_VERSION = "2026-08-31-bybit-pay"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -179,6 +179,11 @@ def _access_kb(uid: int) -> "InlineKeyboardMarkup":
             and not trial_used(uid, "channel")):
         b.button(text=f"📣 +{long_days} дней за подписку",
                  callback_data="trial:offer")
+    # Оплата Bybit — только когда её действительно можно провести. Кнопка,
+    # за которой не задан ни UID, ни ключ, — обещание невозможного.
+    from storage import bybit_ready
+    if bybit_ready():
+        b.button(text="₿ Оплатить USDT", callback_data="pay:menu")
     b.button(text="💳 Прошу счёт", callback_data="sub:order")
     b.button(text="⬅️ Назад", callback_data="start:hello")
     return ui.lay(b).as_markup()
