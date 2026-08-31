@@ -150,7 +150,7 @@ class TheWeekIsGivenOnlyOnce(Bench):
         """Иначе `/forget_me` стал бы способом брать неделю бесконечно."""
         run(trialgate.grant_for_subscription(Bot(Member("member")), self.UID))
         storage.purge_user(self.UID)
-        self.assertTrue(storage.trial_used(self.UID))
+        self.assertTrue(storage.trial_used(self.UID, "channel"))
 
     def test_a_switched_off_trial_does_not_burn_the_right_to_it(self):
         storage.set_trial_days(0)
@@ -193,12 +193,13 @@ class ItIsAWeekAndTheDocumentsSaySo(unittest.TestCase):
             with self.subTest(name):
                 text = self._flat(name)
                 self.assertIn("3 календарных", text)
-                self.assertIn("двух вариантов", text)
+                self.assertIn("двух частях", text)
+                self.assertIn("суммируются", text)
 
-    def test_the_documents_say_one_variant_uses_up_the_right(self):
-        """Взял три дня — неделя уже не положена. Не сказать об этом
-        значит обещать десять дней тому, кто нажмёт обе кнопки."""
-        self.assertIn("исчерпывает право", self._flat("offer.md"))
+    def test_the_documents_say_each_part_is_given_once(self):
+        """Не сказать «каждая однократно» значит обещать пробу без конца
+        тому, кто нажимает кнопку повторно."""
+        self.assertIn("каждая — однократно", self._flat("offer.md"))
 
     def test_both_mention_the_channel_condition(self):
         for name in ("offer.md", "terms.md"):
@@ -261,50 +262,57 @@ class TheTwoKindsOfSubscriptionAreNeverConfused(unittest.TestCase):
         self.assertNotIn("оплат", text.lower().replace("без оплаты", ""))
 
 
-class TwoTrialsOneMark(Bench):
-    """Проб две — три дня без условий и неделя за подписку, — а отметка
-    «уже брал» у них ОДНА.
+class TwoTrialsThatAddUp(Bench):
+    """Проб две, и берутся ОБЕ: три дня просто так, потом ещё семь за
+    подписку на канал. Вместе — десять дней.
 
-    Иначе десять дней вместо семи получал бы любой, кто нажал обе кнопки по
-    очереди. И наоборот: если бы длинную давали без условий, подписываться
-    было бы незачем — условие обесценивается ровно в тот момент, когда его
-    можно обойти.
+    Отметок тоже две, по одной на вид. Одна общая означала бы «взял три дня
+    — семь уже не дадут», а это ровно то, чего быть не должно: подписка на
+    канал ради семи дней теряет смысл, если человек уже нажал первую кнопку.
+
+    Второе здесь важное — сложение. `grant_subscription` прибавляет к
+    остатку, а не заменяет его: подписка на канал на второй день пробы
+    иначе отнимала бы у человека день.
     """
 
     def test_the_short_one_is_shorter(self):
         self.assertLess(storage.get_trial_free_days(),
                         storage.get_trial_days())
 
-    def test_taking_the_short_one_closes_the_long_one(self):
-        self.assertEqual(storage.start_trial(self.UID,
-                                             storage.get_trial_free_days()), 3)
+    def test_both_can_be_taken(self):
+        self.assertEqual(storage.start_trial(self.UID, 3, kind="free"), 3)
         days, _ = run(trialgate.grant_for_subscription(
             Bot(Member("member")), self.UID))
-        self.assertEqual(days, 0, "выдали и три дня, и неделю")
+        self.assertEqual(days, 7, "вторая проба не досталась")
 
-    def test_an_expired_short_trial_still_closes_the_long_one(self):
-        """Отметка «уже брал» — единственная защита, когда короткая проба
-        уже истекла: пока она действует, отказ даёт проверка подписки, и
-        настоящую дыру за ней не видно.
-        """
-        storage.start_trial(self.UID, storage.get_trial_free_days())
-        # Срок вышел — подписки больше нет, осталась только отметка.
-        data = storage._load_admin()
-        data.get("subscriptions", {}).pop(str(self.UID), None)
-        storage._save_admin(data)
-        self.assertFalse(storage.has_active_subscription(self.UID))
-        days, _ = run(trialgate.grant_for_subscription(
-            Bot(Member("member")), self.UID))
-        self.assertEqual(days, 0, "истёкшая проба открыла вторую")
-
-    def test_taking_the_long_one_closes_the_short_one(self):
+    def test_they_add_up_instead_of_replacing(self):
+        """Семь дней, выданные поверх трёх, обязаны дать десять, а не семь."""
+        storage.start_trial(self.UID, 3, kind="free")
         run(trialgate.grant_for_subscription(Bot(Member("member")), self.UID))
-        self.assertEqual(storage.start_trial(self.UID, 3), 0)
+        left = storage.subscription_days_left(self.UID)
+        self.assertGreaterEqual(left, 9, f"осталось {left} дн. вместо десяти")
 
-    def test_the_short_one_asks_for_nothing(self):
-        """Три дня даются просто так: канал тут ни при чём."""
-        storage.set_trial_channel("@ch")
-        self.assertEqual(storage.start_trial(self.UID, 3), 3)
+    def test_each_one_is_still_given_only_once(self):
+        storage.start_trial(self.UID, 3, kind="free")
+        self.assertEqual(storage.start_trial(self.UID, 3, kind="free"), 0)
+        run(trialgate.grant_for_subscription(Bot(Member("member")), self.UID))
+        days, _ = run(trialgate.grant_for_subscription(
+            Bot(Member("member")), self.UID))
+        self.assertEqual(days, 0, "неделя за подписку досталась дважды")
+
+    def test_the_marks_do_not_leak_into_each_other(self):
+        """Общая отметка — самая вероятная поломка здесь, и тихая."""
+        storage.start_trial(self.UID, 3, kind="free")
+        self.assertTrue(storage.trial_used(self.UID, "free"))
+        self.assertFalse(storage.trial_used(self.UID, "channel"),
+                         "короткая проба закрыла длинную")
+
+    def test_a_paying_seller_gets_no_trial_on_top(self):
+        """Оплаченную подписку от пробной отличает поле `by`: у выданной
+        админом там его номер. Без этого различия проба поверх оплаты была
+        бы неотличима от пробы поверх пробы."""
+        storage.grant_subscription(self.UID, 30, by=storage.OWNER_ID)
+        self.assertEqual(storage.start_trial(self.UID, 3, kind="free"), 0)
 
     def test_switching_off_the_short_one_leaves_the_long_one(self):
         storage.set_trial_free_days(0)
@@ -334,13 +342,19 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
         storage.set_trial_free_days(4)
         text = self.S._welcome_text()
         self.assertIn("4 дня доступа", text)
-        self.assertIn("7 дней доступа", text)
+        self.assertIn("7 дней сверху", text)
+
+    def test_it_names_how_much_is_free_in_total(self):
+        """Три и семь по отдельности не складываются в голове у того, кто
+        читает экран впервые."""
+        storage.set_trial_free_days(3)
+        self.assertIn("10 дней бесплатно", self.S._welcome_text())
 
     def test_it_names_the_price_when_there_is_one(self):
         admin = storage._load_admin()
         try:
-            storage.set_price(7, 390)
-            self.assertIn("390", self.S._welcome_text())
+            storage.set_price(14, 249)
+            self.assertIn("249", self.S._welcome_text())
         finally:
             storage._save_admin(admin)
 
@@ -361,10 +375,17 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
         self.assertIn("3 дня доступа", labels)
         self.assertIn("за подписку", labels)
 
-    def test_a_used_up_trial_shows_no_trial_buttons(self):
-        """Кнопка «3 дня» тому, кто их уже брал, — обещание невозможного:
-        нажатие ответит отказом, а виноватым выглядит бот."""
-        storage.note_trial(self.UID)
+    def test_a_used_up_trial_hides_only_its_own_button(self):
+        """Кнопка «3 дня» тому, кто их уже брал, — обещание невозможного.
+        Но вторая обязана остаться: её ещё не брали."""
+        storage.note_trial(self.UID, "free")
+        labels = " ".join(self._labels(self.UID))
+        self.assertNotIn("дня доступа", labels)
+        self.assertIn("за подписку", labels, "скрыли и вторую пробу")
+
+    def test_both_used_up_shows_neither(self):
+        storage.note_trial(self.UID, "free")
+        storage.note_trial(self.UID, "channel")
         labels = " ".join(self._labels(self.UID))
         self.assertNotIn("дня доступа", labels)
         self.assertNotIn("за подписку", labels)

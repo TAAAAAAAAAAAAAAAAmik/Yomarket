@@ -65,5 +65,7 @@ async def grant_for_subscription(bot, user_id: int) -> tuple[int, str]:
     ok, why = await check_member(bot, channel, user_id)
     if not ok and not why:
         return 0, ""                        # честно не подписан
-    days = start_trial(user_id)
+    # Вид «channel»: у него своя отметка. Общая с короткой пробой означала
+    # бы «взял три дня — семь уже не дадут», а они как раз складываются.
+    days = start_trial(user_id, kind="channel")
     return days, why

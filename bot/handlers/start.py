@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-30-showcase"
+BOT_VERSION = "2026-08-30-stack"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -119,13 +119,16 @@ def _hello_kb(uid: int = 0) -> "InlineKeyboardMarkup":
     b = InlineKeyboardBuilder()
     b.button(text="🔌 Подключить магазин", callback_data="start:connect")
     solo = {"start:connect"}
-    if uid and not trial_used(uid):
+    if uid:
+        # Пробы независимы: взявший три дня всё ещё может добрать семь за
+        # подписку. Общая проверка скрыла бы вторую кнопку после первой.
         free_days = get_trial_free_days()
         long_days = get_trial_days()
-        if free_days > 0:
+        if free_days > 0 and not trial_used(uid, "free"):
             b.button(text=f"🎁 {free_days} дня доступа",
                      callback_data="trial:free")
-        if long_days > 0 and get_trial_channel():
+        if (long_days > 0 and get_trial_channel()
+                and not trial_used(uid, "channel")):
             b.button(text=f"📣 {long_days} дней за подписку",
                      callback_data="trial:offer")
     b.button(text="💳 Тарифы", callback_data="menu:prices")
@@ -217,9 +220,10 @@ def _welcome_text() -> str:
     prices = [p for p in get_prices().values() if p] or (
         [get_bot_price()] if get_bot_price() else [])
     price = f" — от {min(prices)} ₽" if prices else ""
+    free_days, long_days = get_trial_free_days(), get_trial_days()
     return render_custom_text("welcome", цена=price,
-                              проба=get_trial_free_days(),
-                              неделя=get_trial_days())
+                              проба=free_days, неделя=long_days,
+                              всего=free_days + long_days)
 
 
 def _trial_offer_text() -> str:
@@ -244,9 +248,9 @@ async def trial_offer(callback: CallbackQuery, state: FSMContext) -> None:
     не вместо него.
     """
     from storage import trial_used
-    if trial_used(callback.from_user.id):
-        await callback.answer("Пробный период уже брали — он даётся один раз",
-                              show_alert=True)
+    if trial_used(callback.from_user.id, "channel"):
+        await callback.answer("Неделю за подписку уже брали — она даётся "
+                              "один раз", show_alert=True)
         return
     await callback.message.edit_text(_trial_offer_text(),
                                      reply_markup=_trial_kb())
@@ -266,11 +270,11 @@ async def trial_free(callback: CallbackQuery, state: FSMContext) -> None:
     from storage import get_trial_free_days, start_trial, trial_used
 
     uid = callback.from_user.id
-    if trial_used(uid):
-        await callback.answer("Пробный период уже брали — он даётся один раз",
+    if trial_used(uid, "free"):
+        await callback.answer("Эти дни уже брали — они даются один раз",
                               show_alert=True)
         return
-    days = start_trial(uid, get_trial_free_days())
+    days = start_trial(uid, get_trial_free_days(), kind="free")
     if not days:
         # Проба выключена владельцем или подписка уже действует. Молчать
         # нельзя: кнопка нажата, ничего не произошло.
@@ -344,11 +348,11 @@ async def trial_check(callback: CallbackQuery, state: FSMContext) -> None:
     from storage import get_support_contact, render_custom_text, trial_used
 
     uid = callback.from_user.id
-    if trial_used(uid):
+    if trial_used(uid, "channel"):
         # Отметка не удаляется вместе с данными — иначе `/forget_me` стал бы
         # способом брать неделю бесконечно.
-        await callback.answer("Пробный период уже брали — он даётся один раз",
-                              show_alert=True)
+        await callback.answer("Неделю за подписку уже брали — она даётся "
+                              "один раз", show_alert=True)
         return
 
     days, why = await trialgate.grant_for_subscription(callback.bot, uid)
@@ -410,7 +414,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
     await logs.log_event(message.bot, "users",
                          ["Зашёл в бота впервые."
-                          if not trial_used(message.from_user.id) else
+                          if not trial_used(message.from_user.id, "free")
+                          else
                           "Вернулся, магазин не подключён."],
                          user=message.from_user)
 

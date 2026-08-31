@@ -170,7 +170,10 @@ class TheTrialIsGivenOnceAndOnlyOnce(Admin):
         self.assertEqual(storage.start_trial(7), 3)
 
     def test_a_paying_seller_is_not_given_a_trial_on_top(self):
-        storage.grant_subscription(7, 30)
+        # `by` обязателен: именно он отличает оплаченную подписку от
+        # пробной. Без него запись неотличима от пробы, и проба поверх
+        # пробы — законная (три дня плюс семь), а поверх оплаты — нет.
+        storage.grant_subscription(7, 30, by=storage.OWNER_ID)
         self.assertEqual(storage.start_trial(7), 0)
 
     def test_a_seller_who_never_took_it_still_can_after_someone_else_did(self):
@@ -273,19 +276,17 @@ class TheAdminCanSetAllOfIt(unittest.TestCase):
                          f"проба выдаётся не только своей кнопкой: {where}")
 
 
-class TheWeekIsTheShortestPaidTier(unittest.TestCase):
-    """Неделю добавили, чтобы после бесплатной пробы можно было купить
-    такой же срок, не решаясь сразу на месяц.
-
-    Два соседних смысла у одного слова: бесплатная неделя даётся один раз
-    за подписку на канал, платная — покупается сколько угодно раз.
+class TwoWeeksIsTheEntryTier(unittest.TestCase):
+    """Две недели — точка входа. После десяти бесплатных дней (три просто
+    так плюс семь за подписку) человек решает не «стоит ли», а «продлить
+    ли», и самый короткий платный срок должен быть рядом с этим решением.
     """
 
-    def test_a_week_is_among_the_tiers(self):
-        self.assertIn(7, [days for days, _label in storage.PRICE_TIERS])
+    def test_two_weeks_is_among_the_tiers(self):
+        self.assertIn(14, [days for days, _label in storage.PRICE_TIERS])
 
     def test_it_is_the_shortest_one(self):
-        self.assertEqual(storage.PRICE_TIERS[0][0], 7)
+        self.assertEqual(storage.PRICE_TIERS[0][0], 14)
 
     def test_the_documents_list_it(self):
         """Документ, перечисляющий не те сроки, что показывает бот, хуже
@@ -293,16 +294,16 @@ class TheWeekIsTheShortestPaidTier(unittest.TestCase):
         docs = pathlib.Path(storage.__file__).parents[1] / "docs" / "legal"
         for name in ("offer.md", "terms.md"):
             with self.subTest(name):
-                self.assertIn("1 неделя", (docs / name).read_text())
+                self.assertIn("2 недели", (docs / name).read_text())
 
     def test_no_discount_is_claimed_on_the_week(self):
         """Неделя дороже всех в пересчёте на день. Приписка «выгоднее» к
         ней была бы враньём, которое клиент проверит за десять секунд."""
         admin = storage._load_admin()
         try:
-            for days, price in ((7, 390), (30, 990), (365, 7990)):
+            for days, price in ((14, 249), (30, 449), (365, 3990)):
                 storage.set_price(days, price)
-            week = [ln for ln in storage.price_lines() if "неделя" in ln][0]
+            week = [ln for ln in storage.price_lines() if "недели" in ln][0]
             self.assertNotIn("−", week)
             self.assertNotIn("%", week)
         finally:
@@ -313,21 +314,21 @@ class TheWeekIsTheShortestPaidTier(unittest.TestCase):
         из-за появления недели."""
         admin = storage._load_admin()
         try:
-            for days, price in ((7, 390), (30, 990), (365, 7990)):
+            for days, price in ((14, 249), (30, 449), (365, 3990)):
                 storage.set_price(days, price)
             year = [ln for ln in storage.price_lines() if "12" in ln][0]
             self.assertIn("%", year)
         finally:
             storage._save_admin(admin)
 
-    def test_a_week_can_actually_be_granted(self):
+    def test_the_entry_tier_can_actually_be_granted(self):
         """Тариф, который нельзя выдать, — строка на экране и больше
         ничего."""
         admin = storage._load_admin()
         try:
-            storage.grant_subscription(4242, 7)
+            storage.grant_subscription(4242, 14)
             self.assertTrue(storage.has_active_subscription(4242))
-            self.assertLessEqual(storage.subscription_days_left(4242), 7)
+            self.assertLessEqual(storage.subscription_days_left(4242), 14)
         finally:
             storage._save_admin(admin)
 

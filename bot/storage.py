@@ -1319,7 +1319,7 @@ _WHAT_I_DO = (
 CUSTOM_TEXTS = {
     "welcome": {
         "title": "Приветствие /start",
-        "vars": ["{цена}", "{проба}", "{неделя}"],
+        "vars": ["{цена}", "{проба}", "{неделя}", "{всего}"],
         "default": (
             "👋 Привет! Я — YooMarket.\n\n"
             "Смотри, в чём дело. Пока ты спишь, ешь или просто живёшь — "
@@ -1334,8 +1334,9 @@ CUSTOM_TEXTS = {
             "💳 <b>Подписка{цена}</b> — открывает автоответы, автовыдачу, "
             "продвижение и вывод средств.\n\n"
             "🎁 <b>{проба} дня доступа</b> — просто так, без условий.\n"
-            "📣 <b>{неделя} дней доступа</b> — за подписку на наш канал.\n\n"
-            "<i>Берётся что-то одно и один раз.</i>"
+            "📣 <b>{неделя} дней сверху</b> — за подписку на наш канал.\n\n"
+            "<i>Берётся и то, и другое — по одному разу. Вместе выходит "
+            "{всего} дней бесплатно.</i>"
         ),
     },
     "connect": {
@@ -1581,10 +1582,10 @@ def expired_before(cutoff: float) -> list[int]:
 # Сроки, под которые заводятся тарифы. Дни, а не «месяцы»: `grant_subscription`
 # считает днями, и перевод месяцев в дни в двух местах разошёлся бы.
 PRICE_TIERS: tuple[tuple[int, str], ...] = (
-    # Неделя — самый короткий платный срок. Она же длина бесплатной пробы,
-    # и это не совпадение: попробовал неделю — можешь купить такую же, не
-    # решаясь сразу на месяц.
-    (7, "1 неделя"),
+    # Две недели — самый короткий платный срок и точка входа: после десяти
+    # бесплатных дней (три просто так плюс семь за подписку) человек уже
+    # видел, что бот делает, и решает не «стоит ли», а «продлить ли».
+    (14, "2 недели"),
     (30, "1 месяц"),
     (90, "3 месяца"),
     (180, "6 месяцев"),
@@ -1712,20 +1713,47 @@ def set_trial_days(days: int) -> None:
     _save_admin(data)
 
 
-def trial_used(user_id: int) -> bool:
-    return int(user_id) in [int(x) for x in _load_admin().get("trials", [])]
+# Пробы две, и берутся они ОБЕ: три дня просто так, потом ещё семь за
+# подписку на канал. Значит и отметок две — по одной на вид. Одна общая
+# отметка означала бы «взял три дня — семь уже не дадут», то есть ровно то,
+# чего мы не хотим.
+#
+# Прежний плоский список `trials` остаётся списком коротких проб: почти все
+# записи в нём — от старой молчаливой выдачи, и считать их израсходованной
+# подпиской на канал значило бы отнять у людей то, чего они не брали.
+def _trial_key(kind: str) -> str:
+    return "trials" if kind == "free" else f"trials_{kind}"
 
 
-def note_trial(user_id: int) -> None:
+def trial_used(user_id: int, kind: str = "free") -> bool:
+    saved = _load_admin().get(_trial_key(kind), [])
+    return int(user_id) in [int(x) for x in saved]
+
+
+def note_trial(user_id: int, kind: str = "free") -> None:
     data = _load_admin()
-    used = [int(x) for x in data.get("trials", [])]
+    key = _trial_key(kind)
+    used = [int(x) for x in data.get(key, [])]
     if int(user_id) not in used:
         used.append(int(user_id))
-        data["trials"] = used
+        data[key] = used
         _save_admin(data)
 
 
-def start_trial(user_id: int, days: int | None = None) -> int:
+def _paid_now(user_id: int) -> bool:
+    """Есть ли ОПЛАЧЕННАЯ подписка — та, что выдал админ.
+
+    Пробную от неё отличает поле `by`: у выданной админом там его номер, у
+    пробной ноль. Без этого различия проба, взятая поверх пробы, была бы
+    неотличима от пробы, взятой поверх оплаты.
+    """
+    sub = (_load_admin().get("subscriptions", {}) or {}).get(str(user_id)) or {}
+    return bool(int(sub.get("by") or 0)) and \
+        float(sub.get("expires", 0) or 0) > _time.time()
+
+
+def start_trial(user_id: int, days: int | None = None,
+                kind: str = "free") -> int:
     """Выдать пробный период → сколько дней выдано (0 — не положено).
 
     Ноль возвращается в трёх случаях: пробный период выключен владельцем,
@@ -1738,8 +1766,11 @@ def start_trial(user_id: int, days: int | None = None) -> int:
     кто нажал обе кнопки по очереди.
     """
     days = get_trial_days() if days is None else int(days)
-    if days <= 0 or trial_used(user_id) or has_active_subscription(user_id):
+    if days <= 0 or trial_used(user_id, kind) or _paid_now(user_id):
         return 0
-    note_trial(user_id)
+    note_trial(user_id, kind)
+    # `grant_subscription` прибавляет к остатку, а не заменяет его: три дня
+    # плюс семь дают десять, а не семь. Иначе подписка на канал на второй
+    # день пробы отнимала бы у человека день.
     grant_subscription(user_id, days)
     return days
