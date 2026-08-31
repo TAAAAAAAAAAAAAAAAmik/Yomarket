@@ -335,9 +335,33 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
         storage.set_trial_channel("@ch")
 
     def _labels(self, uid):
-        """Надписи экрана «Получить доступ» — там живут кнопки проб."""
-        return [b.text for row in self.S._access_kb(uid).inline_keyboard
-                for b in row]
+        """Надписи экрана «🎁 Получить бесплатно» — там живут кнопки проб.
+
+        Экран собирается вызовом, а не сборкой клавиатуры руками: пробы
+        переехали с витрины сюда, и проверка, оставшаяся у прежней
+        клавиатуры, проверяла бы экран, которого человек уже не видит.
+        """
+        import handlers.subscribe as SUB
+        seen = []
+
+        class Screen:
+            async def edit_text(s, text, reply_markup=None, **kw):
+                seen.append(reply_markup)
+
+        class St:
+            async def clear(s):
+                return None
+
+        cb = type("CB", (), {})()
+        cb.message = Screen()
+        cb.from_user = type("U", (), {"id": uid})()
+
+        async def answer(*a, **kw):
+            return None
+
+        cb.answer = answer
+        run(SUB.free_menu(cb, St()))
+        return [b.text for row in seen[0].inline_keyboard for b in row]
 
     def _hello_labels(self, uid):
         return [b.text for row in self.S._hello_kb(uid).inline_keyboard
@@ -398,23 +422,23 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
 
     def test_both_trial_buttons_are_offered_to_a_newcomer(self):
         labels = " ".join(self._labels(self.UID))
-        self.assertIn("3 дня бесплатно", labels)
-        self.assertIn("за подписку", labels)
+        self.assertIn("3 дня", labels)
+        self.assertIn("7 дней", labels)
 
     def test_a_used_up_trial_hides_only_its_own_button(self):
         """Кнопка «3 дня» тому, кто их уже брал, — обещание невозможного.
         Но вторая обязана остаться: её ещё не брали."""
         storage.note_trial(self.UID, "free")
         labels = " ".join(self._labels(self.UID))
-        self.assertNotIn("дня бесплатно", labels)
-        self.assertIn("за подписку", labels, "скрыли и вторую пробу")
+        self.assertNotIn("3 дня", labels)
+        self.assertIn("7 дней", labels, "скрыли и вторую пробу")
 
     def test_both_used_up_shows_neither(self):
         storage.note_trial(self.UID, "free")
         storage.note_trial(self.UID, "channel")
         labels = " ".join(self._labels(self.UID))
-        self.assertNotIn("дня бесплатно", labels)
-        self.assertNotIn("за подписку", labels)
+        self.assertNotIn("3 дня", labels)
+        self.assertNotIn("7 дней", labels)
 
     def test_paying_stays_possible_when_the_trials_are_gone(self):
         """Экран, с которого нечего нажать, — тупик: человек пришёл платить,
@@ -424,25 +448,67 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
         data = [b.callback_data
                 for row in self.S._access_kb(self.UID).inline_keyboard
                 for b in row]
-        self.assertIn("sub:order", data)
+        self.assertIn("sub:buy", data)
+
+    def test_the_free_button_is_gone_once_both_trials_are_used(self):
+        """Кнопка «бесплатно» тому, кто взял обе пробы, — обещание
+        невозможного: нажмёт и получит отказ."""
+        data = [b.callback_data
+                for row in self.S._access_kb(self.UID).inline_keyboard
+                for b in row]
+        self.assertIn("trial:menu", data)
+        storage.note_trial(self.UID, "free")
+        storage.note_trial(self.UID, "channel")
+        data = [b.callback_data
+                for row in self.S._access_kb(self.UID).inline_keyboard
+                for b in row]
+        self.assertNotIn("trial:menu", data)
 
     def test_without_a_channel_only_the_short_one_is_offered(self):
         """Кнопка «за подписку» без заданного канала вела бы в пустоту."""
         storage.set_trial_channel("")
         labels = " ".join(self._labels(self.UID))
-        self.assertIn("3 дня бесплатно", labels)
-        self.assertNotIn("за подписку", labels)
+        self.assertIn("3 дня", labels)
+        self.assertNotIn("7 дней", labels)
 
-    def test_connecting_the_shop_is_always_there(self):
+    def test_the_showcase_does_not_offer_to_connect_a_shop(self):
+        """На витрине человек решает, брать ли бота вообще. Инструкция к
+        тому, чего он пока не купил, — лишний шаг перед выбором."""
         labels = self._hello_labels(self.UID)
-        self.assertTrue(any("одключить" in x for x in labels))
+        self.assertFalse(any("одключить" in x for x in labels), labels)
+
+    def test_but_the_screens_about_connecting_do_offer_it(self):
+        """«Магазин ещё не подключён» и «дни открыты, цепляй магазин» без
+        этой кнопки — тупики: сказано что делать и нечем."""
+        labels = [b.text for row in self.S._connect_kb(self.UID).inline_keyboard
+                  for b in row]
+        self.assertTrue(any("одключить" in x for x in labels), labels)
 
     def test_the_long_trial_shows_the_channel_before_refusing(self):
         """Кнопка вела прямо на проверку: не подписан — получи отказ и ищи
         канал сам. Ссылку надо дать до отказа, а не вместо него."""
-        target = [b.callback_data
-                  for row in self.S._access_kb(self.UID).inline_keyboard
-                  for b in row if "за подписку" in b.text]
+        import handlers.subscribe as SUB
+        seen = []
+
+        class Screen:
+            async def edit_text(s, text, reply_markup=None, **kw):
+                seen.append(reply_markup)
+
+        class St:
+            async def clear(s):
+                return None
+
+        cb = type("CB", (), {})()
+        cb.message = Screen()
+        cb.from_user = type("U", (), {"id": self.UID})()
+
+        async def answer(*a, **kw):
+            return None
+
+        cb.answer = answer
+        run(SUB.free_menu(cb, St()))
+        target = [b.callback_data for row in seen[0].inline_keyboard
+                  for b in row if "7 дней" in b.text]
         self.assertEqual(target, ["trial:offer"])
         offer = [b.text for row in self.S._trial_kb().inline_keyboard
                  for b in row]

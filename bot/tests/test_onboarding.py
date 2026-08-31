@@ -255,21 +255,24 @@ class TheGreetingSellsBeforeItInstructs(unittest.TestCase):
                          "инструкция про токен показана до согласия подключаться")
         self.assertNotIn("Создать токен", said.now)
 
-    def test_the_greeting_offers_access_first_and_connecting_next(self):
-        """Приветствие стало витриной — кнопок несколько. Первой стоит
-        «Получить доступ»: у нового человека доступа ещё нет, и подключать
-        магазин ему пока нечем. Само подключение остаётся рядом — без него
-        бот не работает, и убрать его нельзя.
+    def test_the_greeting_offers_one_thing_and_it_is_getting_access(self):
+        """Приветствие — витрина. У нового человека доступа ещё нет, и
+        подключать магазин ему нечем: инструкция к тому, чего он пока не
+        купил, — лишний шаг перед выбором.
 
-        Витрина при этом остаётся витриной: способы оплаты и пробы живут за
-        «Получить доступ», а не выкладываются кнопками здесь.
+        Способы оплаты и пробы живут за «Получить доступ», а не
+        выкладываются кнопками здесь.
         """
         said, _ = self._start()
         kb = texts(said.markup)
         self.assertIn("олучить доступ", kb[0], f"доступ не первый: {kb}")
-        self.assertTrue(any("одключ" in t for t in kb[1:]),
-                        f"подключение магазина пропало: {kb}")
-        self.assertLessEqual(len(kb), 5, f"витрина превратилась в список: {kb}")
+        self.assertLessEqual(len(kb), 3, f"витрина превратилась в список: {kb}")
+
+    def test_a_token_pasted_on_the_showcase_is_still_caught(self):
+        """Кнопки подключения на витрине больше нет, но форма ждёт токен:
+        кто уже знает, где его брать, вставит не нажимая ничего."""
+        _said, st = self._start()
+        self.assertIsNotNone(st.state)
 
     def test_a_token_pasted_without_pressing_anything_is_still_caught(self):
         """Кто уже знает, где брать токен, кнопку не нажмёт."""

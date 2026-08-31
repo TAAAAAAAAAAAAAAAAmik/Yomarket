@@ -84,12 +84,12 @@ async def _needs_shop(message: Message, state: FSMContext) -> bool:
     """
     if get_token(message.from_user.id):
         return False
-    from handlers.start import AuthState, _hello_kb
+    from handlers.start import AuthState, _connect_kb
     await state.set_state(AuthState.waiting_for_token)
     await message.answer(ui.screen(
         "🔌 <b>Магазин ещё не подключён</b>",
         ["Открывать пока нечего. Подключим — и раздел заработает."]),
-        reply_markup=_hello_kb())
+        reply_markup=_connect_kb(message.from_user.id))
     return True
 
 
@@ -431,7 +431,32 @@ async def sub_order(callback) -> None:
     await callback.answer("Заявка отправлена" if ok else "Напиши в поддержку")
 
 
-@router.callback_query(lambda c: c.data == "pay:paid")
+def _paid_details(data: str) -> str:
+    """«1 месяц · 499 ₽ · СБП» из хвоста `pay:paid:<дней>:<способ>`.
+
+    Хвоста может не быть (кнопка нажата со старого сообщения), а срок или
+    способ — исчезнуть, пока человек платил. Тогда строки просто нет:
+    заявка важнее подробностей, и терять её из-за них нельзя.
+    """
+    from storage import PRICE_TIERS, get_prices, pay_method
+    parts = str(data or "").split(":")
+    if len(parts) < 4:
+        return ""
+    try:
+        days = int(parts[2])
+    except ValueError:
+        return ""
+    bits = [dict(PRICE_TIERS).get(days, f"{days} дн.")]
+    price = get_prices().get(days)
+    if price:
+        bits.append(f"{price} ₽")
+    method = pay_method(parts[3])
+    if method:
+        bits.append(ui.esc(method["title"]))
+    return "🧾 " + " · ".join(bits)
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("pay:paid"))
 async def paid_claim(callback) -> None:
     """«Я оплатил» — сказать владельцу, что деньги ушли.
 
@@ -452,9 +477,15 @@ async def paid_claim(callback) -> None:
             f"напиши {get_support_contact()}.", show_alert=True)
         return
 
-    ok = await logs.log_event(callback.bot, "payment",
-                              ["✅ <b>Сообщил, что оплатил подписку.</b>",
-                               "Проверь поступление и выдай дни."],
+    # Срок и способ приходят хвостом в callback_data: заявка «оплатил» без
+    # них заставляет владельца переспрашивать, за что и куда, — то есть
+    # ровно тот круг переписки, ради которого кнопку и делали.
+    lines = ["✅ <b>Сообщил, что оплатил подписку.</b>"]
+    what = _paid_details(callback.data)
+    if what:
+        lines.append(what)
+    lines.append("Проверь поступление и выдай дни.")
+    ok = await logs.log_event(callback.bot, "payment", lines,
                               user=callback.from_user)
     body = ["Передал владельцу — он проверит поступление и включит доступ."
             if ok else

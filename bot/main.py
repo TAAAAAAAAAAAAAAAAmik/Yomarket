@@ -20,7 +20,7 @@ from aiogram.types import TelegramObject
 from config import BOT_TOKEN
 from api.yoomarket import YooMarketAPI
 from storage import get_token
-from handlers import accounts, admin, ads, approute, auto_settings, autopilot, balance, chats, commands, create_ad, fallback, notifications, nsgifts, orders, packs, panel, panel_items, plugins, policy, prices, responders, selenium_settings, settings, start, stats
+from handlers import accounts, admin, ads, approute, auto_settings, autopilot, balance, chats, commands, create_ad, fallback, notifications, nsgifts, orders, packs, panel, panel_items, plugins, policy, prices, responders, selenium_settings, settings, start, stats, subscribe
 from tasks import TaskManager
 
 logging.basicConfig(
@@ -44,7 +44,9 @@ logger = logging.getLogger(__name__)
 FREE_CALLBACKS = frozenset({
     "access:menu", "menu:prices",                  # тарифы
     "trial:free", "trial:offer", "trial:check",    # пробы
-    "sub:order", "pay:paid",                       # счёт и «я оплатил»
+    # Покупка целиком: срок, способ, реквизиты и «я оплатил». Заперев
+    # её подпиской, мы заперли бы единственный способ подписку купить.
+    "sub:buy", "sub:order", "pay:paid", "trial:menu",
     "menu:help", "start:hello",                    # поддержка и путь назад
     # Документы: кнопка обязана открываться там же, где `/policy`. Иначе
     # политика конфиденциальности читается только тем, кто знает команду.
@@ -55,6 +57,12 @@ FREE_CALLBACKS = frozenset({
 # обещает удаление данных по требованию, и обещание, упирающееся в оплату,
 # было бы ложью в опубликованном документе.
 FREE_COMMANDS = ("/start", "/policy", "/forget_me")
+
+# Экраны покупки носят в адресе срок и способ (`sub:buy:30`, `sub:m:30:2`,
+# `pay:paid:30:2`) — перечнем их не задать, поэтому по приставке. Приставки
+# узкие намеренно: `sub:` целиком открыло бы и то, что к покупке не
+# относится.
+FREE_PREFIXES = ("sub:buy:", "sub:m:", "pay:paid:")
 
 
 class AccessMiddleware:
@@ -86,7 +94,8 @@ class AccessMiddleware:
                 # его и ищет. Слово целиком, а не начало строки: «/startup»
                 # — не команда, и пускать его незачем.
                 head = text.split(maxsplit=1)[0].split("@")[0] if text else ""
-                free = head in FREE_COMMANDS or data_ in FREE_CALLBACKS
+                free = (head in FREE_COMMANDS or data_ in FREE_CALLBACKS
+                        or data_.startswith(FREE_PREFIXES))
                 if not free:
                     from storage import price_lines, render_custom_text
                     # Тарифы по срокам, а не одно число: документы обещают
@@ -648,6 +657,7 @@ async def main() -> None:
     dp.include_router(stats.router)
     dp.include_router(panel.router)
     dp.include_router(policy.router)
+    dp.include_router(subscribe.router)
     # Команды-ярлыки. Позже разделов намеренно: их обработчики
     # вызываются отсюда напрямую, и роутер нужен только ради имён
     # команд, которых больше нигде нет.

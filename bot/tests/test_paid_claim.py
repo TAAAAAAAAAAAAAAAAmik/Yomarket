@@ -156,14 +156,27 @@ class SayingItIsNotLockedBehindTheSubscription(unittest.TestCase):
         import main as M
         self.assertIn("pay:paid", M.FREE_CALLBACKS)
 
-    def test_it_is_offered_next_to_asking_for_an_invoice(self):
-        """Следующий шаг после «прошу счёт» — сказать, что оплатил. Искать
-        для этого другой экран человек не должен."""
-        import handlers.start as S
-        data = [b.callback_data for row in S._access_kb(1).inline_keyboard
-                for b in row]
-        self.assertIn("pay:paid", data)
-        self.assertIn("sub:order", data)
+    def test_the_tails_of_the_purchase_flow_pass_the_gate_too(self):
+        """Адреса покупки носят срок и способ (`sub:buy:30`, `sub:m:30:2`,
+        `pay:paid:30:2`) — перечнем их не задать, и проверка списка их бы
+        не заметила."""
+        import main as M
+        for data in ("sub:buy:30", "sub:m:30:2", "pay:paid:30:2"):
+            with self.subTest(data):
+                self.assertTrue(data.startswith(M.FREE_PREFIXES), data)
+
+    def test_it_is_offered_at_the_end_of_the_purchase_flow(self):
+        """Кнопка переехала с экрана доступа на экран с реквизитами: там
+        она и нужна — человек только что заплатил, и следующий его шаг
+        именно этот."""
+        import ast
+        import pathlib
+        src = pathlib.Path(
+            storage.__file__).parent / "handlers" / "subscribe.py"
+        found = [n.value for n in ast.walk(ast.parse(src.read_text("utf-8")))
+                 if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                 and "pay:paid" in n.value]
+        self.assertTrue(found, "«Я оплатил» пропало из потока покупки")
 
 
 if __name__ == "__main__":

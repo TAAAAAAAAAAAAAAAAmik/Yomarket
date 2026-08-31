@@ -45,6 +45,8 @@ class AdminState(StatesGroup):
     menu_label = State()
     header_emoji = State()
     edit_text = State()
+    pay_title = State()
+    pay_details = State()
 
 
 def _menu_kb(uid: int):
@@ -57,14 +59,15 @@ def _menu_kb(uid: int):
     b.button(text="🎨 Оформление", callback_data="admin:appearance")
     b.button(text="📝 Тексты сообщений", callback_data="admin:texts")
     b.button(text="📄 Правовые документы", callback_data="admin:docs")
+    b.button(text="💳 Способы оплаты", callback_data="admin:pays")
     b.button(text="🔐 Требовать подписку", callback_data="admin:toggle_sub")
     if is_owner(uid):
         b.button(text="👑 Управление админами", callback_data="admin:admins")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     if is_owner(uid):
-        b.adjust(2, 2, 2, 2, 1, 1)  # 9 actions (2-per-row) + nav on its own row
+        b.adjust(2, 2, 2, 2, 2, 1)  # 10 действий по двое + навигация
     else:
-        b.adjust(2, 2, 2, 2, 1)  # 8 actions (2-per-row) + nav on its own row
+        b.adjust(2, 2, 2, 2, 1, 1)  # 9 действий + навигация
     return b.as_markup()
 
 
@@ -1221,3 +1224,138 @@ async def trial_input(message: Message, state: FSMContext) -> None:
         [f"Пробный период: <b>{days} дн.</b>" if days else
          "Пробный период <b>выключен</b> — бот о нём не упоминает."]),
         reply_markup=b.as_markup())
+
+
+# ── Способы оплаты ──────────────────────────────────────────────────────────
+#
+# Приёма денег внутри бота нет: продавец платит владельцу напрямую, а бот
+# показывает, куда именно. Реквизиты задаются здесь — вписать за владельца
+# «Сбербанк» или «СБП» значит выдумать чужие реквизиты.
+
+@router.callback_query(F.data == "admin:pays")
+async def pays_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    from storage import get_pay_methods
+    methods = get_pay_methods()
+
+    body = []
+    b = InlineKeyboardBuilder()
+    for m in methods:
+        filled = bool(m.get("details"))
+        body.append(f"{'✅' if filled else '○'} <b>{ui.esc(m['title'])}</b>"
+                    + ("" if filled else
+                       " — <i>реквизиты не заданы, продавцу не показывается</i>"))
+        b.button(text=f"✏️ {m['title']}", callback_data=f"admin:pay:{m['id']}")
+    b.button(text="➕ Добавить способ", callback_data="admin:pay:new")
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
+    await callback.message.edit_text(
+        ui.screen("💳 <b>Способы оплаты</b>",
+                  body or ["Ни одного способа не задано — продавцу платить "
+                           "некуда, и экран оплаты честно об этом говорит."],
+                  footer="<i>Продавец выбирает срок, потом способ, видит "
+                         "реквизиты и жмёт «Я оплатил». Проверяешь и "
+                         "выдаёшь дни ты.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:pay:new")
+async def pay_new(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminState.pay_title)
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="admin:pays")
+    await callback.message.edit_text(ui.screen(
+        "➕ <b>Новый способ оплаты</b>",
+        ["Пришли название — коротко, оно встанет на кнопку.", "",
+         "Например: <code>СБП</code>, <code>Карта</code>, "
+         "<code>USDT TRC20</code>."]),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.message(AdminState.pay_title)
+async def pay_title_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    from storage import add_pay_method
+    title = (message.text or "").strip()
+    if not title:
+        await message.answer("Название пустое — пришли ещё раз.")
+        return
+    if len(title) > 32:
+        # Длинная надпись расползается на кнопке и обрезается Telegram
+        # посередине слова: продавец увидит огрызок и не поймёт, чем платит.
+        await message.answer("Слишком длинно для кнопки — до 32 знаков.")
+        return
+    mid = add_pay_method(title)
+    await state.set_state(AdminState.pay_details)
+    await state.update_data(pay_id=mid)
+    await message.answer(ui.screen(
+        f"💳 <b>{ui.esc(title)}</b>",
+        ["Теперь пришли реквизиты — то, что увидит продавец.", "",
+         "Номер карты, телефон для СБП, адрес кошелька — как есть, целиком. "
+         "Можно несколькими строками."],
+        footer="<i>Пока реквизиты пусты, способ продавцу не показывается: "
+               "кнопка, за которой ничего нет, — обещание невозможного.</i>"))
+
+
+@router.message(AdminState.pay_details)
+async def pay_details_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    from storage import set_pay_method
+    data = await state.get_data()
+    mid = str(data.get("pay_id") or "")
+    details = (message.text or "").strip()
+    if not details:
+        await message.answer("Реквизиты пустые — пришли ещё раз.")
+        return
+    set_pay_method(mid, details=details)
+    await state.clear()
+    await message.answer("✅ Способ готов — продавцы его увидят.")
+    await _show_menu(message, message.from_user.id, edit=False)
+
+
+@router.callback_query(F.data.startswith("admin:pay:"))
+async def pay_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    mid = callback.data.split(":")[-1]
+    from storage import pay_method
+    method = pay_method(mid)
+    if not method:
+        await callback.answer()
+        await pays_menu(callback, state)
+        return
+    await state.set_state(AdminState.pay_details)
+    await state.update_data(pay_id=mid)
+    b = InlineKeyboardBuilder()
+    b.button(text="🗑 Удалить способ", callback_data=f"admin:paydel:{mid}")
+    b.button(text="⬅️ Назад", callback_data="admin:pays")
+    await callback.message.edit_text(ui.screen(
+        f"💳 <b>{ui.esc(method['title'])}</b>",
+        ["Сейчас продавец видит:", "",
+         ui.esc(method["details"]) if method["details"]
+         else "<i>ничего — реквизиты не заданы</i>", "",
+         "Пришли новые реквизиты, чтобы заменить."]),
+        reply_markup=ui.lay(b, solo={f"admin:paydel:{mid}"}).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:paydel:"))
+async def pay_delete(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    from storage import del_pay_method
+    del_pay_method(callback.data.split(":")[-1])
+    await state.clear()
+    await callback.answer("Способ удалён", show_alert=True)
+    await pays_menu(callback, state)

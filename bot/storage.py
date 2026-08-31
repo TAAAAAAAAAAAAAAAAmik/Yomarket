@@ -1697,6 +1697,78 @@ def price_lines() -> list[str]:
     return lines
 
 
+# --- Способы оплаты ---------------------------------------------------------
+#
+# Приёма денег внутри бота нет: продавец платит владельцу напрямую, а бот
+# показывает, куда именно. Поэтому способы задаёт владелец — вписать сюда
+# «Сбербанк» или «СБП» за него значит выдумать чужие реквизиты.
+#
+# У каждого способа два поля: название на кнопке и то, что увидит продавец,
+# нажав её. Больше ничего не нужно: проверять оплату бот всё равно не умеет
+# и не притворяется, что умеет.
+
+def get_pay_methods() -> list[dict]:
+    """Способы оплаты по порядку. Пустой список — способов не задано."""
+    items = _load_admin().get("pay_methods") or []
+    out = []
+    for row in items:
+        if isinstance(row, dict) and row.get("id") and row.get("title"):
+            out.append({"id": str(row["id"]), "title": str(row["title"]),
+                        "details": str(row.get("details") or "")})
+    return out
+
+
+def pay_method(mid: str) -> dict | None:
+    for row in get_pay_methods():
+        if row["id"] == str(mid):
+            return row
+    return None
+
+
+def add_pay_method(title: str, details: str = "") -> str:
+    """Добавить способ. Отдаёт его номер.
+
+    Номер — счётчик, а не порядковый индекс: удалив второй способ из трёх,
+    мы бы иначе перевесили кнопку третьего на номер второго, и нажатие
+    показало бы чужие реквизиты.
+    """
+    data = _load_admin()
+    items = list(data.get("pay_methods") or [])
+    nxt = int(data.get("pay_method_seq") or 0) + 1
+    data["pay_method_seq"] = nxt
+    items.append({"id": str(nxt), "title": str(title), "details": str(details)})
+    data["pay_methods"] = items
+    _save_admin(data)
+    return str(nxt)
+
+
+def set_pay_method(mid: str, title: str | None = None,
+                   details: str | None = None) -> bool:
+    data = _load_admin()
+    items = list(data.get("pay_methods") or [])
+    for row in items:
+        if isinstance(row, dict) and str(row.get("id")) == str(mid):
+            if title is not None:
+                row["title"] = str(title)
+            if details is not None:
+                row["details"] = str(details)
+            data["pay_methods"] = items
+            _save_admin(data)
+            return True
+    return False
+
+
+def del_pay_method(mid: str) -> bool:
+    data = _load_admin()
+    items = [r for r in (data.get("pay_methods") or [])
+             if str((r or {}).get("id")) != str(mid)]
+    if len(items) == len(data.get("pay_methods") or []):
+        return False
+    data["pay_methods"] = items
+    _save_admin(data)
+    return True
+
+
 # --- «Я оплатил» ------------------------------------------------------------
 #
 # Продавец платит вне бота, и узнать об этом бот сам не может. Значит,

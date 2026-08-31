@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-31-paid-claim"
+BOT_VERSION = "2026-08-31-buy-flow"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -74,7 +74,7 @@ async def _no_shop_screen(target: "Message | CallbackQuery",
         await state.set_state(AuthState.waiting_for_token)
     text = ui.screen("🔌 <b>Магазин ещё не подключён</b>",
                      ["Открывать пока нечего. Подключим — и меню появится."])
-    kb = _hello_kb(_uid(target))
+    kb = _connect_kb(_uid(target))
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=kb)
         await target.answer()
@@ -150,39 +150,60 @@ def _hello_kb(uid: int = 0) -> "InlineKeyboardMarkup":
     отказом, и виноватым будет выглядеть бот.
     """
     b = InlineKeyboardBuilder()
-    # Главное действие первым и отдельной строкой. Способов получить доступ
-    # несколько — бесплатные и платные, — и раскладывать их прямо здесь
-    # значит превратить витрину в список кнопок вместо предложения.
+    # Одно действие, и оно первое. Подключение магазина отсюда снято: на
+    # витрине человек решает, брать ли бота вообще, а не как его настроить.
+    # Инструкция к тому, чего он пока не купил, — лишний шаг перед выбором.
     b.button(text="🚀 Получить доступ", callback_data="access:menu")
-    b.button(text="🔌 Подключить магазин", callback_data="start:connect")
     b.button(text="🧡 Поддержка", callback_data="menu:help")
-    return ui.lay(b, solo={"access:menu", "start:connect"}).as_markup()
+    return ui.lay(b, solo={"access:menu"}).as_markup()
+
+
+def _connect_kb(uid: int = 0) -> "InlineKeyboardMarkup":
+    """Кнопки экранов, которые ПРО подключение.
+
+    С витрины «Подключить магазин» снято, но здесь оно и есть смысл
+    экрана: «магазин ещё не подключён» и «дни открыты, цепляй магазин» без
+    этой кнопки — тупики, где сказано что делать и нечем.
+    """
+    b = InlineKeyboardBuilder()
+    b.button(text="🔌 Подключить магазин", callback_data="start:connect")
+    b.button(text="🚀 Получить доступ", callback_data="access:menu")
+    b.button(text="🧡 Поддержка", callback_data="menu:help")
+    return ui.lay(b, solo={"start:connect"}).as_markup()
+
+
+def _has_free_left(uid: int) -> bool:
+    """Осталась ли этому продавцу хоть одна непрожитая проба."""
+    from storage import (get_trial_channel, get_trial_days,
+                         get_trial_free_days, trial_used)
+    if not uid:
+        return True                            # неизвестному показываем обе
+    if get_trial_free_days() > 0 and not trial_used(uid, "free"):
+        return True
+    return bool(get_trial_days() > 0 and get_trial_channel()
+                and not trial_used(uid, "channel"))
 
 
 def _access_kb(uid: int) -> "InlineKeyboardMarkup":
-    """Кнопки экрана «Получить доступ».
+    """Кнопки экрана «Получить доступ» — ровно два действия.
 
-    Пробы независимы: взявший три дня всё ещё может добрать семь за
-    подписку. Общая проверка скрыла бы вторую кнопку после первой.
+    Раньше здесь лежали обе пробы, «Прошу счёт» и «Я оплатил» — четыре
+    кнопки, из которых две про одно и то же. Человек на этом экране решает
+    не «какой кнопкой», а «платить или попробовать»; всё остальное —
+    следующий шаг, и ему место на следующем экране.
 
-    Кнопка пробы тому, кто её уже брал, — обещание невозможного: нажатие
-    ответит отказом, а виноватым будет выглядеть бот.
+    «Прошу счёт» снят: он просил подождать, пока с человеком свяжутся, и
+    половина не дожидалась. Теперь срок и реквизиты он видит сам.
+
+    Кнопка «бесплатно» тому, кто обе пробы уже взял, — обещание
+    невозможного: нажмёт и получит отказ, а виноватым будет выглядеть бот.
     """
-    from storage import (get_trial_channel, get_trial_days,
-                         get_trial_free_days, trial_used)
     b = InlineKeyboardBuilder()
-    free_days, long_days = get_trial_free_days(), get_trial_days()
-    if uid and free_days > 0 and not trial_used(uid, "free"):
-        b.button(text=f"🎁 {free_days} дня бесплатно",
-                 callback_data="trial:free")
-    if (uid and long_days > 0 and get_trial_channel()
-            and not trial_used(uid, "channel")):
-        b.button(text=f"📣 +{long_days} дней за подписку",
-                 callback_data="trial:offer")
-    b.button(text="💳 Прошу счёт", callback_data="sub:order")
-    b.button(text="✅ Я оплатил", callback_data="pay:paid")
+    b.button(text="💳 Оплатить подписку", callback_data="sub:buy")
+    if _has_free_left(uid):
+        b.button(text="🎁 Получить бесплатно", callback_data="trial:menu")
     b.button(text="⬅️ Назад", callback_data="start:hello")
-    return ui.lay(b).as_markup()
+    return ui.lay(b, solo={"sub:buy", "trial:menu"}).as_markup()
 
 
 def _welcome_kb(back: bool = False) -> "InlineKeyboardMarkup":
@@ -339,7 +360,7 @@ async def trial_free(callback: CallbackQuery, state: FSMContext) -> None:
         ["Полный доступ — без оплаты.",
          "",
          "Цепляй магазин, и автоматика заработает сразу."]),
-        reply_markup=_hello_kb(uid))
+        reply_markup=_connect_kb(uid))
     await callback.answer("Готово")
     await state.set_state(AuthState.waiting_for_token)
 
@@ -374,8 +395,7 @@ async def show_access(callback: CallbackQuery) -> None:
 
     await callback.message.edit_text(ui.screen(
         "🚀 <b>Получить доступ</b>", body,
-        footer="<i>Оплата вне бота: жми «Прошу счёт», и владелец напишет "
-               f"сюда же. Вопросы — {ui.esc(get_support_contact())}</i>"),
+        footer=f"<i>Вопросы — {ui.esc(get_support_contact())}</i>"),
         reply_markup=_access_kb(uid))
     await callback.answer()
 
@@ -452,8 +472,10 @@ async def trial_check(callback: CallbackQuery, state: FSMContext) -> None:
          "",
          "Цепляй магазин — и автоматика заработает сразу."]))
     await callback.answer("Готово")
+    # Сказали «цепляй магазин» — значит кнопка для этого обязана быть под
+    # сообщением, а не остаться на витрине, куда ещё надо вернуться.
     await callback.message.answer(_welcome_text(),
-                                  reply_markup=_hello_kb(callback.from_user.id),
+                                  reply_markup=_connect_kb(callback.from_user.id),
                                   disable_web_page_preview=True)
     await state.set_state(AuthState.waiting_for_token)
 

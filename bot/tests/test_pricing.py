@@ -454,7 +454,7 @@ class TheAccessScreenShowsOnlyRealPrices(Admin):
         cb = self._open()
         data = [b.callback_data for row in cb.markup.inline_keyboard
                 for b in row]
-        self.assertIn("sub:order", data)
+        self.assertIn("sub:buy", data)
         self.assertNotIn("Бесплатно", cb.text)
 
 
