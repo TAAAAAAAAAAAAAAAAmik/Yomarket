@@ -45,7 +45,7 @@ class Bench(unittest.TestCase):
         self._log = logs.log_event
         self.log_ok = True
 
-        async def fake_log(bot, kind, lines, user=None):
+        async def fake_log(bot, kind, lines, user=None, markup=None):
             self.logged.append((kind, list(lines)))
             return self.log_ok
 
@@ -147,6 +147,188 @@ class TheLogDoesNotBecomeASpamFeed(Bench):
         self.tap()
         self.assertEqual(len(self.logged), 2)
 
+
+class TheOwnerGrantsInOneTap(Bench):
+    """Проверить оплату бот не может — она идёт вне его. Но всё, что ПОСЛЕ
+    проверки, он делает сам: владелец жмёт кнопку под записью, и дни уходят
+    тому, кто их просил, ровно в том количестве, которое он оплатил.
+
+    Без этого владелец шёл в админку и вводил номер продавца руками — а
+    номер брал из той же записи, то есть переписывал цифры из сообщения в
+    сообщение. Ошибиться цифрой здесь значит выдать месяц чужому человеку.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.markups: list = []
+
+        async def fake_log(bot, kind, lines, user=None, markup=None):
+            self.logged.append(list(lines))
+            self.markups.append(markup)
+            return True
+
+        logs.log_event = fake_log
+        self._is_admin = storage.is_admin
+        storage.is_admin = lambda uid: True
+
+    def tearDown(self):
+        storage.is_admin = self._is_admin
+        super().tearDown()
+
+    def claim(self, data="pay:paid:30:1"):
+        """Продавец жмёт «Я оплатил» и отдаёт кнопки, что ушли владельцу."""
+        storage.set_price(30, 499)
+        storage.add_pay_method("СБП", "+7 900")
+        cb = type("CB", (), {})()
+        cb.data = data
+        cb.bot = None
+        cb.message = type("M", (), {})()
+
+        async def answer(text, reply_markup=None, **kw):
+            return None
+
+        cb.message.answer = answer
+        cb.from_user = type("U", (), {"id": self.UID, "full_name": "Иван",
+                                      "username": "ivan"})()
+        cb.answer = lambda *a, **kw: asyncio.sleep(0)
+        run(C.paid_claim(cb))
+        return [(b.text, b.callback_data)
+                for row in self.markups[-1].inline_keyboard for b in row]
+
+    def press(self, data, admin=True):
+        """Владелец жмёт кнопку под записью в журнале."""
+        storage.is_admin = lambda uid: admin
+        told: list[tuple[int, str]] = []
+        edits: list[str] = []
+        alerts: list[str] = []
+
+        class Bot:
+            async def send_message(s, chat, text, **kw):
+                told.append((int(chat), str(text)))
+
+        cb = type("CB", (), {})()
+        cb.data = data
+        cb.bot = Bot()
+        cb.message = type("M", (), {})()
+        cb.message.text = "заявка"
+        cb.message.html_text = "заявка"
+
+        async def edit_text(text, reply_markup=None, **kw):
+            edits.append(text)
+
+        async def edit_markup(**kw):
+            edits.append("<сняты кнопки>")
+
+        cb.message.edit_text = edit_text
+        cb.message.edit_reply_markup = edit_markup
+
+        async def answer(text="", **kw):
+            alerts.append(text)
+
+        cb.answer = answer
+        cb.from_user = type("U", (), {"id": 1})()
+        run(C.claim_confirm(cb) if ":ok:" in data else C.claim_reject(cb))
+        return told, edits, alerts
+
+    def _cid(self, buttons):
+        return [d for _t, d in buttons if d.startswith("claim:ok:")][0]
+
+    def test_the_entry_carries_a_grant_button_with_the_term_on_it(self):
+        """Кнопка без числа дней заставляет вспоминать, сколько выдавать."""
+        buttons = self.claim()
+        grant = [t for t, d in buttons if d.startswith("claim:ok:")]
+        self.assertEqual(len(grant), 1, buttons)
+        self.assertIn("30", grant[0])
+
+    def test_pressing_it_grants_exactly_those_days_to_that_seller(self):
+        cid = self._cid(self.claim())
+        self.press(cid)
+        self.assertGreaterEqual(storage.subscription_days_left(self.UID), 29)
+
+    def test_the_seller_is_told_his_access_is_open(self):
+        cid = self._cid(self.claim())
+        told, _e, _a = self.press(cid)
+        self.assertTrue(any(uid == self.UID and "подтверждена" in t
+                            for uid, t in told), told)
+
+    def test_pressing_it_twice_does_not_grant_twice(self):
+        """Нажимают дважды именно тогда, когда не поняли, сработало ли, а
+        вторая выдача — это подаренный месяц."""
+        cid = self._cid(self.claim())
+        self.press(cid)
+        before = storage.subscription_days_left(self.UID)
+        _t, _e, alerts = self.press(cid)
+        self.assertEqual(storage.subscription_days_left(self.UID), before)
+        self.assertTrue(any("уже разобрали" in a for a in alerts), alerts)
+
+    def test_the_entry_itself_shows_the_outcome(self):
+        """Отдельное «выдал» ниже по ленте оставило бы прежнюю запись
+        выглядеть неразобранной."""
+        cid = self._cid(self.claim())
+        _t, edits, _a = self.press(cid)
+        self.assertTrue(any("Выдано 30" in e for e in edits), edits)
+
+    def test_an_undatable_message_still_loses_its_buttons(self):
+        """Сообщение старше двух суток Telegram править не даёт — но
+        кнопки снять обязан, иначе по ним нажмут ещё раз."""
+        cid = self._cid(self.claim())
+
+        class Cb:
+            pass
+
+        told: list = []
+        stripped: list = []
+
+        class Bot:
+            async def send_message(s, *a, **kw):
+                told.append(1)
+
+        cb = Cb()
+        cb.data = cid
+        cb.bot = Bot()
+        cb.message = type("M", (), {})()
+        cb.message.text = cb.message.html_text = "заявка"
+
+        async def boom(*a, **kw):
+            raise RuntimeError("message is too old")
+
+        async def strip(**kw):
+            stripped.append(1)
+
+        cb.message.edit_text = boom
+        cb.message.edit_reply_markup = strip
+        cb.from_user = type("U", (), {"id": 1})()
+        cb.answer = lambda *a, **kw: asyncio.sleep(0)
+        run(C.claim_confirm(cb))
+        self.assertTrue(stripped, "кнопки остались под старой заявкой")
+        self.assertGreaterEqual(storage.subscription_days_left(self.UID), 29)
+
+    def test_rejecting_grants_nothing_and_tells_the_seller(self):
+        buttons = self.claim()
+        cid = [d for _t, d in buttons if d.startswith("claim:no:")][0]
+        told, _e, _a = self.press(cid)
+        self.assertEqual(storage.subscription_days_left(self.UID), 0)
+        self.assertTrue(any("не нашли" in t for _u, t in told), told)
+
+    def test_a_stranger_cannot_grant_himself_a_subscription(self):
+        """Кнопка живёт в группе, и нажать её может любой, кто там есть."""
+        cid = self._cid(self.claim())
+        told, _e, alerts = self.press(cid, admin=False)
+        self.assertEqual(storage.subscription_days_left(self.UID), 0)
+        self.assertTrue(any("доступа" in a for a in alerts), alerts)
+
+    def test_a_claim_without_a_term_offers_no_grant_button(self):
+        """Кнопка «Выдать» без числа дней выдала бы неизвестно сколько."""
+        buttons = self.claim("pay:paid")
+        self.assertEqual([d for _t, d in buttons if d.startswith("claim:ok:")],
+                         [])
+        self.assertTrue(any("вручную" in " ".join(self.logged[-1])
+                            for _ in [0]), self.logged[-1])
+
+    def test_a_claim_too_old_to_be_found_says_so(self):
+        told, _e, alerts = self.press("claim:ok:99999")
+        self.assertEqual(told, [])
+        self.assertTrue(any("слишком старая" in a for a in alerts), alerts)
 
 class SayingItIsNotLockedBehindTheSubscription(unittest.TestCase):
     """Заплативший не может сказать об этом ровно потому, что ещё не

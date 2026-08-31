@@ -431,28 +431,35 @@ async def sub_order(callback) -> None:
     await callback.answer("Заявка отправлена" if ok else "Напиши в поддержку")
 
 
-def _paid_details(data: str) -> str:
-    """«1 месяц · 499 ₽ · СБП» из хвоста `pay:paid:<дней>:<способ>`.
+def _paid_what(data: str) -> tuple[int, int, str]:
+    """(дней, цена, способ) из хвоста `pay:paid:<дней>:<способ>`.
 
     Хвоста может не быть (кнопка нажата со старого сообщения), а срок или
-    способ — исчезнуть, пока человек платил. Тогда строки просто нет:
-    заявка важнее подробностей, и терять её из-за них нельзя.
+    способ — исчезнуть, пока человек платил. Тогда просто нули: заявка
+    важнее подробностей, и терять её из-за них нельзя.
     """
-    from storage import PRICE_TIERS, get_prices, pay_method
+    from storage import get_prices, pay_method
     parts = str(data or "").split(":")
     if len(parts) < 4:
-        return ""
+        return 0, 0, ""
     try:
         days = int(parts[2])
     except ValueError:
+        return 0, 0, ""
+    method = pay_method(parts[3]) or {}
+    return days, int(get_prices().get(days) or 0), str(method.get("title") or "")
+
+
+def _paid_details(days: int, price: int, method: str) -> str:
+    """«🧾 1 месяц · 499 ₽ · СБП» — то, без чего владелец переспрашивает."""
+    from storage import PRICE_TIERS
+    if not days:
         return ""
     bits = [dict(PRICE_TIERS).get(days, f"{days} дн.")]
-    price = get_prices().get(days)
     if price:
         bits.append(f"{price} ₽")
-    method = pay_method(parts[3])
     if method:
-        bits.append(ui.esc(method["title"]))
+        bits.append(ui.esc(method))
     return "🧾 " + " · ".join(bits)
 
 
@@ -480,13 +487,32 @@ async def paid_claim(callback) -> None:
     # Срок и способ приходят хвостом в callback_data: заявка «оплатил» без
     # них заставляет владельца переспрашивать, за что и куда, — то есть
     # ровно тот круг переписки, ради которого кнопку и делали.
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    from storage import add_claim
+
+    days, price, method = _paid_what(callback.data)
     lines = ["✅ <b>Сообщил, что оплатил подписку.</b>"]
-    what = _paid_details(callback.data)
+    what = _paid_details(days, price, method)
     if what:
         lines.append(what)
-    lines.append("Проверь поступление и выдай дни.")
+
+    # Заявка кладётся в хранилище, а кнопка несёт только её номер: имя
+    # продавца и срок в 64 байта `callback_data` вместе не влезут, а по
+    # номеру бот сам находит, кому и сколько.
+    cid = add_claim(callback.from_user.id, days, method, price)
+    b = InlineKeyboardBuilder()
+    if days:
+        lines.append("Проверь поступление и жми «Выдать».")
+        b.button(text=f"✅ Выдать {days} дн.", callback_data=f"claim:ok:{cid}")
+    else:
+        # Срок не назван — выдать одним нажатием нечего, и делать вид, что
+        # есть, нельзя: кнопка «Выдать» без числа дней выдала бы неизвестно
+        # сколько.
+        lines.append("Срок не назван — выдай дни вручную в админке.")
+    b.button(text="❌ Отклонить", callback_data=f"claim:no:{cid}")
     ok = await logs.log_event(callback.bot, "payment", lines,
-                              user=callback.from_user)
+                              user=callback.from_user,
+                              markup=b.as_markup())
     body = ["Передал владельцу — он проверит поступление и включит доступ."
             if ok else
             "Записать не вышло, поэтому напиши напрямую: "
@@ -549,3 +575,91 @@ async def cmd_keyboard(message: Message) -> None:
                    "",
                    "Переключить обратно — <code>/keyboard</code>."]),
         reply_markup=main_reply_keyboard() if on else hide_keyboard())
+
+
+# --- Разбор заявки об оплате ------------------------------------------------
+#
+# Проверить оплату бот не может — она идёт вне его. Но всё, что ПОСЛЕ
+# проверки, он делает сам: владелец жмёт одну кнопку под записью в журнале,
+# и дни уходят тому, кто их просил, ровно в том количестве, которое он
+# оплатил. Без этого владелец идёт в админку и вводит номер продавца
+# руками — а номер он берёт из той же записи, то есть переписывает цифры
+# из сообщения в сообщение.
+
+async def _claim_answer(callback, cid: str, ok: bool) -> None:
+    """Общее для «выдать» и «отклонить»: проверить права, решить заявку,
+    переписать запись в журнале."""
+    import logs
+    from storage import (get_claim, grant_subscription, is_admin,
+                         settle_claim, subscription_days_left)
+
+    uid = callback.from_user.id
+    if not is_admin(uid):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    claim = get_claim(cid)
+    if not claim:
+        await callback.answer("Заявки нет — она слишком старая",
+                              show_alert=True)
+        return
+    # Отметка ставится ДО выдачи и одна на оба исхода: нажимают дважды
+    # именно тогда, когда не поняли, сработало ли, и вторая выдача — это
+    # подаренный месяц.
+    if not settle_claim(cid, "ok" if ok else "no"):
+        await callback.answer("Эту заявку уже разобрали", show_alert=True)
+        return
+
+    seller = int(claim.get("user") or 0)
+    days = int(claim.get("days") or 0)
+    if ok and days:
+        grant_subscription(seller, days, by=uid)
+        left = subscription_days_left(seller)
+        await _tell_seller(callback.bot, seller,
+                           f"✅ <b>Оплата подтверждена.</b>\n"
+                           f"Доступ открыт на <b>{days} дн.</b> — "
+                           f"осталось {left} дн.")
+        mark = f"✅ Выдано {days} дн. · подтвердил {uid}"
+    elif ok:
+        mark = f"✅ Отмечено разобранным · {uid}"
+    else:
+        await _tell_seller(callback.bot, seller,
+                           "❌ Оплату не нашли. Проверь, что перевод ушёл, "
+                           "и напиши в поддержку — разберёмся.")
+        mark = f"❌ Отклонено · {uid}"
+
+    # Запись переписывается на месте: кнопки исчезают, а исход виден
+    # там же, где заявка. Отдельное сообщение «выдал» ниже по ленте
+    # оставило бы прежнюю запись выглядеть неразобранной.
+    try:
+        await callback.message.edit_text(
+            (callback.message.html_text or callback.message.text or "")
+            + f"\n\n<b>{mark}</b>",
+            reply_markup=None)
+    except Exception:                                       # noqa: BLE001
+        # Сообщение старше двух суток Telegram править не даёт. Тогда хотя
+        # бы снимаем кнопки, чтобы по ним не нажали снова.
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:                                   # noqa: BLE001
+            pass
+    await callback.answer(mark, show_alert=True)
+
+
+async def _tell_seller(bot, user_id: int, text: str) -> None:
+    """Наружу отсюда ничего не летит: неудачная отправка продавцу не должна
+    отменять уже выданные дни."""
+    try:
+        await bot.send_message(user_id, text, parse_mode="HTML")
+    except Exception as e:                                  # noqa: BLE001
+        logger.warning("не смог сказать продавцу %s о подписке: %s",
+                       user_id, e)
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("claim:ok:"))
+async def claim_confirm(callback) -> None:
+    await _claim_answer(callback, callback.data.split(":")[-1], True)
+
+
+@router.callback_query(lambda c: (c.data or "").startswith("claim:no:"))
+async def claim_reject(callback) -> None:
+    await _claim_answer(callback, callback.data.split(":")[-1], False)

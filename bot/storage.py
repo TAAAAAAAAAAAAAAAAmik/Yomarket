@@ -1781,6 +1781,53 @@ def del_pay_method(mid: str) -> bool:
 PAID_CLAIM_EVERY = 3600
 
 
+# Заявка живёт в хранилище, а не только в тексте сообщения: владелец жмёт
+# «выдать» кнопкой под записью в журнале, и по номеру заявки бот сам
+# находит, КОМУ и СКОЛЬКО. Номер в `callback_data` короткий — там 64 байта
+# на всё, а имя продавца и срок туда не влезут вместе с прочим.
+#
+# Отметка «решена» здесь же: без неё второе нажатие выдало бы дни второй
+# раз, а нажимают именно дважды — когда не поняли, сработало ли.
+
+def add_claim(user_id: int, days: int = 0, method: str = "",
+              price: int = 0) -> str:
+    data = _load_admin()
+    claims = data.setdefault("claims", {})
+    nxt = int(data.get("claim_seq") or 0) + 1
+    data["claim_seq"] = nxt
+    claims[str(nxt)] = {"user": int(user_id), "days": int(days or 0),
+                        "method": str(method or ""), "price": int(price or 0),
+                        "at": _time.time(), "done": ""}
+    # Разобранные заявки не копятся вечно: их читают в тот же день, а
+    # хранилище — это те же файлы, что и настройки продавцов.
+    if len(claims) > 500:
+        for key in sorted(claims, key=lambda k: claims[k].get("at", 0))[:200]:
+            if claims[key].get("done"):
+                claims.pop(key, None)
+    _save_admin(data)
+    return str(nxt)
+
+
+def get_claim(cid: str) -> dict:
+    return dict((_load_admin().get("claims") or {}).get(str(cid)) or {})
+
+
+def settle_claim(cid: str, how: str) -> bool:
+    """Отметить заявку решённой. False — её уже решили.
+
+    Проверка и запись здесь, а не у вызывающего: два нажатия подряд
+    успевают между «прочитал» и «записал», и дни выдались бы дважды.
+    """
+    data = _load_admin()
+    claim = (data.get("claims") or {}).get(str(cid))
+    if not claim or claim.get("done"):
+        return False
+    claim["done"] = str(how)
+    claim["done_at"] = _time.time()
+    _save_admin(data)
+    return True
+
+
 def note_paid_claim(user_id: int) -> bool:
     """Отметить заявление об оплате. False — было меньше часа назад."""
     data = _load_admin()

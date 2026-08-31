@@ -75,7 +75,7 @@ class Bench(unittest.TestCase):
         self.logged: list[list[str]] = []
         self._log = logs.log_event
 
-        async def fake_log(bot, kind, lines, user=None):
+        async def fake_log(bot, kind, lines, user=None, markup=None):
             self.logged.append(list(lines))
             return True
 

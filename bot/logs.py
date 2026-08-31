@@ -69,11 +69,17 @@ def _person(user) -> str:
     return f"{name}{at} · <code>{getattr(user, 'id', '?')}</code>"
 
 
-async def log_event(bot, kind: str, lines: list[str], user=None) -> bool:
+async def log_event(bot, kind: str, lines: list[str], user=None,
+                    markup=None) -> bool:
     """Записать событие в свою тему. Отвечает, дошло ли.
 
     Ответ нужен не вызывающему — ему всё равно, — а `/log_here`, который
     проверяет журнал на живой отправке, а не по наличию настроек.
+
+    `markup` — кнопки под записью. Нужны там, где владелец не просто
+    читает событие, а отвечает на него: заявка об оплате с кнопкой
+    «выдать» решается в одно нажатие, а без неё — походом в админку и
+    вводом номера продавца руками.
     """
     from storage import get_log_target, note_log_error
 
@@ -91,6 +97,8 @@ async def log_event(bot, kind: str, lines: list[str], user=None) -> bool:
     body.append(f"<i>{_lt.fmt(time.time(), {}, '%d.%m %H:%M')}</i>")
 
     kwargs = {"disable_web_page_preview": True}
+    if markup is not None:
+        kwargs["reply_markup"] = markup
     thread = (target.get("topics") or {}).get(kind)
     if thread:
         kwargs["message_thread_id"] = int(thread)
