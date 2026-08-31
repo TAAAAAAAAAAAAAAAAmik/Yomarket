@@ -28,9 +28,16 @@ from storage import POLICY_DOCS, get_policy_links, is_admin, render_custom_text
 
 router = Router()
 
-# Куда ведёт «Назад». Отдельным именем, а не строкой в трёх местах: экран
-# зовут и командой, и кнопкой, и возвращать они обязаны в одно место.
+# Куда ведёт «Назад». Экран зовут из четырёх мест, и вернуть он обязан
+# туда, откуда позвали: «Назад», приводящее из поддержки в главное меню,
+# показывает человеку без подключённого магазина полный бот — как будто
+# доступ у него уже есть.
+#
+# Откуда пришли, говорит хвост в `callback_data` (`menu:policy:help`).
+# Перечень закрытый: подставить сюда любой адрес значит нарисовать кнопку,
+# ведущую куда угодно.
 _BACK = "menu:main"
+_RETURNS = {"help": "menu:help"}
 
 
 def policy_keyboard(back: str = _BACK) -> InlineKeyboardMarkup:
@@ -70,12 +77,15 @@ async def cmd_policy(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.callback_query(F.data == "menu:policy")
+@router.callback_query(F.data.in_({"menu:policy"}
+                                  | {f"menu:policy:{k}" for k in _RETURNS}))
 async def show_policy(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
+    origin = (callback.data or "").split(":")[2:]
     await callback.message.edit_text(
         policy_text(is_admin(callback.from_user.id)),
-        reply_markup=policy_keyboard(),
+        reply_markup=policy_keyboard(
+            _RETURNS.get(origin[0] if origin else "", _BACK)),
         disable_web_page_preview=True,
     )
     await callback.answer()

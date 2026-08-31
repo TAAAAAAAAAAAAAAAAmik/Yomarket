@@ -46,6 +46,9 @@ FREE_CALLBACKS = frozenset({
     "trial:free", "trial:offer", "trial:check",    # пробы
     "sub:order",                                   # просьба о счёте
     "menu:help", "start:hello",                    # поддержка и путь назад
+    # Документы: кнопка обязана открываться там же, где `/policy`. Иначе
+    # политика конфиденциальности читается только тем, кто знает команду.
+    "menu:policy", "menu:policy:help",
 })
 
 # `/policy` и `/forget_me` — не любезность: политика конфиденциальности

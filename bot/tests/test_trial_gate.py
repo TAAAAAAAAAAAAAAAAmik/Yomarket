@@ -536,16 +536,40 @@ class TheGateDoesNotLockTheDoorFromOutside(unittest.TestCase):
                                 f"кнопка {data} на экране подписки мертва")
 
     def test_every_way_out_of_the_first_screen_works(self):
-        """То же самое для витрины и экрана «Получить доступ»: кнопка,
-        которую видит человек без подписки, обязана работать. Кроме
-        подключения магазина — это и есть оплаченный товар."""
+        """Каждый экран, до которого человек без подписки может дойти с
+        витрины, проходится кнопка за кнопкой. Кроме подключения магазина —
+        это и есть оплаченный товар.
+
+        Экран поддержки берётся не списком, а вызовом: до документов
+        добираются именно через него, и кнопка, забытая в списке входа,
+        отвечала бы «🔒 Нужна подписка» на политику конфиденциальности.
+        """
         import handlers.start as S
         storage.set_trial_channel("@ch")
+
+        help_screen = type("CB", (), {})()
+        help_screen.message = type("M", (), {})()
+        seen_kb = []
+
+        async def edit(text, reply_markup=None, **kw):
+            seen_kb.append(reply_markup)
+
+        help_screen.message.edit_text = edit
+        help_screen.from_user = type("U", (), {"id": 4242})()
+
+        async def noop(*a, **kw):
+            return None
+
+        help_screen.answer = noop
+        run(S.show_help(help_screen))
+
         seen = [b.callback_data
-                for kb in (S._hello_kb(4242), S._access_kb(4242))
+                for kb in [S._hello_kb(4242), S._access_kb(4242)] + seen_kb
                 for row in kb.inline_keyboard for b in row
                 if b.callback_data and b.callback_data != "start:connect"]
         self.assertTrue(seen)
+        self.assertTrue([d for d in seen if d.startswith("menu:policy")],
+                        "документы с экрана поддержки не проверены")
         for data in seen:
             with self.subTest(data):
                 self.assertTrue(self._pass(self._tap(data)),

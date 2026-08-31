@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-31-what-i-do"
+BOT_VERSION = "2026-08-31-menu-guard"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -50,6 +50,41 @@ def _extract_shop(info: dict) -> tuple[str, str]:
         name = "Магазин"
         balance = "—"
     return str(name), str(balance)
+
+
+async def _no_shop_screen(target: "Message | CallbackQuery",
+                          state=None) -> bool:
+    """Сказать, что магазин не подключён, и вернуть True.
+
+    Меню без подключённого магазина — пустая витрина: половина разделов
+    ответит «сначала подключи токен», вторая уйдёт в маркетплейс и вернётся
+    с отказом. А выглядит оно как открытый доступ: восемь разделов и
+    название магазина сверху. Человек, попавший сюда с витрины через
+    «Поддержка → Документы → Назад», решает, что уже всё оплачено, — а
+    следом, что бот сломан.
+
+    Проверка живёт здесь, а не в `/menu`, именно поэтому: путей в меню два
+    (команда и кнопка «Назад»), а проверял токен только один. Один экран с
+    двумя разными поведениями расходится молча.
+    """
+    if get_token(_uid(target)):
+        return False
+    if state is not None:
+        # Кто уже знает, где брать токен, вставит его не нажимая кнопку.
+        await state.set_state(AuthState.waiting_for_token)
+    text = ui.screen("🔌 <b>Магазин ещё не подключён</b>",
+                     ["Открывать пока нечего. Подключим — и меню появится."])
+    kb = _hello_kb(_uid(target))
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb)
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=kb)
+    return True
+
+
+def _uid(target: "Message | CallbackQuery") -> int:
+    return target.from_user.id
 
 
 async def _send_menu(target: Message | CallbackQuery, user_id: int) -> None:
@@ -352,7 +387,7 @@ async def show_help(callback: CallbackQuery) -> None:
     if contact.startswith("@"):
         b.button(text=f"✍️ Написать {contact}",
                  url=f"https://t.me/{contact[1:]}")
-    b.button(text="📄 Документы и условия", callback_data="menu:policy")
+    b.button(text="📄 Документы и условия", callback_data="menu:policy:help")
     b.button(text="⬅️ Назад", callback_data="start:hello")
     await callback.message.edit_text(ui.screen(
         "🧡 <b>Поддержка</b>",
@@ -473,15 +508,7 @@ async def cmd_menu(message: Message, state: FSMContext) -> None:
     `CommandsEscapeForms` — он срабатывает на любую команду и раньше
     фильтров.
     """
-    if not get_token(message.from_user.id):
-        # Меню без подключённого магазина — пустая витрина: половина
-        # разделов ответит «сначала подключи токен». Говорим это сразу и
-        # даём ту же кнопку, что и в приветствии.
-        await state.set_state(AuthState.waiting_for_token)
-        await message.answer(ui.screen(
-            "🔌 <b>Магазин ещё не подключён</b>",
-            ["Открывать пока нечего. Подключим — и меню появится."]),
-            reply_markup=_hello_kb())
+    if await _no_shop_screen(message, state):
         return
     await _send_menu(message, message.from_user.id)
     await _show_keyboard(message)
@@ -807,7 +834,9 @@ async def _connect(uid: int, token: str, wait: Message, state: FSMContext,
 
 
 @router.callback_query(F.data == "menu:main")
-async def back_to_main(callback: CallbackQuery) -> None:
+async def back_to_main(callback: CallbackQuery, state: FSMContext) -> None:
+    if await _no_shop_screen(callback, state):
+        return
     await _send_menu(callback, callback.from_user.id)
 
 

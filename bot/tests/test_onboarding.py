@@ -789,5 +789,98 @@ class TheGreetingNamesEverythingTheBotDoes(unittest.TestCase):
                                           проба=3, неделя=7, всего=10)
         self.assertLess(len(text), 4096)
 
+class NobodySeesTheMenuBeforeConnectingAShop(unittest.TestCase):
+    """Витрина → «🧡 Поддержка» → «📄 Документы и условия» → «⬅️ Назад» —
+    и человек оказывался в полном главном меню: заказы, чаты, баланс,
+    плагины, автопилот, название магазина сверху. Он ничего не подключал и
+    ничего не оплачивал.
+
+    Снаружи это читается как «доступ уже открыт». А половина разделов
+    ответит «сначала подключи токен», вторая — ошибкой маркетплейса; то
+    есть следом он решит, что бот сломан.
+
+    Причин две, и закрывать их надо порознь:
+
+    * «Назад» в документах вело в ГЛАВНОЕ МЕНЮ, а не туда, откуда позвали;
+    * `menu:main` не проверял токен вовсе — а `/menu` проверял. Один экран,
+      два пути, разное поведение: ровно та же беда, что у команд-двойников,
+      только заметная не сразу.
+    """
+
+    def setUp(self):
+        self._token = S.get_token
+        S.get_token = lambda uid: ""
+
+    def tearDown(self):
+        S.get_token = self._token
+
+    def _tap(self, data):
+        """Настоящий CallbackQuery, а не самоделка.
+
+        `_send_menu` разбирает `isinstance(target, CallbackQuery)`: экран
+        правится на месте или шлётся заново. Подделка молча уходит во
+        вторую ветку — то есть проверка проверяла бы не то, что происходит
+        при нажатии.
+        """
+        from aiogram.types import CallbackQuery, User
+        cb = CallbackQuery.model_construct(
+            id="1", from_user=User(id=7, is_bot=False, first_name="ы"),
+            chat_instance="c", data=data, message=Sent("экран"))
+
+        async def answer(*a, **kw):
+            return None
+
+        object.__setattr__(cb, "answer", answer)
+        return cb
+
+    @staticmethod
+    def _backs(markup):
+        return [b.callback_data for row in markup.inline_keyboard
+                for b in row if b.text.startswith("⬅️")]
+
+    def test_the_way_back_from_the_documents_returns_where_it_came_from(self):
+        """Не в главное меню, а на экран поддержки — оттуда и пришли."""
+        import handlers.policy as P
+        cb = self._tap("menu:help")
+        run(S.show_help(cb))
+        opens = [b.callback_data for row in cb.message.markup.inline_keyboard
+                 for b in row if "окумент" in b.text]
+        self.assertEqual(len(opens), 1, opens)
+
+        doc = self._tap(opens[0])
+        run(P.show_policy(doc, FakeState()))
+        self.assertEqual(self._backs(doc.message.markup), ["menu:help"],
+                         "«Назад» из документов ведёт мимо поддержки")
+
+    def test_the_menu_screen_still_returns_to_the_menu(self):
+        """Обратная сторона: у подключённого продавца документы зовутся из
+        меню, и «Назад» обязано вести туда же."""
+        import handlers.policy as P
+        doc = self._tap("menu:policy")
+        run(P.show_policy(doc, FakeState()))
+        self.assertEqual(self._backs(doc.message.markup), ["menu:main"])
+
+    def test_opening_the_menu_without_a_shop_says_so_instead(self):
+        cb = self._tap("menu:main")
+        run(S.back_to_main(cb, FakeState()))
+        self.assertIn("не подключён", cb.message.now)
+        self.assertNotIn("Главное меню", cb.message.now)
+
+    def test_the_two_ways_into_the_menu_agree(self):
+        """`/menu` проверял токен, кнопка — нет. Пока экран один, а путей
+        два, расходиться они будут молча."""
+        cb = self._tap("menu:main")
+        run(S.back_to_main(cb, FakeState()))
+        m, st = FakeMessage(), FakeState()
+        run(S.cmd_menu(m, st))
+        self.assertEqual(cb.message.now, m.sent[-1].text)
+
+    def test_a_connected_shop_still_gets_its_menu(self):
+        """Проверка не должна закрыть меню тому, у кого магазин на связи."""
+        S.get_token = lambda uid: "wli-token"
+        cb = self._tap("menu:main")
+        run(S.back_to_main(cb, FakeState()))
+        self.assertIn("Главное меню", cb.message.now)
+
 if __name__ == "__main__":
     unittest.main()
