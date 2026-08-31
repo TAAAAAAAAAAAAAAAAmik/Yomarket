@@ -421,10 +421,49 @@ async def sub_order(callback) -> None:
             f"{ui.esc(get_support_contact())}"]
     if rows:
         body += ["", *rows]
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Я оплатил", callback_data="pay:paid")
     await callback.message.answer(ui.screen(
         "💳 <b>Заявка на оплату</b>", body,
-        footer=f"<i>Если ответа долго нет — {ui.esc(get_support_contact())}</i>"))
+        footer=f"<i>Если ответа долго нет — {ui.esc(get_support_contact())}</i>"),
+        reply_markup=ui.lay(b).as_markup())
     await callback.answer("Заявка отправлена" if ok else "Напиши в поддержку")
+
+
+@router.callback_query(lambda c: c.data == "pay:paid")
+async def paid_claim(callback) -> None:
+    """«Я оплатил» — сказать владельцу, что деньги ушли.
+
+    Оплата идёт вне бота, и увидеть её он не может: узнать об этом ему
+    неоткуда, кроме как от самого продавца. Поэтому кнопка не «проверяю
+    оплату» — проверять нечем, — а «передаю владельцу». Обещать проверку
+    там, где её нет, значит отправить человека ждать того, чего не будет.
+    """
+    import logs
+    from storage import get_support_contact, note_paid_claim
+
+    if not note_paid_claim(callback.from_user.id):
+        # Нажали второй раз подряд. Молчать нельзя — снаружи это
+        # неотличимо от сломанной кнопки, — но и слать вторую заявку
+        # незачем: первая уже у владельца.
+        await callback.answer(
+            "Уже передал — владелец видит заявку. Если ответа долго нет, "
+            f"напиши {get_support_contact()}.", show_alert=True)
+        return
+
+    ok = await logs.log_event(callback.bot, "payment",
+                              ["✅ <b>Сообщил, что оплатил подписку.</b>",
+                               "Проверь поступление и выдай дни."],
+                              user=callback.from_user)
+    body = ["Передал владельцу — он проверит поступление и включит доступ."
+            if ok else
+            "Записать не вышло, поэтому напиши напрямую: "
+            f"{ui.esc(get_support_contact())}"]
+    await callback.message.answer(ui.screen(
+        "✅ <b>Спасибо</b>", body,
+        footer=f"<i>Если ответа долго нет — {ui.esc(get_support_contact())}</i>"))
+    await callback.answer("Передал владельцу" if ok else "Напиши в поддержку")
 
 
 # --- Постоянная клавиатура --------------------------------------------------

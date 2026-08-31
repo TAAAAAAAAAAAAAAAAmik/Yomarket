@@ -20,7 +20,7 @@ from aiogram.types import TelegramObject
 from config import BOT_TOKEN
 from api.yoomarket import YooMarketAPI
 from storage import get_token
-from handlers import accounts, admin, ads, approute, auto_settings, autopilot, balance, chats, commands, create_ad, fallback, notifications, nsgifts, orders, packs, panel, panel_items, pay, plugins, policy, prices, responders, selenium_settings, settings, start, stats
+from handlers import accounts, admin, ads, approute, auto_settings, autopilot, balance, chats, commands, create_ad, fallback, notifications, nsgifts, orders, packs, panel, panel_items, plugins, policy, prices, responders, selenium_settings, settings, start, stats
 from tasks import TaskManager
 
 logging.basicConfig(
@@ -44,10 +44,7 @@ logger = logging.getLogger(__name__)
 FREE_CALLBACKS = frozenset({
     "access:menu", "menu:prices",                  # тарифы
     "trial:free", "trial:offer", "trial:check",    # пробы
-    "sub:order",                                   # просьба о счёте
-    # Оплата — та самая дверь: заперев её подпиской, мы заперли бы
-    # единственный способ подписку купить.
-    "pay:menu", "pay:uid", "pay:check",
+    "sub:order", "pay:paid",                       # счёт и «я оплатил»
     "menu:help", "start:hello",                    # поддержка и путь назад
     # Документы: кнопка обязана открываться там же, где `/policy`. Иначе
     # политика конфиденциальности читается только тем, кто знает команду.
@@ -651,7 +648,6 @@ async def main() -> None:
     dp.include_router(stats.router)
     dp.include_router(panel.router)
     dp.include_router(policy.router)
-    dp.include_router(pay.router)
     # Команды-ярлыки. Позже разделов намеренно: их обработчики
     # вызываются отсюда напрямую, и роутер нужен только ради имён
     # команд, которых больше нигде нет.

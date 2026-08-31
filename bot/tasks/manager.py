@@ -1096,7 +1096,6 @@ class TaskManager:
         self._chat_pace: dict[int, float] = {}
         # Проход удаления данных — один на весь бот, а не по продавцу.
         self._purge_task: asyncio.Task | None = None
-        self._billing_task: asyncio.Task | None = None
         # Замок на продавца: проход по заказам (60 с) и проход авто-функций
         # (30 мин) оба читают, правят и сохраняют весь словарь настроек целиком.
         # Без выстраивания их в очередь тот, кто сохранит последним, молча затрёт
@@ -1146,7 +1145,6 @@ class TaskManager:
         for uid in get_all_users():
             self.start_for_user(uid)
         self.start_purge_loop()
-        self.start_billing_loop()
 
     # ------------------------------------------------------------------
     # Удаление данных по истечении подписки
@@ -1163,38 +1161,6 @@ class TaskManager:
 
     PURGE_AFTER = 3 * 86400        # три календарных дня из политики
     PURGE_EVERY = 6 * 3600         # как часто смотреть
-
-    # ------------------------------------------------------------------
-    # Оплата подписки переводом внутри Bybit
-    # ------------------------------------------------------------------
-    #
-    # Проход один на весь бот, а не по продавцу: кабинет Bybit у владельца
-    # один, и заводить его опрос на каждого продавца значит читать одно и
-    # то же столько раз, сколько запущено циклов.
-    #
-    # Полминуты — не подгонка под лимит: у этого вызова 300 запросов в
-    # секунду, и упереться в него нечем. Столько ждать не жалко, а быстрее
-    # незачем: продавцу и так обещано «в течение минуты», и у него есть
-    # кнопка «я оплатил», которая смотрит немедленно.
-    BILLING_EVERY = 30
-
-    def start_billing_loop(self) -> None:
-        if self._billing_task is not None and not self._billing_task.done():
-            return
-        self._billing_task = asyncio.create_task(self._billing_loop())
-
-    async def _billing_loop(self) -> None:
-        from billing import collect
-        while True:
-            try:
-                await collect(self.bot)
-            except asyncio.CancelledError:
-                break
-            except Exception:                      # noqa: BLE001
-                # Деньги важнее аккуратности лога, но цикл ронять нельзя:
-                # упавший опрос — это оплаты, которые никто не засчитает.
-                logger.exception("проход по оплатам сорвался")
-            await asyncio.sleep(self.BILLING_EVERY)
 
     def start_purge_loop(self) -> None:
         if self._purge_task is not None and not self._purge_task.done():

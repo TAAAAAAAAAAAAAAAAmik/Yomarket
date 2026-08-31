@@ -1697,248 +1697,33 @@ def price_lines() -> list[str]:
     return lines
 
 
-# --- Оплата через Bybit -----------------------------------------------------
+# --- «Я оплатил» ------------------------------------------------------------
 #
-# Продавец переводит USDT на UID владельца внутри Bybit, бот видит
-# поступление и засчитывает оплату сам.
+# Продавец платит вне бота, и узнать об этом бот сам не может. Значит,
+# сказать должен продавец — а бот передаёт это владельцу в журнал.
 #
-# Всё это принадлежит ВЛАДЕЛЬЦУ бота, а не продавцу-подписчику: и кабинет,
-# и ключ, и цены. Поэтому лежит в общем хранилище рядом с тарифами, а не в
-# настройках магазина.
-#
-# **Секрет ключа шифруется тем же способом, что seed-фраза TON.** Ключ на
-# чтение — не пароль от денег, но он показывает все поступления владельца,
-# то есть его выручку; в открытом виде в базе ему не место. Подстраховки
-# «нет SECRET_KEY — выведем ключ из чего-нибудь» здесь нет по той же
-# причине, что и там.
+# Не чаще раза в час на человека: кнопка, нажатая десять раз подряд (а её
+# нажимают именно так, когда ждут ответа), превратила бы журнал в рассылку,
+# и настоящая заявка утонула бы среди повторов.
 
-# UID отправителя приходит от Bybit, а Telegram-номер знаем мы. Связать их
-# может только сам продавец — больше эту пару взять неоткуда.
-def get_bybit() -> dict:
-    """Настройки приёма оплаты. Секрет расшифрован; наружу не показывать."""
-    data = (_load_admin().get("bybit") or {})
-    out = dict(data)
-    if out.get("secret"):
-        out["secret"] = _unseal(out["secret"])
-    return out
+PAID_CLAIM_EVERY = 3600
 
 
-def set_bybit(**fields) -> None:
-    """Правит только переданные поля: ключ и UID задаются на разных экранах,
-    и запись целиком стирала бы соседнее."""
+def note_paid_claim(user_id: int) -> bool:
+    """Отметить заявление об оплате. False — было меньше часа назад."""
     data = _load_admin()
-    cur = dict(data.get("bybit") or {})
-    for key, value in fields.items():
-        if key == "secret" and value:
-            value = _seal(str(value))
-        cur[key] = value
-    data["bybit"] = cur
-    _save_admin(data)
-
-
-def bybit_ready() -> bool:
-    """Можно ли предлагать оплату: включено И есть чем принимать.
-
-    Кнопка «оплатить», за которой не задан UID, — обещание невозможного:
-    продавец нажмёт и увидит пустоту.
-    """
-    b = get_bybit()
-    return bool(b.get("enabled") and b.get("uid") and b.get("key")
-                and b.get("secret") and get_usdt_prices())
-
-
-def bybit_trouble() -> str:
-    """Чего не хватает, чтобы приём заработал. Пустая строка — всё есть.
-
-    Отвечает словами, а не «выключено»: владелец включил тумблер и не
-    понимает, почему у продавцов ничего не появилось.
-    """
-    b = get_bybit()
-    missing = []
-    if not b.get("uid"):
-        missing.append("твой UID на Bybit")
-    if not (b.get("key") and b.get("secret")):
-        missing.append("ключ API")
-    if not get_usdt_prices():
-        missing.append("хотя бы одна цена в USDT")
-    if missing:
-        return "не задано: " + ", ".join(missing)
-    if not b.get("enabled"):
-        return "всё задано, но приём выключен"
-    return ""
-
-
-# --- Цены в USDT ------------------------------------------------------------
-#
-# Отдельные от рублёвых, а не пересчёт по курсу: пересчитывая, бот сам
-# решал бы, сколько денег взять, и при скачке курса продавец заплатил бы не
-# то, что видел на экране.
-
-def get_usdt_prices() -> dict[int, float]:
-    """{дней: цена в USDT} — только заданные и только для живых тарифов."""
-    saved = (_load_admin().get("usdt_prices") or {})
-    out: dict[int, float] = {}
-    for days, _label in PRICE_TIERS:
-        try:
-            value = float(saved.get(str(days), 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if value > 0:
-            out[days] = round(value, 2)
-    return out
-
-
-def set_usdt_price(days: int, price: float) -> None:
-    data = _load_admin()
-    prices = data.setdefault("usdt_prices", {})
-    value = round(float(price or 0), 2)
-    if value > 0:
-        prices[str(int(days))] = value
-    else:
-        prices.pop(str(int(days)), None)
-    _save_admin(data)
-
-
-def usdt(amount: float) -> str:
-    """Сумма в USDT для экрана: «3», а не «3.0»; «4.5» — как есть.
-
-    Хранится числом (сравнивать «4.5» со строкой нельзя), а показывается
-    так, как её пишет человек.
-    """
-    value = round(float(amount or 0), 2)
-    return str(int(value)) if value == int(value) else f"{value:g}"
-
-
-def tier_for_amount(amount: float) -> int:
-    """Сколько дней даёт присланная сумма. Ноль — ни на что не хватило.
-
-    Берётся САМЫЙ ДЛИННЫЙ тариф, который сумма покрывает. Прислали больше
-    — значит хотели длиннее, а не «переплатили за две недели»; прислали
-    чуть меньше — не хватило, и придумывать за продавца скидку мы не
-    вправе.
-    """
-    paid = round(float(amount or 0), 2)
-    best = 0
-    for days, price in get_usdt_prices().items():
-        if paid + 1e-9 >= price and days > best:
-            best = days
-    return best
-
-
-# --- Кто из продавцов какой UID назвал --------------------------------------
-#
-# UID закрепляется за одним продавцом. Иначе вписавший чужой UID забирал бы
-# чужие оплаты — а пострадавший увидел бы только то, что деньги ушли, а
-# подписки нет.
-
-def get_payer_uid(user_id: int) -> str:
-    return str((_load_admin().get("bybit_uids") or {}).get(str(user_id)) or "")
-
-
-def uid_taken_by(uid: str) -> int:
-    """Кем занят этот UID. Ноль — никем."""
-    uid = str(uid or "").strip()
-    for owner, theirs in (_load_admin().get("bybit_uids") or {}).items():
-        if str(theirs) == uid:
-            try:
-                return int(owner)
-            except (TypeError, ValueError):
-                return 0
-    return 0
-
-
-def set_payer_uid(user_id: int, uid: str) -> bool:
-    """Закрепить UID за продавцом. False — занят другим."""
-    uid = str(uid or "").strip()
-    taken = uid_taken_by(uid)
-    if taken and taken != int(user_id):
+    claims = data.setdefault("paid_claims", {})
+    now = _time.time()
+    if now - float(claims.get(str(user_id), 0) or 0) < PAID_CLAIM_EVERY:
         return False
-    data = _load_admin()
-    data.setdefault("bybit_uids", {})[str(user_id)] = uid
+    claims[str(user_id)] = now
     _save_admin(data)
     return True
 
 
-def payer_by_uid(uid: str) -> int:
-    """Продавец по UID отправителя. Ноль — такого не знаем."""
-    return uid_taken_by(uid)
-
-
-# --- Что уже засчитано ------------------------------------------------------
-#
-# `txID` перевода. Без этого списка перезапуск бота выдавал бы подписку по
-# второму разу за те же деньги — а вернуть выданное нечем.
-
-def payment_seen(tx_id: str) -> bool:
-    return str(tx_id or "") in (_load_admin().get("bybit_seen") or {})
-
-
-def note_payment(tx_id: str, user_id: int, amount: float, days: int) -> None:
-    """Отметить перевод засчитанным. Хранится и что именно выдали — иначе
-    на вопрос «за что списали» ответить нечем."""
-    data = _load_admin()
-    seen = data.setdefault("bybit_seen", {})
-    seen[str(tx_id)] = {"user": int(user_id), "amount": round(float(amount), 2),
-                        "days": int(days), "at": _time.time()}
-    # Список не растёт бесконечно: Bybit отдаёт максимум 30 дней истории,
-    # значит и помнить дольше незачем — но с запасом, чтобы поступление на
-    # границе окна не засчиталось вторым разом.
-    if len(seen) > 2000:
-        for key in sorted(seen, key=lambda k: seen[k].get("at", 0))[:500]:
-            seen.pop(key, None)
-    _save_admin(data)
-
-
-# --- Поступления, которые не к кому привязать -------------------------------
-#
-# Продавец мог заплатить раньше, чем назвал свой UID, или прислать меньше
-# самого дешёвого тарифа. Деньги при этом ПРИШЛИ. Забыть такой перевод
-# значит взять деньги и не дать ничего — худшее, что здесь возможно.
-#
-# Поэтому он не теряется: лежит в списке с причиной, виден владельцу в
-# админке и разбирается сам, как только продавец назовёт свой UID.
-
-def add_unresolved(tx_id: str, uid: str, amount: float, coin: str,
-                   reason: str) -> None:
-    data = _load_admin()
-    items = data.setdefault("bybit_unresolved", {})
-    items[str(tx_id)] = {"uid": str(uid or ""), "amount": round(float(amount), 2),
-                         "coin": str(coin or ""), "reason": str(reason),
-                         "at": _time.time()}
-    _save_admin(data)
-
-
-def unresolved_payments() -> dict:
-    return dict(_load_admin().get("bybit_unresolved") or {})
-
-
-def unresolved_for_uid(uid: str) -> list[tuple[str, dict]]:
-    uid = str(uid or "").strip()
-    return [(tx, row) for tx, row in unresolved_payments().items()
-            if str(row.get("uid") or "") == uid]
-
-
-def drop_unresolved(tx_id: str) -> None:
-    data = _load_admin()
-    items = data.setdefault("bybit_unresolved", {})
-    if items.pop(str(tx_id), None) is not None:
-        _save_admin(data)
-
-
-def payments_since() -> int:
-    """С какого момента (мс) спрашивать поступления.
-
-    От последнего разбора минус запас: перевод, попавший в ту же секунду,
-    иначе оказался бы «до» границы и не был бы прочитан никогда.
-    """
-    at = float((_load_admin().get("bybit") or {}).get("checked_at") or 0)
-    if not at:
-        return int((_time.time() - 86400) * 1000)
-    return int((at - 3600) * 1000)
-
-
-def note_payments_checked(at: float | None = None) -> None:
-    set_bybit(checked_at=float(at if at is not None else _time.time()))
+def last_paid_claim(user_id: int) -> float:
+    return float((_load_admin().get("paid_claims") or {}).get(str(user_id), 0)
+                 or 0)
 
 
 # --- Пробный период ---------------------------------------------------------
