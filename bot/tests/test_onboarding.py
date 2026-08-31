@@ -730,17 +730,32 @@ class TheGreetingNamesEverythingTheBotDoes(unittest.TestCase):
                     key, цена="", проба=3, неделя=7, всего=10, days=30, left=30)
                 self.assertNotIn("{", text)
 
-    def test_the_card_list_is_read_from_the_registry(self):
+    def _welcome(self):
+        return storage.render_custom_text("welcome", цена="", проба=3,
+                                          неделя=7, всего=10)
+
+    def test_the_number_of_cards_is_counted_from_the_registry(self):
+        """Поимённо тринадцать карт занимали в приветствии три строки, и оно
+        вышло вдвое длиннее нужного — перечень переехал на экран плагинов.
+        Но ЧИСЛО осталось, и считается по реестру: включат четырнадцатую —
+        приветствие скажет «14», а не промолчит."""
         from automation import giftcards as G
-        extra = dataclasses.replace(G.CARDS[0], slug="nosuch",
-                                    title="Такой карты нет")
         saved = G.CARDS
         try:
-            G.CARDS = saved + (extra,)
-            text = storage.render_custom_text("welcome", цена="", проба=3,
-                                              неделя=7, всего=10)
-            self.assertIn("Такой карты нет", text)
-            self.assertIn(str(len(saved) + 1), text)
+            self.assertIn(str(len(saved)), self._welcome())
+            G.CARDS = saved + (dataclasses.replace(saved[0], slug="nosuch",
+                                                   title="Ещё одна"),)
+            self.assertIn(str(len(saved) + 1), self._welcome())
+        finally:
+            G.CARDS = saved
+
+    def test_the_promise_of_cards_is_not_a_number_written_by_hand(self):
+        """Число, вписанное прозой, разъедется с реестром молча."""
+        from automation import giftcards as G
+        saved = G.CARDS
+        try:
+            G.CARDS = saved[:3]
+            self.assertNotIn(str(len(saved)), self._welcome())
         finally:
             G.CARDS = saved
 
@@ -748,18 +763,29 @@ class TheGreetingNamesEverythingTheBotDoes(unittest.TestCase):
         """Список подставляется во все тексты сам. Но подстановка сверху не
         должна затирать переданное: экран, которому нужен свой перечень,
         тихо получил бы общий."""
-        text = storage.render_custom_text("welcome", цена="", проба=3,
-                                          неделя=7, всего=10,
-                                          карты="только Apple")
+        saved = storage.get_custom_text
+        try:
+            storage.get_custom_text = lambda key: "Карты: {карты}"
+            text = storage.render_custom_text("welcome", карты="только Apple")
+        finally:
+            storage.get_custom_text = saved
         self.assertIn("только Apple", text)
 
-    def test_every_card_that_is_offered_is_named(self):
+    def test_the_owner_can_still_put_the_full_list_into_his_own_text(self):
+        """Перечень карт ушёл из приветствия, но подстановка осталась:
+        владелец правит тексты сам, и `{карты}` в его версии обязано
+        превращаться в список, а не остаться скобками на экране."""
+        saved = storage.get_custom_text
+        try:
+            storage.get_custom_text = lambda key: "Карты: {карты} ({карт})"
+            text = storage.render_custom_text("welcome")
+        finally:
+            storage.get_custom_text = saved
         from automation.giftcards import cards
-        text = storage.render_custom_text("welcome", цена="", проба=3,
-                                          неделя=7, всего=10)
         for c in cards():
             with self.subTest(c.slug):
                 self.assertIn(c.title, text)
+        self.assertNotIn("{", text)
 
     def test_the_big_selling_points_are_all_there(self):
         """Не проверка прозы: каждая строка — отдельная функция бота, и

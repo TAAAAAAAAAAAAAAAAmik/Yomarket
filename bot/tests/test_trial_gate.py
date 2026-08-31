@@ -345,11 +345,14 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
 
     def test_it_names_both_trials_with_real_numbers(self):
         """Числа берутся из настроек: приветствие, обещающее прежние сроки,
-        — то же враньё, только на первом экране."""
+        — то же враньё, только на первом экране. Проверяются числа, а не
+        обороты вокруг них: текст правит и владелец."""
         storage.set_trial_free_days(4)
+        storage.set_trial_days(9)
         text = self.S._welcome_text()
-        self.assertIn("4 дня доступа", text)
-        self.assertIn("7 дней сверху", text)
+        self.assertIn("4 дня", text)
+        self.assertIn("9 дней", text)
+        self.assertNotIn("3 дня", text, "остался прежний срок")
 
     def test_it_names_how_much_is_free_in_total(self):
         """Три и семь по отдельности не складываются в голове у того, кто
