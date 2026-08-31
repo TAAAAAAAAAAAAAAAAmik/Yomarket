@@ -30,6 +30,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Вход мимо ворот: экраны, которыми в бота ВХОДЯТ.
+#
+# Проверка подписки висит и на нажатиях кнопок, а не только на командах, и
+# пропускала один `/start`. То есть в день, когда владелец включит «доступ
+# по подписке», все кнопки первого экрана начали бы отвечать «🔒 Нужна
+# подписка» и не делать ничего — включая «💳 Прошу счёт», собственную
+# кнопку экрана «нужна подписка». Новый человек не мог бы ни взять пробу,
+# ни попросить счёт: заплатить нам было бы нечем.
+#
+# Список узкий намеренно: это дверь, а не бот. Заказы, чаты и подключение
+# магазина — оплаченный товар, они остаются за воротами.
+FREE_CALLBACKS = frozenset({
+    "access:menu", "menu:prices",                  # тарифы
+    "trial:free", "trial:offer", "trial:check",    # пробы
+    "sub:order",                                   # просьба о счёте
+    "menu:help", "start:hello",                    # поддержка и путь назад
+})
+
+# `/policy` и `/forget_me` — не любезность: политика конфиденциальности
+# обещает удаление данных по требованию, и обещание, упирающееся в оплату,
+# было бы ложью в опубликованном документе.
+FREE_COMMANDS = ("/start", "/policy", "/forget_me")
+
+
 class AccessMiddleware:
     """Отсекает заблокированных и, если включена подписка, — тех, у кого её нет.
     Владелец и админы проходят всегда."""
@@ -52,8 +76,15 @@ class AccessMiddleware:
             if (require_subscription_enabled() and not is_admin(uid)
                     and not has_active_subscription(uid)):
                 text = getattr(event, "text", "") or ""
-                is_start = text.startswith("/start")
-                if not is_start:
+                data_ = getattr(event, "data", "") or ""
+                # `@имя_бота` отрезается: в группе Telegram шлёт команду
+                # именно так, и `/start@YoMarketBot` иначе упёрся бы в
+                # ворота — то есть вход закрылся бы ровно там, где человек
+                # его и ищет. Слово целиком, а не начало строки: «/startup»
+                # — не команда, и пускать его незачем.
+                head = text.split(maxsplit=1)[0].split("@")[0] if text else ""
+                free = head in FREE_COMMANDS or data_ in FREE_CALLBACKS
+                if not free:
                     from storage import price_lines, render_custom_text
                     # Тарифы по срокам, а не одно число: документы обещают
                     # скидку за длинный срок, и клиент должен её видеть.
@@ -69,9 +100,21 @@ class AccessMiddleware:
                         # на оплату», вместе с номером человека.
                         from aiogram.utils.keyboard import InlineKeyboardBuilder
                         kb = InlineKeyboardBuilder()
+                        # «Получить доступ» рядом со счётом: у упёршегося в
+                        # подписку могла остаться неиспользованная проба —
+                        # взять её отсюда иначе нечем, а экран о ней молчит.
+                        kb.button(text="🚀 Получить доступ",
+                                  callback_data="access:menu")
                         kb.button(text="💳 Прошу счёт", callback_data="sub:order")
+                        kb.adjust(1)
                         if isinstance(event, _CQ):
-                            await event.answer("🔒 Нужна подписка", show_alert=True)
+                            # Всплывающее окно кнопок не носит, поэтому оно
+                            # называет ту, которую надо нажать: «нужна
+                            # подписка» без «а где её взять» — тупик.
+                            await event.answer(
+                                "🔒 Нужна подписка.\nЖми «🚀 Получить "
+                                "доступ» — там есть и бесплатные дни.",
+                                show_alert=True)
                         elif isinstance(event, _Msg):
                             await event.answer(msg,
                                                reply_markup=kb.as_markup())

@@ -254,13 +254,20 @@ class TheGreetingSellsBeforeItInstructs(unittest.TestCase):
                          "инструкция про токен показана до согласия подключаться")
         self.assertNotIn("Создать токен", said.now)
 
-    def test_the_greeting_offers_to_connect(self):
-        """Приветствие стало витриной — кнопок несколько. Но подключение
-        среди них главное и стоит первым: остальные ведут читать, а эта —
-        работать."""
+    def test_the_greeting_offers_access_first_and_connecting_next(self):
+        """Приветствие стало витриной — кнопок несколько. Первой стоит
+        «Получить доступ»: у нового человека доступа ещё нет, и подключать
+        магазин ему пока нечем. Само подключение остаётся рядом — без него
+        бот не работает, и убрать его нельзя.
+
+        Витрина при этом остаётся витриной: способы оплаты и пробы живут за
+        «Получить доступ», а не выкладываются кнопками здесь.
+        """
         said, _ = self._start()
         kb = texts(said.markup)
-        self.assertIn("одключ", kb[0], f"подключение не первое: {kb}")
+        self.assertIn("олучить доступ", kb[0], f"доступ не первый: {kb}")
+        self.assertTrue(any("одключ" in t for t in kb[1:]),
+                        f"подключение магазина пропало: {kb}")
         self.assertLessEqual(len(kb), 5, f"витрина превратилась в список: {kb}")
 
     def test_a_token_pasted_without_pressing_anything_is_still_caught(self):

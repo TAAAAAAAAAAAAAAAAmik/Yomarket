@@ -333,5 +333,94 @@ class TwoWeeksIsTheEntryTier(unittest.TestCase):
             storage._save_admin(admin)
 
 
+class TheAccessScreenShowsOnlyRealPrices(Admin):
+    """Экран «🚀 Получить доступ»: сколько стоит и что можно взять даром.
+
+    Раньше тарифы жили на отдельном экране «💳 Тарифы», а кнопки проб — на
+    витрине. Нажавший «Получить доступ» обязан увидеть всё сразу: и
+    бесплатные дни, и цены — иначе он выбирает, не зная, из чего.
+
+    Тариф без назначенной цены сюда не попадает: строка «1 месяц — 0 ₽»
+    читается как «бесплатно», и это обещание, за которое спросят.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import handlers.start as S
+        self.S = S
+        storage.set_trial_channel("@ch")
+
+    def _open(self, uid=4242):
+        import asyncio
+
+        class Cb:
+            def __init__(self, uid):
+                self.from_user = type("U", (), {"id": uid})()
+                self.message = self
+                self.text = ""
+                self.markup = None
+
+            async def edit_text(self, text, reply_markup=None, **kw):
+                self.text, self.markup = text, reply_markup
+
+            async def answer(self, *a, **kw):
+                return None
+
+        cb = Cb(uid)
+        asyncio.run(self.S.show_access(cb))
+        return cb
+
+    def test_a_priced_tier_is_named_with_its_price(self):
+        storage.set_price(14, 249)
+        self.assertIn("249", self._open().text)
+
+    def test_an_unpriced_tier_is_not_listed(self):
+        """«1 месяц — 0 ₽» читается как «бесплатно»."""
+        storage.set_price(14, 249)
+        text = self._open().text
+        self.assertNotIn("1 месяц", text)
+        self.assertNotIn("0 ₽", text)
+
+    def test_no_prices_at_all_is_explained_and_not_left_blank(self):
+        """Пустое место под заголовком «По подписке» читается как поломка
+        бота, а не как «цены ещё не назначены»."""
+        text = self._open().text
+        self.assertIn("не назначены", text)
+
+    def test_the_free_days_are_named_with_real_numbers(self):
+        storage.set_trial_free_days(3)
+        storage.set_trial_days(7)
+        text = self._open().text
+        self.assertIn("3 дня", text)
+        self.assertIn("7 дней", text)
+
+    def test_a_used_up_trial_is_not_advertised_in_the_text(self):
+        """Строка «3 дня — просто так» тому, кто их уже брал, — обещание
+        невозможного, и кнопку мы для него уже прячем."""
+        storage.note_trial(4242, "free")
+        text = self._open().text
+        self.assertNotIn("просто так", text)
+        self.assertIn("за подписку на канал", text)
+
+    def test_the_channel_offer_is_not_advertised_without_a_channel(self):
+        """Кнопку «за подписку» без заданного канала мы прячем, а текст
+        обещал бы дальше: способ, которого нет. Ровно такое расхождение
+        кнопки и текста и ловится здесь."""
+        storage.set_trial_channel("")
+        text = self._open().text
+        self.assertNotIn("за подписку на канал", text)
+        self.assertIn("просто так", text, "заодно потеряли и короткую пробу")
+
+    def test_paying_is_offered_even_when_nothing_is_free_anymore(self):
+        storage.note_trial(4242, "free")
+        storage.note_trial(4242, "channel")
+        storage.set_price(14, 249)
+        cb = self._open()
+        data = [b.callback_data for row in cb.markup.inline_keyboard
+                for b in row]
+        self.assertIn("sub:order", data)
+        self.assertNotIn("Бесплатно", cb.text)
+
+
 if __name__ == "__main__":
     unittest.main()

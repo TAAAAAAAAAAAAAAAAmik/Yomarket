@@ -26,8 +26,10 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("BOT_TOKEN", "x")
 
+import re                                                 # noqa: E402
 import storage                                            # noqa: E402
 import trialgate                                          # noqa: E402
+import main as M                                          # noqa: E402
 
 
 def run(coro):
@@ -333,6 +335,11 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
         storage.set_trial_channel("@ch")
 
     def _labels(self, uid):
+        """Надписи экрана «Получить доступ» — там живут кнопки проб."""
+        return [b.text for row in self.S._access_kb(uid).inline_keyboard
+                for b in row]
+
+    def _hello_labels(self, uid):
         return [b.text for row in self.S._hello_kb(uid).inline_keyboard
                 for b in row]
 
@@ -370,9 +377,25 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
         finally:
             storage._save_admin(admin)
 
+    def test_the_showcase_leads_to_the_ways_of_getting_access(self):
+        """Витрина продаёт, а не раскладывает способы оплаты. Но кнопка,
+        ведущая к ним, обязана на ней быть — иначе продали и не сказали,
+        где платить."""
+        target = [b.callback_data
+                  for row in self.S._hello_kb(self.UID).inline_keyboard
+                  for b in row if "олучить доступ" in b.text]
+        self.assertEqual(target, ["access:menu"])
+
+    def test_the_showcase_does_not_carry_the_trial_buttons(self):
+        """Четыре способа получить доступ на витрине — это уже не витрина,
+        а список кнопок. Пробы живут за «Получить доступ»."""
+        labels = " ".join(self._hello_labels(self.UID))
+        self.assertNotIn("бесплатно", labels)
+        self.assertNotIn("за подписку", labels)
+
     def test_both_trial_buttons_are_offered_to_a_newcomer(self):
         labels = " ".join(self._labels(self.UID))
-        self.assertIn("3 дня доступа", labels)
+        self.assertIn("3 дня бесплатно", labels)
         self.assertIn("за подписку", labels)
 
     def test_a_used_up_trial_hides_only_its_own_button(self):
@@ -380,38 +403,242 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
         Но вторая обязана остаться: её ещё не брали."""
         storage.note_trial(self.UID, "free")
         labels = " ".join(self._labels(self.UID))
-        self.assertNotIn("дня доступа", labels)
+        self.assertNotIn("дня бесплатно", labels)
         self.assertIn("за подписку", labels, "скрыли и вторую пробу")
 
     def test_both_used_up_shows_neither(self):
         storage.note_trial(self.UID, "free")
         storage.note_trial(self.UID, "channel")
         labels = " ".join(self._labels(self.UID))
-        self.assertNotIn("дня доступа", labels)
+        self.assertNotIn("дня бесплатно", labels)
         self.assertNotIn("за подписку", labels)
+
+    def test_paying_stays_possible_when_the_trials_are_gone(self):
+        """Экран, с которого нечего нажать, — тупик: человек пришёл платить,
+        а ему нечем."""
+        storage.note_trial(self.UID, "free")
+        storage.note_trial(self.UID, "channel")
+        data = [b.callback_data
+                for row in self.S._access_kb(self.UID).inline_keyboard
+                for b in row]
+        self.assertIn("sub:order", data)
 
     def test_without_a_channel_only_the_short_one_is_offered(self):
         """Кнопка «за подписку» без заданного канала вела бы в пустоту."""
         storage.set_trial_channel("")
         labels = " ".join(self._labels(self.UID))
-        self.assertIn("3 дня доступа", labels)
+        self.assertIn("3 дня бесплатно", labels)
         self.assertNotIn("за подписку", labels)
 
     def test_connecting_the_shop_is_always_there(self):
-        labels = self._labels(self.UID)
+        labels = self._hello_labels(self.UID)
         self.assertTrue(any("одключить" in x for x in labels))
 
     def test_the_long_trial_shows_the_channel_before_refusing(self):
         """Кнопка вела прямо на проверку: не подписан — получи отказ и ищи
         канал сам. Ссылку надо дать до отказа, а не вместо него."""
-        labels = self._labels(self.UID)
         target = [b.callback_data
-                  for row in self.S._hello_kb(self.UID).inline_keyboard
+                  for row in self.S._access_kb(self.UID).inline_keyboard
                   for b in row if "за подписку" in b.text]
         self.assertEqual(target, ["trial:offer"])
         offer = [b.text for row in self.S._trial_kb().inline_keyboard
                  for b in row]
         self.assertTrue(any("анал" in x for x in offer), offer)
+
+class TheGateDoesNotLockTheDoorFromOutside(unittest.TestCase):
+    """Включённая подписка не должна запирать вход снаружи.
+
+    `AccessMiddleware` висит и на нажатиях кнопок, а не только на командах,
+    и пропускала мимо себя один `/start`. То есть стоило владельцу включить
+    «доступ по подписке», как ВСЕ кнопки первого экрана начинали отвечать
+    «🔒 Нужна подписка» и не делать ничего: и «🚀 Получить доступ», и «🎁 3
+    дня бесплатно», и «💳 Прошу счёт» — собственная кнопка экрана «нужна
+    подписка».
+
+    Снаружи это выглядит осмысленно: бот отвечает про подписку. На деле
+    новый человек не может ни взять пробу, ни попросить счёт — то есть
+    заплатить нам ему нечем.
+
+    Обратная сторона тут же: пропустить надо ВХОД, а не сам бот. Заказы,
+    чаты и подключение магазина — это оплаченный товар, и они остаются за
+    воротами.
+    """
+
+    def setUp(self):
+        self.admin = {"require_subscription": True}
+        self._load, self._save = storage._load_admin, storage._save_admin
+        storage._load_admin = lambda: self.admin
+        storage._save_admin = lambda d: self.admin.update(d)
+        self.mw = M.AccessMiddleware()
+
+    def tearDown(self):
+        storage._load_admin, storage._save_admin = self._load, self._save
+
+    def _pass(self, event):
+        """Дошло ли нажатие до обработчика."""
+        got = []
+
+        async def handler(e, data):
+            got.append(e)
+            return "готово"
+
+        run(self.mw(handler, event, {"event_from_user":
+                                     type("U", (), {"id": 4242})()}))
+        return bool(got)
+
+    def _tap(self, data):
+        cb = type("CB", (), {})()
+        cb.data = data
+        cb.message = None
+
+        async def answer(*a, **kw):
+            return None
+
+        cb.answer = answer
+        return cb
+
+    def _say(self, text):
+        m = type("M", (), {})()
+        m.text = text
+
+        async def answer(*a, **kw):
+            return None
+
+        m.answer = answer
+        return m
+
+    def test_the_ways_in_are_let_through(self):
+        for data in ("access:menu", "trial:free", "trial:offer", "trial:check",
+                     "sub:order", "menu:help", "start:hello"):
+            with self.subTest(data):
+                self.assertTrue(self._pass(self._tap(data)),
+                                f"{data} упёрлось в подписку — войти нечем")
+
+    def test_the_paid_part_stays_behind_the_gate(self):
+        for data in ("menu:main", "start:connect", "orders:list"):
+            with self.subTest(data):
+                self.assertFalse(self._pass(self._tap(data)),
+                                 f"{data} пропущено бесплатно")
+
+    def test_every_button_of_the_paywall_screen_actually_works(self):
+        """Кнопки на экране «нужна подписка» ставит сам `main.py`. Список
+        сверяется с ним, а не переписывается сюда: разъехавшись, они дали бы
+        ровно ту же мёртвую кнопку, только незаметно."""
+        src = pathlib.Path(M.__file__).read_text(encoding="utf-8")
+        head = src[src.index("class AccessMiddleware"):
+                   src.index("_COMMAND_RE")]
+        found = re.findall(r'callback_data="([^"]+)"', head)
+        self.assertTrue(found, "кнопок на экране подписки не нашлось — "
+                               "проверка ничего не проверяет")
+        for data in found:
+            with self.subTest(data):
+                self.assertTrue(self._pass(self._tap(data)),
+                                f"кнопка {data} на экране подписки мертва")
+
+    def test_every_way_out_of_the_first_screen_works(self):
+        """То же самое для витрины и экрана «Получить доступ»: кнопка,
+        которую видит человек без подписки, обязана работать. Кроме
+        подключения магазина — это и есть оплаченный товар."""
+        import handlers.start as S
+        storage.set_trial_channel("@ch")
+        seen = [b.callback_data
+                for kb in (S._hello_kb(4242), S._access_kb(4242))
+                for row in kb.inline_keyboard for b in row
+                if b.callback_data and b.callback_data != "start:connect"]
+        self.assertTrue(seen)
+        for data in seen:
+            with self.subTest(data):
+                self.assertTrue(self._pass(self._tap(data)),
+                                f"кнопка {data} первого экрана мертва")
+
+    def test_deleting_your_data_is_not_behind_the_paywall(self):
+        """Политика конфиденциальности обещает удаление по требованию.
+        Обещание, упирающееся в оплату, — ложь в опубликованном документе."""
+        for cmd in ("/start", "/policy", "/forget_me"):
+            with self.subTest(cmd):
+                self.assertTrue(self._pass(self._say(cmd)), cmd)
+
+    def test_a_command_addressed_to_the_bot_by_name_still_gets_in(self):
+        """В группе Telegram шлёт команду как `/start@YoMarketBot`. Сверка
+        со словом целиком закрыла бы вход ровно там, где его ищут."""
+        for cmd in ("/start@YoMarketBot", "/forget_me@YoMarketBot",
+                    "/start вместе с хвостом"):
+            with self.subTest(cmd):
+                self.assertTrue(self._pass(self._say(cmd)), cmd)
+
+    def test_a_word_that_merely_begins_like_a_command_is_not_a_pass(self):
+        """`text.startswith("/start")` пускал бы и «/startup», и
+        «/policy_all» — то есть ворота открывались бы приставкой."""
+        for text in ("/startup", "/policy_all", "/forget_me_not"):
+            with self.subTest(text):
+                self.assertFalse(self._pass(self._say(text)), text)
+
+    def test_the_bot_itself_still_needs_paying_for(self):
+        for cmd in ("/orders", "/chats", "/menu"):
+            with self.subTest(cmd):
+                self.assertFalse(self._pass(self._say(cmd)), cmd)
+
+class TurningTheGateOnSaysWhatItBreaks(unittest.TestCase):
+    """Приветствие обещает: «бесплатно и сразу — подключить магазин».
+    Включённая подписка это обещание отменяет: подключение уходит за
+    ворота вместе со всем остальным.
+
+    Заметить это владелец не может: он админ и проходит мимо проверки —
+    у него всё работает. Узнал бы он от продавцов, которые к тому времени
+    уже ушли. Поэтому последствие называется в тот момент, когда переключают.
+    """
+
+    def setUp(self):
+        import handlers.admin as A
+        self.A = A
+        self.admin = {}
+        self._load, self._save = storage._load_admin, storage._save_admin
+        storage._load_admin = lambda: self.admin
+        storage._save_admin = lambda d: self.admin.update(d)
+        self._is_admin = A.is_admin
+        A.is_admin = lambda uid: True
+        self._menu = A._show_menu
+
+        async def _noop(*a, **kw):
+            return None
+
+        A._show_menu = _noop
+
+    def tearDown(self):
+        storage._load_admin, storage._save_admin = self._load, self._save
+        self.A.is_admin = self._is_admin
+        self.A._show_menu = self._menu
+
+    def _toggle(self):
+        said = []
+        cb = type("CB", (), {})()
+        cb.from_user = type("U", (), {"id": 1})()
+        cb.message = None
+
+        async def answer(text="", **kw):
+            said.append(text)
+
+        cb.answer = answer
+        run(self.A.toggle_sub(cb))
+        return said[0]
+
+    def test_switching_it_on_names_the_promise_it_cancels(self):
+        note = self._toggle()
+        self.assertTrue(storage.require_subscription_enabled())
+        self.assertIn("подключение магазина", note.lower())
+        self.assertIn("неправда", note.lower())
+
+    def test_the_warning_fits_into_a_telegram_alert(self):
+        """Всплывающее окно Telegram обрезает всё после 200 знаков — вместе
+        с советом, ради которого оно и написано."""
+        self.assertLessEqual(len(self._toggle()), 200)
+
+    def test_switching_it_off_does_not_scare_anyone(self):
+        self.A.is_admin = lambda uid: True
+        self._toggle()                      # включили
+        note = self._toggle()               # выключили
+        self.assertFalse(storage.require_subscription_enabled())
+        self.assertNotIn("неправда", note.lower())
 
 
 if __name__ == "__main__":

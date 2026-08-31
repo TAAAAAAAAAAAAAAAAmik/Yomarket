@@ -359,8 +359,16 @@ async def toggle_sub(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     set_require_subscription(not require_subscription_enabled())
-    state_txt = "включено" if require_subscription_enabled() else "выключено"
-    await callback.answer(f"Требование подписки {state_txt}", show_alert=True)
+    on = require_subscription_enabled()
+    # Включение меняет смысл приветствия: там обещано «бесплатно и сразу —
+    # подключить магазин», а за воротами подключение оказывается платным.
+    # Владелец этого не увидит: он админ и проходит мимо проверки. Поэтому
+    # последствие называется здесь, а не выясняется по жалобам.
+    note = ("Требование подписки включено.\n\nПриветствие обещает "
+            "подключение магазина бесплатно — теперь это неправда. Поправь "
+            "текст в «Тексты бота» или выключи обратно."
+            if on else "Требование подписки выключено.")
+    await callback.answer(note, show_alert=True)
     await _show_menu(callback.message, callback.from_user.id)
 
 

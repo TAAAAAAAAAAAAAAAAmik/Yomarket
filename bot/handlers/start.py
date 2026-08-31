@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-30-stack"
+BOT_VERSION = "2026-08-31-access"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -114,26 +114,39 @@ def _hello_kb(uid: int = 0) -> "InlineKeyboardMarkup":
     тому, кто их уже брал, — обещание невозможного: нажатие ответит
     отказом, и виноватым будет выглядеть бот.
     """
-    from storage import (get_trial_days, get_trial_free_days,
-                         get_trial_channel, trial_used)
     b = InlineKeyboardBuilder()
+    # Главное действие первым и отдельной строкой. Способов получить доступ
+    # несколько — бесплатные и платные, — и раскладывать их прямо здесь
+    # значит превратить витрину в список кнопок вместо предложения.
+    b.button(text="🚀 Получить доступ", callback_data="access:menu")
     b.button(text="🔌 Подключить магазин", callback_data="start:connect")
-    solo = {"start:connect"}
-    if uid:
-        # Пробы независимы: взявший три дня всё ещё может добрать семь за
-        # подписку. Общая проверка скрыла бы вторую кнопку после первой.
-        free_days = get_trial_free_days()
-        long_days = get_trial_days()
-        if free_days > 0 and not trial_used(uid, "free"):
-            b.button(text=f"🎁 {free_days} дня доступа",
-                     callback_data="trial:free")
-        if (long_days > 0 and get_trial_channel()
-                and not trial_used(uid, "channel")):
-            b.button(text=f"📣 {long_days} дней за подписку",
-                     callback_data="trial:offer")
-    b.button(text="💳 Тарифы", callback_data="menu:prices")
     b.button(text="🧡 Поддержка", callback_data="menu:help")
-    return ui.lay(b, solo=solo).as_markup()
+    return ui.lay(b, solo={"access:menu", "start:connect"}).as_markup()
+
+
+def _access_kb(uid: int) -> "InlineKeyboardMarkup":
+    """Кнопки экрана «Получить доступ».
+
+    Пробы независимы: взявший три дня всё ещё может добрать семь за
+    подписку. Общая проверка скрыла бы вторую кнопку после первой.
+
+    Кнопка пробы тому, кто её уже брал, — обещание невозможного: нажатие
+    ответит отказом, а виноватым будет выглядеть бот.
+    """
+    from storage import (get_trial_channel, get_trial_days,
+                         get_trial_free_days, trial_used)
+    b = InlineKeyboardBuilder()
+    free_days, long_days = get_trial_free_days(), get_trial_days()
+    if uid and free_days > 0 and not trial_used(uid, "free"):
+        b.button(text=f"🎁 {free_days} дня бесплатно",
+                 callback_data="trial:free")
+    if (uid and long_days > 0 and get_trial_channel()
+            and not trial_used(uid, "channel")):
+        b.button(text=f"📣 +{long_days} дней за подписку",
+                 callback_data="trial:offer")
+    b.button(text="💳 Прошу счёт", callback_data="sub:order")
+    b.button(text="⬅️ Назад", callback_data="start:hello")
+    return ui.lay(b).as_markup()
 
 
 def _welcome_kb(back: bool = False) -> "InlineKeyboardMarkup":
@@ -295,20 +308,39 @@ async def trial_free(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AuthState.waiting_for_token)
 
 
-@router.callback_query(F.data == "menu:prices")
-async def show_prices(callback: CallbackQuery) -> None:
-    """Тарифы с первого экрана — до подключения магазина."""
-    from storage import get_support_contact, price_lines
+@router.callback_query(F.data.in_({"access:menu", "menu:prices"}))
+async def show_access(callback: CallbackQuery) -> None:
+    """Как получить доступ: бесплатные способы и тарифы.
+
+    Показываются только тарифы, которым владелец назначил цену. Строка
+    «1 месяц — 0 ₽» читалась бы как «бесплатно», а это обещание, за которое
+    спросят. Пустой список тоже объясняется, а не выдаётся за отсутствие
+    платного доступа.
+    """
+    from storage import (get_support_contact, get_trial_channel,
+                         get_trial_days, get_trial_free_days, price_lines,
+                         trial_used)
+    uid = callback.from_user.id
+    free_days, long_days = get_trial_free_days(), get_trial_days()
+    body: list[str] = []
+
+    free_rows = []
+    if free_days > 0 and not trial_used(uid, "free"):
+        free_rows.append(f"🎁 <b>{free_days} дня</b> — просто так")
+    if long_days > 0 and get_trial_channel() and not trial_used(uid, "channel"):
+        free_rows.append(f"📣 <b>+{long_days} дней</b> — за подписку на канал")
+    if free_rows:
+        body += ["<b>Бесплатно</b>"] + free_rows + [""]
+
     rows = price_lines()
-    b = InlineKeyboardBuilder()
-    b.button(text="💳 Прошу счёт", callback_data="sub:order")
-    b.button(text="⬅️ Назад", callback_data="start:hello")
+    body.append("<b>По подписке</b>")
+    body += rows or ["<i>Цены пока не назначены — напиши, договоримся.</i>"]
+
     await callback.message.edit_text(ui.screen(
-        "💳 <b>Тарифы</b>",
-        rows or ["<i>Цены пока не назначены — напиши, договоримся.</i>"],
-        footer=f"<i>Оплата вне бота. Вопросы — {ui.esc(get_support_contact())}"
-               "</i>"),
-        reply_markup=ui.lay(b).as_markup())
+        "🚀 <b>Получить доступ</b>", body,
+        footer="<i>Оплата вне бота: жми «Прошу счёт», и владелец напишет "
+               f"сюда же. Вопросы — {ui.esc(get_support_contact())}</i>"),
+        reply_markup=_access_kb(uid))
     await callback.answer()
 
 
