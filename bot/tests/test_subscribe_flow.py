@@ -116,8 +116,13 @@ class TheAccessScreenOffersTwoThingsAndNoMore(Bench):
                 for row in S._access_kb(uid or self.UID).inline_keyboard
                 for b in row]
 
-    def test_it_offers_paying_and_taking_it_free(self):
-        self.assertEqual(self._data(), ["sub:buy", "trial:menu", "start:hello"])
+    def test_it_offers_paying_and_both_trials_by_name(self):
+        """Каждая проба своей кнопкой, и на ней написано, сколько дней:
+        «взять бесплатно» заставляло вспоминать, что за этим скрывается."""
+        storage.set_trial_channel("@ch")
+        self.assertEqual(self._data(),
+                         ["sub:buy", "trial:free", "trial:offer",
+                          "start:hello"])
 
     def test_asking_for_an_invoice_is_gone(self):
         """«Прошу счёт» просил подождать, пока свяжутся."""
@@ -315,25 +320,6 @@ class TheClaimSaysWhatWasPaidFor(Bench):
         said = self._claim(f"pay:paid:30:{self.sbp}")
         self.assertIn("оплатил", said)
         self.assertIn("1 месяц", said)
-
-
-class TheFreeScreenKeepsBothTrialsApart(Bench):
-
-    def test_a_newcomer_is_offered_both(self):
-        storage.set_trial_channel("@ch")
-        cb = self.tap("trial:menu", SUB.free_menu)
-        data = [d for _t, d in self.buttons(cb)]
-        self.assertIn("trial:free", data)
-        self.assertIn("trial:offer", data)
-
-    def test_having_taken_both_is_said_out_loud(self):
-        """Пустой экран без объяснения читается как поломка."""
-        storage.set_trial_channel("@ch")
-        storage.note_trial(self.UID, "free")
-        storage.note_trial(self.UID, "channel")
-        cb = self.tap("trial:menu", SUB.free_menu)
-        self.assertIn("уже брал", cb.message.text)
-        self.assertEqual([d for _t, d in self.buttons(cb)], ["access:menu"])
 
 
 if __name__ == "__main__":

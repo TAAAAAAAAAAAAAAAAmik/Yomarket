@@ -335,33 +335,13 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
         storage.set_trial_channel("@ch")
 
     def _labels(self, uid):
-        """Надписи экрана «🎁 Получить бесплатно» — там живут кнопки проб.
+        """Надписи экрана «🚀 Получить доступ» — там живут кнопки проб.
 
-        Экран собирается вызовом, а не сборкой клавиатуры руками: пробы
-        переехали с витрины сюда, и проверка, оставшаяся у прежней
-        клавиатуры, проверяла бы экран, которого человек уже не видит.
+        Промежуточного экрана «Получить бесплатно» больше нет: он показывал
+        тот же текст ещё раз и стоял между решением и действием.
         """
-        import handlers.subscribe as SUB
-        seen = []
-
-        class Screen:
-            async def edit_text(s, text, reply_markup=None, **kw):
-                seen.append(reply_markup)
-
-        class St:
-            async def clear(s):
-                return None
-
-        cb = type("CB", (), {})()
-        cb.message = Screen()
-        cb.from_user = type("U", (), {"id": uid})()
-
-        async def answer(*a, **kw):
-            return None
-
-        cb.answer = answer
-        run(SUB.free_menu(cb, St()))
-        return [b.text for row in seen[0].inline_keyboard for b in row]
+        return [b.text for row in self.S._access_kb(uid).inline_keyboard
+                for b in row]
 
     def _hello_labels(self, uid):
         return [b.text for row in self.S._hello_kb(uid).inline_keyboard
@@ -450,19 +430,22 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
                 for b in row]
         self.assertIn("sub:buy", data)
 
-    def test_the_free_button_is_gone_once_both_trials_are_used(self):
-        """Кнопка «бесплатно» тому, кто взял обе пробы, — обещание
-        невозможного: нажмёт и получит отказ."""
-        data = [b.callback_data
-                for row in self.S._access_kb(self.UID).inline_keyboard
-                for b in row]
-        self.assertIn("trial:menu", data)
+    def test_each_trial_button_goes_away_on_its_own(self):
+        """Кнопка пробы тому, кто её уже брал, — обещание невозможного.
+        Но вторая обязана остаться: пробы независимы."""
+        def data():
+            return [b.callback_data
+                    for row in self.S._access_kb(self.UID).inline_keyboard
+                    for b in row]
+
+        self.assertIn("trial:free", data())
+        self.assertIn("trial:offer", data())
         storage.note_trial(self.UID, "free")
+        self.assertNotIn("trial:free", data())
+        self.assertIn("trial:offer", data(), "скрыли и вторую пробу")
         storage.note_trial(self.UID, "channel")
-        data = [b.callback_data
-                for row in self.S._access_kb(self.UID).inline_keyboard
-                for b in row]
-        self.assertNotIn("trial:menu", data)
+        self.assertNotIn("trial:offer", data())
+        self.assertIn("sub:buy", data(), "платить стало нечем")
 
     def test_without_a_channel_only_the_short_one_is_offered(self):
         """Кнопка «за подписку» без заданного канала вела бы в пустоту."""
@@ -470,6 +453,22 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
         labels = " ".join(self._labels(self.UID))
         self.assertIn("3 дня", labels)
         self.assertNotIn("7 дней", labels)
+
+    def test_the_channel_button_leads_to_the_channel_before_the_check(self):
+        """Кнопка вела прямо на проверку: не подписан — получи отказ и ищи
+        канал сам. Ссылку надо дать ДО отказа, а не вместо него."""
+        offer = self.S._trial_kb().inline_keyboard
+        texts = [b.text for row in offer for b in row]
+        self.assertTrue(any("анал" in t for t in texts), texts)
+        urls = [b.url for row in offer for b in row if getattr(b, "url", None)]
+        self.assertTrue(urls, "ссылки на канал нет — искать его негде")
+
+    def test_the_way_back_from_the_channel_offer_returns_to_access(self):
+        """Назад с экрана канала вело на витрину — то есть на два шага
+        дальше, чем нужно."""
+        back = [b.callback_data for row in self.S._trial_kb().inline_keyboard
+                for b in row if (b.text or "").startswith("⬅️")]
+        self.assertEqual(back, ["access:menu"])
 
     def test_the_showcase_does_not_offer_to_connect_a_shop(self):
         """На витрине человек решает, брать ли бота вообще. Инструкция к
@@ -487,27 +486,8 @@ class TheFirstScreenSellsBeforeItAsks(Bench):
     def test_the_long_trial_shows_the_channel_before_refusing(self):
         """Кнопка вела прямо на проверку: не подписан — получи отказ и ищи
         канал сам. Ссылку надо дать до отказа, а не вместо него."""
-        import handlers.subscribe as SUB
-        seen = []
-
-        class Screen:
-            async def edit_text(s, text, reply_markup=None, **kw):
-                seen.append(reply_markup)
-
-        class St:
-            async def clear(s):
-                return None
-
-        cb = type("CB", (), {})()
-        cb.message = Screen()
-        cb.from_user = type("U", (), {"id": self.UID})()
-
-        async def answer(*a, **kw):
-            return None
-
-        cb.answer = answer
-        run(SUB.free_menu(cb, St()))
-        target = [b.callback_data for row in seen[0].inline_keyboard
+        target = [b.callback_data
+                  for row in self.S._access_kb(self.UID).inline_keyboard
                   for b in row if "7 дней" in b.text]
         self.assertEqual(target, ["trial:offer"])
         offer = [b.text for row in self.S._trial_kb().inline_keyboard

@@ -130,37 +130,3 @@ async def show_details(callback: CallbackQuery, state: FSMContext) -> None:
                "не умеет и делать вид не будет.</i>"),
         reply_markup=ui.lay(b).as_markup())
     await callback.answer()
-
-
-@router.callback_query(F.data == "trial:menu")
-async def free_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    """Бесплатные дни — обе пробы на одном экране.
-
-    Пробы независимы: взявший три дня всё ещё может добрать семь за
-    подписку. Кнопка пробы тому, кто её уже брал, — обещание невозможного.
-    """
-    await state.clear()
-    from storage import (get_trial_channel, get_trial_days,
-                         get_trial_free_days, trial_used)
-    uid = callback.from_user.id
-    free_days, long_days = get_trial_free_days(), get_trial_days()
-    channel = get_trial_channel()
-
-    b = InlineKeyboardBuilder()
-    body: list[str] = []
-    if free_days > 0 and not trial_used(uid, "free"):
-        body.append(f"🎁 <b>{free_days} дня</b> — просто так, без условий")
-        b.button(text=f"🎁 Взять {free_days} дня", callback_data="trial:free")
-    if long_days > 0 and channel and not trial_used(uid, "channel"):
-        body.append(f"📣 <b>+{long_days} дней</b> — за подписку на канал")
-        b.button(text=f"📣 Взять +{long_days} дней", callback_data="trial:offer")
-    if len(body) > 1:
-        body += ["", "<i>Берётся и то, и другое — по одному разу.</i>"]
-    b.button(text="⬅️ Назад", callback_data="access:menu")
-
-    await callback.message.edit_text(
-        ui.screen("🎁 <b>Получить бесплатно</b>",
-                  body or ["Бесплатные дни ты уже брал — оба раза.", "",
-                           "Дальше только по подписке."]),
-        reply_markup=ui.lay(b).as_markup())
-    await callback.answer()

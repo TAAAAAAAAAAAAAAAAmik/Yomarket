@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-31-connect-gate"
+BOT_VERSION = "2026-09-01-trial-buttons"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -222,25 +222,42 @@ def _has_free_left(uid: int) -> bool:
 
 
 def _access_kb(uid: int) -> "InlineKeyboardMarkup":
-    """Кнопки экрана «Получить доступ» — ровно два действия.
+    """Кнопки экрана «Получить доступ»: заплатить или взять бесплатно.
 
-    Раньше здесь лежали обе пробы, «Прошу счёт» и «Я оплатил» — четыре
-    кнопки, из которых две про одно и то же. Человек на этом экране решает
-    не «какой кнопкой», а «платить или попробовать»; всё остальное —
-    следующий шаг, и ему место на следующем экране.
+    Пробы стоят здесь же, а не за общей кнопкой «Получить бесплатно».
+    Экран, на котором написано «🎁 3 дня — просто так», и кнопка, ведущая
+    к тому же тексту ещё раз, — лишний шаг между решением и действием.
+
+    Каждая проба своей кнопкой, и на ней написано, СКОЛЬКО дней: «взять
+    бесплатно» заставляет вспоминать, что за этим скрывается.
+
+    Кнопка пробы тому, кто её уже брал, — обещание невозможного: нажмёт и
+    получит отказ, а виноватым будет выглядеть бот. Пробы независимы,
+    поэтому и проверяются по отдельности: взявший три дня всё ещё может
+    добрать семь за подписку.
 
     «Прошу счёт» снят: он просил подождать, пока с человеком свяжутся, и
     половина не дожидалась. Теперь срок и реквизиты он видит сам.
-
-    Кнопка «бесплатно» тому, кто обе пробы уже взял, — обещание
-    невозможного: нажмёт и получит отказ, а виноватым будет выглядеть бот.
     """
+    from storage import (get_trial_channel, get_trial_days,
+                         get_trial_free_days, trial_used)
     b = InlineKeyboardBuilder()
     b.button(text="💳 Оплатить подписку", callback_data="sub:buy")
-    if _has_free_left(uid):
-        b.button(text="🎁 Получить бесплатно", callback_data="trial:menu")
+    free_days, long_days = get_trial_free_days(), get_trial_days()
+    solo = {"sub:buy"}
+    if uid and free_days > 0 and not trial_used(uid, "free"):
+        b.button(text=f"🎁 {free_days} дня бесплатно",
+                 callback_data="trial:free")
+        solo.add("trial:free")
+    # Без заданного канала кнопка «за подписку» вела бы в пустоту: подписаться
+    # не на что, и проверять нечего.
+    if (uid and long_days > 0 and get_trial_channel()
+            and not trial_used(uid, "channel")):
+        b.button(text=f"📣 +{long_days} дней за подписку на канал",
+                 callback_data="trial:offer")
+        solo.add("trial:offer")
     b.button(text="⬅️ Назад", callback_data="start:hello")
-    return ui.lay(b, solo={"sub:buy", "trial:menu"}).as_markup()
+    return ui.lay(b, solo=solo).as_markup()
 
 
 def _welcome_kb(back: bool = False) -> "InlineKeyboardMarkup":
@@ -311,7 +328,8 @@ def _trial_kb() -> "InlineKeyboardMarkup":
     if url:
         b.button(text="📣 Открыть канал", url=url)
     b.button(text="✅ Я подписался", callback_data="trial:check")
-    b.button(text="⬅️ Назад", callback_data="start:hello")
+    # Назад — туда, откуда сюда попадают: на экран доступа, а не на витрину.
+    b.button(text="⬅️ Назад", callback_data="access:menu")
     return ui.lay(b).as_markup()
 
 
