@@ -118,8 +118,13 @@ async def show_details(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="⬅️ Другой способ", callback_data=f"sub:buy:{days}")
     await callback.message.edit_text(ui.screen(
         f"💳 <b>{ui.esc(method['title'])}</b>",
+        # Реквизиты — через `copyable`, а не `esc`: номер карты, телефон и
+        # адрес кошелька уходят в моноширинный `<code>`, и Telegram копирует
+        # их по нажатию. Обёрнут ровно номер: вместе с ним не должно
+        # скопироваться «в комментарии — свой ник», иначе это уедет в поле
+        # перевода и останется там.
         [f"К оплате: <b>{price} ₽</b> за {_tier_label(days)}", "",
-         ui.esc(method["details"]), "",
+         ui.copyable(method["details"]), "",
          "Оплатил — жми кнопку ниже, и владелец включит доступ."],
         footer="<i>Доступ включает владелец вручную: проверять оплату бот "
                "не умеет и делать вид не будет.</i>"),

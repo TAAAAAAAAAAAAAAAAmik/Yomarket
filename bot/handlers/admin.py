@@ -1341,8 +1341,10 @@ async def pay_edit(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="⬅️ Назад", callback_data="admin:pays")
     await callback.message.edit_text(ui.screen(
         f"💳 <b>{ui.esc(method['title'])}</b>",
+        # Тем же способом, что и у продавца: владелец должен видеть ровно
+        # то, что увидит тот, — включая, что именно копируется нажатием.
         ["Сейчас продавец видит:", "",
-         ui.esc(method["details"]) if method["details"]
+         ui.copyable(method["details"]) if method["details"]
          else "<i>ничего — реквизиты не заданы</i>", "",
          "Пришли новые реквизиты, чтобы заменить."]),
         reply_markup=ui.lay(b, solo={f"admin:paydel:{mid}"}).as_markup())

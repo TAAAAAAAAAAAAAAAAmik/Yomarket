@@ -216,6 +216,71 @@ class SeeingTheDetails(Bench):
         self.assertTrue(any("не доступен" in a for a in cb.alerts), cb.alerts)
 
 
+class TheDetailsAreTappableToCopy(Bench):
+    """Продавец переписывает номер карты руками с экрана телефона — и
+    ошибается цифрой. Обёрнутое в `<code>` Telegram рисует моноширинным и
+    копирует по нажатию целиком.
+
+    «Целиком» здесь и есть загвоздка: обернуть весь текст было бы проще, но
+    тогда вместе с картой скопировалось бы «в комментарии — свой ник», и
+    это уехало бы в поле перевода.
+    """
+
+    def _details(self, text):
+        storage.del_pay_method(self.sbp)
+        mid = storage.add_pay_method("Карта", text)
+        cb = self.tap(f"sub:m:30:{mid}", SUB.show_details)
+        return cb.message.text
+
+    def test_the_card_number_is_wrapped_for_copying(self):
+        got = self._details("2204 3204 9541 4437, Иван И.")
+        self.assertIn("<code>2204 3204 9541 4437</code>", got)
+
+    def test_but_the_instruction_next_to_it_is_not(self):
+        """Скопированное «в комментарии — свой ник» уедет в поле перевода и
+        останется там."""
+        got = self._details("2204 3204 9541 4437, Иван И.\\n"
+                            "В комментарии — свой ник")
+        self.assertNotIn("<code>В комментарии", got)
+        self.assertIn("В комментарии — свой ник", got)
+
+    def test_a_phone_keeps_its_plus(self):
+        """Скопированный «7 900…» без плюса в поле перевода не годится."""
+        got = self._details("+7 900 000-00-00 (СБП)")
+        self.assertIn("<code>+7 900 000-00-00</code>", got)
+
+    def test_a_wallet_address_is_wrapped_whole(self):
+        got = self._details("USDT TRC20: TXk9aBcDeFgHiJkLmNoPqRsTuVwXyZ1234")
+        self.assertIn("<code>TXk9aBcDeFgHiJkLmNoPqRsTuVwXyZ1234</code>", got)
+
+    def test_an_address_starting_with_digits_is_not_bitten_in_half(self):
+        """Нажатие обязано скопировать адрес целиком. Скопированная
+        половина кошелька — это деньги, ушедшие в никуда.
+
+        Держит это `(?![\\w/])` в цифровом правиле: за цифрами не должно
+        идти буквы. Порядок правил здесь ни при чём — проверено мутацией,
+        перестановка ничего не меняет."""
+        got = self._details("TON: 1234567890abcdefghijklmnop")
+        self.assertIn("<code>1234567890abcdefghijklmnop</code>", got)
+
+    def test_plain_words_are_left_alone(self):
+        """Лишний `<code>` вокруг фразы хуже, чем его отсутствие."""
+        got = self._details("Напиши мне, договоримся")
+        self.assertNotIn("<code>", got.split("К оплате")[-1])
+
+    def test_a_short_number_is_not_mistaken_for_a_requisite(self):
+        """«Оплата до 5 числа» — не реквизит, и копировать там нечего."""
+        got = self._details("Оплата до 5 числа, срок 30 дней")
+        self.assertNotIn("<code>5</code>", got)
+        self.assertNotIn("<code>30</code>", got)
+
+    def test_the_details_are_still_escaped(self):
+        """Одиночный `<` в реквизитах роняет отправку целиком, и продавец
+        не получает ничего."""
+        got = self._details("Карта <2204> & Ко")
+        self.assertNotIn("<2204>", got)
+        self.assertIn("&amp;", got)
+
 class TheClaimSaysWhatWasPaidFor(Bench):
 
     def _claim(self, data):
