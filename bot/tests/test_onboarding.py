@@ -236,11 +236,20 @@ class TheGreetingSellsBeforeItInstructs(unittest.TestCase):
         self._token = S.get_token
         self._save = S.save_token
         S.get_token = lambda uid: ""
-        storage.CUSTOM_TEXTS  # тексты берутся отсюда, подмены не нужно
+        # Хранилище подменяется целиком, а не только токен. Приветствие
+        # смотрит ещё и на подписку, и без подмены проверка зависела бы от
+        # того, что оставил после себя соседний прогон, — а он оставлял:
+        # подписку продавцу №7 в НАСТОЯЩЕМ хранилище.
+        self.admin: dict = {}
+        self._load, self._save_admin = storage._load_admin, storage._save_admin
+        storage._load_admin = lambda: self.admin
+        storage._save_admin = lambda d: self.admin.update(d)
 
     def tearDown(self):
         S.get_token = self._token
         S.save_token = self._save
+        storage._load_admin = self._load
+        storage._save_admin = self._save_admin
 
     def _start(self):
         m, st = FakeMessage(), FakeState()

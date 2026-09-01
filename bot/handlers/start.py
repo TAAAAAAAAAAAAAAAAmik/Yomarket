@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-09-01-lifetime"
+BOT_VERSION = "2026-09-01-access-state"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -158,13 +158,22 @@ def _hello_kb(uid: int = 0) -> "InlineKeyboardMarkup":
     тому, кто их уже брал, — обещание невозможного: нажатие ответит
     отказом, и виноватым будет выглядеть бот.
     """
+    from storage import has_active_subscription
     b = InlineKeyboardBuilder()
     # Одно действие, и оно первое. Подключение магазина отсюда снято: на
     # витрине человек решает, брать ли бота вообще, а не как его настроить.
     # Инструкция к тому, чего он пока не купил, — лишний шаг перед выбором.
-    b.button(text="🚀 Получить доступ", callback_data="access:menu")
+    #
+    # Но тому, у кого доступ УЖЕ открыт, продавать его второй раз нельзя:
+    # он нажал «получить доступ», получил его — и снова видит ту же
+    # кнопку, а того, что делать дальше, на экране нет вовсе.
+    if uid and has_active_subscription(uid):
+        main = ("🔌 Подключить магазин", "start:connect")
+    else:
+        main = ("🚀 Получить доступ", "access:menu")
+    b.button(text=main[0], callback_data=main[1])
     b.button(text="🧡 Поддержка", callback_data="menu:help")
-    return ui.lay(b, solo={"access:menu"}).as_markup()
+    return ui.lay(b, solo={main[1]}).as_markup()
 
 
 def _can_connect(uid: int) -> bool:
@@ -209,6 +218,28 @@ def _connect_kb(uid: int = 0) -> "InlineKeyboardMarkup":
     return ui.lay(b, solo=solo).as_markup()
 
 
+def _plain(html_text: str) -> str:
+    """Текст без разметки — для всплывающих окон: Telegram их не
+    форматирует, и `<b>` доехало бы до человека как есть."""
+    import re as _re
+    return _re.sub(r"<[^>]+>", "", html_text)
+
+
+def _left_line(uid: int) -> str:
+    """«Осталось 29 дн.» или «Подписка навсегда» — одной строкой.
+
+    Отдельной функцией, потому что это говорят три экрана, и сказать
+    по-разному значит однажды сказать неправду на одном из них.
+    """
+    from storage import is_lifetime, subscription_days_left
+    if is_lifetime(uid):
+        return "Подписка — <b>навсегда</b>."
+    left = subscription_days_left(uid)
+    return (f"Осталось <b>{left} дн.</b>" if left > 0 else
+            # Ноль дней — не «активна», а «кончается сегодня».
+            "Подписка кончается <b>сегодня</b>.")
+
+
 def _has_free_left(uid: int) -> bool:
     """Осталась ли этому продавцу хоть одна непрожитая проба."""
     from storage import (get_trial_channel, get_trial_days,
@@ -240,18 +271,22 @@ def _access_kb(uid: int) -> "InlineKeyboardMarkup":
     половина не дожидалась. Теперь срок и реквизиты он видит сам.
     """
     from storage import (get_trial_channel, get_trial_days,
-                         get_trial_free_days, trial_used)
+                         get_trial_free_days, has_active_subscription,
+                         trial_used)
     b = InlineKeyboardBuilder()
     b.button(text="💳 Оплатить подписку", callback_data="sub:buy")
     free_days, long_days = get_trial_free_days(), get_trial_days()
+    # Кнопка пробы тому, у кого доступ уже есть, ведёт к отказу: поверх
+    # действующей подписки проба не выдаётся.
+    got = bool(uid and has_active_subscription(uid))
     solo = {"sub:buy"}
-    if uid and free_days > 0 and not trial_used(uid, "free"):
+    if uid and not got and free_days > 0 and not trial_used(uid, "free"):
         b.button(text=f"🎁 {free_days} дня бесплатно",
                  callback_data="trial:free")
         solo.add("trial:free")
     # Без заданного канала кнопка «за подписку» вела бы в пустоту: подписаться
     # не на что, и проверять нечего.
-    if (uid and long_days > 0 and get_trial_channel()
+    if (uid and not got and long_days > 0 and get_trial_channel()
             and not trial_used(uid, "channel")):
         b.button(text=f"📣 +{long_days} дней за подписку на канал",
                  callback_data="trial:offer")
@@ -392,7 +427,8 @@ async def trial_free(callback: CallbackQuery, state: FSMContext) -> None:
     в своём недовольстве.
     """
     import logs
-    from storage import get_trial_free_days, start_trial, trial_used
+    from storage import (get_trial_free_days, has_active_subscription,
+                         start_trial, trial_used)
 
     uid = callback.from_user.id
     if trial_used(uid, "free"):
@@ -401,10 +437,13 @@ async def trial_free(callback: CallbackQuery, state: FSMContext) -> None:
         return
     days = start_trial(uid, get_trial_free_days(), kind="free")
     if not days:
-        # Проба выключена владельцем или подписка уже действует. Молчать
-        # нельзя: кнопка нажата, ничего не произошло.
-        await callback.answer("Сейчас пробный период не выдаётся",
-                              show_alert=True)
+        # Причин отказа две, и они разные. «Пробный период не выдаётся»
+        # тому, у кого просто уже есть доступ, читается как поломка: он
+        # видел кнопку, нажал, и бот ответил про что-то своё.
+        await callback.answer(
+            f"У тебя уже есть доступ. {_plain(_left_line(uid))}"
+            if has_active_subscription(uid) else
+            "Пробный период сейчас выключен", show_alert=True)
         return
     await logs.log_event(callback.bot, "trial",
                          [f"Открыт пробный период: <b>{days} дн.</b>",
@@ -430,22 +469,29 @@ async def show_access(callback: CallbackQuery) -> None:
     платного доступа.
     """
     from storage import (get_support_contact, get_trial_channel,
-                         get_trial_days, get_trial_free_days, price_lines,
-                         trial_used)
+                         get_trial_days, get_trial_free_days,
+                         has_active_subscription, price_lines, trial_used)
     uid = callback.from_user.id
     free_days, long_days = get_trial_free_days(), get_trial_days()
+    # Пробы поверх действующей подписки не выдаются (`start_trial`), и
+    # предлагать их значит вести к отказу. Тот, у кого доступ уже есть,
+    # пришёл сюда продлевать — ему нужны сроки, а не «3 дня бесплатно».
+    got_access = has_active_subscription(uid)
     body: list[str] = []
+    if got_access:
+        body += [f"✅ <b>Доступ уже открыт.</b> {_left_line(uid)}", ""]
 
     free_rows = []
-    if free_days > 0 and not trial_used(uid, "free"):
+    if not got_access and free_days > 0 and not trial_used(uid, "free"):
         free_rows.append(f"🎁 <b>{free_days} дня</b> — просто так")
-    if long_days > 0 and get_trial_channel() and not trial_used(uid, "channel"):
+    if (not got_access and long_days > 0 and get_trial_channel()
+            and not trial_used(uid, "channel")):
         free_rows.append(f"📣 <b>+{long_days} дней</b> — за подписку на канал")
     if free_rows:
         body += ["<b>Бесплатно</b>"] + free_rows + [""]
 
     rows = price_lines()
-    body.append("<b>По подписке</b>")
+    body.append("<b>Продлить</b>" if got_access else "<b>По подписке</b>")
     body += rows or ["<i>Цены пока не назначены — напиши, договоримся.</i>"]
 
     await callback.message.edit_text(ui.screen(
@@ -499,11 +545,15 @@ async def trial_check(callback: CallbackQuery, state: FSMContext) -> None:
             "Подписки не вижу. Подпишись и нажми ещё раз", show_alert=True)
         return
     if not days:
-        # Проверка сорвалась И выдать не вышло — например, подписка уже
-        # действует. Молчать нельзя: кнопка нажата, ничего не случилось.
-        await callback.answer("Не вышло открыть пробный период — "
-                              f"напиши {get_support_contact()}",
-                              show_alert=True)
+        # Проверка сорвалась И выдать не вышло. Чаще всего — потому что
+        # доступ уже есть, и об этом надо сказать прямо: «не вышло, напиши
+        # в поддержку» отправляет человека решать несуществующую беду.
+        from storage import has_active_subscription
+        await callback.answer(
+            f"У тебя уже есть доступ. {_plain(_left_line(uid))}"
+            if has_active_subscription(uid) else
+            f"Не вышло открыть пробный период — напиши "
+            f"{get_support_contact()}", show_alert=True)
         return
 
     await logs.log_event(
@@ -563,8 +613,24 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     # уже знает, где брать токен, и вставит его не нажимая кнопку — форма
     # обязана его принять, а не промолчать.
     await state.set_state(AuthState.waiting_for_token)
+
+    # Состояний три, а не два. Раньше `/start` смотрел только на токен, и
+    # тот, кто уже взял пробу или заплатил, снова видел витрину с кнопкой
+    # «Получить доступ» — то есть предложение купить то, что у него уже
+    # есть, и ни слова о том, что делать дальше.
+    from storage import has_active_subscription, subscription_days_left
+    uid = message.from_user.id
+    if has_active_subscription(uid):
+        left = subscription_days_left(uid)
+        await message.answer(ui.screen(
+            "✅ <b>Доступ открыт</b>",
+            [_left_line(uid), "",
+             "Остался один шаг: подключить магазин — и автоматика "
+             "заработает сразу."]),
+            reply_markup=_connect_kb(uid))
+        return
     await message.answer(_welcome_text(),
-                         reply_markup=_hello_kb(message.from_user.id),
+                         reply_markup=_hello_kb(uid),
                          disable_web_page_preview=True)
 
 
