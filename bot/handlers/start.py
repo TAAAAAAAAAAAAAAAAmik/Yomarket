@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-31-copyable"
+BOT_VERSION = "2026-08-31-support-one"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -402,25 +402,16 @@ async def show_access(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "menu:help")
 async def show_help(callback: CallbackQuery) -> None:
-    from storage import get_support_contact
-    contact = get_support_contact()
-    b = InlineKeyboardBuilder()
-    if contact.startswith("@"):
-        b.button(text=f"✍️ Написать {contact}",
-                 url=f"https://t.me/{contact[1:]}")
-    b.button(text="📄 Документы и условия", callback_data="menu:policy:help")
-    b.button(text="⬅️ Назад", callback_data="start:hello")
-    # Код сборки печатается сам, а не добывается командой: `/version`
-    # заодно рассказывал, из чего бот собран и где живёт, — продавцу это
-    # ни к чему. Здесь ровно то, что нужно поддержке.
-    await callback.message.edit_text(ui.screen(
-        "🧡 <b>Поддержка</b>",
-        [f"Пиши сюда: {ui.esc(contact)}",
-         "",
-         f"Код сборки: <code>{BOT_VERSION}</code>",
-         "<i>Приложи его к вопросу — с ним отвечу сразу, без встречных "
-         "вопросов.</i>"]),
-        reply_markup=ui.lay(b).as_markup())
+    """Экран поддержки. Собирается в `support.py` — он же у команды.
+
+    Экранов было два, свой у команды и свой у кнопки, и тексты разъехались:
+    один звал прислать код сборки служебной командой, второй нет. Сверять
+    их было нечем — это были разные куски кода.
+    """
+    from support import support_kb, support_text
+    uid = callback.from_user.id
+    await callback.message.edit_text(support_text(uid),
+                                     reply_markup=support_kb(uid))
     await callback.answer()
 
 

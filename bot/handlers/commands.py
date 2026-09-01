@@ -191,36 +191,14 @@ async def cmd_proxy(message: Message, state: FSMContext) -> None:
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    """Куда писать, если что-то не так.
+    """Тот же экран, что и по кнопке «🧡 Поддержка».
 
-    Отдельно — что приложить к вопросу. «Не работает» без версии и номера
-    заказа означает ещё один круг переписки, а продавец в этот момент уже
-    теряет деньги.
+    Раньше здесь был свой текст, и он разошёлся с кнопочным. Один экран,
+    два входа — расходиться теперь нечему.
     """
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-    from storage import get_support_contact
-
-    contact = get_support_contact()
-    b = InlineKeyboardBuilder()
-    if contact.startswith("@"):
-        b.button(text=f"✍️ Написать {contact}",
-                 url=f"https://t.me/{contact[1:]}")
-    b.button(text="📄 Документы и условия", callback_data="menu:policy")
-    b.button(text="⬅️ В меню", callback_data="menu:main")
-    from handlers.start import BOT_VERSION
-    await message.answer(ui.screen(
-        "🧡 <b>Поддержка</b>",
-        [f"Пиши сюда: {ui.esc(contact)}",
-         "",
-         "<b>Что приложить к вопросу</b>",
-         f"• код сборки: <code>{BOT_VERSION}</code>",
-         "• номер заказа, если беда с конкретным заказом",
-         "• что ты сделал и что увидел вместо ожидаемого",
-         "",
-         "<i>С этим отвечу сразу. Без этого придётся сначала спрашивать "
-         "то же самое, а время идёт.</i>"]),
-        reply_markup=ui.lay(b).as_markup())
+    from support import support_kb, support_text
+    uid = message.from_user.id
+    await message.answer(support_text(uid), reply_markup=support_kb(uid))
 
 
 # --- AutoPUBG ---------------------------------------------------------------
