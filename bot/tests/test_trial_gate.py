@@ -324,6 +324,105 @@ class TwoTrialsThatAddUp(Bench):
         self.assertEqual(days, 7)
 
 
+class TheChannelWeekSurvivesTheShortTrial(Bench):
+    """Живая жалоба 01.09: «подписываешься на канал ради доступа, затем
+    переключаешь раздел бота и возвращаешься на проверку подписки — бот не
+    подтверждает подписку, хотя ты подписан».
+
+    Проверка была ни при чём: с прежнего сообщения кнопка «Я подписался»
+    выдавала неделю исправно. Пропадала сама КНОПКА. Экран «Получить
+    доступ» скрывал обе пробы у всякого, у кого есть действующая подписка,
+    — а у взявшего три дня она как раз есть, своя же пробная. Вернуться к
+    проверке ему было нечем, и снаружи это выглядело отказом.
+
+    Пробы складываются (3 + 7 = 10), значит вторую вправе скрыть только
+    ОПЛАЧЕННАЯ подписка: вот поверх неё проба и правда не выдаётся
+    (`start_trial` → `paid_now`). Отличать их надо по полю `by`, а не по
+    самому факту доступа.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import handlers.start as S
+        self.S = S
+        storage.set_trial_channel("@ch")
+        storage.set_trial_free_days(3)
+
+    def _data(self, uid=None):
+        uid = self.UID if uid is None else uid
+        return [b.callback_data
+                for row in self.S._access_kb(uid).inline_keyboard for b in row]
+
+    def _screen(self):
+        """Текст и кнопки экрана «Получить доступ» — как их видит продавец."""
+        out = {}
+
+        class Screen:
+            async def edit_text(self, text, reply_markup=None, **kw):
+                out["text"], out["kb"] = text, reply_markup
+
+        cb = type("CB", (), {})()
+        cb.data = "access:menu"
+        cb.bot = None
+        cb.message = Screen()
+        cb.from_user = type("U", (), {"id": self.UID})()
+
+        async def answer(text="", **kw):
+            return None
+
+        cb.answer = answer
+        run(self.S.show_access(cb))
+        return re.sub(r"<[^>]+>", "", out["text"]), out["kb"]
+
+    def test_the_channel_button_stays_after_the_short_trial_is_taken(self):
+        """Три дня взяты по-настоящему, то есть подписка теперь есть. Она
+        своя же, пробная, и права на неделю не отменяет."""
+        storage.start_trial(self.UID, 3, kind="free")
+        self.assertTrue(storage.has_active_subscription(self.UID),
+                        "проба не выдалась — тест проверяет не то")
+        self.assertIn("trial:offer", self._data(),
+                      "путь к проверке подписки пропал")
+
+    def test_the_screen_still_names_the_channel_week(self):
+        """Кнопка без строки на экране — это кнопка, о которой не сказано."""
+        storage.start_trial(self.UID, 3, kind="free")
+        text, _kb = self._screen()
+        self.assertIn("за подписку на канал", text)
+
+    def test_the_short_button_goes_away_because_it_was_used_up(self):
+        """Первая проба обязана исчезнуть — но по своей причине, а не за
+        компанию со второй."""
+        storage.start_trial(self.UID, 3, kind="free")
+        self.assertNotIn("trial:free", self._data())
+
+    def test_a_paid_subscription_still_hides_both(self):
+        """Поверх оплаты проба не выдаётся, и кнопка вела бы к отказу."""
+        storage.grant_subscription(self.UID, 30, by=storage.OWNER_ID)
+        data = self._data()
+        self.assertNotIn("trial:free", data)
+        self.assertNotIn("trial:offer", data)
+        self.assertIn("sub:buy", data, "платить стало нечем")
+
+    def test_a_paid_subscription_hides_the_free_rows_too(self):
+        storage.grant_subscription(self.UID, 30, by=storage.OWNER_ID)
+        text, _kb = self._screen()
+        self.assertNotIn("за подписку на канал", text)
+        self.assertNotIn("просто так", text)
+
+    def test_coming_back_from_the_channel_still_leads_to_the_check(self):
+        """Полный путь жалобы: взял три дня, ушёл подписываться, вернулся
+        другим разделом — и снова дошёл до «Я подписался»."""
+        storage.start_trial(self.UID, 3, kind="free")
+        self.assertIn("trial:offer", self._data())
+        kb = self.S._trial_kb()
+        self.assertIn("trial:check", [b.callback_data
+                                      for row in kb.inline_keyboard
+                                      for b in row])
+        days, _ = run(trialgate.grant_for_subscription(
+            Bot(Member("member")), self.UID))
+        self.assertEqual(days, 7, "неделя не досталась после короткой пробы")
+
+
 class TheFirstScreenSellsBeforeItAsks(Bench):
     """Новый человек видит витрину: что бот умеет, сколько стоит и что
     можно взять бесплатно. Кнопки — под ней."""

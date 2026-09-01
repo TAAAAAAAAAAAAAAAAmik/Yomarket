@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-09-01-access-state"
+BOT_VERSION = "2026-09-01-trial-stack"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -267,18 +267,23 @@ def _access_kb(uid: int) -> "InlineKeyboardMarkup":
     поэтому и проверяются по отдельности: взявший три дня всё ещё может
     добрать семь за подписку.
 
+    А вот скрывать их обе по факту действующей подписки нельзя: у взявшего
+    три дня она есть, своя же пробная, и вместе с кнопкой пропадал
+    единственный путь к проверке подписки на канал. Прячет пробы только
+    ОПЛАЧЕННАЯ подписка — ровно та, поверх которой `start_trial` и
+    отказывает.
+
     «Прошу счёт» снят: он просил подождать, пока с человеком свяжутся, и
     половина не дожидалась. Теперь срок и реквизиты он видит сам.
     """
     from storage import (get_trial_channel, get_trial_days,
-                         get_trial_free_days, has_active_subscription,
-                         trial_used)
+                         get_trial_free_days, paid_now, trial_used)
     b = InlineKeyboardBuilder()
     b.button(text="💳 Оплатить подписку", callback_data="sub:buy")
     free_days, long_days = get_trial_free_days(), get_trial_days()
-    # Кнопка пробы тому, у кого доступ уже есть, ведёт к отказу: поверх
-    # действующей подписки проба не выдаётся.
-    got = bool(uid and has_active_subscription(uid))
+    # Кнопка пробы тому, кто уже ЗАПЛАТИЛ, ведёт к отказу: поверх оплаченной
+    # подписки проба не выдаётся. Поверх пробной — выдаётся, они складываются.
+    got = bool(uid and paid_now(uid))
     solo = {"sub:buy"}
     if uid and not got and free_days > 0 and not trial_used(uid, "free"):
         b.button(text=f"🎁 {free_days} дня бесплатно",
@@ -421,14 +426,13 @@ async def trial_offer(callback: CallbackQuery, state: FSMContext) -> None:
 async def trial_free(callback: CallbackQuery, state: FSMContext) -> None:
     """Короткая проба — без условий, по одному нажатию.
 
-    Отметка «уже брал» у обеих проб одна: взял три дня — неделя за подписку
-    уже не положена. Сказать об этом надо ДО выдачи, а не после: человек,
-    узнавший постфактум, что нажатием лишил себя четырёх дней, будет прав
-    в своём недовольстве.
+    Отметка «уже брал» у каждой пробы своя: взявший три дня добирает потом
+    семь за подписку на канал, вместе десять. Общая отметка обесценивала бы
+    условие — подписываться было бы уже не за что.
     """
     import logs
-    from storage import (get_trial_free_days, has_active_subscription,
-                         start_trial, trial_used)
+    from storage import (get_trial_free_days, paid_now, start_trial,
+                         trial_used)
 
     uid = callback.from_user.id
     if trial_used(uid, "free"):
@@ -438,11 +442,12 @@ async def trial_free(callback: CallbackQuery, state: FSMContext) -> None:
     days = start_trial(uid, get_trial_free_days(), kind="free")
     if not days:
         # Причин отказа две, и они разные. «Пробный период не выдаётся»
-        # тому, у кого просто уже есть доступ, читается как поломка: он
-        # видел кнопку, нажал, и бот ответил про что-то своё.
+        # тому, у кого доступ уже оплачен, читается как поломка: он видел
+        # кнопку, нажал, и бот ответил про что-то своё. Спрашивается именно
+        # оплата: пробная подписка выдаче второй пробы не мешает.
         await callback.answer(
             f"У тебя уже есть доступ. {_plain(_left_line(uid))}"
-            if has_active_subscription(uid) else
+            if paid_now(uid) else
             "Пробный период сейчас выключен", show_alert=True)
         return
     await logs.log_event(callback.bot, "trial",
@@ -470,21 +475,24 @@ async def show_access(callback: CallbackQuery) -> None:
     """
     from storage import (get_support_contact, get_trial_channel,
                          get_trial_days, get_trial_free_days,
-                         has_active_subscription, price_lines, trial_used)
+                         has_active_subscription, paid_now, price_lines,
+                         trial_used)
     uid = callback.from_user.id
     free_days, long_days = get_trial_free_days(), get_trial_days()
-    # Пробы поверх действующей подписки не выдаются (`start_trial`), и
-    # предлагать их значит вести к отказу. Тот, у кого доступ уже есть,
-    # пришёл сюда продлевать — ему нужны сроки, а не «3 дня бесплатно».
+    # Доступ и оплата — разные вопросы, и отвечают они на разное.
+    # «Доступ уже открыт» говорится по доступу; пробы прячутся по ОПЛАТЕ:
+    # взявший три дня приходит сюда за неделей, и подписка у него есть —
+    # своя же пробная. Пробы складываются, скрывать вторую не за что.
     got_access = has_active_subscription(uid)
+    paid = paid_now(uid)
     body: list[str] = []
     if got_access:
         body += [f"✅ <b>Доступ уже открыт.</b> {_left_line(uid)}", ""]
 
     free_rows = []
-    if not got_access and free_days > 0 and not trial_used(uid, "free"):
+    if not paid and free_days > 0 and not trial_used(uid, "free"):
         free_rows.append(f"🎁 <b>{free_days} дня</b> — просто так")
-    if (not got_access and long_days > 0 and get_trial_channel()
+    if (not paid and long_days > 0 and get_trial_channel()
             and not trial_used(uid, "channel")):
         free_rows.append(f"📣 <b>+{long_days} дней</b> — за подписку на канал")
     if free_rows:
@@ -548,10 +556,10 @@ async def trial_check(callback: CallbackQuery, state: FSMContext) -> None:
         # Проверка сорвалась И выдать не вышло. Чаще всего — потому что
         # доступ уже есть, и об этом надо сказать прямо: «не вышло, напиши
         # в поддержку» отправляет человека решать несуществующую беду.
-        from storage import has_active_subscription
+        from storage import paid_now
         await callback.answer(
             f"У тебя уже есть доступ. {_plain(_left_line(uid))}"
-            if has_active_subscription(uid) else
+            if paid_now(uid) else
             f"Не вышло открыть пробный период — напиши "
             f"{get_support_contact()}", show_alert=True)
         return

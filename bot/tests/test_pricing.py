@@ -265,13 +265,23 @@ class TheAdminCanSetAllOfIt(unittest.TestCase):
         без условий и неделя за подписку, — и обе даются по нажатию: молчаливая
         выдача обесценивала условие, а выбор между сроками делала за
         человека. Значит и мест выдачи ровно два, по кнопке на каждое.
+
+        Ищется ВЫЗОВ, а не упоминание. Прежняя версия смотрела `ast.dump`
+        целиком — то есть падала на докстринг, объясняющий, почему экран
+        решает так же, как `start_trial`. Объяснение выдачей не является.
         """
         import ast
         src = (Path(__file__).resolve().parents[1]
                / "handlers" / "start.py").read_text()
+
+        def calls_it(node):
+            return any(isinstance(c, ast.Call)
+                       and getattr(c.func, "id", "") == "start_trial"
+                       for c in ast.walk(node))
+
         where = {n.name for n in ast.walk(ast.parse(src))
                  if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
-                 and "start_trial" in ast.dump(n)}
+                 and calls_it(n)}
         self.assertEqual(where, {"trial_free"},
                          f"проба выдаётся не только своей кнопкой: {where}")
 
