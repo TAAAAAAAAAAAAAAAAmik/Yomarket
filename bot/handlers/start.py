@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-08-31-support-one"
+BOT_VERSION = "2026-08-31-connect-gate"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -69,12 +69,21 @@ async def _no_shop_screen(target: "Message | CallbackQuery",
     """
     if get_token(_uid(target)):
         return False
-    if state is not None:
+    uid = _uid(target)
+    if state is not None and _can_connect(uid):
         # Кто уже знает, где брать токен, вставит его не нажимая кнопку.
+        # Но ждать токен от того, кому подключаться ещё нельзя, незачем:
+        # он его пришлёт, а ворота ответят отказом.
         await state.set_state(AuthState.waiting_for_token)
-    text = ui.screen("🔌 <b>Магазин ещё не подключён</b>",
-                     ["Открывать пока нечего. Подключим — и меню появится."])
-    kb = _connect_kb(_uid(target))
+    text = ui.screen(
+        "🔌 <b>Магазин ещё не подключён</b>",
+        ["Открывать пока нечего. Подключим — и меню появится."]
+        if _can_connect(uid) else
+        # Сказать, ЧТО делать, а не только что нельзя. «Нужна подписка» без
+        # продолжения — тупик: человек уже здесь, значит хочет работать.
+        ["Сначала открой доступ — бесплатно или по подписке.",
+         "", "Потом подключим магазин, и всё заработает."])
+    kb = _connect_kb(uid)
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=kb)
         await target.answer()
@@ -158,18 +167,46 @@ def _hello_kb(uid: int = 0) -> "InlineKeyboardMarkup":
     return ui.lay(b, solo={"access:menu"}).as_markup()
 
 
+def _can_connect(uid: int) -> bool:
+    """Может ли этот человек подключить магазин прямо сейчас.
+
+    Подключение — вход в оплаченную часть: фоновый цикл работает всем, у
+    кого есть токен, и подписку он не спрашивает. Значит при включённых
+    воротах подключение обязано быть за ними, иначе оплата обходится одной
+    кнопкой.
+
+    Пока ворота выключены, бот бесплатный для всех — это решение
+    владельца, и мешать ему мы не вправе.
+    """
+    from storage import (has_active_subscription, is_admin,
+                         require_subscription_enabled)
+    if not require_subscription_enabled():
+        return True
+    return bool(is_admin(uid) or has_active_subscription(uid))
+
+
 def _connect_kb(uid: int = 0) -> "InlineKeyboardMarkup":
     """Кнопки экранов, которые ПРО подключение.
 
     С витрины «Подключить магазин» снято, но здесь оно и есть смысл
     экрана: «магазин ещё не подключён» и «дни открыты, цепляй магазин» без
     этой кнопки — тупики, где сказано что делать и нечем.
+
+    А тому, у кого доступа ещё нет, эта кнопка — обещание невозможного:
+    ворота ответят «🔒 Нужна подписка», и виноватым будет выглядеть бот.
+    Ему первым стоит «Получить доступ» — то, что действительно надо
+    сделать.
     """
     b = InlineKeyboardBuilder()
-    b.button(text="🔌 Подключить магазин", callback_data="start:connect")
-    b.button(text="🚀 Получить доступ", callback_data="access:menu")
+    solo = {"start:connect"}
+    if _can_connect(uid):
+        b.button(text="🔌 Подключить магазин", callback_data="start:connect")
+        b.button(text="🚀 Получить доступ", callback_data="access:menu")
+    else:
+        b.button(text="🚀 Получить доступ", callback_data="access:menu")
+        solo = {"access:menu"}
     b.button(text="🧡 Поддержка", callback_data="menu:help")
-    return ui.lay(b, solo={"start:connect"}).as_markup()
+    return ui.lay(b, solo=solo).as_markup()
 
 
 def _has_free_left(uid: int) -> bool:
