@@ -137,6 +137,14 @@ class TheSubscriptionLineIsNotGuessed(Bench):
         storage.grant_subscription(self.UID, 180)
         self.assertRegex(plain(self.by_command()), r"17[89] дн\.")
 
+    def test_a_lifetime_subscription_is_called_forever_not_dated(self):
+        """Дата через сто лет читается как сбой, а не как «навсегда»."""
+        storage.grant_subscription(self.UID, storage.LIFETIME_DAYS)
+        text = plain(self.by_command())
+        self.assertIn("навсегда", text)
+        self.assertNotIn(str(storage.LIFETIME_DAYS), text)
+        self.assertNotRegex(text, r"\d{2}\.\d{2}\.21\d\d")
+
     def test_no_subscription_says_so_and_where_to_get_one(self):
         """«Активна до» с пустой датой — худшее из возможного: человек
         решит, что она есть."""

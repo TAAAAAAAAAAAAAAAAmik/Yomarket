@@ -23,7 +23,7 @@ import ui
 def support_text(user_id: int) -> str:
     from handlers.start import BOT_VERSION
     from storage import (get_settings, get_subscription, get_support_contact,
-                         subscription_days_left)
+                         is_lifetime, subscription_days_left)
     import localtime as _lt
 
     contact = get_support_contact()
@@ -44,7 +44,10 @@ def support_text(user_id: int) -> str:
 
     sub = get_subscription(user_id)
     expires = float((sub or {}).get("expires") or 0)
-    if expires > 0 and subscription_days_left(user_id) >= 0 and sub:
+    if is_lifetime(user_id):
+        # Дата через сто лет читается как сбой, а не как «навсегда».
+        line = "📅 Подписка: <b>навсегда</b>"
+    elif expires > 0 and subscription_days_left(user_id) >= 0 and sub:
         when = _lt.fmt(expires, get_settings(user_id), "%d.%m.%Y %H:%M")
         left = subscription_days_left(user_id)
         line = (f"📅 Подписка активна до: <b>{when}</b> "

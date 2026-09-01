@@ -433,7 +433,8 @@ def _paid_details(days: int, price: int, method: str) -> str:
     from storage import PRICE_TIERS
     if not days:
         return ""
-    bits = [dict(PRICE_TIERS).get(days, f"{days} дн.")]
+    from storage import term_label
+    bits = [dict(PRICE_TIERS).get(days, term_label(days))]
     if price:
         bits.append(f"{price} ₽")
     if method:
@@ -481,7 +482,9 @@ async def paid_claim(callback) -> None:
     b = InlineKeyboardBuilder()
     if days:
         lines.append("Проверь поступление и жми «Выдать».")
-        b.button(text=f"✅ Выдать {days} дн.", callback_data=f"claim:ok:{cid}")
+        from storage import term_label
+        b.button(text=f"✅ Выдать {term_label(days)}",
+                 callback_data=f"claim:ok:{cid}")
     else:
         # Срок не назван — выдать одним нажатием нечего, и делать вид, что
         # есть, нельзя: кнопка «Выдать» без числа дней выдала бы неизвестно
@@ -569,7 +572,8 @@ async def _claim_answer(callback, cid: str, ok: bool) -> None:
     переписать запись в журнале."""
     import logs
     from storage import (get_claim, grant_subscription, is_admin,
-                         settle_claim, subscription_days_left)
+                         is_lifetime, settle_claim, subscription_days_left,
+                         term_label)
 
     uid = callback.from_user.id
     if not is_admin(uid):
@@ -591,12 +595,17 @@ async def _claim_answer(callback, cid: str, ok: bool) -> None:
     days = int(claim.get("days") or 0)
     if ok and days:
         grant_subscription(seller, days, by=uid)
-        left = subscription_days_left(seller)
+        # «Осталось 36499 дн.» вместо «навсегда» — то же число, но
+        # человек прочитает его как ошибку.
+        # «Открыт на навсегда — навсегда» — то же слово дважды и ни разу
+        # по-русски. У бессрочного своя фраза целиком, а не подстановка в
+        # общий шаблон.
+        opened = ("Доступ открыт <b>навсегда</b>." if is_lifetime(seller) else
+                  f"Доступ открыт на <b>{term_label(days)}</b> — осталось "
+                  f"{subscription_days_left(seller)} дн.")
         await _tell_seller(callback.bot, seller,
-                           f"✅ <b>Оплата подтверждена.</b>\n"
-                           f"Доступ открыт на <b>{days} дн.</b> — "
-                           f"осталось {left} дн.")
-        mark = f"✅ Выдано {days} дн. · подтвердил {uid}"
+                           f"✅ <b>Оплата подтверждена.</b>\n{opened}")
+        mark = f"✅ Выдано {term_label(days)} · подтвердил {uid}"
     elif ok:
         mark = f"✅ Отмечено разобранным · {uid}"
     else:

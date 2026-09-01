@@ -75,8 +75,11 @@ class Bench(unittest.TestCase):
         self.logged: list[list[str]] = []
         self._log = logs.log_event
 
+        self.markups: list = []
+
         async def fake_log(bot, kind, lines, user=None, markup=None):
             self.logged.append(list(lines))
+            self.markups.append(markup)
             return True
 
         logs.log_event = fake_log
@@ -321,6 +324,68 @@ class TheClaimSaysWhatWasPaidFor(Bench):
         self.assertIn("оплатил", said)
         self.assertIn("1 месяц", said)
 
+
+class TheLifetimeTierReadsAsAWordEverywhere(Bench):
+    """«Навсегда» лежит в данных как очень большой срок — так выдача,
+    проверка активности и удаление данных работают обычным путём, без
+    исключения в каждом. Но ПОКАЗЫВАТЬ его числом нельзя: «Выдать 36500
+    дн.» на кнопке владелец прочитает как ошибку счёта, а не как срок.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.life = storage.LIFETIME_DAYS
+        storage.set_price(self.life, 9990)
+
+    def test_the_term_button_names_it_by_word(self):
+        cb = self.tap("sub:buy", SUB.choose_term)
+        texts = [t for t, d in self.buttons(cb)
+                 if d == f"sub:buy:{self.life}"]
+        self.assertEqual(len(texts), 1, self.buttons(cb))
+        self.assertIn("Навсегда", texts[0])
+        self.assertNotIn("36500", texts[0])
+
+    def test_the_details_screen_does_not_say_za_navsegda(self):
+        """«9990 ₽ за Навсегда» по-русски не читается: у бессрочного срока
+        нет родительного падежа."""
+        cb = self.tap(f"sub:m:{self.life}:{self.sbp}", SUB.show_details)
+        self.assertIn("доступ навсегда", cb.message.text)
+        self.assertNotIn("за Навсегда", cb.message.text)
+
+    def test_no_screen_of_the_purchase_shows_the_day_count(self):
+        for data, handler in ((f"sub:buy:{self.life}", SUB.choose_method),
+                              (f"sub:m:{self.life}:{self.sbp}",
+                               SUB.show_details)):
+            with self.subTest(data):
+                cb = self.tap(data, handler)
+                self.assertNotIn(str(self.life), cb.message.text)
+
+    def test_the_claim_button_says_grant_forever(self):
+        cb = self.tap(f"sub:m:{self.life}:{self.sbp}", SUB.show_details)
+        data = [d for _t, d in self.buttons(cb) if d.startswith("pay:paid")]
+        self.assertEqual(data, [f"pay:paid:{self.life}:{self.sbp}"])
+
+    def test_and_the_owner_sees_a_word_not_a_number(self):
+        cb = type("CB", (), {})()
+        cb.data = f"pay:paid:{self.life}:{self.sbp}"
+        cb.bot = None
+        cb.message = Screen()
+        cb.from_user = type("U", (), {"id": self.UID, "full_name": "Иван",
+                                      "username": "ivan"})()
+
+        async def answer(text="", **kw):
+            return None
+
+        cb.answer = answer
+        run(C.paid_claim(cb))
+        said = " ".join(self.logged[-1])
+        self.assertIn("Навсегда", said)
+        self.assertNotIn(str(self.life), said)
+        # И на кнопке тоже: «✅ Выдать 36500 дн.» владелец прочитает как
+        # ошибку счёта, а не как срок, и не нажмёт.
+        grant = [b.text for row in self.markups[-1].inline_keyboard
+                 for b in row if (b.callback_data or "").startswith("claim:ok")]
+        self.assertEqual(grant, ["✅ Выдать навсегда"])
 
 if __name__ == "__main__":
     unittest.main()

@@ -296,41 +296,74 @@ class TwoWeeksIsTheEntryTier(unittest.TestCase):
             with self.subTest(name):
                 self.assertIn("2 недели", (docs / name).read_text())
 
-    def test_the_three_month_term_is_gone(self):
-        """Снят решением владельца 31.08: между месяцем и полугодием он
-        ничего не добавлял. Вернувшийся тариф — это срок, который бот снова
-        начнёт продавать, и заметит это не он, а покупатель."""
-        self.assertNotIn(90, [days for days, _l in storage.PRICE_TIERS])
-        self.assertNotIn("3 месяца", [l for _d, l in storage.PRICE_TIERS])
+    def test_the_lifetime_tier_is_a_term_like_any_other(self):
+        """«Навсегда» — это очень большой срок, а не особый случай. Так
+        выдача, проверка активности и удаление данных по истечении
+        работают обычным путём, без исключения в каждом из них."""
+        self.assertIn(storage.LIFETIME_DAYS,
+                      [days for days, _l in storage.PRICE_TIERS])
+        self.assertGreater(storage.LIFETIME_DAYS, 365 * 50)
 
-    def test_a_price_left_over_from_it_is_shown_to_nobody(self):
-        """Цена за снятый срок могла остаться в хранилище с прошлого раза.
+    def test_it_is_shown_as_a_word_and_not_as_a_number_of_days(self):
+        """«Выдать 36500 дн.» на кнопке — не подробность, а причина не
+        нажать: владелец решит, что бот посчитал не то."""
+        self.assertEqual(storage.term_label(storage.LIFETIME_DAYS), "навсегда")
+        self.assertEqual(storage.term_label(30), "30 дн.")
+
+    def test_a_lifetime_subscription_is_recognised_as_one(self):
+        admin = storage._load_admin()
+        try:
+            storage.grant_subscription(4243, storage.LIFETIME_DAYS)
+            self.assertTrue(storage.is_lifetime(4243))
+            storage.grant_subscription(4244, 365)
+            self.assertFalse(storage.is_lifetime(4244),
+                             "годовую приняли за бессрочную")
+        finally:
+            storage._save_admin(admin)
+
+    def test_no_discount_is_claimed_on_the_lifetime_tier(self):
+        """«−99%» — арифметика, в которую никто не поверит, а сравнивать
+        «навсегда» с месяцем не с чем."""
+        admin = storage._load_admin()
+        try:
+            storage.set_price(30, 499)
+            storage.set_price(storage.LIFETIME_DAYS, 9990)
+            row = [l for l in storage.price_lines() if "Навсегда" in l][0]
+            self.assertNotIn("%", row)
+        finally:
+            storage._save_admin(admin)
+
+    def test_the_three_month_term_is_back(self):
+        """Снимался решением владельца 31.08, возвращён 01.09."""
+        self.assertIn(90, [days for days, _l in storage.PRICE_TIERS])
+
+    def test_a_price_for_a_term_not_on_the_list_is_shown_to_nobody(self):
+        """Цена за снятый когда-то срок могла остаться в хранилище.
         Показать её значит продать то, чего в списке нет."""
         admin = storage._load_admin()
         try:
             data = storage._load_admin()
-            data["prices"] = {"90": 2490, "30": 449}
+            data["prices"] = {"77": 2490, "30": 449}
             storage._save_admin(data)
             self.assertEqual(storage.get_prices(), {30: 449},
-                             "снятый срок вернулся из хранилища")
-            self.assertNotIn("3 месяца", "\n".join(storage.price_lines()))
+                             "срок, которого нет в списке, вернулся из "
+                             "хранилища")
         finally:
             storage._save_admin(admin)
 
-    def test_the_documents_do_not_offer_a_term_the_bot_does_not_sell(self):
-        """Трёхмесячный тариф снят. Документ, продолжающий его перечислять,
-        — обещание, которого бот не выполнит: сроки в оферте и в коде
-        расходятся молча, а сошлются на документ."""
+    def test_the_documents_list_the_terms_the_bot_sells(self):
+        """Сроки в оферте и в коде расходятся молча, а сошлются на
+        документ. Бессрочная подписка — обязательство навсегда, и не
+        назвать её в оферте нельзя."""
         docs = pathlib.Path(storage.__file__).parents[1] / "docs" / "legal"
         labels = [label for _days, label in storage.PRICE_TIERS]
         for name in ("offer.md", "terms.md"):
-            line = [ln for ln in (docs / name).read_text().splitlines()
-                    if "Доступные варианты подписки" in ln][0]
-            for gone in ("3 месяца", "3 месяцев", ", 3,"):
-                with self.subTest(name=name, gone=gone):
-                    self.assertNotIn(gone, line)
-            with self.subTest(name=name):
-                self.assertIn("12 месяцев", line, labels)
+            text = (docs / name).read_text()
+            head = text.index("Доступные варианты подписки")
+            line = text[head:head + 260]
+            for promised in ("3", "12 месяцев", "ессрочн"):
+                with self.subTest(name=name, promised=promised):
+                    self.assertIn(promised, line, labels)
 
     def test_no_discount_is_claimed_on_the_week(self):
         """Неделя дороже всех в пересчёте на день. Приписка «выгоднее» к

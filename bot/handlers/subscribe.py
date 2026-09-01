@@ -27,8 +27,8 @@ router = Router()
 
 
 def _tier_label(days: int) -> str:
-    from storage import PRICE_TIERS
-    return dict(PRICE_TIERS).get(int(days), f"{days} дн.")
+    from storage import PRICE_TIERS, term_label
+    return dict(PRICE_TIERS).get(int(days), term_label(days))
 
 
 @router.callback_query(F.data == "sub:buy")
@@ -98,7 +98,7 @@ async def choose_method(callback: CallbackQuery, state: FSMContext) -> None:
 async def show_details(callback: CallbackQuery, state: FSMContext) -> None:
     """Шаг 3 — реквизиты и кнопка «я оплатил»."""
     await state.clear()
-    from storage import get_prices, pay_method
+    from storage import LIFETIME_DAYS, get_prices, pay_method
     parts = callback.data.split(":")
     try:
         days, mid = int(parts[2]), parts[3]
@@ -123,7 +123,11 @@ async def show_details(callback: CallbackQuery, state: FSMContext) -> None:
         # их по нажатию. Обёрнут ровно номер: вместе с ним не должно
         # скопироваться «в комментарии — свой ник», иначе это уедет в поле
         # перевода и останется там.
-        [f"К оплате: <b>{price} ₽</b> за {_tier_label(days)}", "",
+        # «за Навсегда» по-русски не читается: у бессрочного срока нет
+        # родительного падежа, и подставлять его в общий шаблон нельзя.
+        [(f"К оплате: <b>{price} ₽</b> — доступ навсегда"
+          if int(days) >= LIFETIME_DAYS else
+          f"К оплате: <b>{price} ₽</b> за {_tier_label(days)}"), "",
          ui.copyable(method["details"]), "",
          "Оплатил — жми кнопку ниже, и владелец включит доступ."],
         footer="<i>Доступ включает владелец вручную: проверять оплату бот "
