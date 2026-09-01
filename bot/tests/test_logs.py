@@ -224,6 +224,126 @@ class EveryTopicInTheGroupHasAKind(unittest.TestCase):
                 self.assertIn(kind, written, f"в тему «{title}» никто не пишет")
 
 
+class TheNewUsersTopicGetsOneRecordPerPerson(unittest.TestCase):
+    """Тема называется «🔔 Новые пользователи · первый заход в бота», а в
+    неё уходило по записи на КАЖДОЕ `/start`.
+
+    Строк было две. «Вернулся, магазин не подключён» — событие без
+    действия: сделать по нему нечего, а приходило оно каждый раз, когда
+    человек открывал бота, то есть чаще всего именно тогда, когда он
+    растерян и жмёт `/start` подряд. В этом шуме тонули записи, ради
+    которых журнал и заведён, — просьбы о счёте и оплаты.
+
+    Вторая, «Зашёл в бота впервые», решалась по отметке пробного периода —
+    то есть означала «пробу не брал». Не бравший её видел «впервые» и на
+    пятый свой заход. Считать это первым заходом нельзя: единственная
+    цифра, ради которой тема и заведена, — сколько людей вообще дошло до
+    бота.
+    """
+
+    UID = 5150
+
+    def setUp(self):
+        import handlers.start as S
+        self.S = S
+        self.admin: dict = {}
+        self.blobs: dict = {}
+        self._load, self._save = storage._load_admin, storage._save_admin
+        self._read, self._write = storage._read_blob, storage._write_blob
+        self._owner, self._log = storage.is_owner, logs.log_event
+        storage._load_admin = lambda: self.admin
+        storage._save_admin = lambda d: self.admin.update(d)
+        storage._read_blob = lambda n: (self.admin if n == "admin"
+                                        else self.blobs.setdefault(n, {}))
+        storage._write_blob = lambda n, d: (self.admin.update(d) if n == "admin"
+                                            else self.blobs.__setitem__(n, d))
+        storage.is_owner = lambda uid: False
+        self.written: list[tuple[str, str]] = []
+
+        async def catch(bot, kind, lines, **kw):
+            self.written.append((kind, " ".join(lines)))
+            return True
+
+        logs.log_event = catch
+        import handlers.start as _s
+        _s.logs = logs
+
+    def tearDown(self):
+        storage._load_admin, storage._save_admin = self._load, self._save
+        storage._read_blob, storage._write_blob = self._read, self._write
+        storage.is_owner, logs.log_event = self._owner, self._log
+
+    def start(self, uid=None):
+        class St:
+            async def clear(self):
+                return None
+
+            async def set_state(self, x):
+                return None
+
+            async def update_data(self, **kw):
+                return None
+
+        class Msg:
+            def __init__(s, uid):
+                s.from_user = type("U", (), {"id": uid, "full_name": "Т",
+                                             "username": "t"})()
+                s.bot = None
+
+            async def answer(s, text, reply_markup=None, **kw):
+                return None
+
+        run(self.S.cmd_start(Msg(self.UID if uid is None else uid), St()))
+
+    def _users(self) -> list[str]:
+        return [line for kind, line in self.written if kind == "users"]
+
+    def test_the_first_visit_is_written_down(self):
+        self.start()
+        self.assertEqual(len(self._users()), 1)
+        self.assertIn("впервые", self._users()[0])
+
+    def test_the_second_one_is_not(self):
+        """Заход тот же самый человек делает десятками — записью он быть
+        перестал."""
+        self.start()
+        self.start()
+        self.start()
+        self.assertEqual(len(self._users()), 1,
+                         f"журнал повторяется: {self._users()}")
+
+    def test_coming_back_is_not_an_event_at_all(self):
+        """«Вернулся, магазин не подключён» — строка, по которой владельцу
+        нечего сделать."""
+        self.start()
+        self.start()
+        self.assertNotIn("ернулся", " ".join(self._users()))
+
+    def test_a_different_person_is_a_new_record(self):
+        """Отметка личная: общая означала бы «один зашёл — остальных не
+        считаем»."""
+        self.start()
+        self.start(uid=6000)
+        self.assertEqual(len(self._users()), 2)
+
+    def test_the_trial_does_not_decide_who_is_new(self):
+        """Прежняя версия спрашивала отметку пробы, то есть писала
+        «впервые» всякому, кто пробу не брал."""
+        self.start()
+        storage.note_trial(self.UID, "free")
+        self.start()
+        self.assertEqual(len(self._users()), 1)
+
+    def test_forgetting_the_person_forgets_the_mark_too(self):
+        """Список тех, кого бот видел, — тоже данные о человеке, и держать
+        его после «удали мои данные» значит нарушить обещание из политики.
+        Оговорки там всего две, и это не одна из них."""
+        self.start()
+        storage.purge_user(self.UID)
+        self.start()
+        self.assertEqual(len(self._users()), 2)
+
+
 class BindingNeverAnswersWithSilence(unittest.TestCase):
     """`/log_here` в группе не ответил вовсе — и это выглядело как «команды
     не существует».

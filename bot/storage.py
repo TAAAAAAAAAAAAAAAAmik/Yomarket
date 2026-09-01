@@ -1561,6 +1561,14 @@ def purge_user(user_id: int) -> dict:
         data["admins"] = [x for x in admins if x != uid]
         report["admins"] = 1
         dirty = True
+    # Список тех, кого бот видел, — тоже данные о человеке. Оговорок в
+    # политике две (чёрный список и отметка о пробе), и это не одна из них:
+    # он не защищает ничего, а всего лишь бережёт журнал от повторов.
+    seen = [int(x) for x in data.get("seen", [])]
+    if uid in seen:
+        data["seen"] = [x for x in seen if x != uid]
+        report["seen"] = 1
+        dirty = True
     if dirty:
         _save_admin(data)
     return report
@@ -1944,6 +1952,28 @@ def note_trial(user_id: int, kind: str = "free") -> None:
         used.append(int(user_id))
         data[key] = used
         _save_admin(data)
+
+
+def note_visit(user_id: int) -> bool:
+    """Отметить заход и сказать, был ли он ПЕРВЫМ.
+
+    Тема журнала называется «новые пользователи», и запись в ней имеет
+    смысл ровно одна на человека: сколько людей вообще дошло до бота.
+    Прежде это решалось по отметке пробного периода — то есть означало «пробу
+    не брал», и не бравший её попадал в журнал на каждый свой заход.
+
+    Спрашивает и отмечает одна функция, а не две: разнесённые «посмотреть» и
+    «записать» однажды разъезжаются, и тогда запись либо повторяется, либо
+    пропадает совсем.
+    """
+    data = _load_admin()
+    seen = [int(x) for x in data.get("seen", [])]
+    if int(user_id) in seen:
+        return False
+    seen.append(int(user_id))
+    data["seen"] = seen
+    _save_admin(data)
+    return True
 
 
 def paid_now(user_id: int) -> bool:
