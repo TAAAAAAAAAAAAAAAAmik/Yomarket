@@ -163,37 +163,45 @@ class TheClientsOwnCommandsStillWork(Bench):
                 self.assertTrue(reached)
 
 
+def _registered_commands() -> set[str]:
+    """Все имена команд бота, какими бы они ни были объявлены.
+
+    Одного `Command("x")` мало: `/admin` объявлен как `F.text == "/admin"`,
+    и проверка, знающая только первый способ, объявила бы его
+    несуществующим.
+
+    Функция общая: по ней и делят команды на публичные и скрытые, и ищут
+    советы набрать скрытую. Два перечня расходятся молча — этот как раз и
+    разошёлся: `/cat_debug` попала в один и не попала во второй.
+    """
+    names: set[str] = set()
+    root = pathlib.Path(M.__file__).parent
+    for f in sorted((root / "handlers").glob("*.py")):
+        tree = ast.parse(f.read_text(encoding="utf-8"), filename=str(f))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "Command"):
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and \
+                            isinstance(arg.value, str):
+                        names.add(arg.value)
+            elif isinstance(node, ast.Compare):
+                for side in [node.left] + list(node.comparators):
+                    if (isinstance(side, ast.Constant)
+                            and isinstance(side.value, str)
+                            and side.value.startswith("/")
+                            and side.value[1:].isidentifier()):
+                        names.add(side.value[1:])
+    return names
+
+
 class EveryCommandIsClassified(unittest.TestCase):
     """Список закрытый — иначе новая диагностика окажется публичной молча."""
 
     @staticmethod
     def _registered() -> set[str]:
-        """Все имена команд, какими бы они ни были объявлены.
-
-        Одного `Command("x")` мало: `/admin` объявлен как
-        `F.text == "/admin"`, и проверка, знающая только первый способ,
-        объявила бы его несуществующим.
-        """
-        names: set[str] = set()
-        root = pathlib.Path(M.__file__).parent
-        for f in sorted((root / "handlers").glob("*.py")):
-            tree = ast.parse(f.read_text(encoding="utf-8"), filename=str(f))
-            for node in ast.walk(tree):
-                if (isinstance(node, ast.Call)
-                        and isinstance(node.func, ast.Name)
-                        and node.func.id == "Command"):
-                    for arg in node.args:
-                        if isinstance(arg, ast.Constant) and \
-                                isinstance(arg.value, str):
-                            names.add(arg.value)
-                elif isinstance(node, ast.Compare):
-                    for side in [node.left] + list(node.comparators):
-                        if (isinstance(side, ast.Constant)
-                                and isinstance(side.value, str)
-                                and side.value.startswith("/")
-                                and side.value[1:].isidentifier()):
-                            names.add(side.value[1:])
-        return names
+        return _registered_commands()
 
     def test_there_are_commands_to_classify_at_all(self):
         self.assertGreater(len(self._registered()), 30)
@@ -336,12 +344,18 @@ class TheMenuTelegramShowsIsSetByTheBot(unittest.TestCase):
                   and isinstance(node.func, ast.Name)}
         self.assertIn("publish_commands", called)
 
-class TheSupportScreenStillTellsTheOwnerWhatHeNeeds(unittest.TestCase):
-    """`/version` продавцу больше не советуют — значит код сборки обязан
-    быть на экране поддержки сам. Иначе на вопрос «какая у тебя версия»
-    ответить будет нечем, и починка начнётся с угадывания."""
+class ServiceScreensAreHiddenAsWholeThingsNotJustByName(unittest.TestCase):
+    """Скрыть команду и оставить её вывод на экране значит не скрыть ничего.
 
-    def test_the_showcase_support_screen_carries_the_build_code(self):
+    `/version` продавцу не советуют — а код сборки, который она печатает,
+    висел прямо на экране поддержки и на каждом экране отказа. Продавцу он
+    не объясняет ничего и рассказывает о боте то, чего тот не спрашивал:
+    как часто его пересобирают и по каким веткам.
+
+    Владельцу метка остаётся — он открывает те же экраны у себя.
+    """
+
+    def _support_screen(self, uid: int = 7) -> str:
         import handlers.start as S
 
         class Screen:
@@ -353,13 +367,12 @@ class TheSupportScreenStillTellsTheOwnerWhatHeNeeds(unittest.TestCase):
 
         cb = type("CB", (), {})()
         cb.message = Screen()
-        cb.from_user = type("U", (), {"id": 7})()
+        cb.from_user = type("U", (), {"id": uid})()
         cb.answer = lambda *a, **k: asyncio.sleep(0)
         run(S.show_help(cb))
-        self.assertIn(S.BOT_VERSION, cb.message.text)
-        self.assertNotIn("/version", cb.message.text)
+        return cb.message.text
 
-    def test_the_help_command_carries_it_too(self):
+    def _help_command(self, uid: int = 7) -> str:
         import handlers.commands as C
         msg = Msg("/help")
 
@@ -367,21 +380,46 @@ class TheSupportScreenStillTellsTheOwnerWhatHeNeeds(unittest.TestCase):
             msg.said.append(text)
 
         msg.answer = answer
-        msg.from_user = type("U", (), {"id": 7})()
+        msg.from_user = type("U", (), {"id": uid})()
         run(C.cmd_help(msg))
+        return " ".join(msg.said)
+
+    def test_the_showcase_support_screen_hides_the_build_code(self):
+        import handlers.start as S
+        text = self._support_screen()
+        self.assertNotIn(S.BOT_VERSION, text)
+        self.assertNotIn("/version", text)
+
+    def test_the_help_command_hides_it_too(self):
         from handlers.start import BOT_VERSION
-        said = " ".join(msg.said)
-        self.assertIn(BOT_VERSION, said)
+        said = self._help_command()
+        self.assertNotIn(BOT_VERSION, said)
         self.assertNotIn("/version", said)
+
+    def test_the_admin_sees_the_build_code_on_the_same_screens(self):
+        """Проверка, которая ничего не оставляет, не отличает «спрятали» от
+        «выкинули»: убрать метку совсем значило бы вернуть починку к
+        угадыванию версии."""
+        import handlers.start as S
+        admin = dict(storage._load_admin())
+        try:
+            storage.add_admin(4242)
+            self.assertIn(S.BOT_VERSION, self._support_screen(4242))
+            self.assertIn(S.BOT_VERSION, self._help_command(4242))
+        finally:
+            storage._save_admin(admin)
 
 
 class NoScreenAdvisesAHiddenCommand(unittest.TestCase):
     """Совет нажать то, что бот у продавца отнял, — это «не советуйте
     невозможного» в чистом виде: он нажмёт и получит «такой команды нет»."""
 
-    HIDDEN = ("/version", "/sent", "/scan", "/panel_map", "/order_debug",
-              "/chat_debug", "/stats_debug", "/panel_debug", "/log_here",
-              "/withdraw_debug", "/orders_debug", "/chats_debug")
+    # Перечень не переписывается руками: прежний собирался так, и
+    # `/cat_debug` в него не попал — а экран «каталог не читается» её
+    # советовал. Список, который надо не забыть пополнить, однажды не
+    # пополняют.
+    HIDDEN = tuple(sorted("/" + n for n in _registered_commands()
+                          if n not in CL.PUBLIC))
 
     @staticmethod
     def _seller_facing(fn) -> bool:
@@ -437,7 +475,10 @@ class NoScreenAdvisesAHiddenCommand(unittest.TestCase):
                     continue
                 if not self._seller_facing(fn):
                     continue
+                for_owner = self._owner_only(fn)
                 for node in ast.walk(fn):
+                    if node in for_owner:
+                        continue
                     if isinstance(node, ast.Constant) and \
                             isinstance(node.value, str):
                         for cmd in self.HIDDEN:
@@ -445,6 +486,26 @@ class NoScreenAdvisesAHiddenCommand(unittest.TestCase):
                                 bad.append(f"{name}:{node.lineno} "
                                            f"…{node.value[:60]}…")
         return bad
+
+    @staticmethod
+    def _owner_only(fn) -> set:
+        """Строки внутри `ui.admin_hint(...)` — они до продавца не доходят.
+
+        Исключение точечное, на аргументы одного вызова, а не на функцию
+        целиком: экран, где владельцу советуют `/cat_debug`, продавцу
+        по-прежнему не вправе советовать её же строкой рядом.
+        """
+        inside = set()
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            fname = getattr(node.func, "attr", "") or \
+                getattr(node.func, "id", "")
+            if fname != "admin_hint":
+                continue
+            for arg in node.args:
+                inside.update(ast.walk(arg))
+        return inside
 
     def test_the_check_would_notice_such_a_screen(self):
         """Проверка, которая ничего не запрещает, — не проверка. Здесь она

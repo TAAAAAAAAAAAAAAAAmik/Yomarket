@@ -96,5 +96,56 @@ class SomeoneElsesTextCannotBreakTheSend(unittest.TestCase):
         self.assertEqual(ui.esc(None), "")
 
 
+class WhatOnlyTheOwnerSees(unittest.TestCase):
+    """Код сборки и советы набрать служебную команду — не для продавца.
+
+    Он купил подписку на сервис, а не экскурсию по серверу: метка сборки
+    ему ничего не объясняет, а `/cat_debug` у него попросту нет — наберёт и
+    получит молчание, как на несуществующую команду.
+
+    Но и выбрасывать это нельзя: читает метку владелец, и без неё «кнопка
+    не работает» и «в контейнере старый код» снова станут неотличимы.
+    Поэтому одно место на весь бот — здесь и проверяется, что оно молчит
+    продавцу и говорит админу.
+    """
+
+    def setUp(self):
+        import storage
+        self.storage = storage
+        self.admin: dict = {}
+        self._load, self._save = storage._load_admin, storage._save_admin
+        self._owner = storage.is_owner
+        storage._load_admin = lambda: self.admin
+        storage._save_admin = lambda d: self.admin.update(d)
+        storage.is_owner = lambda uid: False
+
+    def tearDown(self):
+        self.storage._load_admin = self._load
+        self.storage._save_admin = self._save
+        self.storage.is_owner = self._owner
+
+    def test_the_seller_gets_nothing_at_all(self):
+        """Пустая строка, а не «—»: место, где метки нет, не занято."""
+        self.assertEqual(ui.build_mark(7), "")
+        self.assertEqual(ui.admin_hint(7, "проверь /cat_debug"), "")
+
+    def test_the_admin_gets_the_build_code(self):
+        from handlers.start import BOT_VERSION
+        self.storage.add_admin(7)
+        self.assertIn(BOT_VERSION, ui.build_mark(7))
+        self.assertIn("/cat_debug", ui.admin_hint(7, "проверь /cat_debug"))
+
+    def test_nobody_is_nobody(self):
+        """Экраны, у которых номера под рукой нет, зовут с нулём."""
+        self.assertEqual(ui.build_mark(0), "")
+        self.assertEqual(ui.build_mark(None), "")
+
+    def test_a_blank_line_inside_a_hint_stays_a_blank_line(self):
+        """Пустая строка — намеренный отступ. Фильтр по правдивости
+        однажды уже съел все разделители разом."""
+        self.storage.add_admin(7)
+        self.assertEqual(ui.admin_hint(7, "раз", "", "два"), "раз\n\nдва")
+
+
 if __name__ == "__main__":
     unittest.main()

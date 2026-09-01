@@ -207,21 +207,19 @@ class SupportHasSomewhereToWrite(unittest.TestCase):
                       (docs / "privacy.md").read_text())
 
     def test_the_screen_carries_what_makes_an_answer_possible(self):
-        """Экран просил прислать код сборки служебной командой. Она стала
-        скрытой — просить её значит советовать невозможное, — поэтому код
-        печатается прямо здесь. Без него первый вопрос поддержки будет «а
-        какая у тебя версия», и починка начнётся с угадывания.
+        """Контакт — текстом, а не только кнопкой: кнопка-ссылка рисуется
+        лишь для контакта вида `@ник`, а вписать можно что угодно, и экран
+        поддержки остался бы без поддержки.
 
-        Контакт — тоже текстом, а не только кнопкой: кнопка-ссылка
-        рисуется лишь для контакта вида `@ник`, а вписать можно что
-        угодно, и экран поддержки остался бы без поддержки."""
+        А вот служебного здесь нет ни в каком виде: ни совета набрать
+        скрытую команду, ни того, что она печатает."""
         from handlers.start import BOT_VERSION
         m = FakeMessage()
         run(C.cmd_help(m))
         said = m.sent[0].text
-        self.assertIn(BOT_VERSION, said)
-        self.assertNotIn("/version", said)
         self.assertIn(storage.get_support_contact(), said)
+        self.assertNotIn("/version", said)
+        self.assertNotIn(BOT_VERSION, said)
 
 
 class ProxiesAreShownWithoutTheirPasswords(unittest.TestCase):

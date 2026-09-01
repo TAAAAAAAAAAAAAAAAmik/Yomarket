@@ -545,10 +545,7 @@ class NamingTheSectionByHand(FlowCase):
             ws[0]["url"],
             "https://yoomarket.net/categories/black-russia/akkaunty-s-virtami")
 
-    def test_an_unreadable_catalogue_says_why_and_which_step(self):
-        """«Каталог не читается» без причины и без версии стоило круга:
-        по такому экрану не понять даже, доехал ли до бота код, в котором
-        подразделы вообще умеют спрашиваться."""
+    def _unreadable(self) -> str:
         def slow(parent=""):
             raise TimeoutError("медленно")
 
@@ -556,12 +553,40 @@ class NamingTheSectionByHand(FlowCase):
         self.patch(M, "category_node", lambda slug: {})
         cb = FakeCallback("pos:cat:telegram")
         self.run_(S.pos_pick_category(cb))
-        said = "\n".join(cb.message.sent)
+        return "\n".join(cb.message.sent)
+
+    def test_an_unreadable_catalogue_says_why_and_which_step(self):
+        """«Каталог не читается» без причины и без шага стоило круга: по
+        такому экрану не понять даже, на чём оно споткнулось."""
+        said = self._unreadable()
         self.assertIn("не читается", said)
         self.assertIn("telegram", said, "не сказано, на каком шаге")
-        self.assertIn("/cat_debug", said, "не сказано, чем проверить")
+        # Причина по-русски: английский код отказа на экране продавца —
+        # отписка, а не объяснение.
+        self.assertIn("Причина: витрина не ответила", said,
+                      "не сказано, что случилось")
+
+    def test_but_it_keeps_the_service_part_to_the_owner(self):
+        """`/cat_debug` продавцу скрыта: советовать её значит советовать
+        невозможное — наберёт и получит молчание. Код сборки ему тем более
+        не объясняет ничего."""
         from handlers.start import BOT_VERSION
-        self.assertIn(BOT_VERSION, said, "по экрану не понять, что доехало")
+        said = self._unreadable()
+        self.assertNotIn("/cat_debug", said)
+        self.assertNotIn(BOT_VERSION, said)
+
+    def test_and_shows_it_to_the_owner(self):
+        """Убрать служебное совсем значило бы вернуть починку к угадыванию:
+        владелец открывает тот же экран у себя."""
+        from handlers.start import BOT_VERSION
+        admin = dict(storage._load_admin())
+        try:
+            storage.add_admin(FakeCallback("x").from_user.id)
+            said = self._unreadable()
+            self.assertIn("/cat_debug", said)
+            self.assertIn(BOT_VERSION, said)
+        finally:
+            storage._save_admin(admin)
 
     def test_and_offers_to_try_again(self):
         self.patch(M, "category_children", lambda parent="": [])

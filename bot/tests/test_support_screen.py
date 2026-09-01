@@ -10,9 +10,12 @@
 
 * **свой Telegram ID** — без него разговор начинается с «а какой у вас
   номер», а найти его негде;
-* **до какого числа подписка** — половина обращений именно про это;
-* **код сборки** — служебная команда продавцу скрыта, значит версию надо
-  показать здесь, иначе на вопрос «какая у тебя версия» ответить нечем.
+* **до какого числа подписка** — половина обращений именно про это.
+
+Кода сборки продавцу здесь НЕ показывают. Он ему ничего не объясняет, а
+рассказывает о боте то, чего тот не спрашивал, — прячется по тому же
+правилу, что и `/version`. Владельцу метка остаётся: он открывает тот же
+экран у себя и видит её на том же месте.
 """
 from __future__ import annotations
 
@@ -109,8 +112,20 @@ class ItTellsHimWhatHeCannotLookUpHimself(Bench):
         значит ошибиться в одной."""
         self.assertIn(f"<code>{self.UID}</code>", self.by_command())
 
-    def test_the_build_code_is_there(self):
+    def test_the_build_code_is_not_shown_to_the_seller(self):
+        """Служебное прячется целиком: и команда `/version`, и то, что она
+        печатает. Скрыть команду, оставив её вывод на экране, значит не
+        скрыть ничего."""
+        for text in (self.by_command(), self.by_button()):
+            self.assertNotIn(S.BOT_VERSION, text)
+            self.assertNotIn("сборки", plain(text))
+
+    def test_but_the_admin_still_sees_it(self):
+        """Метку читает владелец — он воспроизводит беду у себя. Убрать её
+        совсем значило бы вернуть починку к угадыванию версии."""
+        storage.add_admin(self.UID)
         self.assertIn(S.BOT_VERSION, self.by_command())
+        self.assertIn(S.BOT_VERSION, self.by_button())
 
     def test_the_support_contact_is_in_the_text_not_only_on_a_button(self):
         """Кнопка-ссылка рисуется лишь для контакта вида `@ник`, а вписать

@@ -394,11 +394,11 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
         # форму ответа API: прежняя версия прятала причину от панели за
         # сообщением про /check, и два круга прошли, не узнав, что ответила
         # панель. Метка сборки здесь по той же причине, что и на экране
-        # возврата в продажу: вывод из устаревшего контейнера выглядит так же.
-        from handlers.start import BOT_VERSION
+        # возврата в продажу: вывод из устаревшего контейнера выглядит так
+        # же. Видит её только админ — продавцу код сборки не говорит ничего.
         from storage import get_panel_creds
         has_panel = bool((get_panel_creds(callback.from_user.id) or {}).get("cookies"))
-        lines = [f"💰 <b>Баланс</b>  <code>{BOT_VERSION}</code>", ""]
+        lines = [f"💰 <b>Баланс</b>{ui.build_mark(callback.from_user.id)}", ""]
         lines.append("<b>API:</b> в ответе нет баланса — это только проверка "
                      "доступа:")
         lines.append(f"<code>{_esc(_shape(raw))[:400]}</code>" if raw

@@ -12,8 +12,10 @@
   у вас номер», а найти его негде.
 * **До какого числа подписка.** Половина обращений — «а у меня ещё
   работает?». Ответ на экране дешевле ответа в переписке.
-* **Код сборки.** `/version` продавцу скрыт, значит версию надо показать
-  здесь, иначе на вопрос «какая у тебя версия» ответить нечем.
+* **Код сборки — только админу.** Продавцу он ничего не объясняет, а
+  рассказывает о боте то, чего тот не спрашивал; прячется по тому же
+  правилу, что и `/version`. Владельцу метка остаётся: он воспроизводит
+  беду у себя и видит её на том же месте (`ui.build_mark`).
 """
 from __future__ import annotations
 
@@ -21,7 +23,6 @@ import ui
 
 
 def support_text(user_id: int) -> str:
-    from handlers.start import BOT_VERSION
     from storage import (get_settings, get_subscription, get_support_contact,
                          is_lifetime, subscription_days_left)
     import localtime as _lt
@@ -60,9 +61,10 @@ def support_text(user_id: int) -> str:
         line = "📅 Подписки нет — открыть можно на экране «🚀 Получить доступ»."
     body += [f"🆔 Твой Telegram ID: <code>{int(user_id)}</code>", line]
 
+    mark = ui.build_mark(user_id)
     return ui.screen(
         "💡 <b>Центр помощи YooMarket</b>", body,
-        footer=f"<i>Код сборки: {ui.esc(BOT_VERSION)}</i>")
+        footer=f"<i>Код сборки:</i>{mark}" if mark else "")
 
 
 def support_kb(user_id: int = 0):
