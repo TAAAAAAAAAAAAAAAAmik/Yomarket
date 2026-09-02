@@ -229,6 +229,101 @@ def md_to_nodes(raw: str):
 
 
 # ---------------------------------------------------------------------------
+# То же самое, но для вставки руками
+# ---------------------------------------------------------------------------
+
+# Разметку в Telegraph вставляют не текстом, а форматированным куском: его
+# редактор понимает жирное, заголовки и списки при вставке, а `**звёздочки**`
+# оставил бы буквами. Поэтому вывод — HTML, и берётся он из ТЕХ ЖЕ узлов,
+# что уходят в API: два разных пути к одному тексту однажды разъедутся, и
+# опубликованное перестанет совпадать с проверенным.
+_ESC = {"&": "&amp;", "<": "&lt;", ">": "&gt;"}
+
+
+def esc(text: str) -> str:
+    return "".join(_ESC.get(c, c) for c in str(text))
+
+
+def nodes_to_html(nodes) -> str:
+    """Узлы → HTML. Один в один с тем, что получит Telegraph через API."""
+    out = []
+    for node in nodes:
+        out.append(_html(node))
+    return "\n".join(out)
+
+
+def _html(node) -> str:
+    if isinstance(node, str):
+        return esc(node)
+    tag = node.get("tag", "p")
+    attrs = "".join(f' {k}="{esc(v)}"'
+                    for k, v in (node.get("attrs") or {}).items())
+    kids = "".join(_html(c) for c in node.get("children", []))
+    if tag in ("hr", "br"):
+        return f"<{tag}>"
+    return f"<{tag}{attrs}>{kids}</{tag}>"
+
+
+def nodes_to_text(nodes) -> str:
+    """Узлы → простой текст: на случай, если вставлять придётся без разметки."""
+    lines = []
+    for node in nodes:
+        tag = node.get("tag", "p")
+        if tag == "hr":
+            lines.append("———")
+        elif tag in ("ul", "ol"):
+            for item in node.get("children", []):
+                lines.append("— " + "".join(_text(c)
+                                            for c in item.get("children", [])))
+        else:
+            lines.append("".join(_text(c) for c in node.get("children", [])))
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _text(node) -> str:
+    if isinstance(node, str):
+        return node
+    return "".join(_text(c) for c in node.get("children", []))
+
+
+PASTE_TPL = "paste.tpl"
+PASTE_PAGE = "paste.html"
+
+
+def paste_page(ready) -> str:
+    """Страница «вставь это на Telegraph»: три документа с кнопками.
+
+    Собирается из шаблона рядом с документами — по тому же уговору, что и
+    `page.tpl` у общей страницы: вёрстка правится как вёрстка, а не строками
+    внутри питона.
+
+    Текст берётся из узлов, а не из файла заново: иначе вставленное руками
+    однажды разойдётся с тем, что выкладывает API, и заметить это будет
+    нечем.
+    """
+    blocks = []
+    for key, _raw, title, nodes, notes, _size in ready:
+        words = len(nodes_to_text(nodes).split())
+        note = ("" if not notes else
+                '<div class="note"><span>⚠️</span><span>'
+                + esc("; ".join(notes)) + "</span></div>")
+        blocks.append(
+            f'<section>\n  <div class="bar">\n    <div><h2>{esc(title)}</h2>'
+            f'\n      <span class="meta">{words} слов · {len(nodes)} блоков'
+            f'</span></div>\n    <button class="copy" data-copy="{key}">'
+            f'Скопировать текст</button>\n  </div>\n  {note}\n'
+            f'  <div class="doc" id="doc-{key}">\n{nodes_to_html(nodes)}\n'
+            f'  </div>\n  <div class="fade">Показан весь документ — блок '
+            f'прокручивается. Кнопка копирует его целиком.</div>\n</section>')
+    tpl = (SRC / PASTE_TPL).read_text(encoding="utf-8")
+    if "<!--DOCS-->" not in tpl:
+        raise SystemExit(f"{PASTE_TPL}: некуда вставить документы — "
+                         f"пропало место <!--DOCS-->")
+    return tpl.replace("<!--DOCS-->", "\n".join(blocks))
+
+
+# ---------------------------------------------------------------------------
 # Telegraph
 # ---------------------------------------------------------------------------
 
@@ -355,6 +450,8 @@ def main(argv=None) -> int:
                     help="показать, что получится, и не ходить в сеть")
     ap.add_argument("--new-account", action="store_true",
                     help="завести ключ Telegraph и напечатать его")
+    ap.add_argument("--export", metavar="КАТАЛОГ", nargs="?", const="",
+                    help="сложить текст для вставки руками и не ходить в сеть")
     args = ap.parse_args(argv)
 
     if args.new_account:
@@ -367,6 +464,26 @@ def main(argv=None) -> int:
         return 0
 
     ready = [(key, *prepare(fname)) for key, fname in DOCS]
+
+    if args.export is not None:
+        out = pathlib.Path(args.export or (SRC / "paste"))
+        out.mkdir(parents=True, exist_ok=True)
+        for key, _raw, title, nodes, notes, _size in ready:
+            (out / f"{key}.html").write_text(nodes_to_html(nodes),
+                                             encoding="utf-8")
+            (out / f"{key}.txt").write_text(nodes_to_text(nodes),
+                                            encoding="utf-8")
+            print(f"📄 {key}: «{title}»")
+            print(f"   {out / (key + '.html')}  (с разметкой)")
+            print(f"   {out / (key + '.txt')}  (без разметки)")
+            for note in notes:
+                print(f"   ⚠️  {note}")
+        page = SRC / PASTE_PAGE
+        page.write_text(paste_page(ready), encoding="utf-8")
+        print(f"\n📋 Страница с кнопками: {page}")
+        print(f"В поле автора на Telegraph впиши: {AUTHOR}")
+        print("Ссылку не добавляй — подпись должна быть именем без ссылки.")
+        return 0
 
     if args.dry_run:
         for key, _raw, title, nodes, notes, size in ready:

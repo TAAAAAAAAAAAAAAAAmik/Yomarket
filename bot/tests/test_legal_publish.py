@@ -155,6 +155,68 @@ class TheTableIsUnfoldedNotDropped(unittest.TestCase):
         self.assertTrue(notes, "таблица в политике перестала замечаться")
 
 
+class TheHandPasteVersionComesFromTheSameNodes(unittest.TestCase):
+    """Вставлять руками — законный путь: ключа может не быть под рукой.
+
+    Но текст для вставки обязан собираться из ТЕХ ЖЕ узлов, что уходят в
+    API. Второй разбор того же файла — это второй источник правды, и
+    однажды опубликованное перестанет совпадать с проверенным.
+
+    Формата два, потому что редактор Telegraph понимает при вставке
+    разметку: HTML сохраняет жирное и заголовки, простой текст — на случай,
+    когда вставить получается только его.
+    """
+
+    SAMPLE = ("# З\n\n## Раздел\n\nтекст с **жирным** и `кодом`\n\n"
+              "- пункт\n\n---\n")
+
+    def nodes(self, raw=None):
+        return P.md_to_nodes(raw or self.SAMPLE)[1]
+
+    def test_the_html_keeps_the_formatting(self):
+        got = P.nodes_to_html(self.nodes())
+        self.assertIn("<h3>Раздел</h3>", got)
+        self.assertIn("<b>жирным</b>", got)
+        self.assertIn("<code>кодом</code>", got)
+        self.assertIn("<li>пункт</li>", got)
+        self.assertIn("<hr>", got)
+
+    def test_the_html_carries_no_raw_markdown(self):
+        self.assertNotIn("**", P.nodes_to_html(self.nodes()))
+
+    def test_someone_elses_angle_bracket_does_not_break_the_html(self):
+        """В договорах встречается «<», и вставленный как есть он съел бы
+        кусок текста."""
+        got = P.nodes_to_html(P.md_to_nodes("# З\n\nусловие a < b\n")[1])
+        self.assertIn("a &lt; b", got)
+
+    def test_the_plain_text_carries_no_tags(self):
+        got = P.nodes_to_text(self.nodes())
+        for mark in ("<", ">", "**", "`"):
+            with self.subTest(mark):
+                self.assertNotIn(mark, got)
+
+    def test_the_plain_text_keeps_the_words(self):
+        got = P.nodes_to_text(self.nodes())
+        for word in ("Раздел", "жирным", "кодом", "пункт"):
+            with self.subTest(word):
+                self.assertIn(word, got)
+
+    def test_a_list_stays_readable_without_markup(self):
+        self.assertIn("— пункт", P.nodes_to_text(self.nodes()))
+
+    def test_the_table_survives_both_ways(self):
+        """Ради неё всё и проверяется: перечень получателей персональных
+        данных потерять нельзя ни в одном формате."""
+        raw = (P.SRC / "privacy.md").read_text(encoding="utf-8")
+        nodes = self.nodes(raw)
+        for render in (P.nodes_to_html, P.nodes_to_text):
+            with self.subTest(render.__name__):
+                said = render(nodes)
+                self.assertIn("AppRoute", said)
+                self.assertIn("только при автовыдаче звёзд", said)
+
+
 class Bench(unittest.TestCase):
     """Подставной Telegraph: настоящий отсюда недоступен, а проверять надо
     то, что уходит на сервер, и то, что скрипт делает с ответом."""
@@ -445,6 +507,86 @@ class TheRequestItselfIsShapedRight(unittest.TestCase):
             urllib.request.urlopen = old
         self.assertIn("author_url=", seen["body"])
         self.assertNotIn("short_name", seen["body"])
+
+
+class TheExportTouchesNothingAndSaysTheByline(Bench):
+    def test_it_writes_both_formats_for_every_document(self):
+        out = pathlib.Path(self.tmp.name) / "paste"
+        self.assertEqual(self.run_("--export", str(out), token=None), 0)
+        for key, _f in P.DOCS:
+            with self.subTest(key):
+                self.assertTrue((out / f"{key}.html").exists())
+                self.assertTrue((out / f"{key}.txt").exists())
+
+    def test_it_names_what_to_type_in_the_author_field(self):
+        """Подпись на Telegraph — отдельное поле, а не часть текста: не
+        сказать про неё значит не сделать того, ради чего всё затевалось."""
+        out = pathlib.Path(self.tmp.name) / "paste"
+        self.run_("--export", str(out), token=None)
+        self.assertIn("YooMarket Manager", self.said)
+        self.assertIn("сылку не добавляй", self.said)
+
+    def test_it_never_goes_online(self):
+        out = pathlib.Path(self.tmp.name) / "paste"
+        self.run_("--export", str(out), token=None)
+        self.assertEqual(self.calls, [])
+
+    def test_the_table_change_is_announced_here_too(self):
+        out = pathlib.Path(self.tmp.name) / "paste"
+        self.run_("--export", str(out), token=None)
+        self.assertIn("таблиц", self.said)
+
+
+class ThePastePageIsRebuiltFromTheDocuments(unittest.TestCase):
+    """Страница с кнопками собирается из шаблона рядом с документами — по
+    тому же уговору, что и `page.tpl` у общей страницы.
+
+    Собирается, а не лежит готовой: страница, которую нечем пересобрать,
+    после первой же правки оферты станет показывать прежние тарифы, и
+    заметить это будет нечем.
+    """
+
+    def page(self) -> str:
+        ready = [(key, *P.prepare(fname)) for key, fname in P.DOCS]
+        return P.paste_page(ready)
+
+    def test_every_document_is_on_it(self):
+        got = self.page()
+        for title in ("Пользовательское соглашение", "Договор-оферта",
+                      "Политика конфиденциальности"):
+            with self.subTest(title):
+                self.assertIn(title, got)
+
+    def test_it_names_the_byline_to_type(self):
+        """Ради подписи всё и затевалось: не сказать про неё значит отдать
+        страницу, которая не решает задачу."""
+        self.assertIn("YooMarket Manager", self.page())
+
+    def test_each_document_has_its_own_copy_button(self):
+        got = self.page()
+        for key, _f in P.DOCS:
+            with self.subTest(key):
+                self.assertIn(f'data-copy="{key}"', got)
+                self.assertIn(f'id="doc-{key}"', got)
+
+    def test_the_table_warning_is_on_the_page(self):
+        self.assertIn("таблиц", self.page())
+
+    def test_no_raw_markdown_reaches_the_page(self):
+        self.assertNotIn("**", self.page())
+
+    def test_a_template_without_a_slot_is_refused(self):
+        """Шаблон правят руками, и место для документов из него однажды
+        пропадёт. Молча отдать страницу без текста нельзя."""
+        import tempfile as _tf
+        old = P.SRC
+        try:
+            P.SRC = pathlib.Path(_tf.mkdtemp())
+            (P.SRC / P.PASTE_TPL).write_text("<p>пусто</p>", encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                P.paste_page([])
+        finally:
+            P.SRC = old
 
 
 class TheLimitsAreCheckedHere(unittest.TestCase):
