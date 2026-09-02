@@ -32,10 +32,14 @@
 
 ━━━ Как пользоваться ━━━
 
-    python scripts/publish_legal.py --dry-run     что получится, без сети
-    python scripts/publish_legal.py --new-account завести ключ (один раз)
+    python3 scripts/publish_legal.py --dry-run     что получится, без сети
+    python3 scripts/publish_legal.py --new-account завести ключ (один раз)
     export TELEGRAPH_TOKEN=…
-    python scripts/publish_legal.py               выложить или обновить
+    python3 scripts/publish_legal.py               выложить или обновить
+
+На сервере бота питон живёт в его окружении, и звать надо оттуда:
+`~/yomarket/.venv/bin/python scripts/publish_legal.py --dry-run`. Просто
+`python` там нет вовсе — в Debian и Ubuntu есть только `python3`.
 
 Ключ живёт в переменной окружения и в репозиторий не попадает: он и есть
 единственное право править эти страницы. Печатается он ровно один раз — при
@@ -380,8 +384,19 @@ def main(argv=None) -> int:
 
     token = os.environ.get("TELEGRAPH_TOKEN", "").strip()
     if not token:
-        print("Нет TELEGRAPH_TOKEN. Заведи ключ:\n"
-              "  python scripts/publish_legal.py --new-account", file=sys.stderr)
+        # Команда собирается из того, чем скрипт ЗАПУЩЕН, а не пишется
+        # словом «python»: на сервере бота такой команды нет вовсе, и совет
+        # набрать её — это «не советуйте невозможного» в чистом виде.
+        print(f"Нет TELEGRAPH_TOKEN. Заведи ключ:\n"
+              f"  {sys.executable} {sys.argv[0]} --new-account",
+              file=sys.stderr)
+        return 2
+    if token in ("…", "...", "<токен>"):
+        # Строка `export TELEGRAPH_TOKEN=…` из инструкции, вставленная
+        # целиком, молча кладёт в переменную многоточие — и дальше отказ
+        # приходит уже от Telegraph, про «неверный ключ».
+        print("В TELEGRAPH_TOKEN лежит многоточие из инструкции, а не ключ.\n"
+              "  unset TELEGRAPH_TOKEN", file=sys.stderr)
         return 2
 
     rec, failed, fresh = load_record(), [], []

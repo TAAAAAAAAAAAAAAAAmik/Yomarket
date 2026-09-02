@@ -360,6 +360,22 @@ class ItNeverTouchesTheNetworkByAccident(Bench):
         self.run_(token=None)
         self.assertIn("--new-account", self.said)
 
+    def test_the_advice_names_an_interpreter_that_exists(self):
+        """Живой отказ на сервере: `python: command not found`. Совет был
+        написан словом «python», а в Debian и Ubuntu такой команды нет —
+        есть `python3`, а у бота свой питон в окружении. Команда собирается
+        из того, чем скрипт запущен."""
+        self.run_(token=None)
+        self.assertIn(sys.executable, self.said)
+
+    def test_the_ellipsis_from_the_instructions_is_not_a_key(self):
+        """`export TELEGRAPH_TOKEN=…`, вставленное вместе с остальными
+        строками, кладёт в переменную многоточие. Отказ Telegraph про
+        «неверный ключ» отправил бы искать беду не там."""
+        self.assertEqual(self.run_(token="…"), 2)
+        self.assertIn("многоточие", self.said)
+        self.assertEqual(self.calls, [], "пошёл в сеть с многоточием")
+
     def test_a_new_address_is_never_announced_for_a_page_that_failed(self):
         """Страница, не прошедшая сверку, адресом не является: советовать
         вписать её в бота значит советовать вписать неизвестно что."""
