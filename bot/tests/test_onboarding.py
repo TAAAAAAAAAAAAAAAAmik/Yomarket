@@ -804,13 +804,15 @@ class TheGreetingNamesEverythingTheBotDoes(unittest.TestCase):
         пропажа любой означает, что за неё перестали продавать."""
         text = storage.render_custom_text("welcome", цена="", проба=3,
                                           неделя=7, всего=10).lower()
+        # Звёзд в перечне нет намеренно: плагин скрыт целиком, а витрина,
+        # обещающая раздел, которого у продавца не будет, — это вопрос в
+        # поддержку вместо продажи.
         for what in ("позици",         # слежение за позицией на витрине
                      "премиум",        # продвижение
                      "пак",            # поднятие пака
                      "восстановлю",    # авто-восстановление снятых
                      "выложу",         # создание товара
                      "гифт-карт",      # плагины выдачи
-                     "stars",          # звёзды
                      "автопилот",      # включить всё одной кнопкой
                      "магазин",        # несколько магазинов
                      "отзыв",          # отзывы
@@ -818,6 +820,16 @@ class TheGreetingNamesEverythingTheBotDoes(unittest.TestCase):
                      "баланс"):        # порог баланса
             with self.subTest(what):
                 self.assertIn(what, text)
+
+    def test_it_does_not_sell_the_hidden_plugin(self):
+        """Витрина продаёт то, что продавец получит. Пока звёзды скрыты,
+        обещать их значит продать то, чего у него не будет."""
+        import features
+        if not features.STARS_HIDDEN:
+            self.skipTest("плагин показан — обещать его законно")
+        text = storage.render_custom_text("welcome", цена="", проба=3,
+                                          неделя=7, всего=10).lower()
+        self.assertNotIn("stars", text)
 
     def test_it_still_fits_into_one_telegram_message(self):
         """4096 знаков — предел Telegram. Приветствие, не влезшее в

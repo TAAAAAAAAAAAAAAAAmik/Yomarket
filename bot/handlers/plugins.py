@@ -177,7 +177,8 @@ async def _read_catalog(creds: dict) -> tuple[bool, object, str]:
     return await read_catalog(creds)
 
 
-def _plugins_menu_keyboard(settings: dict | None = None) -> InlineKeyboardMarkup:
+def _plugins_menu_keyboard(settings: dict | None = None,
+                           uid: int = 0) -> InlineKeyboardMarkup:
     """Меню плагинов.
 
     Включённые карты выносятся сюда своими кнопками: та, которой продавец
@@ -190,9 +191,14 @@ def _plugins_menu_keyboard(settings: dict | None = None) -> InlineKeyboardMarkup
     девятая однажды не появилась бы вовсе.
     """
     from automation.giftcards import enabled_cards
+    from features import stars_shown
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="⭐ AutoStars", callback_data="plugins:auto_stars")
+    # Звёзды пока показываются только владельцу: покупка на Fragment
+    # доведена не до конца, и кнопка вела бы к трате чужих TON.
+    stars = stars_shown(uid)
+    if stars:
+        builder.button(text="⭐ AutoStars", callback_data="plugins:auto_stars")
     pinned = enabled_cards(settings or {})
     # Robux переехал под гифт-карты: это такая же карта, просто номинал у
     # неё в игровой единице. Отдельная кнопка вела бы во второй экран того
@@ -212,8 +218,10 @@ def _plugins_menu_keyboard(settings: dict | None = None) -> InlineKeyboardMarkup
     # командой, а про команду продавцу неоткуда узнать.
     builder.button(text="🔑 ns.gifts (сравнить цену)", callback_data="ns:creds")
     builder.button(text="⬅️ Главное меню", callback_data="menu:main")
-    # Включённые карты — по две в ряд, остальное по одной.
-    builder.adjust(1, *([2] * ((len(pinned) + 1) // 2)), 1, 1, 1)
+    # Включённые карты — по две в ряд, остальное по одной. Первая единица —
+    # это AutoStars, и без неё ряды съехали бы на один.
+    head = [1] if stars else []
+    builder.adjust(*head, *([2] * ((len(pinned) + 1) // 2)), 1, 1, 1)
     return builder.as_markup()
 
 
@@ -312,6 +320,30 @@ def _stars_settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
     builder.button(text="⬅️ Назад", callback_data="plugins:auto_stars")
     builder.adjust(2, 2, 1, 1, 1)
     return builder.as_markup()
+
+
+async def _stars_gate(handler, event, data):
+    """Скрытый плагин не отвечает и на кнопку из старого сообщения.
+
+    Заслон один на все нажатия раздела, а не проверка в каждом из двадцати
+    обработчиков: разложенная по местам, она однажды не сойдётся сама с
+    собой — и «выключить» осталось бы доступным там, где «включить» уже
+    нет, или наоборот.
+
+    Ответ тот же, что у несуществующей кнопки: рассказывать продавцу, что
+    раздел есть, но не для него, значит не прятать ничего.
+    """
+    from features import stars_shown
+
+    d = str(getattr(event, "data", "") or "")
+    if (d == "plugins:auto_stars" or d.startswith("plugins:stars")) \
+            and not stars_shown(getattr(event.from_user, "id", 0)):
+        await event.answer("Этого раздела сейчас нет", show_alert=True)
+        return None
+    return await handler(event, data)
+
+
+router.callback_query.outer_middleware(_stars_gate)
 
 
 @router.callback_query(F.data == "plugins:auto_stars")
@@ -3332,7 +3364,8 @@ async def gift_make_handoff(message: Message, state: FSMContext) -> None:
 # Главный экран плагинов
 # ---------------------------------------------------------------------------
 
-def _plugins_menu_text(settings: dict, shop_name: str = "") -> str:
+def _plugins_menu_text(settings: dict, shop_name: str = "",
+                       uid: int = 0) -> str:
     """Экран плагинов — короткая витрина, а не отчёт.
 
     Счёт выдач отсюда убран по решению продавца 21.08: это первый экран, и
@@ -3358,12 +3391,17 @@ def _plugins_menu_text(settings: dict, shop_name: str = "") -> str:
     """
     from ui import screen
 
+    from features import stars_shown
+
     return screen("🧩 <b>Плагины</b>", [
         "Покупатель оплатил — бот сам купил товар у поставщика и отправил "
         "его в чат заказа. Без тебя.",
         "",
         "🎁 Гифт-карты: Apple, Xbox, Steam, PlayStation, Roblox, Amazon…",
-        "⭐ Telegram Stars — свой плагин, с кошельком TON",
+        # Строка про звёзды уходит вместе с кнопкой: обещание раздела,
+        # которого на экране нет, — это вопрос в поддержку, а не реклама.
+        "⭐ Telegram Stars — свой плагин, с кошельком TON"
+        if stars_shown(uid) else None,
         "🌙 Ночью и в выходные заказы не ждут тебя",
         "⏱ Ни поставщика, ни ручного копирования",
         "🆕 Плагины прибавляются — новые появятся здесь же",
@@ -3376,7 +3414,7 @@ async def plugins_menu(callback: CallbackQuery, state: FSMContext) -> None:
     uid = callback.from_user.id
     settings = get_settings(uid)
     await callback.message.edit_text(
-        _plugins_menu_text(settings, get_shop_name(uid)),
-        reply_markup=_plugins_menu_keyboard(settings),
+        _plugins_menu_text(settings, get_shop_name(uid), uid),
+        reply_markup=_plugins_menu_keyboard(settings, uid),
     )
     await callback.answer()

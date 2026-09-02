@@ -251,13 +251,21 @@ class TheScreensSellWithNumbersNotAdjectives(unittest.TestCase):
         self.assertIn("не ждут тебя", got)
 
     def test_the_shop_is_not_only_about_codes(self):
-        """Гифт-карты — не весь товар: у бота есть и звёзды Telegram, и
-        список плагинов будет расти. Экран, говорящий только про коды,
-        продаёт меньше, чем есть."""
+        """Гифт-карты — не весь товар, и список плагинов будет расти. Экран,
+        говорящий только про коды, продаёт меньше, чем есть."""
         got = self.menu(self.settings(delivered=0, enabled=False))
-        self.assertIn("Stars", got)
         self.assertIn("Гифт-карты", got)
         self.assertIn("прибавляются", got)
+
+    def test_the_hidden_plugin_is_not_named_to_the_seller(self):
+        """Строка про звёзды уходит вместе с кнопкой: единственное
+        упоминание раздела, которого на экране нет, — это вопрос в
+        поддержку."""
+        import features
+        if not features.STARS_HIDDEN:
+            self.skipTest("плагин показан")
+        self.assertNotIn("Stars", self.menu(self.settings(delivered=0,
+                                                          enabled=False)))
 
     def test_the_stars_are_not_promised_to_deliver_themselves(self):
         """Плагин звёзд в боте есть, но выдача заблокирована снаружи:

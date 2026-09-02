@@ -140,7 +140,14 @@ async def cmd_stats(message: Message, state: FSMContext, **data) -> None:
 @router.message(Command("stars"))
 async def cmd_stars(message: Message, state: FSMContext) -> None:
     """Автовыдача звёзд. Токен здесь не нужен: экран показывает настройки
-    плагина, а не данные магазина."""
+    плагина, а не данные магазина.
+
+    Пока плагин скрыт, команда молчит — ровно как несуществующая. Ответ
+    «этот раздел не для тебя» рассказывал бы о существовании скрытого.
+    """
+    from features import stars_shown
+    if not stars_shown(message.from_user.id):
+        return
     from handlers.plugins import stars_screen
     await stars_screen(AsCallback(message, "plugins:auto_stars"), state)
 
@@ -157,11 +164,15 @@ async def cmd_proxy(message: Message, state: FSMContext) -> None:
     from aiogram.utils.keyboard import InlineKeyboardBuilder
 
     from automation.fragment import proxy_label
+    from features import stars_shown
     from storage import get_ar_creds, get_fragment_creds
 
     uid = message.from_user.id
+    # Прокси Fragment — часть скрытого плагина: строка про него на экране
+    # у продавца была бы единственным упоминанием раздела, которого нет.
+    stars = stars_shown(uid)
     ar = (get_ar_creds(uid) or {}).get("proxy", "")
-    fr = (get_fragment_creds(uid) or {}).get("proxy", "")
+    fr = (get_fragment_creds(uid) or {}).get("proxy", "") if stars else ""
 
     # Показываем только хост и порт: в строке прокси лежат логин и пароль,
     # и это такой же чужой доступ, как куки.
@@ -170,7 +181,8 @@ async def cmd_proxy(message: Message, state: FSMContext) -> None:
         "сервера меняется. В список вписывается прокси, а не сервер.",
         "",
         f"📦 <b>AppRoute</b> — {ui.esc(proxy_label(ar))}",
-        f"⭐ <b>AutoStars и Fragment</b> — {ui.esc(proxy_label(fr))}",
+        (f"⭐ <b>AutoStars и Fragment</b> — {ui.esc(proxy_label(fr))}"
+         if stars else None),
     ]
     if not ar and not fr:
         body += ["", "<i>Ни одного не задано. Пока сервисы отвечают — он и "
@@ -178,7 +190,9 @@ async def cmd_proxy(message: Message, state: FSMContext) -> None:
 
     b = InlineKeyboardBuilder()
     b.button(text="📦 Прокси AppRoute", callback_data="apr:proxy")
-    b.button(text="⭐ Прокси AutoStars", callback_data="plugins:stars:set_proxy")
+    if stars:
+        b.button(text="⭐ Прокси AutoStars",
+                 callback_data="plugins:stars:set_proxy")
     b.button(text="⬅️ В меню", callback_data="menu:main")
     await message.answer(
         ui.screen("🌐 <b>Мои прокси</b>", body,

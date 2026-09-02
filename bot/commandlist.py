@@ -35,7 +35,6 @@ MENU: tuple[tuple[str, str], ...] = (
     ("balance", "Баланс"),
     ("stats", "Статистика"),
     ("prices", "Цены и расписание"),
-    ("stars", "Telegram Stars"),
     ("keyboard", "Показать или убрать кнопки"),
     ("help", "Поддержка"),
     ("policy", "Документы и условия"),
@@ -58,6 +57,19 @@ EXTRA_PUBLIC: frozenset[str] = frozenset({
     "ns_stock", "ns_balance",
     "fragment_cookies", "fragment_debug", "fragment_js", "stars_probe",
 })
+
+# Скрытый плагин прячется вместе со своими командами: `/stars` в меню — это
+# обещание экрана, которого у продавца нет, а `/fragment_debug` без экрана
+# незачем и подавно. Перечень считается, а не переписан руками: вычеркнув
+# плагин в одном месте и забыв в другом, мы бы показали половину.
+from features import STARS_HIDDEN                            # noqa: E402
+
+_STARS_OWN = frozenset({"stars", "stars_probe", "fragment_cookies",
+                        "fragment_debug", "fragment_js"})
+
+if STARS_HIDDEN:
+    MENU = tuple((n, d) for n, d in MENU if n not in _STARS_OWN)
+    EXTRA_PUBLIC = frozenset(EXTRA_PUBLIC - _STARS_OWN)
 
 PUBLIC: frozenset[str] = frozenset(name for name, _d in MENU) | EXTRA_PUBLIC
 

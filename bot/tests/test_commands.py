@@ -252,12 +252,32 @@ class ProxiesAreShownWithoutTheirPasswords(unittest.TestCase):
 
     def test_both_proxies_are_shown_in_one_place(self):
         """Их два, они настраивались в разных углах бота, и продавец,
-        задавший один, о втором не знал."""
+        задавший один, о втором не знал.
+
+        Пока звёзды скрыты, второй остаётся владельцу: строка про прокси
+        Fragment была бы у продавца единственным упоминанием раздела,
+        которого у него нет."""
+        import features
+        was = features.STARS_HIDDEN
+        try:
+            features.STARS_HIDDEN = False
+            m = FakeMessage()
+            run(C.cmd_proxy(m, FakeState()))
+            said = m.sent[0].text
+        finally:
+            features.STARS_HIDDEN = was
+        self.assertIn("AppRoute", said)
+        self.assertIn("AutoStars", said)
+
+    def test_the_hidden_plugin_takes_its_proxy_row_with_it(self):
+        import features
+        if not features.STARS_HIDDEN:
+            self.skipTest("плагин показан")
         m = FakeMessage()
         run(C.cmd_proxy(m, FakeState()))
         said = m.sent[0].text
-        self.assertIn("AppRoute", said)
-        self.assertIn("AutoStars", said)
+        self.assertIn("AppRoute", said, "заодно унесли и чужую строку")
+        self.assertNotIn("AutoStars", said)
 
 
 if __name__ == "__main__":

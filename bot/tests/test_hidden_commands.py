@@ -254,21 +254,40 @@ class EveryCommandIsClassified(unittest.TestCase):
         деньги — и его СОБСТВЕННЫЕ интеграции. Кабинет поставщика и сессия
         Fragment принадлежат ему, чинит их он, и про устройство бота они не
         говорят ничего.
+
+        Звёзды и Fragment сейчас не здесь: плагин скрыт целиком
+        (`features.STARS_HIDDEN`), а скрытый плагин уносит с собой и свои
+        команды. `/fragment_debug` без экрана — диагностика того, чего
+        продавцу негде включить.
         """
-        self.assertEqual(CL.PUBLIC, frozenset({
+        base = {
             # день за днём
             "start", "menu", "orders", "chats", "ads", "balance", "stats",
-            "prices", "stars", "keyboard", "help", "policy",
+            "prices", "keyboard", "help", "policy",
             "proxy", "pubg", "watch_chat", "unwatch_chat",
             "logout", "forget_me",
             # свои поставщики
             "apr_login", "apr_forget", "apr_stock", "apr_balance",
             "apr_item", "apr_whoami", "apr_debug",
             "ns_login", "ns_forget", "ns_stock", "ns_balance",
-            # свой Fragment
-            "fragment_cookies", "fragment_debug", "fragment_js",
-            "stars_probe",
-        }))
+        }
+        stars = {"stars", "stars_probe", "fragment_cookies",
+                 "fragment_debug", "fragment_js"}
+        import features
+        self.assertEqual(CL.PUBLIC,
+                         frozenset(base if features.STARS_HIDDEN
+                                   else base | stars))
+
+    def test_the_hidden_plugin_takes_its_commands_with_it(self):
+        """Убрать кнопку и оставить команду — это кнопка, о которой знает
+        только тот, кто её уже видел."""
+        import features
+        if not features.STARS_HIDDEN:
+            self.skipTest("плагин показан — прятать нечего")
+        for name in ("stars", "stars_probe", "fragment_debug"):
+            with self.subTest(name):
+                self.assertNotIn(name, CL.PUBLIC)
+                self.assertNotIn(name, [n for n, _d in CL.MENU])
 
     def test_the_menu_descriptions_are_filled_in(self):
         for name, desc in CL.MENU:

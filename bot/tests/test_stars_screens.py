@@ -19,6 +19,29 @@ from handlers import plugins as P          # noqa: E402
 from tasks import manager as M             # noqa: E402
 
 
+# Набор проверяет сам плагин, а он от того, показан ли он продавцу, не
+# меняется. Без этого спрятанный плагин унёс бы с собой и свои проверки:
+# вернув его однажды, мы узнали бы о поломке от продавца.
+#
+# Правка ОТКАТЫВАЕТСЯ: подменённый на импорте флаг остался бы подменённым
+# на весь прогон, и проверки «плагин спрятан» падали бы через раз — в
+# зависимости от того, какой набор загрузился раньше.
+import features                                            # noqa: E402
+
+_STARS_WAS = features.STARS_HIDDEN
+
+
+def setUpModule():
+    global _STARS_WAS
+    _STARS_WAS = features.STARS_HIDDEN
+    features.STARS_HIDDEN = False
+
+
+def tearDownModule():
+    features.STARS_HIDDEN = _STARS_WAS
+
+
+
 class Screen:
     def __init__(self):
         self.texts: list[str] = []

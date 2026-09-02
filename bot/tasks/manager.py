@@ -1688,7 +1688,7 @@ class TaskManager:
                         _ar_log(settings, chat_id, msg, ok, err, "новый заказ")
                     # AutoStars: спрашиваем у покупателя @ник прямо в чате
                     await self._maybe_ask_stars_username(
-                        api, settings, oid, title, chat_id, status)
+                        api, settings, oid, title, chat_id, status, user_id)
                     # Гифт-карты, и Robux среди них: спрашивать нечего,
                     # код уходит сразу по факту оплаты. Путь к деньгам
                     # здесь один на все карты — второй означал бы, что
@@ -1761,7 +1761,7 @@ class TaskManager:
                         if got:
                             status = real or "work"
                         await self._maybe_ask_stars_username(
-                            api, settings, oid, title, chat_id, status)
+                            api, settings, oid, title, chat_id, status, user_id)
                         robux_tried.add(oid)
                         await self._maybe_deliver_gifts(
                             user_id, api, settings, oid, title, chat_id, status)
@@ -3245,10 +3245,18 @@ class TaskManager:
     async def _maybe_ask_stars_username(
         self, api: YooMarketAPI, settings: dict,
         order_id: str, title: str, chat_id: str, status: str = "",
+        user_id: int = 0,
     ) -> None:
         from automation.stars import is_stars_order, star_quantity
+        from features import stars_shown
         from orderfields import is_paid
 
+        # Скрытый плагин не работает, а не работает молча за спиной.
+        # Продавцу, у которого он был включён, экрана сейчас нет — то есть
+        # нечем ни посмотреть очередь, ни выключить её, — а покупка тратит
+        # его TON. Ни нового вопроса покупателю, ни новой покупки.
+        if not stars_shown(user_id):
+            return
         p = settings.get("plugins", {}).get("auto_stars", {})
         if not p.get("enabled") or not p.get("ask_username", True):
             return
@@ -3281,6 +3289,12 @@ class TaskManager:
 
         Отдаёт True, когда письмо забрала себе выдача звёзд.
         """
+        from features import stars_shown
+
+        # Пока плагин скрыт, покупка не идёт: она тратит TON продавца, а
+        # выключить её ему нечем — экран спрятан вместе с плагином.
+        if not stars_shown(user_id):
+            return False
         p = settings.get("plugins", {}).get("auto_stars", {})
         if not p.get("enabled"):
             return False
