@@ -147,26 +147,38 @@ class NothingWithoutAPhotoReachesTheMarketplace(unittest.TestCase):
 
 
 class ATemplateWhosePhotoVanishedSaysSo(unittest.TestCase):
+    """Каталог данных на Railway стирается при редеплое, и путь к
+    картинке остаётся, а файла нет. Панель товар без картинки не примет —
+    молчаливая пропажа читается как забывчивость образца: поля на месте,
+    фото нет, и почему, непонятно."""
+
+    TEMPLATE = {"title": "1000 Robux", "price": 990, "description": "код",
+                "quantity": 1, "photo_path": "/nonexistent/photo.jpg"}
 
     def setUp(self):
-        self._get = C.get_settings
-        C.get_settings = lambda uid: {"ad_templates": [{
-            "title": "1000 Robux", "price": 990, "description": "код",
-            "quantity": 1, "photo_path": "/nonexistent/photo.jpg"}]}
+        import features
+        import storage
+        self.storage = storage
+        self._get, self._save = storage.get_settings, storage.save_settings
+        self._shown = features.ad_templates_shown
+        self.features = features
+        storage.get_settings = lambda uid: {"ad_templates": [dict(self.TEMPLATE)]}
+        storage.save_settings = lambda uid, s: None
+        features.ad_templates_shown = lambda uid: True
 
     def tearDown(self):
-        C.get_settings = self._get
+        self.storage.get_settings = self._get
+        self.storage.save_settings = self._save
+        self.features.ad_templates_shown = self._shown
 
     def test_the_loss_is_announced_not_swallowed(self):
         cb = CB("create_ad:use_template:0")
-        fsm = FSM()
-        asyncio.run(C.use_template(cb, fsm))
-        self.assertTrue(any("Фото" in a for a in cb.alerts))
+        asyncio.run(C.use_template(cb, FSM()))
+        self.assertTrue(any("Фото" in a for a in cb.alerts), cb.alerts)
 
     def test_and_the_preview_will_not_let_it_through(self):
         cb = CB("create_ad:use_template:0")
-        fsm = FSM()
-        asyncio.run(C.use_template(cb, fsm))
+        asyncio.run(C.use_template(cb, FSM()))
         self.assertNotIn("create_ad:submit", callbacks(cb.message.kbs[-1]))
 
 

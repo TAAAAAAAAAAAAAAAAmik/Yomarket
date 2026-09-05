@@ -1000,6 +1000,79 @@ def count_subscribers() -> int:
     return sum(1 for s in subs.values() if float(s.get("expires", 0)) > now)
 
 
+# --- Образцы созданных товаров ---------------------------------------------
+#
+# Копия товара должна создаваться БЕЗ ВОПРОСОВ, а вопросы в мастере — не
+# название с ценой, а раздел панели и её `filter__N`: их пять-шесть штук,
+# и до выбора категории панель о половине из них молчит. Поэтому образец
+# хранит весь пакет, который ушёл в панель, а не то, что удобно показать.
+#
+# Записывается он сам, по факту успешного создания. Отдельная кнопка
+# «сохранить как шаблон» означала бы, что копия есть только у того, кто
+# заранее догадался её нажать.
+
+AD_TEMPLATES_MAX = 12
+
+
+def _ad_key(t: dict) -> tuple:
+    """Чем один образец отличается от другого.
+
+    Название плюс цена плюс раздел: по одному названию два разных товара
+    («Robux 400» за 300 и за 350 ₽) слились бы в один, а список образцов
+    молча потерял бы половину.
+    """
+    return (str(t.get("title") or "").strip().lower(),
+            int(t.get("price") or 0), str(t.get("category") or ""))
+
+
+def note_ad_made(user_id: int, values: dict, extra: dict | None = None,
+                 item_id: str = "") -> None:
+    """Запомнить созданный товар как образец для копии.
+
+    Повтор не плодит записей: тот же товар поднимается наверх, а не ложится
+    вторым. Иначе список после трёх копий состоял бы из одного товара.
+    """
+    s = get_settings(user_id)
+    made = [t for t in (s.get("ad_templates") or [])
+            if isinstance(t, dict)]
+    row = {
+        "title": str(values.get("title") or ""),
+        "price": values.get("price") or 0,
+        "description": str(values.get("description") or ""),
+        "quantity": values.get("quantity", 1),
+        "category": values.get("category") or "",
+        "photo_path": values.get("photo_path") or None,
+        "extra": dict(extra or {}),
+        "item_id": str(item_id or ""),
+        "at": _time.time(),
+    }
+    made = [t for t in made if _ad_key(t) != _ad_key(row)]
+    made.insert(0, row)
+    s["ad_templates"] = made[:AD_TEMPLATES_MAX]
+    save_settings(user_id, s)
+
+
+def ad_templates(user_id: int) -> list[dict]:
+    """Образцы, новые впереди."""
+    return [t for t in (get_settings(user_id).get("ad_templates") or [])
+            if isinstance(t, dict) and str(t.get("title") or "").strip()]
+
+
+def ad_template(user_id: int, idx: int) -> dict | None:
+    made = ad_templates(user_id)
+    return made[idx] if 0 <= idx < len(made) else None
+
+
+def ad_template_ready(t: dict) -> bool:
+    """Хватит ли образца, чтобы создать копию БЕЗ ВОПРОСОВ.
+
+    Образцы, сохранённые прежней кнопкой «сохранить как шаблон», раздела не
+    помнят: панель спросит его снова. Это не поломка, но и не «за секунды»,
+    и сказать об этом надо до нажатия, а не после.
+    """
+    return bool(t.get("category") or t.get("extra"))
+
+
 # --- Bot price -------------------------------------------------------------
 
 def get_bot_price() -> int:

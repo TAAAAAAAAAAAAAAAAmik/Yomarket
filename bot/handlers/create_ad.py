@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -119,13 +120,16 @@ def _confirm_kb(has_photo: bool = False) -> InlineKeyboardMarkup:
     приложить фото, и она стоит первой.
     """
     b = InlineKeyboardBuilder()
+    # «Сохранить как шаблон» отсюда снято. Образец теперь пишется сам, по
+    # факту созданного товара, и помнит раздел панели с его полями — а
+    # сохранённый ДО отправки не помнит их и помнить не может: раздел ещё
+    # не выбран. Две кнопки про одно, из которых худшая быстрее, — это
+    # список образцов, наполовину не умеющих копироваться.
     if has_photo:
         b.button(text="✅ Создать товар", callback_data="create_ad:submit")
-        b.button(text="💾 Сохранить как шаблон", callback_data="create_ad:save_template")
         b.button(text="📷 Заменить фото", callback_data="create_ad:edit:photo")
     else:
         b.button(text="📷 Добавить фото", callback_data="create_ad:edit:photo")
-        b.button(text="💾 Сохранить как шаблон", callback_data="create_ad:save_template")
     # Три правки — одной строкой, а не тремя. «Изменить» в каждой надписи
     # съедало половину ширины и повторяло то, что и так понятно из экрана
     # предпросмотра; без него все три помещаются в ряд, и видно, что это
@@ -136,7 +140,10 @@ def _confirm_kb(has_photo: bool = False) -> InlineKeyboardMarkup:
     b.button(text="❌ Отмена", callback_data="menu:ads")
     # «Отмена» отдельной строкой: она бросает набранное, и стоять под одним
     # пальцем с правкой описания ей незачем.
-    b.adjust(*([1] * (3 if has_photo else 2) + [3, 1]))
+    # Столько единиц, сколько кнопок стоит НАД тремя правками. Число было
+    # зашито, и снятая кнопка «сохранить как шаблон» сдвинула бы весь ряд:
+    # правки разъехались бы по строкам, а «Отмена» встала бы рядом с ними.
+    b.adjust(*([1] * (2 if has_photo else 1) + [3, 1]))
     return b.as_markup()
 
 
@@ -146,13 +153,50 @@ def _confirm_kb(has_photo: bool = False) -> InlineKeyboardMarkup:
 
 @router.callback_query(F.data == "create_ad:start")
 async def create_ad_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Развилка: заводить товар с нуля или скопировать уже созданный.
+
+    Развилка показывается, ТОЛЬКО когда есть что копировать. Кнопка
+    «шаблонная копия» у того, кто ещё ничего не создавал, ведёт в пустой
+    список — то есть обещает то, чего нет, и добавляет лишний шаг перед
+    единственным настоящим действием.
+    """
+    from features import ad_templates_shown
+    from storage import ad_templates
+
     await state.clear()
-    await state.set_state(CreateAdState.title)
-    s = get_settings(callback.from_user.id)
-    templates = s.get("ad_templates", [])
+    uid = callback.from_user.id
+    # Копия — только админам (решение владельца). Развилки у продавца нет
+    # вовсе: кнопка, отвечающая отказом, хуже, чем её отсутствие.
+    made = ad_templates(uid) if ad_templates_shown(uid) else []
+    if not made:
+        await _ask_title(callback, state)
+        return
     b = InlineKeyboardBuilder()
-    if templates:
-        b.button(text=f"📋 Использовать шаблон ({len(templates)})", callback_data="create_ad:templates_list")
+    b.button(text="✍️ Создать товар", callback_data="create_ad:new")
+    b.button(text=f"📋 Шаблонная копия ({len(made)})",
+             callback_data="create_ad:templates_list")
+    b.button(text="❌ Отмена", callback_data="menu:ads")
+    await callback.message.edit_text(ui.screen("➕ <b>Новый товар</b>", [
+        "Завести с нуля — мастер спросит название, цену, описание, "
+        "количество, фото и раздел панели.",
+        "",
+        "Копия — тот же товар целиком, вместе с разделом и его полями. "
+        "Один выбор, и товар уходит в панель.",
+    ]), reply_markup=ui.lay(b, solo={"create_ad:new",
+                                     "create_ad:templates_list"}).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "create_ad:new")
+async def create_ad_new(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await _ask_title(callback, state)
+
+
+async def _ask_title(callback: CallbackQuery, state: FSMContext) -> None:
+    """Первый шаг мастера. Один на оба входа — с развилки и без неё."""
+    await state.set_state(CreateAdState.title)
+    b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="menu:ads")
     ui.lay(b)
     await callback.message.edit_text(
@@ -582,7 +626,7 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
                 chosen={},
                 select_queue=queue,
             )
-            await _ask_next_select(callback.message, state, uid)
+            await _ask_next_select(callback.message, state, uid, api)
             await callback.answer()
             return
 
@@ -591,7 +635,7 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
     # с живой формой мастера этот отказ становится вопросом, а не тупиком.
     await state.update_data(pending=values, chosen={})
     await _panel_create_and_report(callback.message, uid, values, extra=None,
-                                   state=state)
+                                   state=state, api=api)
     await callback.answer()
 
 
@@ -626,8 +670,14 @@ def _autopick_match(options: list, words) -> dict | None:
     return None
 
 
-async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
-    """Спросить следующее обязательное поле-список — или уже создать товар."""
+async def _ask_next_select(msg, state: FSMContext, uid: int,
+                           api=None) -> None:
+    """Спросить следующее обязательное поле-список — или уже создать товар.
+
+    `api` едет параметром, а не через состояние: клиент Integration API
+    живёт один запрос, а форма мастера переживает десятки. Нужен он в
+    самом конце — проставить остаток созданному товару.
+    """
     from storage import get_panel_creds
     from automation.panel import panel_sync_field_options_sync
 
@@ -640,7 +690,7 @@ async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
         values = data.get("pending") or {}
         picked = list(data.get("autopicked") or [])
         await _panel_create_and_report(msg, uid, values, extra=chosen,
-                                       picked=picked, state=state)
+                                       picked=picked, state=state, api=api)
         return
 
     attr = queue[0]
@@ -683,7 +733,7 @@ async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
             return
         # Необязательное — пропускаем
         await state.update_data(select_queue=queue[1:])
-        await _ask_next_select(msg, state, uid)
+        await _ask_next_select(msg, state, uid, api)
         return
 
     options = options[:500]
@@ -700,7 +750,7 @@ async def _ask_next_select(msg, state: FSMContext, uid: int) -> None:
         notes.append(f"{label}: {guess.get('label')}")
         await state.update_data(chosen=chosen, autopicked=notes,
                                 select_queue=queue[1:])
-        await _ask_next_select(msg, state, uid)
+        await _ask_next_select(msg, state, uid, api)
         return
 
     await state.update_data(
@@ -852,7 +902,8 @@ async def select_search(message: Message, state: FSMContext) -> None:
 
 
 @router.callback_query(F.data.startswith("cadopt:"))
-async def choose_select_option(callback: CallbackQuery, state: FSMContext) -> None:
+async def choose_select_option(callback: CallbackQuery, state: FSMContext,
+                               api: YooMarketAPI = None) -> None:
     data = await state.get_data()
     attr = data.get("current_attr")
     options = data.get("current_view") or data.get("current_options") or []
@@ -873,7 +924,8 @@ async def choose_select_option(callback: CallbackQuery, state: FSMContext) -> No
         current_view=[], current_page=0,
     )
     await callback.answer(f"✅ {str(options[idx].get('label',''))[:30]}")
-    await _ask_next_select(callback.message, state, callback.from_user.id)
+    await _ask_next_select(callback.message, state, callback.from_user.id,
+                           api)
 
 
 def _picked_note(picked: list | None) -> str:
@@ -923,7 +975,8 @@ def _what_to_do(values: dict, fields: list, is_expired: bool) -> str:
 
 async def _ask_for_refused_fields(msg, uid: int, values: dict,
                                   extra: dict | None, picked: list | None,
-                                  state: FSMContext, result_msg: str) -> bool:
+                                  state: FSMContext, result_msg: str,
+                                  api=None) -> bool:
     """Отказ панели по полю → вопрос продавцу. True, если спросили.
 
     Обязательность полей у панели зависит от раздела: в форме создания
@@ -1002,14 +1055,73 @@ async def _ask_for_refused_fields(msg, uid: int, values: dict,
             f"молчит. Спрошу — и отправлю товар заново.")
     except Exception:
         pass
-    await _ask_next_select(msg, state, uid)
+    await _ask_next_select(msg, state, uid, api)
     return True
+
+
+async def _fill_stock(api, item_id: str, want, ) -> str:
+    """Проставить остаток новому товару. Отдаёт строку для отчёта.
+
+    Без остатка панель товар не публикует, и продавцу приходилось жать
+    «📦 Добавить остатки» и вводить число, которое мастер уже спрашивал.
+
+    Три вещи, из-за которых это не одна строчка кода:
+
+    * **сколько уже есть, читаем сначала.** Панель кладёт количество в свою
+      форму при создании; добавить сверху столько же значит удвоить
+      остаток. Дополняем до нужного, а не прибавляем;
+    * **коды скопировать нельзя.** У товара с авто-выдачей остаток — это
+      сами ключи, и они одноразовые. Придумать их бот не может, а взять из
+      образца — значит продать один код дважды;
+    * **перечитываем.** HTTP 200 не доказательство: в отчёте стоит то
+      число, которое ответил маркетплейс, а не то, которое мы отправили.
+    """
+    try:
+        want = int(float(want or 0))
+    except (TypeError, ValueError):
+        want = 0
+    if not api or not item_id or want <= 0:
+        return ""
+    try:
+        ad = await api.get_ad(item_id)
+        kind = str(((ad.get("data") or ad) or {}).get("type") or "")
+        if kind == "auto-delivery":
+            return ("\n📦 Остатки — это коды, и они одноразовые: "
+                    "скопировать их нельзя, пришли своим списком.")
+        _has, said = await api.ad_stock(item_id, ad)
+        now = _stock_number(said)
+        if now >= want:
+            return f"\n📦 Остаток на месте: {now}"
+        await api.refill_ad_value(item_id, want - now)
+        _has, said = await api.ad_stock(item_id)
+        got = _stock_number(said)
+        if got >= want:
+            return f"\n📦 Остаток проставлен: {got}"
+        # Молчать нельзя: без остатка товар не опубликуется, и продавец
+        # будет искать причину на экране модерации.
+        return (f"\n📦 Остаток проставить не вышло — сейчас {got} "
+                f"из {want}. Добавь вручную.")
+    except Exception as e:                                # noqa: BLE001
+        logger.warning("остаток товару %s не проставлен: %s", item_id, e)
+        return "\n📦 Остаток проставить не вышло — добавь вручную."
+
+
+def _stock_number(said: str) -> int:
+    """Число из «остаток: 500» или «позиций в наличии: 3». 0, если его нет.
+
+    Разбирается строка `api.ad_stock` — та же, что показывают экраны. Свой
+    второй разбор ответа маркетплейса означал бы, что однажды экран и отчёт
+    назовут разные числа.
+    """
+    m = re.search(r"(\d+)", str(said or ""))
+    return int(m.group(1)) if m else 0
 
 
 async def _panel_create_and_report(msg, uid: int, values: dict,
                                    extra: dict | None,
                                    picked: list | None = None,
-                                   state: FSMContext | None = None) -> None:
+                                   state: FSMContext | None = None,
+                                   api=None) -> None:
     """Run panel_create_product_sync in a thread with live progress, then report.
 
     `picked` — разделы, выбранные ботом без спроса (создание из плагина).
@@ -1078,9 +1190,30 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
         if state is not None:
             await state.clear()
         item_id = result_msg if str(result_msg).isdigit() else ""
+        # Образец для копии пишется по факту СОЗДАНИЯ, а не по нажатию
+        # «сохранить как шаблон»: копия есть у всех, а не только у того,
+        # кто заранее догадался её сохранить. И пишется здесь, потому что
+        # сюда сходятся оба пути — мастер и повтор после отказа по полю, —
+        # а значит `values` и `extra` тут окончательные.
+        try:
+            from storage import note_ad_made
+            note_ad_made(uid, values, extra, item_id)
+        except Exception as e:                            # noqa: BLE001
+            # Товар уже создан. Не записанный образец — потеря удобства,
+            # а поднятое отсюда исключение съело бы отчёт о создании.
+            logger.warning("образец товара не записан: %s", e)
         pub_note = ""
+        stock_note = ""
         if item_id:
-            # Сразу пытаемся сделать товар публичным
+            # Остаток — ПЕРЕД публикацией: без него панель публиковать
+            # отказывается, и «добавь остатки» после отказа было лишним
+            # кругом с числом, которое мастер уже спрашивал.
+            try:
+                await status_msg.edit_text("⏳ Товар создан, ставлю остаток…")
+            except Exception:
+                pass
+            stock_note = await _fill_stock(api, item_id,
+                                           values.get("quantity", 0))
             try:
                 await status_msg.edit_text("⏳ Товар создан, делаю публичным...")
             except Exception:
@@ -1132,6 +1265,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
             f"📝 {html.escape(str(values['title']))}\n"            f"💰 {values['price']} ₽"
             f"{chr(10) + '🆔 ' + item_id if item_id else ''}"
             f"{_picked_note(picked)}"
+            f"{stock_note}"
             f"{pub_note}",
             reply_markup=b.as_markup(),
         )
@@ -1145,7 +1279,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
     # отказ повторится, продавец получит отчёт, а не круг вопросов.
     if state is not None:
         asked = await _ask_for_refused_fields(msg, uid, values, extra, picked,
-                                              state, result_msg)
+                                              state, result_msg, api)
         if asked:
             return
         await state.clear()
@@ -1251,71 +1385,108 @@ async def publish_item(callback: CallbackQuery) -> None:
 # Templates
 # ---------------------------------------------------------------------------
 
-@router.callback_query(F.data == "create_ad:save_template")
-async def save_template(callback: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    if not data.get("title"):
-        await callback.answer("❌ Нет данных для сохранения", show_alert=True)
-        return
-    s = get_settings(callback.from_user.id)
-    templates = s.setdefault("ad_templates", [])
-    template = {
-        "title": data.get("title", ""),
-        "price": data.get("price", 0),
-        "description": data.get("description", ""),
-        "quantity": data.get("quantity", 1),
-        "photo_path": data.get("photo_path"),
-    }
-    templates.append(template)
-    save_settings(callback.from_user.id, s)
-    await callback.answer(f"✅ Шаблон «{template['title'][:30]}» сохранён", show_alert=True)
-
-
 @router.callback_query(F.data == "create_ad:templates_list")
 async def templates_list(callback: CallbackQuery) -> None:
-    s = get_settings(callback.from_user.id)
-    templates = s.get("ad_templates", [])
-    if not templates:
-        await callback.answer("Шаблонов нет", show_alert=True)
+    """Список созданных товаров: выбор здесь и есть подтверждение.
+
+    Отдельного «точно создать?» нет намеренно: в строке уже написано, что
+    именно уйдёт в панель — название и цена, — а лишний экран между
+    решением и действием и есть то, ради чего копию заводили.
+    """
+    from features import ad_templates_shown
+    from storage import ad_template_ready, ad_templates
+
+    # Заслон и на самом экране, а не только на кнопке: кнопка осталась в
+    # прежних сообщениях, а нажатие создаёт настоящий товар на витрине.
+    if not ad_templates_shown(callback.from_user.id):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    made = ad_templates(callback.from_user.id)
+    if not made:
+        await callback.answer("Копировать пока нечего — ни одного товара "
+                              "ещё не создано", show_alert=True)
         return
     b = InlineKeyboardBuilder()
-    for i, t in enumerate(templates[:8]):
-        b.button(text=f"📋 {t.get('title','')[:30]} — {t.get('price',0)} ₽", callback_data=f"create_ad:use_template:{i}")
-    b.button(text="➕ Новый товар", callback_data="create_ad:start")
+    rows = []
+    for i, t in enumerate(made):
+        title = str(t.get("title") or "")
+        # Метка у образцов без раздела: они созданы прежней кнопкой
+        # «сохранить как шаблон» и раздела не помнят — панель спросит его
+        # снова. Сказать это надо ДО нажатия, а не после.
+        slow = "" if ad_template_ready(t) else " ·  спросит раздел"
+        b.button(text=f"📋 {title[:28]} — {t.get('price', 0)} ₽",
+                 callback_data=f"create_ad:use_template:{i}")
+        rows.append(f"• <b>{html.escape(title[:40])}</b> — "
+                    f"{t.get('price', 0)} ₽{slow}")
+    b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
     b.button(text="❌ Отмена", callback_data="menu:ads")
     ui.lay(b)
-    await callback.message.edit_text(
-        "📋 <b>Шаблоны товаров</b>\n\nВыбери шаблон:",
-        reply_markup=b.as_markup(),
-    )
+    await callback.message.edit_text(ui.screen(
+        "📋 <b>Шаблонная копия</b>",
+        ["Товар уйдёт в панель точно таким же — с разделом, полями и "
+         "описанием. Вопросов не будет.", ""] + rows),
+        reply_markup=b.as_markup())
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("create_ad:use_template:"))
-async def use_template(callback: CallbackQuery, state: FSMContext) -> None:
-    idx = int(callback.data.split(":")[-1])
-    s = get_settings(callback.from_user.id)
-    templates = s.get("ad_templates", [])
-    if idx >= len(templates):
-        await callback.answer("Шаблон не найден", show_alert=True)
-        return
-    t = templates[idx]
-    await state.clear()
+async def use_template(callback: CallbackQuery, state: FSMContext,
+                       api: YooMarketAPI = None) -> None:
+    """Копия уходит в панель сразу — за тем её и заводили.
+
+    Образец без раздела (прежняя кнопка «сохранить как шаблон») копией «за
+    секунды» быть не может: раздел панель спросит. Тогда мастер
+    открывается на предпросмотре с уже заполненными полями — это честнее,
+    чем отправить заведомо неполный товар и показать продавцу отказ 422.
+    """
     import os
+
+    from features import ad_templates_shown
+    from storage import ad_template, ad_template_ready
+
+    if not ad_templates_shown(callback.from_user.id):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    idx = int(callback.data.split(":")[-1])
+    t = ad_template(callback.from_user.id, idx)
+    if not t:
+        await callback.answer("Такого товара в списке нет", show_alert=True)
+        return
+
     photo_path = t.get("photo_path")
-    lost = bool(photo_path) and not os.path.exists(photo_path)
-    if lost:
-        photo_path = None  # файл могли удалить при редеплое без volume
-    await state.update_data(
-        title=t.get("title", ""),
-        price=t.get("price", 0),
-        description=t.get("description", ""),
-        quantity=t.get("quantity", 1),
-        photo_path=photo_path,
-    )
-    await _show_preview(callback.message, state, edit=True)
-    # Молчаливая пропажа фото выглядела бы как забывчивость шаблона: поля
-    # на месте, картинки нет, и почему — непонятно.
-    await callback.answer(
-        "Фото шаблона не найдено — приложи заново" if lost else "",
-        show_alert=lost)
+    # Файл мог пропасть: на Railway каталог данных стирается при редеплое.
+    # Молча создать товар без картинки значит выдать копию за точную.
+    lost = bool(photo_path) and not os.path.exists(str(photo_path))
+    values = {
+        "title": t.get("title", ""),
+        "price": t.get("price", 0),
+        "description": t.get("description", ""),
+        "quantity": t.get("quantity", 1),
+        "category": t.get("category", ""),
+        "photo_path": None if lost else photo_path,
+    }
+    extra = dict(t.get("extra") or {})
+
+    # Про пропавшее фото говорим до развилки: молчаливая пропажа выглядит
+    # как забывчивость образца — поля на месте, картинки нет, и почему,
+    # непонятно. А панель товар без картинки не принимает вовсе.
+    photo_note = ("Фото образца не нашлось — приложи заново. "
+                  if lost else "")
+
+    if not ad_template_ready(t):
+        await state.clear()
+        await state.update_data(**{k: v for k, v in values.items()
+                                   if k != "category"})
+        await _show_preview(callback.message, state, edit=True)
+        await callback.answer(
+            photo_note + "Этот образец сохранён без раздела — панель "
+            "спросит его. Остальное уже заполнено.", show_alert=True)
+        return
+
+    await callback.answer(photo_note + "Создаю копию…", show_alert=lost)
+    # Состояние живое: отказ панели по недостающему полю станет вопросом, а
+    # не тупиком — раздел мог поменяться с прошлого раза.
+    await state.set_state(CreateAdState.panel_select)
+    await state.update_data(pending=values, chosen=extra, select_queue=[])
+    await _panel_create_and_report(callback.message, callback.from_user.id,
+                                   values, extra=extra, state=state, api=api)

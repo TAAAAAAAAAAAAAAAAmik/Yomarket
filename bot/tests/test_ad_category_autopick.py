@@ -116,9 +116,11 @@ class TheWizardStopsAskingWhatItAlreadyKnows(unittest.TestCase):
         self._create, self._render = (C._panel_create_and_report,
                                       C._render_select)
 
-        async def create(msg, uid, values, extra, picked=None, state=None):
+        async def create(msg, uid, values, extra=None, picked=None,
+                         state=None, api=None):
             self.created.append({"values": values, "extra": extra,
-                                 "picked": picked, "state": state})
+                                 "picked": picked, "state": state,
+                                 "api": api})
 
         async def render(msg, state, edit=True):
             data = await state.get_data()
