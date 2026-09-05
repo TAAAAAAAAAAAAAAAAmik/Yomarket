@@ -1,32 +1,34 @@
 import json
+import logging
 import os
 import shutil
 
+logger = logging.getLogger(__name__)
+
 
 def _resolve_data_dir() -> str:
-    """
-    Pick a data directory that survives container re-deploys.
+    """Выбрать папку данных, которая переживёт пересборку контейнера.
 
-    Priority:
-      1. $DATA_DIR env var (explicit override — e.g. a Railway volume mount path)
-      2. /app/data — the volume mount point declared in docker-compose.yml
-         (`bot_data:/app/data`). Persistent across `docker compose up --build`.
-      3. ~/.yomarket — fallback for bare-metal / non-Docker runs.
+    По порядку:
+      1. переменная $DATA_DIR — явное указание, например точка тома Railway;
+      2. /app/data — том, объявленный в docker-compose.yml
+         (`bot_data:/app/data`); переживает `docker compose up --build`;
+      3. ~/.yomarket — запасной вариант для запуска без Docker.
 
-    The previous version defaulted to ~/.yomarket even inside Docker, which is
-    NOT covered by the docker-compose volume, so data was wiped on every redeploy.
+    Прежняя версия выбирала ~/.yomarket даже внутри Docker, а эта папка томом
+    НЕ накрыта — данные стирались при каждом выкате.
     """
     env = os.environ.get("DATA_DIR")
     if env:
         return env
-    # In the Docker image WORKDIR is /app and the compose volume maps /app/data.
+    # В образе Docker рабочая папка — /app, и том compose ведёт в /app/data.
     if os.path.isdir("/app"):
         return "/app/data"
     return os.path.join(os.path.expanduser("~"), ".yomarket")
 
 
 _DATA_DIR = _resolve_data_dir()
-# Where storage files might have been written by older versions of the bot.
+# Куда прежние версии бота могли складывать файлы хранилища.
 _LEGACY_DIRS = [
     os.path.join(os.path.dirname(__file__), "data"),     # bot/data/
     os.path.join(os.path.expanduser("~"), ".yomarket"),  # previous (broken) default
@@ -34,7 +36,7 @@ _LEGACY_DIRS = [
 
 
 def _migrate_legacy() -> None:
-    """Move *.json from any known legacy location into the active data dir, once."""
+    """Один раз перенести *.json из всех прежних мест в нынешнюю папку данных."""
     os.makedirs(_DATA_DIR, exist_ok=True)
     for legacy in _LEGACY_DIRS:
         if not os.path.isdir(legacy) or os.path.abspath(legacy) == os.path.abspath(_DATA_DIR):
@@ -54,8 +56,11 @@ _migrate_legacy()
 _FILE = os.path.join(_DATA_DIR, "tokens.json")
 _SETTINGS_FILE = os.path.join(_DATA_DIR, "settings.json")
 _PANEL_FILE = os.path.join(_DATA_DIR, "panel_creds.json")
-# Sensitive: Fragment cookies + TON wallet seed phrase. Never logged/committed.
+# Секретное: куки Fragment и seed-фраза кошелька TON. Ни в логи, ни в
+# репозиторий не попадают никогда — это доступ к чужому кошельку.
 _FRAGMENT_FILE = os.path.join(_DATA_DIR, "fragment_creds.json")
+_NS_FILE = os.path.join(_DATA_DIR, "ns_creds.json")
+_AR_FILE = os.path.join(_DATA_DIR, "approute_creds.json")
 _ADMIN_FILE = os.path.join(_DATA_DIR, "admin.json")
 
 _DEFAULT_SETTINGS = {
@@ -66,24 +71,103 @@ _DEFAULT_SETTINGS = {
         "on_refunded": {"enabled": False, "message": "↩️ Возврат оформлен. Ожидайте 1-3 дня."},
     },
     "auto_rules": [],  # [{"keyword": "Roblox", "message": "🎮 Робуксы отправим в течение 15 минут!"}]
-    "auto_restore": {"enabled": False},
+    "auto_restore": {
+        "enabled": False,
+        "interval_hours": 1,     # раньше крутилось каждые 30 минут без паузы
+        # Вернуть товар в продажу сразу после покупки, не дожидаясь
+        # планового прохода: продажа — это и есть момент, когда товар мог уйти
+        # с витрины.
+        "instant": True,
+        "require_stock": True,   # не публиковать распроданное
+        "last_restore_run": 0,
+        "restored_total": 0,
+        # {ad_id: {"tries": n, "until": ts, "reason": str}} — объявление,
+        # которое маркетплейс отверг, не долбится каждый час
+        "failures": {},
+        "last_result": "",
+    },
     "auto_bump": {"enabled": False, "interval_hours": 24},
-    "auto_withdraw": {"enabled": False, "min_amount": 500},
+    # Поднятие по позиции: следим за местом товара в списке предложений на
+    # витрине и поднимаем, когда он опустился ниже порога. Позиции нет в API
+    # продавца — она есть только на публичной витрине, оттуда и читается.
+    "promo_position": {
+        "enabled": False,
+        # Список наблюдений: по одному на товар. Каждое — {url, item_id, title,
+        # max_position, min_price, undercut_guard, ...}; см. automation/position.py.
+        # Старые настройки с одной страницей на магазин переносятся сюда
+        # автоматически при первом чтении.
+        "watches": [],
+        "interval_hours": 1,
+        # По умолчанию только предупреждаем: поднятие тратит деньги, и решение
+        # тратить их автоматически должно быть осознанным.
+        "auto_promote": False,
+        "undercut_notify": True,   # сообщать, когда кто-то дешевле
+        # Предохранители для платного поднятия: пауза между поднятиями одного
+        # товара, потолок поднятий в сутки и денежный потолок на всё
+        # продвижение по позиции. Без них падение позиции на весь день
+        # означало бы оплату на каждой проверке.
+        "cooldown_hours": 6,
+        "daily_limit": 3,
+        "daily_budget": 0,      # ₽ в сутки на все наблюдения; 0 — без потолка
+        "spent_today": 0,
+        "spent_day": "",
+        # Наследие однопозиционной версии — читается только при миграции.
+        "url": "",
+        "max_position": 3,
+        "min_price": 0,
+        "last_check": 0,
+        "last_pos": 0,
+        "last_alert_pos": 0,
+    },
+    # Реквизиты вывода. Автовывода нет: деньги переводит человек, а не
+    # расписание — ключ остался прежним, чтобы уже настроенные реквизиты не
+    # пропали у тех, кто их заполнил.
+    "auto_withdraw": {
+        # Только панель: вывода через Integration API у Юмаркета нет.
+        "method": "panel",
+        # для вывода через панель: действие «Вывести» на ресурсе balances —
+        # id баланса, ключ действия и значения полей (сумма/способ/реквизиты),
+        # прочитанные из панели, а не угаданные
+        "panel_balance_id": "",
+        "panel_action_key": "",
+        "panel_values": {},
+        "last_result": "",
+    },
     "responders": {},  # {"GameName": "message text"} - keyed by ad title/name
+    # Ответы на сообщения покупателя. Полный набор полей и значения по
+    # умолчанию живут в autoreply.DEFAULTS — здесь ключ заведён, чтобы он был
+    # виден среди настроек; autoreply.cfg() дополняет недостающее.
+    "autoreplies": {"enabled": False, "rules": [], "log": [], "state": {}},
     "known_orders": {},  # {order_id: status}
     "known_order_ids": [],
     "known_order_details": {},  # {order_id: {title, buyer, price, chat_id, seen_at}}
     "known_messages": {},  # {order_id: last_msg_id}
+    "deleted_ads": [],  # ids удалённых товаров — API отдаёт их ещё какое-то время
+    # Отслеживаемые чаты, не привязанные ни к одному заказу, — поддержка и
+    # модерация. Найти их сами мы не можем: списка чатов в API нет вовсе,
+    # поэтому номера добавляются руками.
+    "watched_chats": {},   # {chat_id: {"label": str, "last_msg": str}}
     "blacklist": [],  # list of buyer names to suppress notifications for
     "reminders": {"enabled": False, "hours": 24},
     "reminded_orders": [],  # order IDs already reminded (reset on status change)
     "auto_accept": {"enabled": False},  # авто «начать заказ» при поступлении
     "auto_confirm": {"enabled": False, "hours": 24},
+    # Автовозврат «зависших» заказов. Единственная автоматика в боте, которая
+    # ОТДАЁТ деньги, поэтому по умолчанию выключена и работает только там, где
+    # бот сам знает, что товар не выдан.
+    #   scope="stars" — только заказы, которых AutoStars ждёт (ник не прислан);
+    #   scope="any"   — любой застрявший в работе, включая выданные вручную.
+    "auto_refund": {"enabled": False, "hours": 48, "scope": "stars",
+                    "max_per_day": 3, "day": "", "count": 0, "done": []},
     "withdrawal_history": [],  # [{amount, ts, type: manual/auto, status}]
     "balance_notify": {"enabled": False, "threshold": 1000, "last_notified_balance": 0.0},
+    # Уведомления о новых заказах и о сообщениях в чатах. По умолчанию включены:
+    # раньше они не имели выключателя вообще, и выключение не должно менять
+    # поведение для тех, кто ничего не настраивал.
+    "notify_orders": {"enabled": True},
+    "notify_messages": {"enabled": True},
     "daily_report": {"enabled": False, "hour": 20, "last_report_day": ""},
     "quick_replies": ["Спасибо за заказ!", "Отправлю в течение часа.", "Уточните, пожалуйста."],
-    "buyer_notes": {},
     "bump_schedule": {
         "enabled": False, "times": [], "last_runs": {},
         "price_per_bump": 0,   # ₽ за одно поднятие (0 = бесплатно)
@@ -95,26 +179,47 @@ _DEFAULT_SETTINGS = {
     },
     "ad_packs": {},  # {"Пак имя": [ad_id, ...]} — группы объявлений
     "complaint_notify": {"enabled": True, "seen": []},  # уведомления о жалобах
-    "price_schedule": {
-        "enabled": False,
-        "from_hour": 22,   # начало окна (напр. ночь с 22:00)
-        "to_hour": 8,      # конец окна (до 8:00)
-        "percent": -10.0,  # изменение цены в окне
-        "night_active": False,
-        "base_prices": {},  # {ad_id: базовая цена} для восстановления
-    },
     "reviews_monitor": {"enabled": False, "known_review_ids": []},
     "ad_templates": [],
     "plugins": {
         "auto_stars": {
             "enabled": False, "amount": 50, "note": "",
-            "keyword": "звёзд",       # заголовок заказа должен содержать это слово
+            # Пусто — узнаём звёздные заказы по всем обычным написаниям
+            # («звёзд», «звезд», «stars», «⭐»); своё слово здесь означает
+            # «только оно».
+            "keyword": "",
             "ask_username": True,      # спрашивать @username в чате заказа
             "pending": {},             # {order_id: {quantity, asked_at}} — ждём username
             "delivered": [],           # order_id, по которым звёзды уже выданы
             "wallet_version": "v4r2",
+            # Предупреждать, пока пополнить кошелёк ещё есть время: закончиться
+            # TON посреди оплаченного заказа — худший исход.
+            "low_balance_warn": True,
+            "low_balance_deliveries": 2,
+            "balance_checked_at": 0,
+            "balance_low": False,
+            "log": [],                 # журнал выдач: что, кому, почём
+            # Что сообщать продавцу. Раньше слалось всё и всегда: удачная
+            # выдача в потоке из тридцати заказов — это шум, а провал — нет.
+            "notify": {"done": True, "failed": True, "low_balance": True},
+            # Тексты покупателю. Пустая строка = взять стандартный.
+            "texts": {"ask": "", "remind": "", "sending": "", "done": "",
+                      "failed": ""},
         },
-        "auto_roblox": {"enabled": False, "robux": 0, "note": ""},
+        # Robux выдаются кодом, а не зачислением на аккаунт, поэтому здесь
+        # нет ни ника покупателя, ни «сколько выдавать»: количество диктует
+        # заказ, а номинал берётся из каталога поставщика. Регион важен —
+        # глобальный и российский коды невзаимозаменяемы.
+        # `region` остаётся запасным вариантом: у товаров, созданных до
+        # того, как регион стали писать в описание, взять его больше
+        # неоткуда. Основной источник — само описание объявления.
+        #
+        # `ad_title` / `ad_text` — заготовки продавца для создания товара.
+        # Пустые означают «взять наши»; подстановки описаны в
+        # `automation.robux.fill_template`.
+        "auto_roblox": {"enabled": False, "region": "GL", "keyword": "",
+                        "note": "", "ad_title": "", "ad_text": "",
+                        "delivered": [], "log": []},
         "auto_gifts": {"enabled": False, "gift_type": "", "note": ""},
     },
 }
@@ -124,27 +229,28 @@ _DEFAULT_ACCOUNT = "Основной"
 
 
 # ---------------------------------------------------------------------------
-# Storage backend: PostgreSQL when DATABASE_URL is set, else JSON files.
-# The rest of the module (and the whole bot) is unchanged — only _read_blob /
-# _write_blob differ. Each legacy JSON file becomes one row in kv_store, and
-# existing files are auto-migrated into the DB on first read.
+# Где лежат данные: PostgreSQL, если задан DATABASE_URL, иначе JSON-файлы.
+# Остальной модуль (и весь бот) от этого не меняется — различаются только
+# `_read_blob` и `_write_blob`. Каждый прежний JSON-файл становится строкой
+# в kv_store, а имеющиеся файлы переезжают в базу при первом чтении.
 # ---------------------------------------------------------------------------
 
 import threading as _threading
 
 
 def _resolve_database_url() -> str:
-    """Find a Postgres URL from the common env-var names Railway/Heroku use,
-    or assemble one from PG* parts. Returns '' if none configured."""
+    """Найти адрес Postgres среди имён переменных, принятых у Railway и Heroku,
+    либо собрать его из частей PG*. Пусто — значит база не настроена.
+    """
     for var in ("DATABASE_URL", "DATABASE_PRIVATE_URL", "POSTGRES_URL",
                 "POSTGRESQL_URL", "PG_URL", "DATABASE_PUBLIC_URL"):
         url = os.environ.get(var, "").strip()
         if url:
-            # psycopg2 accepts postgres:// but normalize to postgresql://
+            # psycopg2 принимает и postgres://, но приводим к postgresql://
             if url.startswith("postgres://"):
                 url = "postgresql://" + url[len("postgres://"):]
             return url
-    # Assemble from individual PG* variables if present
+    # Если есть отдельные переменные PG*, собираем адрес из них
     host = os.environ.get("PGHOST", "").strip()
     if host:
         user = os.environ.get("PGUSER", "postgres")
@@ -162,12 +268,14 @@ _db_lock = _threading.Lock()
 _db_pool = None
 _cache: dict[str, str] = {}
 
-# blob key -> legacy file path (used for migration + file-mode fallback)
+# ключ хранилища → прежний путь файла: для переезда и для работы без базы
 _BLOBS = {
     "tokens": _FILE,
     "settings": _SETTINGS_FILE,
     "panel_creds": _PANEL_FILE,
     "fragment_creds": _FRAGMENT_FILE,
+    "ns_creds": _NS_FILE,
+    "approute_creds": _AR_FILE,
     "admin": _ADMIN_FILE,
 }
 
@@ -215,7 +323,7 @@ def _db_write_raw(key: str, raw: str) -> None:
 
 
 def _read_blob(key: str) -> dict:
-    """Load a JSON blob (dict) for a storage key from DB or file."""
+    """Прочитать словарь по ключу хранилища — из базы или из файла."""
     if not _USE_DB:
         path = _BLOBS[key]
         if os.path.exists(path):
@@ -229,7 +337,7 @@ def _read_blob(key: str) -> dict:
         if key not in _cache:
             raw = _db_read_raw(key)
             if raw is None:
-                # one-time migration from a legacy JSON file, if present
+                # разовый переезд из прежнего JSON-файла, если он ещё лежит
                 path = _BLOBS[key]
                 if os.path.exists(path):
                     try:
@@ -249,12 +357,24 @@ def _read_blob(key: str) -> dict:
 
 
 def _write_blob(key: str, data: dict) -> None:
-    """Persist a JSON blob (dict) for a storage key to DB or file."""
+    """Записать словарь по ключу хранилища — в базу или в файл."""
     if not _USE_DB:
         path = _BLOBS[key]
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
+        # Не `open(path, "w")`: он обнуляет файл ДО записи, и процесс,
+        # убитый посередине (перезагрузка, нехватка памяти, `systemctl
+        # restart` в неудачный миг), оставляет обрезанный JSON. Это не
+        # «половина настроек», а ноль: файл перестаёт разбираться целиком,
+        # и продавец теряет токен, правила автоответа и цены разом.
+        # Пишем рядом и подменяем одним движением — `os.replace` в пределах
+        # одной файловой системы атомарен. fsync до подмены: без него
+        # переименование может доехать до диска раньше содержимого.
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
         return
     raw = json.dumps(data, ensure_ascii=False)
     with _db_lock:
@@ -271,7 +391,7 @@ def _save_tokens(data: dict) -> None:
 
 
 def _user_entry(data: dict, user_id: int) -> dict | None:
-    """Return the v2 accounts entry for a user, migrating a bare token string."""
+    """Запись аккаунтов продавца, с переносом старого формата «просто токен»."""
     raw = data.get(str(user_id))
     if raw is None:
         return None
@@ -284,11 +404,11 @@ def _user_entry(data: dict, user_id: int) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Multi-account API
+# Несколько аккаунтов
 # ---------------------------------------------------------------------------
 
 def get_accounts(user_id: int) -> dict:
-    """{name: {"token": ...}} for the user (empty dict if none)."""
+    """Аккаунты продавца: {имя: {"token": …}}. Пусто — ни одного нет."""
     entry = _user_entry(_load(), user_id)
     return (entry or {}).get("accounts", {})
 
@@ -341,7 +461,7 @@ def remove_account(user_id: int, name: str) -> bool:
 
 
 def get_token(user_id: int) -> str | None:
-    """Token of the ACTIVE account (backward-compatible entry point)."""
+    """Токен АКТИВНОГО аккаунта — вход, совместимый со старым кодом."""
     entry = _user_entry(_load(), user_id)
     if not entry:
         return None
@@ -351,7 +471,7 @@ def get_token(user_id: int) -> str | None:
 
 
 def save_token(user_id: int, token: str) -> None:
-    """Set the token on the active account (creates the default account)."""
+    """Записать токен активному аккаунту; если аккаунтов нет — создать первый."""
     data = _load()
     entry = _user_entry(data, user_id)
     if entry is None:
@@ -367,7 +487,7 @@ def save_token(user_id: int, token: str) -> None:
 
 
 def delete_token(user_id: int) -> None:
-    """Remove the active account (logout). Other accounts stay."""
+    """Убрать активный аккаунт (выход). Остальные остаются на месте."""
     data = _load()
     entry = _user_entry(data, user_id)
     if not entry:
@@ -413,20 +533,55 @@ def _merge_defaults(settings: dict) -> dict:
 
 
 def _account_key(user_id: int) -> str:
-    """Per-account storage key: '{uid}::{account}'. Falls back to plain uid."""
+    """Ключ хранилища по аккаунту: «{продавец}::{аккаунт}», иначе просто номер."""
     account = get_active_account(user_id)
     return f"{user_id}::{account}" if account else str(user_id)
 
 
+def _first_account_key(user_id: int) -> str:
+    """Ключ ПЕРВОГО аккаунта — того, кому принадлежат данные до аккаунтов.
+
+    Хранилища трёх видов (настройки, куки панели, данные Fragment) заведены
+    ещё до многомагазинности, под голым `uid`. Перенос этих записей шёл
+    **в активный аккаунт** — и в этом была ошибка: `add_account` делает
+    новый аккаунт активным сразу, поэтому «первое чтение после переноса»
+    наступало уже под вторым магазином. Второму доставались чужое название
+    магазина, чужие куки панели и **чужая seed-фраза TON**.
+
+    Так и вышло: продавец добавил второй магазин, а в меню осталось имя
+    первого. Название — самое безобидное из трёх.
+
+    Первый аккаунт — первый ключ в словаре: `save_token` заводит его до
+    того, как появится второй, а порядок словаря сохраняется и в JSON,
+    и в PostgreSQL.
+    """
+    first = next(iter(get_accounts(user_id)), "")
+    return f"{user_id}::{first}" if first else str(user_id)
+
+
+def _take_legacy(data: dict, user_id: int) -> bool:
+    """Перенести долистовую запись первому аккаунту. True — если переносили.
+
+    Данные не перетираются: если у первого аккаунта уже что-то есть,
+    старая запись просто убирается.
+    """
+    legacy = str(user_id)
+    if legacy not in data:
+        return False
+    target = _first_account_key(user_id)
+    if target == legacy:
+        return False
+    moved = data.pop(legacy)
+    if target not in data:
+        data[target] = moved
+    return True
+
+
 def get_settings(user_id: int) -> dict:
     all_settings = _load_settings()
-    key = _account_key(user_id)
-    if key not in all_settings and str(user_id) in all_settings:
-        # migrate legacy per-uid settings to the active account's key
-        all_settings[key] = all_settings.pop(str(user_id))
+    if _take_legacy(all_settings, user_id):
         _save_all_settings(all_settings)
-    raw = all_settings.get(key, {})
-    return _merge_defaults(raw)
+    return _merge_defaults(all_settings.get(_account_key(user_id), {}))
 
 
 def save_settings(user_id: int, settings: dict) -> None:
@@ -450,7 +605,7 @@ def save_shop_name(user_id: int, name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Panel credentials (YooMarket seller panel login/password)
+# Доступ к панели продавца Юмаркета
 # ---------------------------------------------------------------------------
 
 def _load_panel_creds() -> dict:
@@ -462,24 +617,37 @@ def _save_panel_data(data: dict) -> None:
 
 
 def get_panel_creds(user_id: int) -> dict | None:
-    """Panel cookies for the ACTIVE account (per-account, legacy migrated)."""
+    """Куки панели активного аккаунта; старый общий формат переносится сюда же."""
     data = _load_panel_creds()
-    key = _account_key(user_id)
-    if key not in data and str(user_id) in data:
-        data[key] = data.pop(str(user_id))
+    if _take_legacy(data, user_id):
         _save_panel_data(data)
-    return data.get(key)
+    return data.get(_account_key(user_id))
+
+
+def accounts_with_panel(user_id: int) -> list[str]:
+    """Аккаунты, у которых есть вход в панель.
+
+    Вход в панель — свой у каждого магазина, и «баланс не показывается»
+    после переключения обычно значит именно это. Назвать аккаунт, где вход
+    есть, дешевле, чем оставить продавца гадать.
+    """
+    data = _load_panel_creds()
+    out = []
+    for name in get_accounts(user_id):
+        if (data.get(f"{user_id}::{name}") or {}).get("cookies"):
+            out.append(name)
+    return out
 
 
 def save_panel_creds(user_id: int, creds: dict) -> None:
-    """Save panel credentials for the user's active account."""
+    """Сохранить доступ к панели для активного аккаунта продавца."""
     data = _load_panel_creds()
     data[_account_key(user_id)] = creds
     _save_panel_data(data)
 
 
 def delete_panel_creds(user_id: int) -> None:
-    """Remove panel credentials for the user's active account."""
+    """Убрать доступ к панели у активного аккаунта продавца."""
     data = _load_panel_creds()
     data.pop(_account_key(user_id), None)
     data.pop(str(user_id), None)
@@ -487,10 +655,95 @@ def delete_panel_creds(user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fragment credentials (Telegram Stars auto-delivery) — SENSITIVE
-# {cookies: {...}, mnemonic: "24 words", wallet_version: "v4r2", api_hash: "..."}
-# Stored per active account. Never log the mnemonic or cookie values.
+# Доступ к Fragment (автовыдача звёзд Telegram) — СЕКРЕТНОЕ
+# {cookies: {…}, mnemonic: «24 слова», wallet_version: "v4r2", api_hash: "…"}
+# Хранится по активному аккаунту. Ни фраза, ни значения кук в логи не идут.
 # ---------------------------------------------------------------------------
+
+# Ключ шифрования seed-фразы. Берётся из окружения и в репозиторий не
+# попадает; на Railway задаётся переменной SECRET_KEY (или FRAGMENT_KEY).
+#
+# Подстраховки «нет ключа — придумаем свой» здесь нет намеренно. Ключ,
+# выведенный из чего-то, что лежит рядом с данными, шифрованием не является:
+# он создаёт ощущение защиты, а seed-фраза — это чужой кошелёк. Нет ключа —
+# храним как раньше и говорим об этом вслух в /version.
+_SECRET_KEY = (os.environ.get("FRAGMENT_KEY")
+               or os.environ.get("SECRET_KEY") or "").strip()
+_ENC_PREFIX = "enc:v1:"
+
+
+def _fernet():
+    """Шифровальщик или None, если ключа нет либо библиотека недоступна."""
+    if not _SECRET_KEY:
+        return None
+    try:
+        import base64
+        import hashlib
+
+        from cryptography.fernet import Fernet
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        # Не `Exception`: битая сборка cryptography роняет импорт
+        # `pyo3_runtime.PanicException`, а он наследуется от BaseException и
+        # мимо обычного перехвата проходит насквозь. Поймано на этой самой
+        # машине: падал не только вход в настройки, но и /version, то есть
+        # ровно та команда, которой выясняют, что происходит.
+        logger.exception("Шифрование недоступно — cryptography не загрузилась")
+        return None
+    # Ключ Fernet — ровно 32 байта в base64. Продавец задаёт произвольную
+    # строку, поэтому она приводится к нужной длине хешем, а не обрезанием:
+    # обрезание молча ослабило бы длинный ключ до первых символов.
+    digest = hashlib.sha256(_SECRET_KEY.encode("utf-8")).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def ephemeral_disk() -> bool:
+    """Стираются ли файлы хранилища при выкате.
+
+    Только на Railway: там контейнер пересобирается, и всё, что не в базе,
+    пропадает. На своём сервере файлы переживают и перезапуск, и
+    перезагрузку — и пугать там «данные сотрутся» значит врать. Продавец,
+    поверивший этому предупреждению, полезет заводить базу, которая ему не
+    нужна, или решит, что боту нельзя доверять деньги.
+
+    Определяется по переменным окружения Railway: их платформа выставляет
+    сама, подделать их у нас поводов нет.
+    """
+    return any(name.startswith("RAILWAY_") for name in os.environ)
+
+
+def encryption_on() -> bool:
+    """Шифруется ли seed-фраза на самом деле. Показывается в /version."""
+    return _fernet() is not None
+
+
+def _seal(value: str) -> str:
+    f = _fernet()
+    if not f or not value or str(value).startswith(_ENC_PREFIX):
+        return value
+    try:
+        return _ENC_PREFIX + f.encrypt(str(value).encode("utf-8")).decode()
+    except Exception:                              # pragma: no cover
+        return value
+
+
+def _unseal(value: str) -> str:
+    """Расшифровать. Записи, сделанные до шифрования, читаются как есть."""
+    text = str(value or "")
+    if not text.startswith(_ENC_PREFIX):
+        return text
+    f = _fernet()
+    if not f:
+        # Ключ потеряли или сменили. Отдать зашифрованную строку как
+        # seed-фразу нельзя: кошелёк из неё не соберётся, а сообщение об
+        # ошибке будет про «неверную seed-фразу» вместо «нет ключа».
+        return ""
+    try:
+        return f.decrypt(text[len(_ENC_PREFIX):].encode()).decode("utf-8")
+    except Exception:
+        return ""
+
 
 def _load_fragment_creds() -> dict:
     return _read_blob("fragment_creds")
@@ -502,18 +755,26 @@ def _save_fragment_data(data: dict) -> None:
 
 def get_fragment_creds(user_id: int) -> dict | None:
     data = _load_fragment_creds()
-    key = _account_key(user_id)
-    # migrate legacy per-uid entry to the active-account key (like settings/panel)
-    if key not in data and str(user_id) in data:
-        data[key] = data.pop(str(user_id))
+    # Перенос — первому аккаунту, а не активному. Здесь лежит seed-фраза
+    # TON: отдать её другому магазину значит отдать доступ к кошельку.
+    if _take_legacy(data, user_id):
         _save_fragment_data(data)
-    return data.get(key)
+    creds = data.get(_account_key(user_id))
+    if not creds:
+        return creds
+    if creds.get("mnemonic"):
+        creds = {**creds, "mnemonic": _unseal(creds["mnemonic"])}
+    return creds
 
 
 def save_fragment_creds(user_id: int, creds: dict) -> None:
     data = _load_fragment_creds()
     existing = data.get(_account_key(user_id)) or {}
     existing.update(creds)
+    # Шифруется в единственном месте — на записи. Старые записи в открытом
+    # виде переезжают сюда же при первом же сохранении.
+    if existing.get("mnemonic"):
+        existing["mnemonic"] = _seal(_unseal(existing["mnemonic"]))
     data[_account_key(user_id)] = existing
     _save_fragment_data(data)
     if not _USE_DB:
@@ -521,6 +782,111 @@ def save_fragment_creds(user_id: int, creds: dict) -> None:
             os.chmod(_FRAGMENT_FILE, 0o600)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Доступ к поставщику ns.gifts: {user_id, login, password, api_secret, proxy}.
+# Шифруются пароль и секрет — вместе они дают право тратить баланс кабинета.
+# ---------------------------------------------------------------------------
+
+# Что именно прячем. Логин и user_id не секреты сами по себе, но без пароля и
+# ключа они бесполезны, поэтому шифруем ровно те два поля, ради которых стоит
+# заводить шифрование.
+_NS_SECRET_FIELDS = ("api_secret", "password")
+
+
+def ns_fields() -> tuple[str, ...]:
+    """Какие поля нужны для входа к поставщику — один список на бота."""
+    return ("user_id", "login", "password", "api_secret")
+
+
+def get_ns_creds(user_id: int) -> dict:
+    data = _read_blob("ns_creds")
+    creds = dict(data.get(_account_key(user_id)) or {})
+    for field in _NS_SECRET_FIELDS:
+        if creds.get(field):
+            creds[field] = _unseal(creds[field])
+    return creds
+
+
+def save_ns_creds(user_id: int, creds: dict) -> None:
+    data = _read_blob("ns_creds")
+    existing = dict(data.get(_account_key(user_id)) or {})
+    existing.update(creds)
+    for field in _NS_SECRET_FIELDS:
+        if existing.get(field):
+            # Как и у seed-фразы: шифруем на записи и только один раз —
+            # `_unseal` перед `_seal` не даёт нарастить второй слой.
+            existing[field] = _seal(_unseal(existing[field]))
+    data[_account_key(user_id)] = existing
+    _write_blob("ns_creds", data)
+    if not _USE_DB:
+        try:
+            os.chmod(_NS_FILE, 0o600)
+        except OSError:
+            pass
+
+
+def delete_ns_creds(user_id: int) -> None:
+    data = _read_blob("ns_creds")
+    data.pop(_account_key(user_id), None)
+    data.pop(str(user_id), None)
+    _write_blob("ns_creds", data)
+
+
+# ---------------------------------------------------------------------------
+# Доступ к поставщику AppRoute: {api_key, region, proxy}. Шифруются ключ и
+# прокси: первый даёт право тратить баланс кабинета целиком, во втором лежат
+# логин с паролем от платного адреса.
+# ---------------------------------------------------------------------------
+
+# Прокси шифруется наравне с ключом: в его строке обычно логин и пароль от
+# платного адреса, то есть чужой доступ ровно так же.
+_AR_SECRET_FIELDS = ("api_key", "proxy")
+
+
+def ar_fields() -> tuple[str, ...]:
+    """Что нужно для входа к AppRoute — один список на бота.
+
+    Регион сюда не входит: у него есть значение по умолчанию, и требовать
+    его выбора значит держать продавца перед экраном, который и так знает
+    ответ.
+    """
+    return ("api_key",)
+
+
+def get_ar_creds(user_id: int) -> dict:
+    data = _read_blob("approute_creds")
+    creds = dict(data.get(_account_key(user_id)) or {})
+    for field in _AR_SECRET_FIELDS:
+        if creds.get(field):
+            creds[field] = _unseal(creds[field])
+    return creds
+
+
+def save_ar_creds(user_id: int, creds: dict) -> None:
+    data = _read_blob("approute_creds")
+    existing = dict(data.get(_account_key(user_id)) or {})
+    existing.update(creds)
+    for field in _AR_SECRET_FIELDS:
+        if existing.get(field):
+            # Как у seed-фразы: шифруем на записи и только один раз —
+            # `_unseal` перед `_seal` не даёт нарастить второй слой.
+            existing[field] = _seal(_unseal(existing[field]))
+    data[_account_key(user_id)] = existing
+    _write_blob("approute_creds", data)
+    if not _USE_DB:
+        try:
+            os.chmod(_AR_FILE, 0o600)
+        except OSError:
+            pass
+
+
+def delete_ar_creds(user_id: int) -> None:
+    data = _read_blob("approute_creds")
+    data.pop(_account_key(user_id), None)
+    data.pop(str(user_id), None)
+    _write_blob("approute_creds", data)
 
 
 def delete_fragment_creds(user_id: int) -> None:
@@ -531,8 +897,8 @@ def delete_fragment_creds(user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Global admin / subscription store (owner + admins, subscriptions, price,
-# blocked users). Not per-account — bot-wide.
+# Общее на весь бот: владелец и админы, подписки, цена, заблокированные.
+# Не по аккаунтам.
 # ---------------------------------------------------------------------------
 
 import time as _time
@@ -586,8 +952,10 @@ def list_admins() -> list[int]:
 # --- Subscriptions ---------------------------------------------------------
 
 def grant_subscription(user_id: int, days: int, by: int = 0) -> float:
-    """Add `days` to a user's subscription (from now, or extends existing).
-    Returns the new expiry timestamp."""
+    """Добавить продавцу `days` подписки — от сегодня либо к уже имеющейся.
+
+    Отдаёт новый момент окончания.
+    """
     data = _load_admin()
     subs = data.setdefault("subscriptions", {})
     now = _time.time()
@@ -632,6 +1000,79 @@ def count_subscribers() -> int:
     return sum(1 for s in subs.values() if float(s.get("expires", 0)) > now)
 
 
+# --- Образцы созданных товаров ---------------------------------------------
+#
+# Копия товара должна создаваться БЕЗ ВОПРОСОВ, а вопросы в мастере — не
+# название с ценой, а раздел панели и её `filter__N`: их пять-шесть штук,
+# и до выбора категории панель о половине из них молчит. Поэтому образец
+# хранит весь пакет, который ушёл в панель, а не то, что удобно показать.
+#
+# Записывается он сам, по факту успешного создания. Отдельная кнопка
+# «сохранить как шаблон» означала бы, что копия есть только у того, кто
+# заранее догадался её нажать.
+
+AD_TEMPLATES_MAX = 12
+
+
+def _ad_key(t: dict) -> tuple:
+    """Чем один образец отличается от другого.
+
+    Название плюс цена плюс раздел: по одному названию два разных товара
+    («Robux 400» за 300 и за 350 ₽) слились бы в один, а список образцов
+    молча потерял бы половину.
+    """
+    return (str(t.get("title") or "").strip().lower(),
+            int(t.get("price") or 0), str(t.get("category") or ""))
+
+
+def note_ad_made(user_id: int, values: dict, extra: dict | None = None,
+                 item_id: str = "") -> None:
+    """Запомнить созданный товар как образец для копии.
+
+    Повтор не плодит записей: тот же товар поднимается наверх, а не ложится
+    вторым. Иначе список после трёх копий состоял бы из одного товара.
+    """
+    s = get_settings(user_id)
+    made = [t for t in (s.get("ad_templates") or [])
+            if isinstance(t, dict)]
+    row = {
+        "title": str(values.get("title") or ""),
+        "price": values.get("price") or 0,
+        "description": str(values.get("description") or ""),
+        "quantity": values.get("quantity", 1),
+        "category": values.get("category") or "",
+        "photo_path": values.get("photo_path") or None,
+        "extra": dict(extra or {}),
+        "item_id": str(item_id or ""),
+        "at": _time.time(),
+    }
+    made = [t for t in made if _ad_key(t) != _ad_key(row)]
+    made.insert(0, row)
+    s["ad_templates"] = made[:AD_TEMPLATES_MAX]
+    save_settings(user_id, s)
+
+
+def ad_templates(user_id: int) -> list[dict]:
+    """Образцы, новые впереди."""
+    return [t for t in (get_settings(user_id).get("ad_templates") or [])
+            if isinstance(t, dict) and str(t.get("title") or "").strip()]
+
+
+def ad_template(user_id: int, idx: int) -> dict | None:
+    made = ad_templates(user_id)
+    return made[idx] if 0 <= idx < len(made) else None
+
+
+def ad_template_ready(t: dict) -> bool:
+    """Хватит ли образца, чтобы создать копию БЕЗ ВОПРОСОВ.
+
+    Образцы, сохранённые прежней кнопкой «сохранить как шаблон», раздела не
+    помнят: панель спросит его снова. Это не поломка, но и не «за секунды»,
+    и сказать об этом надо до нажатия, а не после.
+    """
+    return bool(t.get("category") or t.get("extra"))
+
+
 # --- Bot price -------------------------------------------------------------
 
 def get_bot_price() -> int:
@@ -644,7 +1085,7 @@ def set_bot_price(price: int) -> None:
     _save_admin(data)
 
 
-# --- Blocked users (bot-wide) ----------------------------------------------
+# --- Заблокированные, на весь бот -------------------------------------------
 
 def block_user(user_id: int) -> None:
     data = _load_admin()
@@ -689,12 +1130,12 @@ def set_require_subscription(enabled: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Appearance / branding (bot-wide): custom main-menu button labels and an
-# optional custom-emoji header. Buttons can't be truly colored on Telegram,
-# so "coloring" = colored emoji in the label.
+# Оформление, на весь бот: свои надписи кнопок главного меню и, если задано,
+# кастомное эмодзи в заголовке. По-настоящему покрасить кнопку Telegram не
+# даёт, поэтому «раскраска» — это цветное эмодзи в надписи.
 # ---------------------------------------------------------------------------
 
-# key -> (default label, callback) for the main menu
+# ключ → (стандартная надпись, кнопка) для главного меню
 MENU_BUTTONS = [
     ("ads",      "🚀 Объявления", "menu:ads"),
     ("orders",   "🛒 Заказы",     "menu:orders"),
@@ -702,6 +1143,7 @@ MENU_BUTTONS = [
     ("balance",  "💰 Баланс",     "menu:balance"),
     ("stats",    "📊 Статистика", "menu:stats"),
     ("plugins",  "🧩 Плагины",    "plugins:menu"),
+    ("autopilot", "⚡ Автопилот",  "ap:menu"),
     ("settings", "⚙️ Настройки",  "settings:menu"),
 ]
 
@@ -710,8 +1152,161 @@ def get_appearance() -> dict:
     return _load_admin().get("appearance", {})
 
 
+# --- Правовые документы, на весь бот ----------------------------------------
+#
+# Ссылки на документы принадлежат владельцу бота, а не продавцу-подписчику,
+# поэтому лежат в общем хранилище рядом с ценой и подписками, а не в
+# настройках каждого магазина.
+#
+# Объявлением, а не тремя парами функций: документ добавляется одной строкой
+# здесь, и экран с админкой подхватывают его сами.
+POLICY_DOCS: tuple[tuple[str, str], ...] = (
+    ("terms", "📜 Пользовательское соглашение"),
+    ("offer", "📄 Публичная оферта"),
+    ("privacy", "🔒 Политика конфиденциальности"),
+)
+
+
+# Контакт поддержки. Принадлежит владельцу бота, а не продавцу, поэтому
+# лежит здесь же, рядом со ссылками на документы. Значение по умолчанию —
+# тот же адрес, что назван в правовых документах: два разных контакта в
+# документах и на экране поддержки означали бы, что один из них неверный.
+# --- Журнал событий в группу владельца --------------------------------------
+#
+# Группа и темы принадлежат владельцу бота, а не продавцу, поэтому лежат в
+# общем хранилище рядом с контактом поддержки и ссылками на документы.
+#
+# Номер темы хранится ОТДЕЛЬНО от номера группы намеренно: тему можно
+# удалить, не трогая группу, и тогда запись должна уйти в общий поток, а не
+# пропасть. Слитый воедино адрес такого различить бы не дал.
+
+
+def get_log_target() -> dict:
+    """Куда писать журнал: {"chat": id, "topics": {вид: номер темы}}."""
+    data = _load_admin()
+    return {
+        "chat": data.get("log_chat") or 0,
+        "topics": dict(data.get("log_topics") or {}),
+        "error": str(data.get("log_error") or ""),
+    }
+
+
+def set_log_topic(kind: str, chat_id: int, thread_id: int | None) -> list[str]:
+    """Привязать вид события к теме. Вернуть виды, слетевшие при смене группы.
+
+    Группа задаётся здесь же: отдельной команды «запомни группу» нет
+    намеренно — она позволила бы привязать темы к одной группе, а писать в
+    другую, и разошлось бы это молча.
+
+    Отсюда же и главная осторожность. Номер темы принадлежит СВОЕЙ группе:
+    в другой он означает другую тему или не означает ничего. Поэтому
+    команда, выполненная в чужом чате, не «добавляет ещё одну группу», а
+    переносит журнал целиком — и прежние привязки надо снять, иначе четыре
+    из пяти видов молча уйдут в никуда. Список снятых возвращается, чтобы
+    экран сказал о нём вслух, а не поставил владельца перед фактом.
+    """
+    data = _load_admin()
+    old_chat = int(data.get("log_chat") or 0)
+    topics = dict(data.get("log_topics") or {})
+    dropped: list[str] = []
+    if old_chat and int(chat_id) != old_chat:
+        dropped = sorted(k for k in topics if k != kind)
+        topics = {}
+    data["log_chat"] = int(chat_id)
+    if thread_id:
+        topics[kind] = int(thread_id)
+    else:
+        topics.pop(kind, None)             # общий поток группы, не тема
+    data["log_topics"] = topics
+    _save_admin(data)
+    return dropped
+
+
+def clear_log_topic(kind: str) -> bool:
+    """Отвязать один вид, не трогая остальные. Отвечает, было ли что снимать.
+
+    Без этого «ошибся темой» лечилось бы выключением журнала целиком — то
+    есть потерей четырёх правильных привязок из-за одной неправильной.
+    """
+    data = _load_admin()
+    topics = dict(data.get("log_topics") or {})
+    if kind not in topics:
+        return False
+    topics.pop(kind)
+    data["log_topics"] = topics
+    _save_admin(data)
+    return True
+
+
+def clear_log_target() -> None:
+    """Выключить журнал целиком. Без этого «перестань писать» делалось бы
+    удалением бота из группы, то есть наугад."""
+    data = _load_admin()
+    data.pop("log_chat", None)
+    data.pop("log_topics", None)
+    data.pop("log_error", None)
+    _save_admin(data)
+
+
+def note_log_error(why: str) -> None:
+    """Запомнить последнюю беду журнала — её показывает /log_here.
+
+    Пустая строка стирает отметку: журнал, починившийся сам, не должен
+    вечно показывать старую жалобу.
+    """
+    data = _load_admin()
+    if why:
+        data["log_error"] = str(why)[:300]
+    else:
+        data.pop("log_error", None)
+    _save_admin(data)
+
+
+SUPPORT_DEFAULT = "@YoMhelp"
+
+
+def get_support_contact() -> str:
+    """Куда писать продавцу. Пустое значение в хранилище не считается за
+    ответ: экран поддержки без контакта — это экран, которого нет."""
+    saved = str(_load_admin().get("support") or "").strip()
+    return saved or SUPPORT_DEFAULT
+
+
+def set_support_contact(contact: str) -> None:
+    data = _load_admin()
+    data["support"] = str(contact or "").strip()
+    _save_admin(data)
+
+
+def get_policy_links() -> dict:
+    """{ключ документа: ссылка}. Незаданные ключи отсутствуют, а не пусты.
+
+    Отсутствие и пустая строка — разные вещи для того, кто рисует кнопки:
+    кнопка с пустым адресом не «ведёт никуда», а роняет отправку целиком —
+    Telegram отвергает такую клавиатуру, и экран не приходит вовсе.
+    """
+    saved = _load_admin().get("policy_links", {})
+    return {k: str(saved[k]).strip() for k, _title in POLICY_DOCS
+            if str(saved.get(k) or "").strip()}
+
+
+def set_policy_link(key: str, url: str) -> None:
+    data = _load_admin()
+    links = data.setdefault("policy_links", {})
+    url = str(url or "").strip()
+    if url:
+        links[key] = url
+    else:
+        links.pop(key, None)
+    _save_admin(data)
+
+
+def clear_policy_link(key: str) -> None:
+    set_policy_link(key, "")
+
+
 def get_menu_labels() -> dict:
-    """{key: label} with admin overrides applied over defaults."""
+    """Надписи пунктов меню: {ключ: надпись}, поверх стандартных — правки админа."""
     overrides = get_appearance().get("menu_labels", {})
     return {key: overrides.get(key, default) for key, default, _cb in MENU_BUTTONS}
 
@@ -731,7 +1326,7 @@ def reset_menu_labels() -> None:
 
 
 def get_header_emoji() -> dict | None:
-    """{'id': custom_emoji_id, 'fallback': '🏠'} or None."""
+    """{'id': номер кастомного эмодзи, 'fallback': '🏠'} либо None."""
     return get_appearance().get("header_emoji")
 
 
@@ -749,8 +1344,9 @@ def clear_header_emoji() -> None:
 
 
 def menu_header_html() -> str:
-    """Header prefix for the main menu: custom emoji if set, else a plain
-    emoji if the admin chose one, else the default 🏠."""
+    """Значок в заголовке главного меню: кастомное эмодзи, если задано; иначе
+    обычное, если админ его выбрал; иначе 🏠.
+    """
     he = get_header_emoji()
     if he:
         fb = he.get("fallback") or "🏠"
@@ -761,43 +1357,167 @@ def menu_header_html() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Editable bot message texts (bot-wide), with custom-emoji support.
-# Stored as ready-to-send HTML (from message.html_text). Placeholders in
-# {curly} are substituted at render time.
+# Редактируемые тексты бота, общие на весь бот, с кастомными эмодзи.
+# Хранятся готовым к отправке HTML (из message.html_text). Подстановки в
+# {фигурных} скобках заполняются при сборке сообщения.
 # ---------------------------------------------------------------------------
+
+# Первый экран заканчивается тем, что человек должен сделать прямо сейчас,
+# и кнопка под ним ведёт ровно туда. Раньше шаги упирались в ссылку внутри
+# текста: её надо было заметить, нажать, вернуться — и всё это до того, как
+# бот доказал хоть одну свою пользу.
+# Шаг 1 подключения. Показывается НЕ в приветствии, а после кнопки
+# «Подключить магазин»: человек, который ещё не решил подключаться, читает
+# инструкцию к тому, чего не собирался делать, и закрывает бота.
+_TOKEN_HOWTO = (
+    "🔑 <b>Шаг 1 из 2</b>  ·  цепляем магазин\n\n"
+    "Нужен API-токен — это ключ, которым я вижу твои заказы и чаты.\n\n"
+    "1️⃣ Жми кнопку ниже, откроется панель\n"
+    "2️⃣ Слева <b>Мой магазин</b> → вкладка <b>Интеграции</b>\n"
+    "3️⃣ <b>Создать токен</b> → скопируй\n"
+    "4️⃣ Кидай его сюда одним сообщением\n\n"
+    "<i>🔒 Токен вижу только я, а сообщение с ним сразу сотру из переписки — "
+    "чтобы не висело у тебя в чате.</i>"
+)
+
+# Список карт берётся из реестра, а не переписывается сюда: включат
+# четырнадцатую — приветствие про неё промолчит, и продавец о ней не узнает.
+def cards_all() -> tuple:
+    from automation.giftcards import cards
+    return cards()
+
+
+def _cards_line() -> str:
+    return ", ".join(c.title for c in cards_all())
+
+
+_WHAT_I_DO = (
+    "💬 Отвечу покупателю сам, замечу жалобу до арбитража\n"
+    "📦 Возьму заказ в работу, подтвержу, напомню о зависших\n"
+    "🚀 Держу объявления в топе: слежу за позицией, «Премиум», паки, "
+    "верну распроданное, восстановлю снятые, выложу новые\n"
+    "🧩 Выдам сам: {карт} гифт-карт, код за секунды\n"
+    "📊 Выручка чистыми каждый вечер, порог баланса, отзывы\n"
+    "⚡️ «Автопилот» включает всё одной кнопкой, магазинов — несколько"
+)
 
 CUSTOM_TEXTS = {
     "welcome": {
         "title": "Приветствие /start",
+        "vars": ["{цена}", "{проба}", "{неделя}", "{всего}",
+                 "{карт}", "{карты}"],
+        "default": (
+            "👋 <b>Привет! Я — YooMarket.</b>\n\n"
+            "Заказ приходит в четыре утра, ждёт ответа час — и уходит к "
+            "тому, кто ответил быстрее. Эти часы я и закрываю.\n\n"
+            + _WHAT_I_DO + "\n\n"
+            # Эта строка закрывает предложение, и она короткая. Резать
+            # надо перечисления, а не то, ради чего их читают.
+            "<b>Рутина на мне. Продажи твои.</b>\n"
+            "━━━━━━━━━━━━━━\n"
+            "🆓 <b>Бесплатно:</b> магазин и уведомления о заказах\n"
+            "💳 <b>Подписка{цена}</b> — автоответы, автовыдача, "
+            "продвижение, вывод\n\n"
+            "🎁 <b>{проба} дня</b> просто так  ·  📣 <b>+{неделя} дней</b> "
+            "за подписку на канал\n"
+            "<i>Вместе {всего} дней бесплатно, каждое по разу.</i>"
+        ),
+    },
+    "connect": {
+        "title": "Шаг 1 — как взять токен",
+        "vars": [],
+        "default": _TOKEN_HOWTO,
+    },
+    "token_ok": {
+        "title": "После ввода токена (шаг 2 — панель)",
+        "vars": ["{name}", "{balance}"],
+        "default": (
+            "🔥 <b>Магазин на связи!</b>\n\n"
+            "🏪 {name}   ·   💰 {balance} ₽\n\n"
+            "Заказы и чаты уже под моим присмотром — с этой секунды никто "
+            "не ждёт тебя впустую.\n\n"
+            "━━━━━━━━━━━━━━\n"
+            "🚀 <b>Шаг 2 из 2 — включаем всё остальное</b>\n\n"
+            "Токен открыл заказы и чаты. А вход в панель даёт мне ещё пачку "
+            "штук, которых у Юмаркета в API просто нет:\n\n"
+            "🆕 <b>Выложу товар</b> — с тебя название и цена, остальное моё\n"
+            "⭐️ <b>Подниму объявления</b> — по расписанию, в рамках твоего бюджета\n"
+            "🔄 <b>Верну снятое в продажу</b> — сам, с проверкой остатков\n"
+            "💸 <b>Выведу деньги</b> — по порогу, на карту, СБП или крипту\n"
+            "🛟 <b>Отвечу поддержке</b> — прямо отсюда\n\n"
+            "Дальше ты просто жмёшь кнопки, а рутина крутится без тебя.\n\n"
+            "Тридцать секунд: почта → код из письма → готово.\n"
+            "<i>Пароль не нужен, и я его не спрошу.</i>"
+        ),
+    },
+    "token_help": {
+        "title": "Подсказка «Не нахожу токен»",
         "vars": [],
         "default": (
-            "👋 Добро пожаловать в <b>YooMarket бот</b>!\n\n"
-            "Отправьте ваш <b>API токен</b> из панели YooMarket:\n"
-            "<i>Мой магазин → Интеграции → API токен</i>"
+            "❓ <b>Где взять токен</b>\n"
+            "━━━━━━━━━━━━━━\n"
+            "Токен выдаёт сам Юмаркет — у меня его взять негде, увы.\n\n"
+            "1️⃣ <a href=\"https://panel.yoomarket.net\">panel.yoomarket.net</a> "
+            "— вход тот же, что на сайте\n"
+            "2️⃣ Слева <b>Мой магазин</b>\n"
+            "3️⃣ Вкладка <b>Интеграции</b>\n"
+            "4️⃣ Кнопка <b>Создать токен</b>\n"
+            "5️⃣ Копируй строку целиком и присылай сюда\n\n"
+            "<b>Где обычно спотыкаются</b>\n\n"
+            "• <b>Скопировалась половина.</b> Токен — одна длинная строка без "
+            "пробелов. Бери его кнопкой «копировать» рядом с полем, а не "
+            "выделяй пальцем: на телефоне почти всегда прихватывается не всё.\n"
+            "• <b>Вкладки «Интеграции» нет.</b> Её открывают не всем магазинам "
+            "— это к поддержке Юмаркета, из бота тут ничего не сделать.\n"
+            "• <b>Токен уже создавал раньше.</b> Второй раз панель его не "
+            "покажет: сделай новый, старый после этого перестанет работать.\n\n"
+            "━━━━━━━━━━━━━━\n"
+            "<i>🔒 Токен открывает заказы и чаты — и только их. Деньги через "
+            "него не вывести при всём желании: у Юмаркета в API такой "
+            "возможности нет вовсе.</i>"
+        ),
+    },
+    "policy": {
+        "title": "Экран /policy — правовые документы",
+        "vars": [],
+        "default": (
+            "Пользуясь ботом, ты подтверждаешь, что прочитал и принимаешь "
+            "Пользовательское соглашение, Публичную оферту и Политику "
+            "конфиденциальности."
         ),
     },
     "subscription": {
         "title": "Сообщение «нужна подписка»",
         "vars": ["{price}"],
         "default": (
-            "🔒 <b>Требуется подписка</b>\n\n"
-            "Для доступа к боту нужна активная подписка.{price}\n\n"
-            "Обратитесь к владельцу бота для покупки."
+            "🔒 <b>Тут нужен доступ</b>\n\n"
+            "Доступ к боту и его функциям — по подписке.{price}\n\n"
+            "Напиши владельцу — договоритесь."
         ),
     },
     "sub_granted": {
         "title": "Уведомление о выданной подписке",
-        "vars": ["{days}", "{left}"],
+        "vars": ["{days}", "{left}", "{карт}", "{карты}"],
         "default": (
-            "🎉 Вам выдана подписка на бота на <b>{days} дн.</b>!\n"
-            "Осталось: <b>{left} дн.</b>"
+            "🎉 <b>Доступ открыт — на {days} дн.</b>\n"
+            "<i>Осталось: {left} дн.</i>\n\n"
+            "Спасибо, что доверился. Теперь по делу — что изменится уже "
+            "сегодня.\n\n"
+            "Сейчас магазин зарабатывает, только пока ты у телефона. Ночью "
+            "заказы висят непринятыми, распроданное молчит, а покупатель "
+            "уходит к тому, кто ответил первым.\n\n"
+            "С этой минуты за тебя работаю я:\n\n"
+            + _WHAT_I_DO + "\n\n"
+            "<b>Ты занимаешься ростом. Рутину закрываю я.</b>\n\n"
+            "━━━━━━━━━━━━━━\n"
+            + _TOKEN_HOWTO
         ),
     },
 }
 
 
 def get_custom_text(key: str) -> str:
-    """Stored HTML for a text key, or its default."""
+    """Сохранённый HTML по ключу текста — либо стандартный, если своего нет."""
     saved = get_appearance().get("texts", {}).get(key)
     if saved is not None:
         return saved
@@ -824,8 +1544,551 @@ def is_custom_text_set(key: str) -> bool:
 
 
 def render_custom_text(key: str, **subs) -> str:
-    """Render a text with {placeholder} substitution (brace-safe)."""
+    """Собрать текст с подстановками вида {имя} — не спотыкаясь о чужие скобки.
+
+    Перечень гифт-карт подставляется всегда и во все тексты: он встречается
+    в двух из них, а появится и в третьем. Заставлять каждое место помнить
+    про эти две переменные значит однажды забыть — и продавец прочтёт
+    «{карты}» вместо списка. Свои значения вызывающего важнее: подстановка
+    сверху не должна затирать то, что ему передали.
+    """
     tmpl = get_custom_text(key)
+    subs = {"карт": len(cards_all()), "карты": _cards_line(), **subs}
     for k, v in subs.items():
         tmpl = tmpl.replace("{" + k + "}", str(v))
     return tmpl
+
+
+# ---------------------------------------------------------------------------
+# Удаление данных продавца
+# ---------------------------------------------------------------------------
+#
+# Политика конфиденциальности обещает две вещи: удаление по запросу и
+# удаление через три дня после окончания подписки. Обещание, которого код не
+# выполняет, — это не недоделка, а ложь в публичном документе, на который
+# сошлются в споре.
+#
+# Хранилищ семь, и данные продавца лежат в шести из них под ключом `{uid}`
+# либо `{uid}::{аккаунт}` — по одному на каждый его магазин. Удаление,
+# прошедшее мимо одного хранилища, хуже отсутствующего: оно ЗАЯВЛЯЕТ
+# полноту. Поэтому список хранилищ здесь один и перечислен явно, а функция
+# возвращает отчёт о том, что действительно стёрла.
+
+# Хранилища, где данные разложены по ключу продавца.
+_USER_BLOBS: tuple[str, ...] = (
+    "tokens", "settings", "panel_creds", "fragment_creds",
+    "approute_creds", "ns_creds",
+)
+
+
+def _user_keys(blob: dict, user_id: int) -> list[str]:
+    """Ключи одного продавца в хранилище — свой и по каждому его магазину."""
+    uid = str(int(user_id))
+    return [k for k in blob if k == uid or str(k).startswith(f"{uid}::")]
+
+
+def purge_user(user_id: int) -> dict:
+    """Стереть все данные продавца. Отдаёт отчёт: {хранилище: сколько записей}.
+
+    Чего НЕ трогает и почему:
+
+    * **чёрный список.** Иначе «удалить мои данные» становится способом
+      снять блокировку: заблокировали — стёр — вернулся;
+    * **отметку о выданном пробном периоде.** По той же причине: иначе
+      `/forget_me` превращается в способ брать бесплатные дни сколько
+      угодно раз. Обе оговорки записаны в политике конфиденциальности —
+      данные, тайно оставленные после «полного удаления», это ложь в
+      опубликованном документе;
+    * **владельца бота.** Стереть его данные значит выключить бота себе же;
+      функция на владельце отказывает и говорит об этом отчётом.
+
+    Отчёт возвращается не для красоты: «✅ удалено» без перечня — то самое
+    бодрое сообщение об успехе, по которому нельзя понять, случилось ли
+    что-нибудь. По нему же видно, что удалять было нечего.
+    """
+    uid = int(user_id)
+    if is_owner(uid):
+        return {"отказ": "владелец бота — его данные держат сам бот"}
+
+    report: dict[str, int] = {}
+    for name in _USER_BLOBS:
+        blob = _read_blob(name)
+        keys = _user_keys(blob, uid)
+        if not keys:
+            continue
+        for k in keys:
+            blob.pop(k, None)
+        _write_blob(name, blob)
+        report[name] = len(keys)
+
+    # Подписка и права админа — тоже данные о человеке. Блокировка — нет:
+    # она про защиту бота, а не про удобство того, кого заблокировали.
+    data = _load_admin()
+    dirty = False
+    if str(uid) in (data.get("subscriptions") or {}):
+        data["subscriptions"].pop(str(uid), None)
+        report["subscriptions"] = 1
+        dirty = True
+    admins = [int(x) for x in data.get("admins", [])]
+    if uid in admins:
+        data["admins"] = [x for x in admins if x != uid]
+        report["admins"] = 1
+        dirty = True
+    # Список тех, кого бот видел, — тоже данные о человеке. Оговорок в
+    # политике две (чёрный список и отметка о пробе), и это не одна из них:
+    # он не защищает ничего, а всего лишь бережёт журнал от повторов.
+    seen = [int(x) for x in data.get("seen", [])]
+    if uid in seen:
+        data["seen"] = [x for x in seen if x != uid]
+        report["seen"] = 1
+        dirty = True
+    if dirty:
+        _save_admin(data)
+    return report
+
+
+def expired_before(cutoff: float) -> list[int]:
+    """Продавцы, чья подписка кончилась раньше `cutoff`.
+
+    Только те, у кого запись о подписке ЕСТЬ. Продавец без записи — это не
+    «подписка кончилась бесконечно давно», а человек, работающий в боте с
+    выключенной проверкой подписки; стереть его данные значит снести
+    работающий магазин.
+    """
+    subs = _load_admin().get("subscriptions", {}) or {}
+    out: list[int] = []
+    for uid, row in subs.items():
+        try:
+            expires = float((row or {}).get("expires", 0))
+        except (TypeError, ValueError):
+            continue
+        if expires and expires < cutoff:
+            out.append(int(uid))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Тарифы по срокам и пробный период
+# ---------------------------------------------------------------------------
+#
+# До этого цена была одним числом `bot_price`, и экран «нужна подписка»
+# показывал его же. Документы обещают градацию по срокам со скидкой за
+# длинный срок — значит она должна быть в интерфейсе, а не только в тексте
+# оферты: цена, которой клиент нигде не видит, обещанием не является.
+#
+# `bot_price` оставлен и продолжает работать: это цена месяца и запасной
+# ответ, когда тарифы не заданы.
+
+# Сроки, под которые заводятся тарифы. Дни, а не «месяцы»: `grant_subscription`
+# считает днями, и перевод месяцев в дни в двух местах разошёлся бы.
+# «Навсегда» в днях. Сто лет — не хитрость, а способ не заводить второй
+# вид подписки: все проверки в боте считают дни, и особый случай пришлось
+# бы помнить в каждой. Число берётся с запасом, чтобы за годы работы
+# бессрочная подписка не превратилась в «осталось 400 дней».
+LIFETIME_DAYS = 36500
+
+PRICE_TIERS: tuple[tuple[int, str], ...] = (
+    # Две недели — самый короткий платный срок и точка входа: после десяти
+    # бесплатных дней (три просто так плюс семь за подписку) человек уже
+    # видел, что бот делает, и решает не «стоит ли», а «продлить ли».
+    (14, "2 недели"),
+    (30, "1 месяц"),
+    (90, "3 месяца"),
+    (180, "6 месяцев"),
+    (365, "12 месяцев"),
+    # «Навсегда» — это очень большой срок, а не особый случай. Так выдача,
+    # проверка активности и удаление данных по истечении работают обычным
+    # путём, без исключения в каждом из них; исключение живёт в одном
+    # месте — в том, как срок ПОКАЗЫВАЮТ (`term_label`).
+    (LIFETIME_DAYS, "Навсегда"),
+)
+
+
+def term_label(days: int) -> str:
+    """Срок словами: «навсегда» или «30 дн.».
+
+    «Выдать 36500 дн.» на кнопке — не подробность, а причина не нажать:
+    владелец решит, что бот посчитал не то.
+    """
+    days = int(days or 0)
+    return "навсегда" if days >= LIFETIME_DAYS else f"{days} дн."
+
+
+def is_lifetime(user_id: int) -> bool:
+    """Бессрочная ли подписка у продавца.
+
+    Считается по остатку, а не по отметке о выдаче: продлевать бессрочную
+    никто не станет, а вот выдать её поверх обычной — вполне, и тогда
+    отметка о сроке была бы не о том.
+    """
+    sub = get_subscription(user_id)
+    if not sub:
+        return False
+    left = float(sub.get("expires", 0)) - _time.time()
+    # Половина бессрочного срока: подписка, выданная на сто лет, за годы
+    # использования не должна однажды начать показываться датой.
+    return left > LIFETIME_DAYS * 86400 / 2
+
+# Пробный период. Ноль — выключен: тогда бот про него не заикается, а не
+# обещает «3 дня» и молчит в ответ.
+# Неделя, а не три дня: за три дня продавец успевает подключить магазин, но
+# не успевает увидеть, что автоматика приносит, — а платят именно за это.
+TRIAL_DAYS_DEFAULT = 7
+
+
+def get_trial_channel() -> str:
+    """Канал, подписка на который открывает пробный период. Пусто — условия нет.
+
+    Хранится строкой как есть: и `@name`, и `-100…` Telegram принимает
+    одинаково, а угадывать за владельца, что он вписал, значит однажды
+    угадать неверно.
+    """
+    return str(_load_admin().get("trial_channel") or "").strip()
+
+
+def set_trial_channel(value: str) -> None:
+    data = _load_admin()
+    value = str(value or "").strip()
+    if value:
+        data["trial_channel"] = value
+    else:
+        data.pop("trial_channel", None)
+    _save_admin(data)
+
+
+def get_prices() -> dict[int, int]:
+    """{дней: цена ₽}. Незаданные тарифы отсутствуют, а не равны нулю.
+
+    Ноль и «не задано» — разные вещи: «0 ₽» на экране читается как
+    «бесплатно», а это обещание, за которое спросят.
+    """
+    saved = _load_admin().get("prices", {}) or {}
+    out: dict[int, int] = {}
+    for days, _label in PRICE_TIERS:
+        try:
+            value = int(saved.get(str(days), 0))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            out[days] = value
+    return out
+
+
+def set_price(days: int, price: int) -> None:
+    data = _load_admin()
+    prices = data.setdefault("prices", {})
+    if int(price) > 0:
+        prices[str(int(days))] = int(price)
+    else:
+        prices.pop(str(int(days)), None)
+    _save_admin(data)
+
+
+def price_lines() -> list[str]:
+    """Тарифы строками для экрана «нужна подписка».
+
+    Скидка считается от цены месяца и показывается только там, где она
+    действительно есть: приписка «выгоднее» к тарифу без выгоды — враньё,
+    которое клиент проверит за десять секунд.
+    """
+    prices = get_prices()
+    if not prices:
+        base = get_bot_price()
+        return [f"💰 Стоимость: <b>{base} ₽</b>"] if base else []
+
+    month = prices.get(30) or get_bot_price()
+    lines: list[str] = []
+    for days, label in PRICE_TIERS:
+        price = prices.get(days)
+        if not price:
+            continue
+        row = f"• {label} — <b>{price} ₽</b>"
+        # У бессрочного скидку не считаем: «−99%» — арифметика, в которую
+        # никто не поверит, а сравнивать «навсегда» с месяцем не с чем.
+        if month and 30 < days < LIFETIME_DAYS:
+            full = month * days / 30
+            saved = round((1 - price / full) * 100)
+            if saved >= 1:
+                row += f"  <i>(−{saved}%)</i>"
+        lines.append(row)
+    return lines
+
+
+# --- Способы оплаты ---------------------------------------------------------
+#
+# Приёма денег внутри бота нет: продавец платит владельцу напрямую, а бот
+# показывает, куда именно. Поэтому способы задаёт владелец — вписать сюда
+# «Сбербанк» или «СБП» за него значит выдумать чужие реквизиты.
+#
+# У каждого способа два поля: название на кнопке и то, что увидит продавец,
+# нажав её. Больше ничего не нужно: проверять оплату бот всё равно не умеет
+# и не притворяется, что умеет.
+
+def get_pay_methods() -> list[dict]:
+    """Способы оплаты по порядку. Пустой список — способов не задано."""
+    items = _load_admin().get("pay_methods") or []
+    out = []
+    for row in items:
+        if isinstance(row, dict) and row.get("id") and row.get("title"):
+            out.append({"id": str(row["id"]), "title": str(row["title"]),
+                        "details": str(row.get("details") or "")})
+    return out
+
+
+def pay_method(mid: str) -> dict | None:
+    for row in get_pay_methods():
+        if row["id"] == str(mid):
+            return row
+    return None
+
+
+def add_pay_method(title: str, details: str = "") -> str:
+    """Добавить способ. Отдаёт его номер.
+
+    Номер — счётчик, а не порядковый индекс: удалив второй способ из трёх,
+    мы бы иначе перевесили кнопку третьего на номер второго, и нажатие
+    показало бы чужие реквизиты.
+    """
+    data = _load_admin()
+    items = list(data.get("pay_methods") or [])
+    nxt = int(data.get("pay_method_seq") or 0) + 1
+    data["pay_method_seq"] = nxt
+    items.append({"id": str(nxt), "title": str(title), "details": str(details)})
+    data["pay_methods"] = items
+    _save_admin(data)
+    return str(nxt)
+
+
+def set_pay_method(mid: str, title: str | None = None,
+                   details: str | None = None) -> bool:
+    data = _load_admin()
+    items = list(data.get("pay_methods") or [])
+    for row in items:
+        if isinstance(row, dict) and str(row.get("id")) == str(mid):
+            if title is not None:
+                row["title"] = str(title)
+            if details is not None:
+                row["details"] = str(details)
+            data["pay_methods"] = items
+            _save_admin(data)
+            return True
+    return False
+
+
+def del_pay_method(mid: str) -> bool:
+    data = _load_admin()
+    items = [r for r in (data.get("pay_methods") or [])
+             if str((r or {}).get("id")) != str(mid)]
+    if len(items) == len(data.get("pay_methods") or []):
+        return False
+    data["pay_methods"] = items
+    _save_admin(data)
+    return True
+
+
+# --- «Я оплатил» ------------------------------------------------------------
+#
+# Продавец платит вне бота, и узнать об этом бот сам не может. Значит,
+# сказать должен продавец — а бот передаёт это владельцу в журнал.
+#
+# Не чаще раза в час на человека: кнопка, нажатая десять раз подряд (а её
+# нажимают именно так, когда ждут ответа), превратила бы журнал в рассылку,
+# и настоящая заявка утонула бы среди повторов.
+
+PAID_CLAIM_EVERY = 3600
+
+
+# Заявка живёт в хранилище, а не только в тексте сообщения: владелец жмёт
+# «выдать» кнопкой под записью в журнале, и по номеру заявки бот сам
+# находит, КОМУ и СКОЛЬКО. Номер в `callback_data` короткий — там 64 байта
+# на всё, а имя продавца и срок туда не влезут вместе с прочим.
+#
+# Отметка «решена» здесь же: без неё второе нажатие выдало бы дни второй
+# раз, а нажимают именно дважды — когда не поняли, сработало ли.
+
+def add_claim(user_id: int, days: int = 0, method: str = "",
+              price: int = 0) -> str:
+    data = _load_admin()
+    claims = data.setdefault("claims", {})
+    nxt = int(data.get("claim_seq") or 0) + 1
+    data["claim_seq"] = nxt
+    claims[str(nxt)] = {"user": int(user_id), "days": int(days or 0),
+                        "method": str(method or ""), "price": int(price or 0),
+                        "at": _time.time(), "done": ""}
+    # Разобранные заявки не копятся вечно: их читают в тот же день, а
+    # хранилище — это те же файлы, что и настройки продавцов.
+    if len(claims) > 500:
+        for key in sorted(claims, key=lambda k: claims[k].get("at", 0))[:200]:
+            if claims[key].get("done"):
+                claims.pop(key, None)
+    _save_admin(data)
+    return str(nxt)
+
+
+def get_claim(cid: str) -> dict:
+    return dict((_load_admin().get("claims") or {}).get(str(cid)) or {})
+
+
+def settle_claim(cid: str, how: str) -> bool:
+    """Отметить заявку решённой. False — её уже решили.
+
+    Проверка и запись здесь, а не у вызывающего: два нажатия подряд
+    успевают между «прочитал» и «записал», и дни выдались бы дважды.
+    """
+    data = _load_admin()
+    claim = (data.get("claims") or {}).get(str(cid))
+    if not claim or claim.get("done"):
+        return False
+    claim["done"] = str(how)
+    claim["done_at"] = _time.time()
+    _save_admin(data)
+    return True
+
+
+def note_paid_claim(user_id: int) -> bool:
+    """Отметить заявление об оплате. False — было меньше часа назад."""
+    data = _load_admin()
+    claims = data.setdefault("paid_claims", {})
+    now = _time.time()
+    if now - float(claims.get(str(user_id), 0) or 0) < PAID_CLAIM_EVERY:
+        return False
+    claims[str(user_id)] = now
+    _save_admin(data)
+    return True
+
+
+def last_paid_claim(user_id: int) -> float:
+    return float((_load_admin().get("paid_claims") or {}).get(str(user_id), 0)
+                 or 0)
+
+
+# --- Пробный период ---------------------------------------------------------
+#
+# Кому пробный период уже выдавался. Список ПЕРЕЖИВАЕТ удаление данных —
+# иначе `/forget_me` превращается в способ брать три дня бесплатно сколько
+# угодно раз. Это ровно та же оговорка, что и у чёрного списка, и она
+# записана в политике конфиденциальности: тайно оставленные после «полного
+# удаления» данные — это ложь в опубликованном документе.
+
+
+# Проб две, и берут одну на выбор:
+#   без условий  — короткая, чтобы попробовать прямо сейчас;
+#   за подписку  — длинная, ради неё и подписываются.
+# Если бы длинную давали и без условий, подписываться было бы незачем.
+TRIAL_FREE_DAYS_DEFAULT = 3
+
+
+def get_trial_days() -> int:
+    """Длинная проба — за подписку на канал."""
+    return int(_load_admin().get("trial_days", TRIAL_DAYS_DEFAULT))
+
+
+def get_trial_free_days() -> int:
+    """Короткая проба — без условий. Ноль выключает её, оставляя длинную."""
+    return int(_load_admin().get("trial_free_days", TRIAL_FREE_DAYS_DEFAULT))
+
+
+def set_trial_free_days(days: int) -> None:
+    data = _load_admin()
+    data["trial_free_days"] = max(0, int(days))
+    _save_admin(data)
+
+
+def set_trial_days(days: int) -> None:
+    data = _load_admin()
+    data["trial_days"] = max(0, int(days))
+    _save_admin(data)
+
+
+# Пробы две, и берутся они ОБЕ: три дня просто так, потом ещё семь за
+# подписку на канал. Значит и отметок две — по одной на вид. Одна общая
+# отметка означала бы «взял три дня — семь уже не дадут», то есть ровно то,
+# чего мы не хотим.
+#
+# Прежний плоский список `trials` остаётся списком коротких проб: почти все
+# записи в нём — от старой молчаливой выдачи, и считать их израсходованной
+# подпиской на канал значило бы отнять у людей то, чего они не брали.
+def _trial_key(kind: str) -> str:
+    return "trials" if kind == "free" else f"trials_{kind}"
+
+
+def trial_used(user_id: int, kind: str = "free") -> bool:
+    saved = _load_admin().get(_trial_key(kind), [])
+    return int(user_id) in [int(x) for x in saved]
+
+
+def note_trial(user_id: int, kind: str = "free") -> None:
+    data = _load_admin()
+    key = _trial_key(kind)
+    used = [int(x) for x in data.get(key, [])]
+    if int(user_id) not in used:
+        used.append(int(user_id))
+        data[key] = used
+        _save_admin(data)
+
+
+def note_visit(user_id: int) -> bool:
+    """Отметить заход и сказать, был ли он ПЕРВЫМ.
+
+    Тема журнала называется «новые пользователи», и запись в ней имеет
+    смысл ровно одна на человека: сколько людей вообще дошло до бота.
+    Прежде это решалось по отметке пробного периода — то есть означало «пробу
+    не брал», и не бравший её попадал в журнал на каждый свой заход.
+
+    Спрашивает и отмечает одна функция, а не две: разнесённые «посмотреть» и
+    «записать» однажды разъезжаются, и тогда запись либо повторяется, либо
+    пропадает совсем.
+    """
+    data = _load_admin()
+    seen = [int(x) for x in data.get("seen", [])]
+    if int(user_id) in seen:
+        return False
+    seen.append(int(user_id))
+    data["seen"] = seen
+    _save_admin(data)
+    return True
+
+
+def paid_now(user_id: int) -> bool:
+    """Есть ли ОПЛАЧЕННАЯ подписка — та, что выдал админ.
+
+    Пробную от неё отличает поле `by`: у выданной админом там его номер, у
+    пробной ноль. Без этого различия проба, взятая поверх пробы, была бы
+    неотличима от пробы, взятой поверх оплаты.
+
+    Спрашивают об этом не только здесь: экран «Получить доступ» решает по
+    тому же признаку, показывать ли кнопки проб. `has_active_subscription`
+    там не годится — у взявшего три дня подписка есть, своя же пробная, и
+    по ней экран прятал вторую пробу, которая ему как раз положена.
+    """
+    sub = (_load_admin().get("subscriptions", {}) or {}).get(str(user_id)) or {}
+    return bool(int(sub.get("by") or 0)) and \
+        float(sub.get("expires", 0) or 0) > _time.time()
+
+
+def start_trial(user_id: int, days: int | None = None,
+                kind: str = "free") -> int:
+    """Выдать пробный период → сколько дней выдано (0 — не положено).
+
+    Ноль возвращается в трёх случаях: пробный период выключен владельцем,
+    этот его вид уже брался этим человеком, либо подписка ОПЛАЧЕНА.
+
+    Оплачена — а не просто действует. Проб две, и они складываются: взявший
+    три дня приходит за неделей с действующей подпиской, своей же пробной, и
+    отказывать по ней значит отменять условие «подпишись — дадим неделю».
+    Отличает их поле `by` — это и смотрит `paid_now`.
+
+    Отметок тоже две, по одной на вид (`_trial_key`): общая означала бы
+    «взял три дня — семь уже не дадут».
+
+    Вызывающий по нулю ничего не обещает — молчит.
+    """
+    days = get_trial_days() if days is None else int(days)
+    if days <= 0 or trial_used(user_id, kind) or paid_now(user_id):
+        return 0
+    note_trial(user_id, kind)
+    # `grant_subscription` прибавляет к остатку, а не заменяет его: три дня
+    # плюс семь дают десять, а не семь. Иначе подписка на канал на второй
+    # день пробы отнимала бы у человека день.
+    grant_subscription(user_id, days)
+    return days

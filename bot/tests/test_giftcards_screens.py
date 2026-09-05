@@ -1,0 +1,552 @@
+"""Экраны гифт-карт: у каждой кнопки есть обработчик, и он тот самый.
+
+Выигрыш шаблона именно здесь: карт может стать двадцать пять, а проверка
+остаётся одна. Раньше кнопку добавляли руками — и проверить, что она
+куда-то ведёт, можно было только руками же.
+
+Проверяется не текст экрана, а следствия:
+
+* каждая `callback_data` со всех клавиатур **разбирается** каким-нибудь
+  обработчиком — кнопка, ведущая в никуда, в Telegram молча крутит часики;
+* каждая укладывается в **64 байта** — предел Telegram, за которым кнопка
+  просто не отправится;
+* поле, введённое на экране одной карты, ложится **в её** настройки, а не
+  в соседние.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("BOT_TOKEN", "x")
+
+from automation import giftcards as gc                      # noqa: E402
+from handlers import plugins as P                           # noqa: E402
+
+
+def _all_routers() -> list:
+    """Все роутеры, которые бот подключает на самом деле.
+
+    Перечислять их в тесте руками нельзя: список протух бы на первом же
+    новом разделе, и кнопка, чей обработчик живёт в нём, считалась бы
+    мёртвой. Имена берутся из `main.py` — оттуда же, откуда их берёт бот.
+
+    **`fallback` исключён намеренно.** У него `@router.callback_query(F.data)`
+    — он отвечает на любую нераспознанную кнопку и подключён последним.
+    С ним «обработчик есть» верно для чего угодно, включая опечатку в
+    `callback_data`, и проверка не проверяла бы ничего: первая версия этого
+    теста не заметила кнопку, которую я добавил нарочно.
+    """
+    SKIP = {"fallback"}
+    import importlib
+    import pathlib
+    import re
+
+    source = (pathlib.Path(__file__).resolve().parent.parent
+              / "main.py").read_text(encoding="utf-8")
+    names = sorted(set(re.findall(r"dp\.include_router\((\w+)\.router\)",
+                                  source)) - SKIP)
+    out = []
+    for name in names:
+        try:
+            out.append(importlib.import_module(f"handlers.{name}").router)
+        except Exception:                       # pragma: no cover
+            continue
+    return out
+
+
+class Ev:
+    """Событие с одним полем `data` — этого хватает магическим фильтрам."""
+
+    def __init__(self, data):
+        self.data = data
+
+
+def is_handled(data: str) -> bool:
+    """Разберёт ли эту кнопку хоть один зарегистрированный обработчик."""
+    for router in _all_routers():
+        for handler in router.observers["callback_query"].handlers:
+            magics = [f.magic for f in handler.filters or [] if f.magic]
+            if magics and all(m.resolve(Ev(data)) for m in magics):
+                return True
+    return False
+
+
+def all_buttons(markup) -> list[str]:
+    return [b.callback_data for row in markup.inline_keyboard for b in row
+            if b.callback_data]
+
+
+def settings_with_all_cards() -> dict:
+    settings: dict = {}
+    for gift in gc.cards():
+        gc.card_conf(settings, gift.slug)["enabled"] = True
+    return settings
+
+
+class EveryButtonLeadsSomewhere(unittest.TestCase):
+    """Кнопка без обработчика в Telegram не ошибается — она молчит.
+
+    Со стороны продавца это выглядит как «бот сломался», и найти такое
+    можно только нажав. На двадцати пяти картах — двести кнопок.
+    """
+
+    def _every_markup(self):
+        settings = settings_with_all_cards()
+        yield P._gift_cards_keyboard(settings)
+        yield P._plugins_menu_keyboard()
+        for gift in gc.cards():
+            yield P._gift_card_keyboard(settings, gift)
+            yield P._gift_cfg_keyboard(gift)
+
+    def test_every_button_of_every_card_has_a_handler(self):
+        for markup in self._every_markup():
+            for data in all_buttons(markup):
+                self.assertTrue(is_handled(data),
+                                f"кнопка «{data}» никуда не ведёт")
+
+    def test_every_callback_fits_the_telegram_limit(self):
+        for markup in self._every_markup():
+            for data in all_buttons(markup):
+                self.assertLessEqual(len(data.encode()), 64, data)
+
+    def test_the_menu_no_longer_offers_the_telegram_gifts_stub(self):
+        """Заглушка обещала «функция появится в следующем обновлении».
+
+        Обещание, которого бот не сдержит, — то же враньё, только вежливое.
+        """
+        data = all_buttons(P._plugins_menu_keyboard())
+        self.assertNotIn("plugins:auto_gifts", data)
+        self.assertIn("plugins:gifts", data)
+
+
+class FieldsGoToTheRightCard(unittest.TestCase):
+    """Поля вводятся одним экраном на все карты — `slug` лежит в данных
+    состояния. Спутать их значит настроить не ту карту, и продавец увидел
+    бы это только по несостоявшейся выдаче."""
+
+    def setUp(self):
+        self.saved: dict = {}
+        self._real_get = P.get_settings
+        self._real_save = P.save_settings
+        P.get_settings = lambda uid: self.saved
+        P.save_settings = lambda uid, s: self.saved.update(s)
+
+    def tearDown(self):
+        # Подменяете что-то в общем модуле — откатывайте: перемешанный
+        # порядок тестов иначе роняет чужие.
+        P.get_settings = self._real_get
+        P.save_settings = self._real_save
+
+    def test_a_keyword_lands_in_the_card_it_was_typed_for(self):
+        target = gc.cards()[0]
+        other = gc.cards()[1]
+
+        class FSM:
+            async def get_data(_self):
+                return {"gc_slug": target.slug, "gc_field": "keyword"}
+
+            async def clear(_self):
+                pass
+
+        class Msg:
+            text = "моё слово"
+            from_user = type("U", (), {"id": 1})()
+
+            async def answer(_self, *a, **kw):
+                return None
+
+        asyncio.run(P.gift_field_input(Msg(), FSM()))
+        self.assertEqual(gc.card_conf(self.saved, target.slug)["keyword"],
+                         "моё слово")
+        self.assertEqual(gc.card_conf(self.saved, other.slug)["keyword"], "")
+
+    def test_an_unknown_field_is_refused_rather_than_written(self):
+        """Экран мог устареть между нажатием и вводом."""
+        class FSM:
+            async def get_data(_self):
+                return {"gc_slug": gc.cards()[0].slug, "gc_field": "enabled"}
+
+            async def clear(_self):
+                pass
+
+        said = []
+
+        class Msg:
+            text = "да"
+            from_user = type("U", (), {"id": 1})()
+
+            async def answer(_self, text, *a, **kw):
+                said.append(text)
+
+        asyncio.run(P.gift_field_input(Msg(), FSM()))
+        self.assertTrue(said)
+        self.assertNotIn("enabled", str(self.saved))
+
+
+class TheCardScreenTellsTheTruth(unittest.TestCase):
+    """Экран не должен обещать выдачу там, где её не будет."""
+
+    def test_a_card_without_a_region_says_where_it_will_look_for_one(self):
+        settings = settings_with_all_cards()
+        gift = gc.cards()[0]
+        gc.card_conf(settings, gift.slug)["region"] = ""
+        text = P._gift_card_text(settings, gift)
+        self.assertIn("описания товара", text)
+
+    def test_a_card_that_is_off_does_not_claim_to_deliver(self):
+        settings = settings_with_all_cards()
+        gift = gc.cards()[0]
+        gc.card_conf(settings, gift.slug)["enabled"] = False
+        self.assertIn("выключена", P._gift_card_text(settings, gift))
+
+
+
+class TheScreensSellWithNumbersNotAdjectives(unittest.TestCase):
+    """«Упакуй красиво и продажно» — 21.08.
+
+    Продажно здесь не значит «побольше прилагательных». Продавец платит за
+    подписку и вправе видеть, что она сделала: не «автоматическая доставка
+    цифровых товаров», а сколько кодов ушло и когда ушёл последний. Цифры
+    берутся из его собственных журналов — значит это отчёт, а не обещание,
+    и проверить он может там же.
+
+    Отдельно проверяется, что несостоявшиеся выдачи не спрятаны за
+    состоявшимися: «12 выдано» рядом с тремя молча не выданными — это тот
+    самый бодрый отчёт, от которого здесь уходят.
+    """
+
+    def settings(self, delivered=2, failed=0, enabled=True, when=None):
+        import time as _t
+        log = [{"at": when or (_t.time() - 600), "state": "выдан"}
+               for _ in range(delivered)]
+        log += [{"at": _t.time() - 60, "state": "не выдан", "why": "нет кода"}
+                for _ in range(failed)]
+        return {"plugins": {"gift_cards": {"apple": {
+            "enabled": enabled, "delivered": [str(i) for i in range(delivered)],
+            "log": log}}}}
+
+    def menu(self, settings):
+        from handlers import plugins as P
+        return P._plugins_menu_text(settings)
+
+    def shelf(self, settings):
+        from handlers import plugins as P
+        return P._gift_cards_text(settings)
+
+    def test_the_menu_is_a_short_pitch_not_a_report(self):
+        """Первый экран открывают, чтобы включить плагин, а не свериться с
+        цифрами. Счёт убран отсюда 21.08 по решению продавца — он остался
+        там, где по делу: на экране карт и в карточке каждой карты."""
+        got = self.menu(self.settings(delivered=12))
+        self.assertNotIn("Выдано кодов", got)
+        self.assertNotIn("Последняя выдача", got)
+        self.assertLess(len(got), 500, "экран снова разросся в простыню")
+
+    def test_the_menu_says_what_the_plugins_do(self):
+        got = self.menu(self.settings(delivered=0, enabled=False))
+        self.assertIn("не ждут тебя", got)
+
+    def test_the_shop_is_not_only_about_codes(self):
+        """Гифт-карты — не весь товар, и список плагинов будет расти. Экран,
+        говорящий только про коды, продаёт меньше, чем есть."""
+        got = self.menu(self.settings(delivered=0, enabled=False))
+        self.assertIn("Гифт-карты", got)
+        self.assertIn("прибавляются", got)
+
+    def test_the_hidden_plugin_is_not_named_to_the_seller(self):
+        """Строка про звёзды уходит вместе с кнопкой: единственное
+        упоминание раздела, которого на экране нет, — это вопрос в
+        поддержку."""
+        import features
+        if not features.STARS_HIDDEN:
+            self.skipTest("плагин показан")
+        self.assertNotIn("Stars", self.menu(self.settings(delivered=0,
+                                                          enabled=False)))
+
+    def test_the_stars_are_not_promised_to_deliver_themselves(self):
+        """Плагин звёзд в боте есть, но выдача заблокирована снаружи:
+        Fragment отвечает `Access denied` (A1 в `CHECKLIST.md`). Написать
+        «звёзды летят покупателю сами» значит продать чужому продавцу то,
+        чего сегодня нет, — и получить возвраты вместо подписок."""
+        got = self.menu(self.settings(delivered=0, enabled=False)).lower()
+        for claim in ("звёзды уходят сам", "звёзды летят", "звёзды придут сам",
+                      "звёзды выдаются сам"):
+            self.assertNotIn(claim, got)
+
+    def test_the_menu_does_not_count_the_cards_out_loud(self):
+        """Число карт меняется каждую неделю, а цифра в тексте — нет:
+        разойдясь однажды, экран начинает врать по мелочи."""
+        got = self.menu(self.settings(delivered=1))
+        from automation.giftcards import cards
+        self.assertNotIn(f"{len(cards())} ", got)
+
+    def test_nothing_is_promised_that_cannot_be_checked(self):
+        """«Продажи вырастут в разы» проверить нельзя, а «заказы не ждут вас
+        до утра» продавец проверит в первую же ночь. Обещание, которого
+        нельзя сдержать, здесь дороже любой недосказанности."""
+        got = self.menu(self.settings(delivered=3)).lower()
+        for promise in ("в разы", "гарантир", "вырастут", "заработаете",
+                        "прибыль вырастет", "х2", "в два раза больше"):
+            self.assertNotIn(promise, got)
+
+    def test_the_shelf_still_keeps_the_score(self):
+        """Убрали с первого экрана — не значит спрятали."""
+        got = self.shelf(self.settings(delivered=12))
+        self.assertIn("выдано 12", got)
+
+    def test_a_failed_attempt_is_not_reported_as_a_delivery(self):
+        """Самая дорогая мелочь на этом экране. Последняя запись журнала —
+        не то же, что последняя выдача: несостоявшаяся попытка минуту назад
+        отчитывалась как выдача, и строка выходила бодрая, а кода покупатель
+        не получил."""
+        import time as _t
+        settings = {"plugins": {"gift_cards": {"apple": {
+            "enabled": True, "delivered": ["1"],
+            "log": [{"at": _t.time() - 7200, "state": "выдан"},
+                    {"at": _t.time() - 60, "state": "не выдан"}]}}}}
+        got = self.shelf(settings)
+        self.assertIn("2 ч назад", got)
+        self.assertNotIn("1 мин назад", got)
+
+    def test_the_cards_offered_are_the_ones_still_off(self):
+        """Список «доступно ещё» перечислял включённые карты — предлагал
+        завести то, что уже заведено."""
+        got = self.shelf(self.settings(delivered=1))
+        tail = got.split("Доступно ещё")[1]
+        self.assertNotIn("Apple", tail)
+
+    def test_the_card_screen_puts_the_result_above_the_settings(self):
+        from automation.giftcards import card
+        from handlers import plugins as P
+        got = P._gift_card_text(self.settings(delivered=4), card("apple"))
+        self.assertIn("Выдано кодов", got)
+        self.assertLess(got.index("Выдано кодов"), got.index("Регион"))
+
+
+class TimeIsToldWithoutInventingATimezone(unittest.TestCase):
+    """Абсолютное время требует знать пояс продавца, а мы его не знаем: бот
+    живёт на сервере, продавец — где угодно. Соврать на три часа в строке
+    «последняя выдача» — мелочь, из которой складывается недоверие ко
+    всему остальному."""
+
+    def test_minutes_hours_and_days(self):
+        from automation.giftcards import ago
+        now = 1_000_000.0
+        self.assertEqual(ago(now - 30, now), "только что")
+        self.assertEqual(ago(now - 600, now), "10 мин назад")
+        self.assertEqual(ago(now - 7200, now), "2 ч назад")
+        self.assertEqual(ago(now - 86400 * 1.2, now), "вчера")
+        self.assertEqual(ago(now - 86400 * 5, now), "5 дн назад")
+
+    def test_nothing_is_said_when_nothing_happened(self):
+        from automation.giftcards import ago
+        self.assertEqual(ago(0), "")
+
+
+class EveryPluginIntroducesItself(unittest.TestCase):
+    """«К каждому плагину мини-описание» — 21.08.
+
+    Список из одних названий заставляет открывать каждую карту, чтобы
+    понять, что это. Описание лежит в декларации: у новой карты оно
+    появится вместе с ней, а не будет дописано отдельным списком, который
+    однажды отстанет от реестра.
+    """
+
+    def test_every_card_has_one(self):
+        from automation.giftcards import cards
+        for gift in cards():
+            self.assertTrue(gift.pitch.strip(), gift.slug)
+
+    def test_it_fits_one_line_on_a_phone(self):
+        """Мини-описание — значит мини: длинное превращает список в стену."""
+        from automation.giftcards import cards
+        for gift in cards():
+            self.assertLess(len(gift.pitch), 110, gift.slug)
+
+    def test_it_says_what_the_product_is_not_what_it_will_earn(self):
+        """«Самый ходовой номинал» и «покупают чаще всего» проверить нельзя,
+        а «код пополняет Apple ID» покупатель проверит сам."""
+        from automation.giftcards import cards
+        for gift in cards():
+            low = gift.pitch.lower()
+            for promise in ("ходов", "чаще всего", "выгодн", "прибыл",
+                            "заработ", "хит", "лидер продаж"):
+                self.assertNotIn(promise, low, gift.slug)
+
+    def test_the_card_screen_shows_it_under_the_title(self):
+        from automation.giftcards import card
+        from handlers import plugins as P
+        got = P._gift_card_text({}, card("apple"))
+        self.assertIn("Apple ID", got)
+        self.assertLess(got.index("Apple ID"), got.index("Автовыдача"))
+
+    def test_the_stars_plugin_introduces_itself_too(self):
+        """Плагинов у нас не только карты."""
+        from handlers import plugins as P
+        got = P._stars_text({"plugins": {"auto_stars": {}}})
+        self.assertIn("Звёзды на ник покупателя", got)
+
+    def test_the_stars_line_still_does_not_promise_delivery(self):
+        """A1 в CHECKLIST.md: Fragment отвечает `Access denied` на
+        `initBuyStarsRequest`. «Звёзды уходят сами» сегодня неправда."""
+        from handlers import plugins as P
+        got = P._stars_text({"plugins": {"auto_stars": {}}}).lower()
+        for claim in ("звёзды уходят сам", "звёзды летят", "придут сами"):
+            self.assertNotIn(claim, got)
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class AnEnabledCardGetsItsOwnButton(unittest.TestCase):
+    """Карта, которой торгуют каждый день, должна открываться в одно
+    нажатие, а не через общий список из восьми.
+
+    Кнопки берутся из реестра по признаку «включена». Перечислять их руками
+    значило бы завести восемь строчек вида «если это Apple — покажи Apple»,
+    и девятая однажды не появилась бы вовсе — ровно то, от чего уходили,
+    когда сводили плагины в один движок.
+    """
+
+    def buttons(self, settings):
+        from handlers.plugins import _plugins_menu_keyboard
+        kb = _plugins_menu_keyboard(settings)
+        return [(b.text, b.callback_data)
+                for row in kb.inline_keyboard for b in row]
+
+    def test_nothing_enabled_shows_only_the_general_entry(self):
+        cbs = [c for _, c in self.buttons({})]
+        self.assertIn("plugins:gifts", cbs)
+        self.assertFalse([c for c in cbs if c.startswith("plugins:gc:")])
+
+    def test_an_enabled_card_is_pinned_to_the_menu(self):
+        got = self.buttons({"plugins": {"gift_cards": {"apple": {"enabled": True}}}})
+        self.assertIn("plugins:gc:apple", [c for _, c in got])
+        self.assertTrue([t for t, _ in got if "Apple" in t])
+
+    def test_a_disabled_card_is_not(self):
+        got = self.buttons({"plugins": {"gift_cards": {"apple": {"enabled": False}}}})
+        self.assertNotIn("plugins:gc:apple", [c for _, c in got])
+
+    def test_several_enabled_cards_all_appear(self):
+        got = [c for _, c in self.buttons({"plugins": {"gift_cards": {
+            "apple": {"enabled": True}, "xbox": {"enabled": True},
+            "steam": {"enabled": True}}}})]
+        for slug in ("apple", "xbox", "steam"):
+            self.assertIn(f"plugins:gc:{slug}", got)
+
+    def test_the_general_list_never_disappears(self):
+        """Через него включают карту в первый раз. Без него выключенная
+        карта была бы недостижима вовсе."""
+        got = [c for _, c in self.buttons(
+            {"plugins": {"gift_cards": {"apple": {"enabled": True}}}})]
+        self.assertIn("plugins:gifts", got)
+
+    def test_no_card_is_named_in_the_menu_code(self):
+        """Признак того, что кнопки штампуются, а не перечисляются."""
+        import inspect
+        from handlers import plugins as P
+        src = inspect.getsource(P._plugins_menu_keyboard)
+        for slug in ("apple", "xbox", "steam", "amazon", "razer"):
+            self.assertNotIn(f'"{slug}"', src)
+
+
+class MakingAProductLivesInTheTemplateToo(unittest.TestCase):
+    """Создание товара было только у Robux — того плагина, что писался с
+    нуля. У карт его не было вовсе, а завести руками 476 номиналов Apple по
+    31 региону невозможно.
+
+    Смысл не в удобстве: витрина и каталог обязаны сойтись. Объявление на
+    номинал, которого у поставщика нет, автовыдаче недоступно, и узнал бы
+    об этом продавец из отказа — когда покупатель уже заплатил.
+    """
+
+    def keyboard(self, gift):
+        from handlers.plugins import _gift_card_keyboard
+        kb = _gift_card_keyboard({}, gift)
+        return [b.callback_data for row in kb.inline_keyboard for b in row]
+
+    def test_every_card_can_start_a_product(self):
+        import automation.giftcards as G
+        for gift in G.cards():
+            self.assertIn(f"plugins:gc:{gift.slug}:make", self.keyboard(gift))
+
+    def test_the_flow_hands_over_to_the_usual_wizard(self):
+        """Своего создания товаров в шаблоне нет и не нужно: мастер умеет
+        разделы панели, обязательные поля, фото и публикацию."""
+        import inspect
+        from handlers import plugins as P
+        src = inspect.getsource(P.gift_make_handoff)
+        self.assertIn("CreateAdState.quantity", src)
+        self.assertNotIn("panel_create_product_sync", src)
+
+    def test_the_region_goes_into_the_description(self):
+        """Выдача читает регион из описания, а не из панели. Своё поле
+        «Регион» у панели есть (`filter__8`, обязательное), но оно её
+        собственное требование к карточке и описания не заменяет."""
+        import inspect
+        from handlers import plugins as P
+        self.assertIn("with_region", inspect.getsource(P.gift_make_handoff))
+
+    def test_the_section_hint_comes_from_the_card(self):
+        """Подстановка раздела витрины — данные карты, а не ветка в коде."""
+        import inspect
+        from handlers import plugins as P
+        src = inspect.getsource(P.gift_make_handoff)
+        self.assertIn("gift.autopick", src)
+        for slug in ("apple", "xbox", "steam"):
+            self.assertNotIn(f'"{slug}"', src)
+
+
+class TheGreetingIsSentOnceAndOnlyIfAsked(unittest.TestCase):
+    """Автоответ уходит покупателю до кода.
+
+    Нужен не всегда: обычно код приходит через секунды. Но у долгих
+    номиналов поставщик отвечает «принято, код будет позже», и тогда
+    молчание похоже на поломку.
+    """
+
+    def test_silence_is_the_default(self):
+        import automation.giftcards as G
+        self.assertEqual(G.DEFAULT_CARD_CONF["greeting"], "")
+
+    def test_the_mark_lives_in_the_record_not_in_memory(self):
+        """Проход может оборваться между приветом и покупкой — тогда
+        возобновление поздоровалось бы второй раз."""
+        import inspect
+        from tasks import manager as M
+        src = inspect.getsource(M.TaskManager._maybe_deliver_gift)
+        self.assertIn('entry.get("greeted")', src)
+        self.assertIn('entry["greeted"] = True', src)
+
+    def test_it_goes_before_the_purchase(self):
+        import inspect
+        from tasks import manager as M
+        src = inspect.getsource(M.TaskManager._maybe_deliver_gift)
+        self.assertLess(src.index("greeting"), src.index("_gift_finish"))
+
+
+class TheKeywordIsExplainedWhereItIsMisread(unittest.TestCase):
+    """«Слово-опознаватель» понимают по-разному: одни думают, что это слово
+    для покупателя, другие — что бот ищет его в описании."""
+
+    def test_the_prompt_says_where_the_bot_looks(self):
+        from handlers.plugins import _GIFT_FIELDS
+        prompt = _GIFT_FIELDS["kw"][0]
+        self.assertIn("названи", prompt.lower())
+        self.assertIn("витрин", prompt.lower())
+
+    def test_and_shows_an_example_of_both_outcomes(self):
+        from handlers.plugins import _GIFT_FIELDS
+        prompt = _GIFT_FIELDS["kw"][0]
+        self.assertIn("✅", prompt)
+        self.assertIn("❌", prompt)
+
+    def test_and_says_when_not_to_set_it(self):
+        """Совет «задайте всегда» отправил бы продавца делать лишнее."""
+        from handlers.plugins import _GIFT_FIELDS
+        self.assertIn("только если", _GIFT_FIELDS["kw"][0].lower())

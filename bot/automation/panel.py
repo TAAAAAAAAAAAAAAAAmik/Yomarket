@@ -1,4 +1,4 @@
-"""YooMarket panel automation: email OTP login."""
+"""Автоматизация панели Юмаркета: вход по почте и одноразовому коду."""
 from __future__ import annotations
 
 import asyncio
@@ -11,100 +11,32 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 PANEL_URL = "https://panel.yoomarket.net"
-
-# Email input selectors (страница входа: "Введите электронную почту")
-_EMAIL_SELECTORS = [
-    'input[type="email"]',
-    'input[name="email"]',
-    'input[placeholder*="почт" i]',
-    'input[placeholder*="mail" i]',
-    'input[placeholder*="email" i]',
-]
-
-# Code input selectors (после отправки кода)
-_CODE_SELECTORS = [
-    'input[autocomplete="one-time-code"]',
-    'input[placeholder*="код" i]',
-    'input[placeholder*="code" i]',
-    'input[name="code"]',
-    'input[name="otp"]',
-    'input[name="token"]',
-    'input[maxlength="6"]',
-    'input[maxlength="4"]',
-    'input[type="number"]',
-    'input[inputmode="numeric"]',
-]
-
-# "Получить код" button
-_SEND_CODE_SELECTORS = [
-    'button:has-text("Получить код")',
-    'button:has-text("Отправить код")',
-    'button[type="submit"]',
-    'button:has-text("Отправить")',
-    'button:has-text("Получить")',
-    'button:has-text("Войти")',
-]
-
-# "Подтвердить" button
-_CONFIRM_SELECTORS = [
-    'button:has-text("Подтвердить")',
-    'button:has-text("Войти")',
-    'button:has-text("Продолжить")',
-    'button:has-text("Verify")',
-    'button:has-text("Submit")',
-    'button[type="submit"]',
-]
+# У панели продавца нет собственного входа для продавцов: человек входит на
+# самом маркетплейсе (почта → код из письма), а панель подхватывает эту
+# сессию, потому что куки выдаются на общий домен .yoomarket.net. Поэтому код
+# запрашивается здесь, а не с PANEL_URL.
+MAIN_URL = "https://yoomarket.net"
+# Витрина написана на Next.js, поэтому её форма входа обращается к отдельному
+# хосту API, а не отправляет данные сама себе, — и это тот самый хост, которым
+# бот уже пользуется.
+API_URL = "https://api.yoo.market"
 
 
-def _parse_cookies(cookie_string: str) -> list[dict]:
-    """Parse 'key=value; key2=value2' string into Playwright cookie list."""
-    cookies = []
-    for part in cookie_string.split(";"):
-        part = part.strip()
-        if "=" in part:
-            name, _, value = part.partition("=")
-            name = name.strip()
-            value = value.strip()
-            if name:
-                cookies.append({
-                    "name": name,
-                    "value": value,
-                    "domain": "panel.yoomarket.net",
-                    "path": "/",
-                })
-    return cookies
+def _esc(value) -> str:
+    """Экранирование текста, взятого с веб-страницы, перед отправкой в Telegram.
 
-
-async def _fill_first(page, selectors: list[str], value: str) -> bool:
-    """Try selectors in order, fill the first one found. Return True if filled."""
-    for sel in selectors:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                await el.fill(value)
-                return True
-        except Exception:
-            continue
-    return False
-
-
-async def _click_first(page, selectors: list[str]) -> bool:
-    """Try selectors in order, click the first one found. Return True if clicked."""
-    for sel in selectors:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                await el.click()
-                return True
-        except Exception:
-            continue
-    return False
+    Сырые куски страниц содержат теги вроде <!doctype html>, которые Telegram
+    не принимает: отправка срывается, и продавец остаётся смотреть на прежнее
+    «выполняется».
+    """
+    import html as _html
+    return _html.escape(str(value), quote=False)
 
 
 async def try_token_login(api_token: str) -> tuple[bool, str]:
-    """
-    Try to log into the panel using the existing API token (token exchange / SSO).
-    Returns (True, cookie_string) on success, (False, error) on failure.
+    """Попробовать войти в панель по имеющемуся токену API (обмен токена, SSO).
+
+    Отдаёт (True, строка кук) при успехе и (False, ошибка) при отказе.
     """
     connector = aiohttp.TCPConnector(ssl=False)
     timeout = aiohttp.ClientTimeout(total=12)
@@ -116,7 +48,7 @@ async def try_token_login(api_token: str) -> tuple[bool, str]:
     }
 
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-        # Attempt 1: POST token to common auth endpoints
+        # Попытка 1: POST с токеном на обычные адреса входа
         token_payloads = [
             (PANEL_URL + "/api/auth/token",       {"token": api_token}),
             (PANEL_URL + "/api/auth/api-token",   {"api_token": api_token}),
@@ -134,7 +66,7 @@ async def try_token_login(api_token: str) -> tuple[bool, str]:
                         if cookies and not_login:
                             logger.info("Token login succeeded via POST %s", url)
                             return True, cookies
-                        # JSON token in response body
+                        # токен пришёл JSON'ом в теле ответа
                         try:
                             import json as _json_mod
                             data = _json_mod.loads(await resp.text())
@@ -146,7 +78,7 @@ async def try_token_login(api_token: str) -> tuple[bool, str]:
             except Exception as e:
                 logger.debug("Token auth attempt %s: %s", url, e)
 
-        # Attempt 2: GET redirect (SSO-style)
+        # Попытка 2: GET с перенаправлением, как при SSO
         sso_urls = [
             PANEL_URL + f"/auth/token?token={api_token}",
             PANEL_URL + f"/login?api_token={api_token}",
@@ -165,7 +97,7 @@ async def try_token_login(api_token: str) -> tuple[bool, str]:
             except Exception as e:
                 logger.debug("SSO attempt %s: %s", url, e)
 
-        # Attempt 3: Bearer header on panel root
+        # Попытка 3: заголовок Bearer на корень панели
         try:
             async with session.get(
                 PANEL_URL + "/",
@@ -198,9 +130,25 @@ class YooMarketPanelHTTP:
         self._session: aiohttp.ClientSession | None = None
         self._email: str = ""
         self._csrf: str = ""
+        # Путь запроса кода, который действительно сработал: из него выводится
+        # соответствующий путь проверки (та же основа) в `verify_code()`.
+        self._send_path: str = ""
+        # Путь, ответивший «нужен код» во время перебора, — это и есть адрес
+        # проверки, значит `verify_code()` должна пробовать его первым.
+        self._verify_path: str = ""
+        # Хост, который на самом деле обрабатывает вход, — обычно маркетплейс.
+        self._auth_host: str = MAIN_URL
+        # Bearer-токен, который может нести ответ входа: приложение панели кладёт
+        # его в localStorage и ходит с ним в чат-API, куда кукам хода нет.
+        # Перехватываем, чтобы можно было отвечать поддержке.
+        self.chat_token: str = ""
 
     async def start(self) -> None:
-        connector = aiohttp.TCPConnector(ssl=False)
+        connector = aiohttp.TCPConnector(ssl=False, limit=16)
+        # Origin и Referer обязаны совпадать с хостом, к которому идёт запрос:
+        # прибитые к панели, они делали каждое обращение к маркетплейсу похожим на
+        # межсайтовое, а такое Laravel отвергает. Теперь они ставятся на каждый
+        # запрос свои — в `_host_headers()`.
         self._session = aiohttp.ClientSession(
             connector=connector,
             headers={
@@ -211,10 +159,13 @@ class YooMarketPanelHTTP:
                 ),
                 "Accept": "application/json, text/html, */*",
                 "Accept-Language": "ru-RU,ru;q=0.9",
-                "Origin": PANEL_URL,
-                "Referer": PANEL_URL + "/login",
+                "X-Requested-With": "XMLHttpRequest",
             },
         )
+
+    def _host_headers(self, base: str) -> dict:
+        """Origin и Referer того хоста, к которому обращаемся на самом деле."""
+        return {"Origin": base, "Referer": base + "/login"}
 
     async def close(self) -> None:
         if self._session:
@@ -225,7 +176,7 @@ class YooMarketPanelHTTP:
             self._session = None
 
     def _xsrf_token(self) -> str:
-        """Extract XSRF-TOKEN cookie value (URL-decoded) for X-XSRF-TOKEN header."""
+        """Значение куки XSRF-TOKEN, раскодированное, для заголовка X-XSRF-TOKEN."""
         import urllib.parse
         jar = self._session.cookie_jar.filter_cookies(PANEL_URL)
         for name, cookie in jar.items():
@@ -233,177 +184,139 @@ class YooMarketPanelHTTP:
                 return urllib.parse.unquote(cookie.value)
         return self._csrf
 
-    async def send_code(self, email: str) -> tuple[bool, str]:
-        """
-        POST email to trigger OTP code sent to inbox.
-        Returns (True, '') on success, (False, error) on failure.
-        """
-        if not self._session:
-            return False, "Сессия не запущена"
-
-        self._email = email.strip()
-        timeout = aiohttp.ClientTimeout(total=12)
-
-        # Step 1: Laravel Sanctum CSRF handshake
-        for csrf_path in ("/sanctum/csrf-cookie", "/api/csrf-cookie", "/csrf-cookie"):
+    async def _prepare(self) -> dict:
+        """Рукопожатие CSRF с панелью; отдаёт заголовки для POST-запросов входа."""
+        timeout = aiohttp.ClientTimeout(total=15, connect=8)
+        for path in ("/sanctum/csrf-cookie", "/csrf-cookie"):
             try:
                 async with self._session.get(
-                    PANEL_URL + csrf_path, timeout=timeout
+                    PANEL_URL + path, timeout=timeout,
+                    headers=self._host_headers(PANEL_URL),
                 ) as resp:
                     if resp.status < 400:
                         break
             except Exception:
                 continue
-
-        # Step 2: GET /login to pick up any _token in HTML
         try:
-            async with self._session.get(PANEL_URL + "/login", timeout=timeout) as resp:
+            async with self._session.get(
+                PANEL_URL + "/login", timeout=timeout,
+                headers=self._host_headers(PANEL_URL),
+            ) as resp:
                 html = await resp.text()
-                for pattern in [
-                    r'"csrfToken"\s*:\s*"([^"]+)"',
-                    r'name=["\']_token["\']\s+value=["\']([^"\']+)["\']',
-                    r'"_token"\s*:\s*"([^"]+)"',
-                    r'<meta[^>]+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']',
-                ]:
-                    m = re.search(pattern, html)
-                    if m:
-                        self._csrf = m.group(1)
-                        break
+            for pattern in (
+                r'"csrfToken"\s*:\s*"([^"]+)"',
+                r'name=["\']_token["\']\s+value=["\']([^"\']+)["\']',
+                r'<meta[^>]+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']',
+            ):
+                m = re.search(pattern, html)
+                if m:
+                    self._csrf = m.group(1)
+                    break
         except Exception as e:
             logger.warning("GET /login failed: %s", e)
 
+        hdrs = dict(self._host_headers(PANEL_URL))
         xsrf = self._xsrf_token()
-        extra_headers = {"X-XSRF-TOKEN": xsrf} if xsrf else {}
+        if xsrf:
+            hdrs["X-XSRF-TOKEN"] = xsrf
+        return hdrs
 
-        # Step 3: Discover real API paths from the JS bundle
-        discovered, disc_debug = await self._discover_api_paths()
+    async def send_code(self, email: str) -> tuple[bool, str]:
+        """Попросить панель выслать код письмом.
 
-        fallback_paths = [
-            # web.php routes (no /api/ prefix) — most likely for Laravel SPA
-            "/auth/send-code",
-            "/auth/email",
-            "/auth/login",
-            "/auth/code",
-            "/send-code",
-            "/login/send-code",
-            "/login/code",
-            "/login/email",
-            "/sign-in",
-            "/auth/sign-in",
-            # api.php routes
-            "/api/auth/send-code",
-            "/api/auth/email",
-            "/api/send-code",
-            "/api/login",
-            "/api/auth/login",
-            "/api/v1/auth/send-code",
-            "/api/v1/auth/email",
-            "/api/user/send-code",
-        ]
-        all_paths = list(dict.fromkeys(discovered + fallback_paths))
+        Адрес и тело запроса сняты с самого сайта: он шлёт {"email": …, "code": ""}
+        на /token — пустое поле кода и означает «пришлите мне его». Никаким
+        перебором путей эту форму найти было бы нельзя.
 
-        diag_lines = []
-        for path in all_paths:
-            try:
-                async with self._session.post(
-                    PANEL_URL + path,
-                    json={"email": self._email},
-                    headers=extra_headers,
-                    timeout=timeout,
-                    allow_redirects=False,
-                ) as resp:
-                    text = await resp.text()
-                    short = text[:100].replace("\n", " ")
-                    diag_lines.append(f"<code>{path}</code> → <b>{resp.status}</b>: {short}")
-                    logger.info("POST %s → %s: %s", path, resp.status, text[:300])
-                    if resp.status in (200, 201):
-                        return True, ""
-                    if resp.status == 422:
-                        return False, f"422 на <code>{path}</code>:\n<code>{text[:400]}</code>"
-            except Exception as e:
-                diag_lines.append(f"<code>{path}</code> → {str(e)[:60]}")
-
-        diag = "\n".join(diag_lines)
-        return False, f"🔍 <b>Диагностика JS:</b>\n{disc_debug}\n\n<b>Ответы сервера:</b>\n\n{diag}"
-
-    async def _discover_api_paths(self) -> tuple[list[str], str]:
-        """Fetch the JS bundle and extract API paths. Returns (paths, debug_info)."""
-        discovered = []
-        debug = []
-        timeout = aiohttp.ClientTimeout(total=15)
-        try:
-            async with self._session.get(PANEL_URL + "/login", timeout=timeout) as resp:
-                html = await resp.text()
-                debug.append(f"HTML {len(html)}б")
-
-            script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html)
-            js_files = [s for s in script_srcs if ".js" in s]
-            debug.append(f"Скриптов: {len(js_files)} → {[s[-40:] for s in js_files[:3]]}")
-
-            for src in js_files[:3]:
-                url = src if src.startswith("http") else PANEL_URL + src
-                try:
-                    async with self._session.get(url, timeout=timeout) as resp:
-                        js = await resp.text()
-                    debug.append(f"JS {url[-30:]}: {len(js)}б")
-                    patterns = [
-                        r'["\']((?:/api)?/[a-z0-9/_-]{3,60})["\']',
-                        r'post\(["\`](/?[a-z0-9/_-]{3,60})["\`]',
-                        r'axios\.[a-z]+\(["\`](/?[^"\'`\s]{3,60})["\`]',
-                        r'fetch\(["\`](/?[^"\'`\s?]{3,60})["\`]',
-                    ]
-                    kws = ("auth", "login", "code", "send", "verify", "confirm", "email")
-                    for pat in patterns:
-                        for match in re.findall(pat, js, re.I):
-                            if any(kw in match.lower() for kw in kws):
-                                if not match.startswith("http") and match not in discovered:
-                                    discovered.append(match)
-                    if discovered:
-                        break
-                except Exception as e:
-                    debug.append(f"JS ошибка: {e}")
-        except Exception as e:
-            debug.append(f"Ошибка: {e}")
-
-        debug.append(f"Найдено путей: {discovered[:5]}")
-        return discovered, " | ".join(debug)
-
-    async def verify_code(self, code: str) -> tuple[bool, str]:
-        """
-        Submit the code from email. Returns (True, cookie_string) or (False, error).
+        Отдаёт (True, '') либо (False, ошибка).
         """
         if not self._session:
             return False, "Сессия не запущена"
 
-        timeout = aiohttp.ClientTimeout(total=12)
-        xsrf = self._xsrf_token()
-        extra_headers = {"X-XSRF-TOKEN": xsrf} if xsrf else {}
+        self._email = email.strip()
+        self._auth_host = PANEL_URL
+        self._verify_path = "/code"
+        timeout = aiohttp.ClientTimeout(total=25, connect=10)
+        hdrs = await self._prepare()
 
-        json_paths = [
-            "/api/auth/verify",
-            "/api/auth/confirm",
-            "/api/verify",
-            "/api/auth/check-code",
-            "/api/login/verify",
-            "/api/v1/auth/verify",
-            "/api/v1/auth/confirm",
+        attempts = [
+            ("/token", {"email": self._email, "code": ""}),
+            ("/token", {"email": self._email}),
         ]
-        for path in json_paths:
+        detail = []
+        for path, payload in attempts:
             try:
                 async with self._session.post(
-                    PANEL_URL + path,
-                    json={"email": self._email, "code": code},
-                    headers=extra_headers,
-                    timeout=timeout,
-                    allow_redirects=True,
+                    PANEL_URL + path, json=payload, headers=hdrs,
+                    timeout=timeout, allow_redirects=False,
                 ) as resp:
                     text = await resp.text()
-                    logger.info("verify POST %s → %s: %s", path, resp.status, text[:200])
-                    if resp.status in (200, 201):
-                        cookies = _extract_cookies(self._session, PANEL_URL)
-                        if cookies:
+                    logger.info("send_code POST %s → %s: %s",
+                                path, resp.status, text[:200])
+                    if resp.status in (200, 201, 204, 302):
+                        self._send_path = path
+                        return True, ""
+                    if resp.status == 422:
+                        try:
+                            msg = (_json.loads(text) or {}).get("message") or ""
+                        except Exception:
+                            msg = ""
+                        detail.append(f"{path}: {_esc(msg or text[:120])}")
+                        continue
+                    detail.append(f"{path}: HTTP {resp.status} {_esc(text[:100])}")
+            except Exception as e:
+                detail.append(f"{path}: {_esc(str(e)[:80])}")
+
+        return False, "Панель не приняла запрос кода.\n" + "\n".join(detail[:4])
+
+
+
+
+    async def verify_code(self, code: str) -> tuple[bool, str]:
+        """Отправить код из письма на /code и получить куки сессии.
+
+        Сайт шлёт код ЧИСЛОМ, а не строкой — снято с его же запроса, — поэтому эта
+        форма пробуется первой.
+
+        Отдаёт (True, строка кук) либо (False, ошибка).
+        """
+        if not self._session:
+            return False, "Сессия не запущена"
+
+        timeout = aiohttp.ClientTimeout(total=25, connect=10)
+        hdrs = dict(self._host_headers(PANEL_URL))
+        xsrf = self._xsrf_token()
+        if xsrf:
+            hdrs["X-XSRF-TOKEN"] = xsrf
+
+        raw = code.strip()
+        payloads = []
+        if raw.isdigit():
+            payloads.append({"email": self._email, "code": int(raw)})
+        payloads.append({"email": self._email, "code": raw})
+
+        last = ""
+        for payload in payloads:
+            try:
+                async with self._session.post(
+                    PANEL_URL + (self._verify_path or "/code"),
+                    json=payload, headers=hdrs,
+                    timeout=timeout, allow_redirects=True,
+                ) as resp:
+                    text = await resp.text()
+                    logger.info("verify_code → %s: %s", resp.status, text[:200])
+                    if resp.status in (200, 201, 204, 302):
+                        # Ловим Bearer-токен из тела ответа независимо от кук: он нужен
+                        # чат-API, куда куки не достают. Смотрим и во вложенных объектах —
+                        # токен часто лежит под "data" или "user".
+                        self.chat_token = _token_from_body(text)
+                        cookies = _extract_all_cookies(self._session)
+                        if cookies and await self._session_ok():
                             return True, cookies
-                        # Token in JSON body
+                        if cookies:
+                            # Куки выданы, но API панели их пока не принял: сохранить всё
+                            # равно стоит, вызывающий проверит сам.
+                            return True, cookies
                         try:
                             data = _json.loads(text)
                             for key in ("token", "access_token", "api_token"):
@@ -411,26 +324,107 @@ class YooMarketPanelHTTP:
                                     return True, f"{key}={data[key]}"
                         except Exception:
                             pass
+                        last = "вход прошёл, но сессия не выдана"
+                    elif resp.status == 422:
+                        try:
+                            last = (_json.loads(text) or {}).get("message") or ""
+                        except Exception:
+                            last = _esc(text[:150])
+                    else:
+                        last = f"HTTP {resp.status}: {_esc(text[:120])}"
             except Exception as e:
-                logger.debug("verify_code %s: %s", path, e)
+                last = _esc(str(e)[:100])
 
-        return False, "❌ Неверный код или срок действия истёк."
+        return False, last or "Неверный код или срок действия истёк."
+
+    async def _session_ok(self) -> bool:
+        """True, если нынешний набор кук — это вошедшая сессия панели."""
+        timeout = aiohttp.ClientTimeout(total=10)
+        hdrs = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
+        for path in ("/nova-api/navigation", "/api/user"):
+            try:
+                async with self._session.get(
+                    PANEL_URL + path, headers=hdrs, timeout=timeout,
+                    allow_redirects=False,
+                ) as resp:
+                    if resp.status == 200:
+                        return True
+                    if resp.status in (401, 403):
+                        return False
+            except Exception:
+                continue
+        try:
+            async with self._session.get(
+                PANEL_URL + "/", timeout=timeout, allow_redirects=True,
+            ) as resp:
+                final = str(resp.url)
+                return not any(k in final for k in ("/login", "/code", "/auth"))
+        except Exception:
+            return False
+
+
+
+def _token_from_body(text: str) -> str:
+    """Bearer-токен из ответа входа — сверху или под одним из обычных ключей.
+
+    Пустая строка означает, что его там нет.
+    """
+    try:
+        data = _json.loads(text)
+    except Exception:
+        return ""
+
+    def _walk(node, depth=0):
+        if depth > 4 or not isinstance(node, dict):
+            return ""
+        for key in ("token", "access_token", "api_token", "bearer",
+                    "auth_token", "accessToken"):
+            v = node.get(key)
+            if isinstance(v, str) and len(v) >= 20:
+                return v
+        for v in node.values():
+            if isinstance(v, dict):
+                found = _walk(v, depth + 1)
+                if found:
+                    return found
+        return ""
+
+    return _walk(data)
+
+
+def _extract_all_cookies(session: aiohttp.ClientSession) -> str:
+    """Собрать куки, видимые обоим хостам.
+
+    Вход на самом маркетплейсе ставит куки на общий домен .yoomarket.net — как
+    раз поэтому панель эту сессию и принимает. Значит собираем с обоих, а при
+    совпадении имени побеждает кука самой панели.
+    """
+    merged: dict[str, str] = {}
+    for url in (MAIN_URL, PANEL_URL):
+        try:
+            for name, cookie in session.cookie_jar.filter_cookies(url).items():
+                if cookie.value:
+                    merged[name] = cookie.value
+        except Exception:
+            continue
+    return "; ".join(f"{k}={v}" for k, v in merged.items())
 
 
 def _extract_cookies(session: aiohttp.ClientSession, url: str) -> str:
-    """Pull all cookies matching the given URL from an aiohttp session."""
+    """Вытащить из сессии aiohttp все куки, подходящие под этот адрес."""
     jar = session.cookie_jar.filter_cookies(url)
     parts = [f"{name}={cookie.value}" for name, cookie in jar.items()]
     return "; ".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# Synchronous panel product creation (runs in a thread via run_in_executor)
-# Uses `requests` with real socket timeouts so it never blocks the event loop.
+# Синхронное создание товара в панели — идёт в отдельном потоке через
+# run_in_executor. Ходит `requests` с настоящими таймаутами на сокете, чтобы
+# ни при каких условиях не заблокировать цикл событий.
 # ---------------------------------------------------------------------------
 
 def _make_panel_requests_session(cookie_string: str):
-    """Build a `requests` session pre-loaded with panel cookies and headers."""
+    """Собрать сессию `requests`, заранее нагруженную куками и заголовками панели."""
     import requests
     from requests.packages.urllib3.exceptions import InsecureRequestWarning
     requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
@@ -453,9 +447,44 @@ def _make_panel_requests_session(cookie_string: str):
     return session
 
 
+_PANEL_EXPIRED = ("сессия панели истекла — войди заново: "
+                  "Настройки → 🌐 Панель продавца")
+
+
+def _panel_expired(r) -> str:
+    """Ответ панели, означающий «сессия кончилась» — по-русски. Иначе пусто.
+
+    Проверялся один код — 401. Laravel на истёкшей сессии отвечает ещё и
+    419 («Page Expired», просроченный CSRF), и редиректом на /login, а
+    редиректы мы намеренно не ходим — и продавец видел на экране
+    «shops → 302». Английский код вместо объяснения — ровно та отписка,
+    которую проект запрещает.
+
+    Стоило дня: баланс второго магазина «не показывался», и поломку искали
+    в многомагазинности, пока продавец сам не догадался, что сессия просто
+    истекла. Бот это знал и не сказал.
+
+    Строка была выписана в шестнадцати местах; починка одного оставляла
+    пятнадцать как были. Теперь проверка одна.
+    """
+    code = getattr(r, "status_code", 0)
+    if code in (401, 419):
+        return _PANEL_EXPIRED
+    if code in (301, 302, 303, 307, 308):
+        dest = str((getattr(r, "headers", None) or {}).get("Location") or "")
+        # Куда угодно, кроме логина, — это не про сессию, и врать не надо:
+        # совет «войди заново» тому, кто и так внутри, хуже молчания.
+        if not dest or "login" in dest.lower() or "auth" in dest.lower():
+            return _PANEL_EXPIRED
+    return ""
+
+
 def _parse_nova_fields_payload(cf: dict) -> list[dict]:
-    """Extract the field list from a Nova creation-fields response.
-    Handles list, numeric-keyed dict, and panel-nested shapes."""
+    """Достать список полей из ответа Nova на creation-fields.
+
+    Понимает три формы: список, словарь с числовыми ключами и вложенную,
+    которую отдаёт эта панель.
+    """
     raw = cf.get("fields")
     if isinstance(raw, dict):
         raw_fields = list(raw.values())
@@ -474,7 +503,7 @@ def _parse_nova_fields_payload(cf: dict) -> list[dict]:
 
 
 def _normalize_options(field: dict) -> list[dict]:
-    """Return [{'label': str, 'value': any}, ...] from a Nova select field."""
+    """Привести варианты поля-списка Nova к [{'label': str, 'value': …}, …]."""
     options = field.get("options")
     if not options:
         options = (field.get("meta") or {}).get("options")
@@ -495,10 +524,10 @@ def _normalize_options(field: dict) -> list[dict]:
 
 
 def panel_get_item_form_sync(cookie_string: str) -> tuple[bool, object]:
-    """
-    Blocking: fetch the product creation form (fields + select options).
-    Returns (True, {"resource": str, "fields": [{attribute,label,options,required,dependsOn}]})
-    or (False, error_message).
+    """Блокирующая: прочитать форму создания товара — поля и варианты списков.
+
+    Отдаёт (True, {"resource": str, "fields": [{attribute, label, options,
+    required, dependsOn}]}) либо (False, сообщение об ошибке).
     """
     session = _make_panel_requests_session(cookie_string)
     last_err = "форма не найдена"
@@ -511,8 +540,8 @@ def panel_get_item_form_sync(cookie_string: str) -> tuple[bool, object]:
         except Exception as e:
             last_err = str(e)[:60]
             continue
-        if r.status_code == 401:
-            return False, "401: сессия панели истекла — войдите снова"
+        if (dead := _panel_expired(r)):
+            return False, dead
         if r.status_code != 200:
             continue
         try:
@@ -546,18 +575,20 @@ def panel_sync_field_options_sync(
     cookie_string: str, resource: str, field_attr: str, form_values: dict,
     search: str = "",
 ) -> tuple[list[dict], str]:
-    """
-    Blocking: fetch options for a select that has none inline.
-    Tries, in order:
-      1. /nova-api/{res}/associatable/{attr} — BelongsTo relation options
-      2. /nova-api/{res}/creation-fields?field={attr}&... — dependsOn sync
-    `search` narrows associatable results (the endpoint caps unfiltered lists).
-    Returns (options, debug_trace). options=[] if nothing worked.
+    """Блокирующая: добыть варианты для списка, у которого их нет внутри.
+
+    Пробует по порядку:
+      1. /nova-api/{res}/associatable/{attr} — варианты связи BelongsTo;
+      2. /nova-api/{res}/creation-fields?field={attr}&… — разбор зависимости.
+
+    `search` сужает выдачу associatable: без фильтра этот адрес обрезает список.
+
+    Отдаёт (варианты, след разбора). Пустой список — не сработало ничего.
     """
     session = _make_panel_requests_session(cookie_string)
     trace: list[str] = []
 
-    # 1. BelongsTo options endpoint (Nova "associatable")
+    # 1. Адрес вариантов связи BelongsTo — «associatable» у Nova
     assoc_params = {
         "search": search, "first": "false", "withTrashed": "false",
         "editing": "true", "editMode": "create",
@@ -586,7 +617,7 @@ def panel_sync_field_options_sync(
     except Exception as e:
         trace.append(f"associatable: {str(e)[:40]}")
 
-    # 2. dependsOn field sync via creation-fields
+    # 2. Разбор зависимого поля через creation-fields
     params = {"editing": "true", "editMode": "create", "field": field_attr}
     for k, v in form_values.items():
         params[k] = str(v)
@@ -615,8 +646,10 @@ def panel_sync_field_options_sync(
 
 
 def _save_refreshed_cookies(uid: int | None, cookie_string: str, session) -> None:
-    """Merge rotated Laravel session cookies back into storage so the panel
-    session keeps extending instead of aging out from the original login."""
+    """Вернуть в хранилище обновившиеся куки сессии Laravel.
+
+    Так сессия панели продлевается, а не стареет от момента первого входа.
+    """
     if uid is None:
         return
     try:
@@ -639,7 +672,7 @@ def _save_refreshed_cookies(uid: int | None, cookie_string: str, session) -> Non
 
 
 def _panel_xsrf_headers(session, cookie_string: str) -> dict:
-    """CSRF handshake + build X-XSRF-TOKEN headers for a requests session."""
+    """Рукопожатие CSRF и сборка заголовков X-XSRF-TOKEN для сессии requests."""
     import urllib.parse
     try:
         session.get(PANEL_URL + "/sanctum/csrf-cookie",
@@ -669,11 +702,23 @@ _PUBLISH_KWS = ("публик", "publish", "актив", "activ", "показ", 
 _UNPUBLISH_KWS = ("скрыт", "скрыть", "hide", "unpublish", "деактив", "снять",
                   "приостан", "disable", "выключ", "stop")
 _DANGEROUS_KWS = ("удал", "delete", "destroy", "force")
+# Поднятие товара обратно в верх ленты. В Integration API такого метода нет
+# вовсе, а в панели есть — это действие Nova, добираемое так же, как публикация.
+# Простого «поднять» на этом маркетплейсе не существует: продвижение — это
+# платное действие «Премиум», и поднятие ложится именно на него. Оно ТРАТИТ
+# ДЕНЬГИ, поэтому вызывающий обязан передать confirm=True, а дневной потолок
+# трат проверяется принудительно.
+_BUMP_KWS = ("премиум", "premium", "подня", "поднят", "bump", "raise",
+             "продвин", "буст", "boost")
 
 
 def _build_update_form(fields: list[dict], overrides: dict) -> dict:
-    """Form data for a Nova _method=PUT update: preserve every current value
-    (media re-attached by id as __media__[attr][i]) and apply overrides."""
+    """Тело формы для обновления Nova через _method=PUT.
+
+    Сохраняет все нынешние значения — картинки прицепляются обратно по номеру
+    как __media__[attr][i] — и накладывает поверх то, что меняем. Иначе
+    обновление одного поля стирает остальные.
+    """
     form: dict = {}
     for f in fields:
         fa = f.get("attribute")
@@ -706,16 +751,21 @@ def _build_update_form(fields: list[dict], overrides: dict) -> dict:
     return form
 
 
-def _get_update_fields(session, hdrs, item_id: str) -> tuple[list[dict], str]:
-    """GET update-fields for an item. Returns (fields, error)."""
+def _get_update_fields(session, hdrs, item_id: str,
+                       resource: str = "items") -> tuple[list[dict], str]:
+    """GET update-fields for an item. Returns (fields, error).
+
+    `resource` was previously read from an enclosing scope that does not exist,
+    so every call raised NameError and came back as "не получил поля товара".
+    """
     try:
         r = session.get(
-            f"{PANEL_URL}/nova-api/items/{item_id}/update-fields"
+            f"{PANEL_URL}/nova-api/{resource}/{item_id}/update-fields"
             f"?editing=true&editMode=update",
             headers=hdrs, timeout=(6, 10), allow_redirects=False,
         )
-        if r.status_code == 401:
-            return [], "401: сессия истекла"
+        if (dead := _panel_expired(r)):
+            return [], dead
         if r.status_code != 200:
             return [], f"update-fields: {r.status_code}"
         cf = r.json()
@@ -725,37 +775,543 @@ def _get_update_fields(session, hdrs, item_id: str) -> tuple[list[dict], str]:
         return [], str(e)[:60]
 
 
-def _put_item(session, hdrs, item_id: str, form: dict):
+def _put_item(session, hdrs, item_id: str, form: dict, resource: str = "items"):
     return session.post(
-        f"{PANEL_URL}/nova-api/items/{item_id}?editing=true&editMode=update",
+        f"{PANEL_URL}/nova-api/{resource}/{item_id}?editing=true&editMode=update",
         data=form, headers=hdrs, timeout=(6, 15),
     )
+
+
+def _value_of_attr(fields: list[dict], attr: str):
+    """Текущее значение поля по имени атрибута, или None если такого нет."""
+    for f in fields:
+        if f.get("attribute") == attr:
+            return f.get("value")
+    return None
+
+
+def _same_value(want, got) -> bool:
+    """Одно ли это значение. Панель возвращает «139.00» на отправленные 139."""
+    if got is None:
+        return False
+    a, b = _num(want), _num(got)
+    if a is not None and b is not None:
+        return abs(a - b) < 0.005
+    return str(want).strip().lower() == str(got).strip().lower()
+
+
+def _locate_fields(session, hdrs, item_id: str, wanted: set[str]
+                   ) -> tuple[str, str, list[dict]]:
+    """Найти запись, у которой правда есть нужные поля.
+
+    Позиция в `items` — это единица товара: название, остаток, связь с
+    объявлением. Цены среди её полей нет вовсе, и PUT с ценой Nova принимала,
+    ничего не меняя. Поэтому сначала ищем, у кого поле есть, и правим уже
+    того. Возвращает (ресурс, номер записи, поля); пустой ресурс — не нашли.
+    """
+    fields, _err = _get_update_fields(session, hdrs, item_id)
+    have = {str(f.get("attribute")) for f in fields}
+    if fields and wanted <= have:
+        return "items", str(item_id), fields
+
+    resources = [r for r in dict.fromkeys(
+        list(panel_discover_resources_sync(_cookie_of(session)))
+        + list(_ITEM_RESOURCES)) if r not in _NOT_A_LISTING]
+
+    # Сама запись могла найтись в другом ресурсе — «unlimited» товары в
+    # `items` отвечают 404.
+    for resource in resources[:12]:
+        if resource == "items":
+            continue
+        code, other = _probe_one(session, hdrs, resource, item_id)
+        if code == 200 and other and wanted <= {
+                str(f.get("attribute")) for f in other}:
+            return resource, str(item_id), other
+
+    # Иначе — вверх по связи: цена стоит у объявления, а не у его единицы.
+    for f in fields:
+        rid = _looks_like_link(f)
+        if not rid or rid == str(item_id):
+            continue
+        for resource in resources[:12]:
+            code, parent = _probe_one(session, hdrs, resource, rid)
+            if code == 200 and parent and wanted <= {
+                    str(pf.get("attribute")) for pf in parent}:
+                return resource, rid, parent
+    return "", str(item_id), fields
+
+
+def _cookie_of(session) -> str:
+    """Строка cookie этой сессии — для функций, которые берут её, а не сессию."""
+    try:
+        return "; ".join(f"{c.name}={c.value}" for c in session.cookies)
+    except Exception:
+        return ""
 
 
 def panel_update_item_sync(
     cookie_string: str, item_id: str, overrides: dict, uid: int | None = None,
 ) -> tuple[bool, str]:
     """Blocking: change item fields (e.g. {'price': 199, 'title': ...}),
-    preserving everything else including photos."""
+    preserving everything else including photos.
+
+    «Обновлено» здесь значит «в панели теперь так», а не «запрос принят».
+    Nova отвечает 200 и на форму, часть которой молча выбросила, — продавцу
+    приходило «✅ Цена обновлена», а на сайте оставалась старая цена, и
+    поверить боту после такого нельзя ни в чём.
+    """
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
-    fields, err = _get_update_fields(session, hdrs, item_id)
+    wanted = {str(k) for k in overrides}
+    resource, rec_id, fields = _locate_fields(session, hdrs, item_id, wanted)
     if not fields:
-        return False, f"не получил поля товара: {err}"
+        return False, "не получил поля товара"
+    if not resource:
+        have = ", ".join(sorted({str(f.get("attribute")) for f in fields})[:10])
+        return False, (f"панель не хранит {', '.join(sorted(wanted))} у этого "
+                       f"товара. Есть поля: {have}")
+    where = "" if (resource == "items" and rec_id == str(item_id)) \
+        else f" ({resource} #{rec_id})"
+
     form = _build_update_form(fields, overrides)
     try:
-        resp = _put_item(session, hdrs, item_id, form)
+        resp = _put_item(session, hdrs, rec_id, form, resource)
     except Exception as e:
         return False, f"ошибка запроса: {str(e)[:60]}"
     _save_refreshed_cookies(uid, cookie_string, session)
-    if resp.status_code in (200, 201, 204):
-        return True, "обновлено"
-    return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
+    if resp.status_code not in (200, 201, 204):
+        return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
+
+    after, read_err = _get_update_fields(session, hdrs, rec_id, resource)
+    if not after:
+        # Перечитать не вышло — не выдаём это за успех и не выдаём за провал.
+        return True, f"панель приняла запрос (проверить не удалось: {read_err})"
+
+    unknown, stuck = [], []
+    for attr, want in overrides.items():
+        got = _value_of_attr(after, attr)
+        if got is None and not any(f.get("attribute") == attr for f in after):
+            unknown.append(attr)
+        elif not _same_value(want, got):
+            stuck.append(f"{attr}: осталось «{_strip_html(got)}», просили «{want}»")
+
+    if not unknown and not stuck:
+        return True, f"обновлено{where}"
+
+    why = ["панель приняла запрос, но значение не изменилось."]
+    if stuck:
+        why.append("; ".join(stuck))
+    if unknown:
+        near = [f.get("attribute") for f in after
+                if any(k in str(f.get("attribute", "")).lower()
+                       for k in ("price", "cost", "sum", "amount", "цен"))]
+        why.append(f"поля {', '.join(unknown)} у товара нет"
+                   + (f"; похожие: {', '.join(str(n) for n in near[:6])}"
+                      if near else ""))
+    return False, " ".join(why)
+
+
+_MONEY_HINTS = ("price", "cost", "sum", "amount", "цен")
+
+
+def _looks_like_link(f: dict) -> str:
+    """Номер связанной записи, если это поле — ссылка на другую сущность.
+
+    Позиция товара обычно принадлежит объявлению, а цена стоит у объявления.
+    Пока связь не видна, «в items цены нет» — тупик: неизвестно, где искать.
+    """
+    comp = str(f.get("component") or "").lower()
+    val = f.get("value")
+    if isinstance(val, dict):
+        rid = val.get("id") or val.get("value")
+        if rid is not None:
+            return str(rid)
+    if "belongs-to" in comp or "belongsto" in comp:
+        rid = f.get("belongsToId") or f.get("value")
+        if rid is not None and not isinstance(rid, (dict, list)):
+            return str(rid)
+    return ""
+
+
+def _probe_one(session, hdrs, resource: str, rec_id: str) -> tuple[int, list[dict]]:
+    """update-fields одной записи: (код ответа, поля)."""
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/{resource}/{rec_id}/update-fields"
+            f"?editing=true&editMode=update",
+            headers=hdrs, timeout=(6, 10), allow_redirects=False)
+    except Exception:
+        return 0, []
+    if r.status_code != 200:
+        return r.status_code, []
+    try:
+        return 200, _parse_nova_fields_payload(r.json())
+    except Exception:
+        return 200, []
+
+
+def panel_item_fields_probe_sync(cookie_string: str, item_id: str,
+                                 uid: int | None = None) -> list[str]:
+    """Где у этого товара лежит цена — только чтение.
+
+    «Цена не меняется» и «в этой сущности цены вообще нет» — разные вещи, а
+    выглядят одинаково. Здесь перебираются все ресурсы панели, показываются
+    все поля найденной записи и прослеживаются связи: если позиция
+    принадлежит объявлению, цена почти наверняка у него.
+    """
+    out: list[str] = []
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+
+    resources = [r for r in dict.fromkeys(
+        list(panel_discover_resources_sync(cookie_string)) + list(_ITEM_RESOURCES))
+        if r not in _NOT_A_LISTING]
+
+    missing: list[str] = []
+    links: list[tuple[str, str]] = []      # (имя поля, номер записи)
+    for resource in resources[:20]:
+        code, fields = _probe_one(session, hdrs, resource, item_id)
+        if code != 200 or not fields:
+            missing.append(f"{resource}:{code or 'сеть'}")
+            continue
+        out.append(f"✔ {resource}: полей {len(fields)}")
+        for f in fields:
+            attr = str(f.get("attribute") or "")
+            if not attr:
+                continue
+            comp = str(f.get("component") or "").replace("-field", "")
+            value = _field_text(f)[:40]
+            mark = " 💰" if any(k in attr.lower() for k in _MONEY_HINTS) else ""
+            out.append(f"   {attr} [{comp}] = «{value}»{mark}")
+            rid = _looks_like_link(f)
+            if rid and rid != str(item_id):
+                links.append((attr, rid))
+        if len(out) > 45:
+            break
+
+    if missing:
+        out.append("✘ нет записи: " + ", ".join(missing[:12]))
+
+    # По связям — туда, где цена и должна быть.
+    for attr, rid in links[:3]:
+        out.append(f"↳ связь {attr} → #{rid}")
+        for resource in resources[:20]:
+            code, fields = _probe_one(session, hdrs, resource, rid)
+            if code != 200 or not fields:
+                continue
+            money = [f for f in fields
+                     if any(k in str(f.get("attribute", "")).lower()
+                            for k in _MONEY_HINTS)]
+            out.append(f"   ✔ {resource}/{rid}: полей {len(fields)}"
+                       + ("" if money else " — денежных полей нет"))
+            for f in money[:4]:
+                out.append(f"      {f.get('attribute')} = "
+                           f"«{_field_text(f)[:30]}» 💰")
+            break
+
+    return out
+
+
+# Разделы Nova, в которых может лежать товар. Указателя разделов панель не
+# отдаёт (/nova-api/resources отвечает пустотой), поэтому имена перебираются,
+# а не перечисляются: `items` держит часть товаров, но не «безлимитные» — их
+# номера отвечают там 404.
+_ITEM_RESOURCES = ("items", "ad-groups", "ad-group", "ads", "goods", "products",
+                   "lots", "offers", "unlimiteds", "unlimited-items", "adverts")
+
+# Разделы, в которых заведомо лежит не товар. «ad-groups» намеренно
+# отсутствует: его сочли организационной корзиной и исключили, — а на этой
+# панели `items` оказался хранилищем ПРОДАВАЕМЫХ ЕДИНИЦ (отдельных аккаунтов
+# с балансом), то есть сам товар лежит где-то ещё. А группа одинаковых
+# единиц — это ровно то, чем товар и является.
+_NOT_A_LISTING = frozenset({
+    "categories", "tags", "users", "roles", "permissions", "settings", "logs",
+    "reviews", "orders", "chats", "messages", "notifications", "balances",
+    "withdrawals", "transactions", "payments", "nova-notifications",
+})
+
+_RESOURCE_CACHE: dict[str, list[str]] = {}
+
+
+def panel_discover_resources_sync(cookie_string: str) -> list[str]:
+    """Все разделы Nova, которые эта панель показывает, — спрошенные, а не угаданные.
+
+    Угадывание имён и есть причина, по которой поиск раз за разом промахивался:
+    перебрали девять кандидатов, а существовал только `items`. Индексный адрес
+    Nova на этой панели отвечает пустотой, поэтому имена читаются ещё и со
+    страницы самого приложения — там они лежат как uriKeys и пути роутера.
+
+    Запоминается по куке сессии: между проходами список не меняется, а иначе
+    каждый проход перечитывал бы его заново.
+    """
+    import re as _re
+    ck = cookie_string[-32:]
+    if ck in _RESOURCE_CACHE:
+        return _RESOURCE_CACHE[ck]
+
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    names: list[str] = []
+
+    def add(found):
+        for r in found:
+            r = str(r).strip().lower()
+            if r and r not in names and _re.fullmatch(r"[a-z0-9_\-]{3,40}", r):
+                names.append(r)
+
+    for path in ("/nova-api/navigation", "/nova-api/resources"):
+        try:
+            r = session.get(PANEL_URL + path, headers=hdrs,
+                            timeout=(6, 10), allow_redirects=False)
+            if r.status_code == 200:
+                add(_re.findall(r'"uriKey"\s*:\s*"([^"]+)"', r.text))
+        except Exception:
+            pass
+    if not names:
+        try:
+            html = session.get(PANEL_URL + "/", timeout=(6, 12),
+                               allow_redirects=True).text
+            add(_re.findall(r'"uriKey"\s*:\s*"([^"]+)"', html))
+            add(_re.findall(r'/resources/([a-z0-9_\-]+)', html, _re.I))
+        except Exception:
+            pass
+
+    names = [n for n in names if n not in _NOT_A_LISTING]
+    _RESOURCE_CACHE[ck] = names
+    return names
+
+
+def _row_title(res: dict) -> str:
+    """Отображаемое имя строки Nova — где бы эта панель его ни держала."""
+    title = res.get("title") or res.get("display") or ""
+    if isinstance(title, dict):
+        title = title.get("value") or title.get("title") or ""
+    if title:
+        return str(title)
+    fields = res.get("fields")
+    if isinstance(fields, dict):
+        fields = list(fields.values())
+    for f in (fields or []):
+        if not isinstance(f, dict):
+            continue
+        fa = str(f.get("attribute", "")).lower()
+        fn = str(f.get("name", "")).lower()
+        if "title" in fa or "name" in fa or "назван" in fn or "наимен" in fn:
+            v = f.get("value")
+            if isinstance(v, dict):
+                v = v.get("title") or v.get("name") or v.get("display")
+            if v:
+                return str(v)
+    return ""
+
+
+def _row_haystack(res: dict) -> str:
+    """Весь текст строки Nova — для поиска товара по названию.
+
+    Отображаемое имя строки не всегда совпадает с названием объявления: эта
+    панель озаглавливает строку родительским товаром, а имя объявления держит
+    в поле. Поэтому ищем по всей строке, а не по одному атрибуту.
+    """
+    parts = [_row_title(res)]
+    fields = res.get("fields")
+    if isinstance(fields, dict):
+        fields = list(fields.values())
+    for f in (fields or []):
+        if not isinstance(f, dict):
+            continue
+        v = f.get("value")
+        if isinstance(v, dict):
+            v = v.get("title") or v.get("name") or v.get("display") or ""
+        if isinstance(v, str) and v:
+            parts.append(_strip_html(v))
+    return " ".join(str(p) for p in parts if p)
+
+
+def _nova_global_search(session, hdrs, query: str) -> list[dict]:
+    """Собственный сквозной поиск Nova по разделам → [{resource, id, title}].
+
+    Прошлый поиск провалился именно на угадывании имён разделов: все кандидаты,
+    кроме `items`, отвечали 404, а товар лежал в разделе, которого никто не
+    угадал. Nova и так знает, где живут её записи, — значит надо спросить её.
+    """
+    out = []
+    for path in ("/nova-api/search", "/nova-api/global-search"):
+        try:
+            r = session.get(PANEL_URL + path, params={"search": query[:60]},
+                            headers=hdrs, timeout=(6, 12), allow_redirects=False)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+        try:
+            data = r.json()
+        except Exception:
+            continue
+        rows = data if isinstance(data, list) else (
+            data.get("resources") or data.get("data") or [])
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            res = (row.get("resourceName") or row.get("resource")
+                   or row.get("resourceUriKey") or "")
+            rid = row.get("resourceId") or row.get("id")
+            if isinstance(rid, dict):
+                rid = rid.get("value")
+            title = str(row.get("title") or row.get("resourceTitle")
+                        or row.get("display") or "")
+            if res and rid:
+                out.append({"resource": str(res), "id": str(rid),
+                            "title": title})
+        if out:
+            break
+    return out
+
+
+def panel_find_listing_sync(
+    cookie_string: str, titles: list, resources: tuple = _ITEM_RESOURCES,
+) -> tuple[dict, str]:
+    """Блокирующая: найти товары по названию во всех разделах панели.
+
+    Отдаёт ({ключ_названия: (раздел, номер)}, след разбора). Integration API и
+    панель нумеруют один и тот же товар по-разному, а панель не обязательно
+    озаглавливает строку именем объявления, — поэтому ищется по всему тексту
+    строки и по одним буквам с цифрами: украшают и обрезают названия обе
+    стороны, и каждая по-своему.
+    """
+    import re as _re
+
+    def key(t) -> str:
+        return _re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", "", str(t or "")).lower()
+
+    wanted = {key(t) for t in titles if len(key(t)) >= 8}
+    found: dict = {}
+    trace: list[str] = []
+    samples: list[str] = []
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+
+    # Спрашиваем у Nova, где живёт каждый товар, до того как обходить разделы
+    # по именам: она знает, а имена — это как раз то, в чём мы ошибались.
+    for t in titles:
+        wk = key(t)
+        if len(wk) < 8 or wk in found:
+            continue
+        for hit in _nova_global_search(session, hdrs, str(t)):
+            hk = key(hit["title"])
+            if hk and (wk in hk or hk in wk or hk[:24] in wk or wk[:24] in hk):
+                found[wk] = (hit["resource"], hit["id"])
+                trace.append(f"поиск: {hit['resource']}#{hit['id']}")
+                break
+    if len(found) == len(wanted):
+        return found, "; ".join(trace)[:400]
+
+    # Кроме угаданных имён обходим то, что панель сама о себе говорит. Девять
+    # догадок нашли только `items`, а `items` оказался хранилищем продаваемых
+    # единиц, а не товаров, — значит раздел с товарами тот, которого никто не
+    # назвал.
+    try:
+        discovered = [r for r in panel_discover_resources_sync(cookie_string)
+                      if r not in resources]
+    except Exception:
+        discovered = []
+    if discovered:
+        trace.append(f"ещё есть: {', '.join(discovered[:12])}")
+
+    for res_name in tuple(resources) + tuple(discovered):
+        if len(found) == len(wanted):
+            break
+        rows = []
+        # Идём по страницам: товар, которого нет на первой, — это не товар,
+        # которого нет в панели.
+        for page in (1, 2, 3):
+            try:
+                r = session.get(f"{PANEL_URL}/nova-api/{res_name}",
+                                params={"perPage": "100", "page": str(page)},
+                                headers=hdrs, timeout=(6, 12),
+                                allow_redirects=False)
+            except Exception as e:
+                trace.append(f"{res_name}: {str(e)[:30]}")
+                break
+            if r.status_code != 200:
+                if page == 1:
+                    trace.append(f"{res_name}: {r.status_code}")
+                break
+            try:
+                chunk = (r.json() or {}).get("resources") or []
+            except Exception:
+                break
+            rows += [x for x in chunk if isinstance(x, dict)]
+            if len(chunk) < 100:
+                break
+        if not rows:
+            continue
+        trace.append(f"{res_name}: {len(rows)} шт.")
+        for row in rows:
+            rid = row.get("id")
+            if isinstance(rid, dict):
+                rid = rid.get("value")
+            if not rid:
+                continue
+            hay = key(_row_haystack(row))
+            if len(samples) < 6:
+                samples.append(_row_title(row)[:28] or f"#{rid}")
+            for wk in wanted:
+                if wk in found:
+                    continue
+                # Вхождение в обе стороны: панель может держать и более полное имя,
+                # и более короткое. Порог в восемь знаков выше не даёт короткому
+                # названию совпасть с половиной каталога.
+                if wk in hay or (len(hay) >= 8 and hay[:24] in wk):
+                    found[wk] = (res_name, str(rid))
+                    break
+    if len(found) < len(wanted) and samples:
+        trace.append("названия в панели: " + ", ".join(samples))
+    return found, "; ".join(trace)[:400]
+
+
+# Поля, по которым видно, опубликован товар или нет.
+_STATUS_ATTRS = ("status", "state", "public", "is_public", "visible",
+                 "is_active", "active", "published", "moderation")
+
+
+def _publish_state(fields: list[dict]) -> str:
+    """Состояние публикации одной строкой, или «» — если поля нет.
+
+    Сравнивать «до и после» надо по чему-то устойчивому: имена полей у панели
+    свои, поэтому берём все похожие на статус сразу.
+    """
+    if not fields:
+        return ""
+    parts: list[str] = []
+    for f in fields:
+        attr = str(f.get("attribute") or "").lower()
+        if attr in _STATUS_ATTRS:
+            parts.append(f"{attr}={_field_text(f)[:24]}")
+    return ", ".join(parts)
+
+
+def _nova_refusal(resp) -> str:
+    """Отказ, спрятанный в теле успешного ответа Nova.
+
+    Действие может вернуть 200 и при этом ничего не сделать: причина лежит в
+    поле `danger`. По коду ответа это неотличимо от успеха.
+    """
+    try:
+        body = resp.json()
+    except Exception:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    for key in ("danger", "error"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def panel_publish_item_sync(
     cookie_string: str, item_id: str, uid: int | None = None,
-    public: bool = True,
+    public: bool = True, resource: str = "items",
 ) -> tuple[bool, str]:
     """
     Blocking: make an item public (or hide it with public=False).
@@ -774,7 +1330,7 @@ def panel_publish_item_sync(
     actions: list[dict] = []
     try:
         r = session.get(
-            f"{PANEL_URL}/nova-api/items/actions",
+            f"{PANEL_URL}/nova-api/{resource}/actions",
             params={"resources": str(item_id)},
             headers=hdrs, timeout=(6, 10), allow_redirects=False,
         )
@@ -786,6 +1342,12 @@ def panel_publish_item_sync(
                            if isinstance(a, dict)]
     except Exception as e:
         trace.append(f"actions: {str(e)[:40]}")
+
+    # Снимок состояния до действия. Nova отвечает 200 и на отказ — сообщение
+    # об отказе лежит в теле, а бот рапортовал «Отправлен на модерацию» по
+    # одному коду ответа. Сравнение «до и после» — единственное доказательство.
+    _code_before, _fields_before = _probe_one(session, hdrs, resource, item_id)
+    before = _publish_state(_fields_before)
 
     action_names = [(a.get("name") or a.get("uriKey") or "?") for a in actions]
     for a in actions:
@@ -799,18 +1361,33 @@ def panel_publish_item_sync(
         if any(kw in blob for kw in want_kws):
             try:
                 resp = session.post(
-                    f"{PANEL_URL}/nova-api/items/action?action={key}",
+                    f"{PANEL_URL}/nova-api/{resource}/action?action={key}",
                     data={"resources": str(item_id)},
                     headers=hdrs, timeout=(6, 15),
                 )
                 trace.append(f"action {key}: {resp.status_code}")
                 if resp.status_code in (200, 201, 204):
+                    refused = _nova_refusal(resp)
+                    if refused:
+                        trace.append(f"отказ: {refused[:60]}")
+                        continue
                     _save_refreshed_cookies(uid, cookie_string, session)
-                    return True, f"через действие «{a.get('name') or key}»"
+                    _code, fields_after = _probe_one(session, hdrs, resource,
+                                                     item_id)
+                    after = _publish_state(fields_after)
+                    if after and before and after == before:
+                        # Панель приняла запрос и ничего не изменила. Самый
+                        # частый случай — у нового товара нет остатков, и
+                        # публиковать нечего.
+                        return False, (
+                            f"панель приняла «{a.get('name') or key}», но "
+                            f"статус не изменился ({after})")
+                    what = f" — статус: {after}" if after else ""
+                    return True, f"через действие «{a.get('name') or key}»{what}"
             except Exception as e:
                 trace.append(f"action {key}: {str(e)[:40]}")
 
-    # --- 2. Flag flip via update ---------------------------------------------
+    # --- 2. Переключение признака через обновление ---------------------------
     fields, err = _get_update_fields(session, hdrs, item_id)
     if err:
         trace.append(err)
@@ -851,149 +1428,1126 @@ def panel_publish_item_sync(
     )
 
 
-# ---------------------------------------------------------------------------
-# Stock / остатки — a listing must have stock before it can go to moderation.
-# The panel stores stock as a separate Nova resource related to the item
-# (ad-values / ad-group-items / item-values …), so we discover it dynamically.
-# ---------------------------------------------------------------------------
+def _find_promo_action(actions: list[dict]) -> dict | None:
+    """The «Премиум» action among a resource's Nova actions."""
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        key = str(a.get("uriKey") or "")
+        if not key:
+            continue
+        blob = str(a.get("name") or "").lower() + " " + key.lower()
+        if any(kw in blob for kw in _DANGEROUS_KWS + _UNPUBLISH_KWS):
+            continue
+        if any(kw in blob for kw in _BUMP_KWS):
+            return a
+    return None
 
-_STOCK_RESOURCES = ("ad-values", "ad-items", "item-values", "ad-group-items",
-                    "values", "item-stocks", "stocks", "goods-values")
-_STOCK_TEXT_KWS = ("value", "content", "data", "text", "login", "key", "code",
-                   "товар", "данн", "значен", "ключ")
+
+_PRICE_RE = re.compile(r"(\d[\d\s ]*)\s*₽")
 
 
-def panel_discover_stock_sync(cookie_string: str) -> tuple[bool, object]:
+def _option_price(label: str) -> int:
+    """'7 дней - 49 ₽' -> 49. The tariff labels carry the price, which is the
+    only place the cost of a promotion is stated before buying it."""
+    m = _PRICE_RE.search(str(label))
+    if not m:
+        return 0
+    try:
+        return int(m.group(1).replace(" ", "").replace(" ", ""))
+    except ValueError:
+        return 0
+
+
+def _nova_rows_to_options(data) -> list[dict]:
+    """Превратить ответ Nova (index или associatable) в [{label, value}]."""
+    if not isinstance(data, dict):
+        return []
+    rows = data.get("resources")
+    if not isinstance(rows, list):
+        return []
+    opts = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        val = row.get("value", row.get("id"))
+        if isinstance(val, dict):                # index rows nest {value: ...}
+            val = val.get("value", val.get("id"))
+        label = row.get("display") or row.get("title")
+        if not label:
+            # у строк указателя колонки лежат в `fields`
+            for fl in (row.get("fields") or []):
+                if isinstance(fl, dict) and fl.get("value") not in (None, ""):
+                    if str(fl.get("attribute")) not in ("id",):
+                        label = str(fl.get("value"))
+                        break
+        if val in (None, ""):
+            continue
+        opts.append({"label": str(label or val), "value": val})
+    return opts
+
+
+def panel_action_field_options_sync(
+    cookie_string: str, item_id: str, action_key: str, attr: str,
+    chosen: dict | None = None, component_key: str = "",
+    depends_on: dict | None = None,
+) -> tuple[list[dict], str]:
+    """Blocking: resolve the options of a dependent action field.
+
+    «Оплата» ships as `visible: false, options: [], dependsOn: {up_id,
+    parameter_id}` — it has nothing to offer until the term is chosen, and the
+    panel then asks the server to re-resolve it. That request is what is
+    reproduced here: PATCH, the dependency values as the body, and the field's
+    own `dependentComponentKey` as the `component` parameter, exactly as Nova's
+    form does. Several route shapes are tried because the action variant is not
+    the same across Nova versions; whatever each answered is reported.
     """
-    Blocking: find the Nova resource used for stock (остатки) and return its
-    creation form so we know exactly what to fill.
-    Returns (True, {"resource": str, "fields": [{attribute,label,required,
-    component,options}]}) or (False, diagnostic_text).
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = dict(_panel_xsrf_headers(session, cookie_string))
+    hdrs.setdefault("Accept", "application/json")
+    trace: list[str] = []
+
+    # В теле едет нынешнее состояние всех полей, от которых зависит нужное.
+    values: dict = {}
+    for k in (depends_on or {}):
+        values[k] = (depends_on or {}).get(k)
+    values.update({k: v for k, v in (chosen or {}).items()})
+    values = {k: ("" if v is None else v) for k, v in values.items()}
+
+    params = {
+        "editing": "true", "editMode": "update",
+        "resources": str(item_id), "action": action_key,
+        "field": attr,
+    }
+    if component_key:
+        params["component"] = component_key
+
+    def _field_options(data) -> list[dict]:
+        """Nova отвечает на разбор либо одним полем, либо списком полей."""
+        if not isinstance(data, dict):
+            return []
+        candidates = []
+        if data.get("attribute"):
+            candidates.append(data)
+        candidates.extend(_parse_nova_fields_payload(data))
+        for a in (data.get("actions") or []):
+            if isinstance(a, dict) and (not action_key
+                                        or a.get("uriKey") == action_key):
+                candidates.extend([f for f in (a.get("fields") or [])
+                                   if isinstance(f, dict)])
+        for f in candidates:
+            if isinstance(f, dict) and f.get("attribute") == attr:
+                opts = _normalize_options(f)
+                if opts:
+                    return opts
+        return _nova_rows_to_options(data)
+
+    # Эта панель разбирает зависимые поля действия на самом списке действий,
+    # как только переданы значения, от которых они зависят, — это измерено, а не
+    # предположено. Отдельные адреса разбора отвечают здесь 404 или 405 и
+    # оставлены только как запасной путь для панели другой версии.
+    routes = [
+        ("GET", "/nova-api/items/actions"),
+        ("PATCH", f"/nova-api/items/action-fields/{action_key}"),
+        ("PATCH", "/nova-api/items/action-fields"),
+        ("PATCH", f"/nova-api/items/actions/{action_key}/fields"),
+        ("GET", f"/nova-api/items/actions/{action_key}/fields"),
+    ]
+    for method, path in routes:
+        try:
+            if method == "PATCH":
+                r = session.patch(f"{PANEL_URL}{path}", params=params,
+                                  json=values, headers=hdrs,
+                                  timeout=(6, 12), allow_redirects=False)
+            else:
+                r = session.get(f"{PANEL_URL}{path}",
+                                params={**params, **{k: str(v) for k, v
+                                                     in values.items()}},
+                                headers=hdrs, timeout=(6, 12),
+                                allow_redirects=False)
+        except Exception as e:
+            trace.append(f"{method} {path}: {str(e)[:30]}")
+            continue
+        if r.status_code in (404, 405):
+            trace.append(f"{method} {path}: {r.status_code}")
+            continue
+        trace.append(f"{method} {path}: {r.status_code}")
+        if r.status_code != 200:
+            trace.append(f"  {r.text[:80]}")
+            continue
+        try:
+            found = _field_options(r.json())
+        except Exception:
+            continue
+        if found:
+            return found, "; ".join(trace)
+
+    # Последняя надежда: раздел, в котором способы оплаты могут лежать строками
+    stem = attr[:-3] if attr.endswith("_id") else attr
+    for guess in (f"{stem}s", "payment-systems", "payments", "wallets"):
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/{guess}",
+                            params={"perPage": "100"}, headers=hdrs,
+                            timeout=(5, 10), allow_redirects=False)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+        trace.append(f"/nova-api/{guess}: 200")
+        try:
+            found = _nova_rows_to_options(r.json())
+        except Exception:
+            continue
+        if found:
+            return found, "; ".join(trace)
+
+    return [], "; ".join(trace)[:400]
+
+
+def panel_promo_fields_sync(
+    cookie_string: str, item_id: str,
+) -> tuple[bool, object]:
+    """Blocking: describe the «Премиум» action so a tariff can be chosen.
+
+    Returns (True, {"key", "name", "fields": [{attribute, label, options,
+    required, price}]}) or (False, error). Options that Nova does not inline
+    («Оплата» is a relation, not a plain select) are fetched separately.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/items/actions",
+            params={"resources": str(item_id)},
+            headers=hdrs, timeout=(6, 10), allow_redirects=False,
+        )
+    except Exception as e:
+        return False, f"не получил список действий: {str(e)[:60]}"
+    if (dead := _panel_expired(r)):
+        return False, dead
+    if r.status_code != 200:
+        return False, f"actions: {r.status_code}"
+    try:
+        actions = [a for a in ((r.json() or {}).get("actions") or [])
+                   if isinstance(a, dict)]
+    except Exception:
+        return False, "не разобрал ответ панели"
+
+    a = _find_promo_action(actions)
+    if not a:
+        names = [(x.get("name") or x.get("uriKey") or "?") for x in actions]
+        return False, f"действие продвижения не найдено. Доступные: {names}"
+
+    out_fields = []
+    for f in (a.get("fields") or []):
+        if not isinstance(f, dict):
+            continue
+        attr = f.get("attribute")
+        if not attr:
+            continue
+        opts = _normalize_options(f)
+        for o in opts:
+            o["price"] = _option_price(o["label"])
+        out_fields.append({
+            "attribute": attr,
+            "label": f.get("name") or attr,
+            "options": opts,
+            # У «Оплаты» нет признака обязательности — панель требует её только
+            # на своей стороне, — поэтому пустое поле нельзя считать
+            # необязательным: как раз пропуск и давал отказ 422.
+            "required": "required" in str(f.get("rules", "")) or not opts,
+            "value": f.get("value"),
+            # Загружается лениво, когда известен предыдущий выбор: у зависимого
+            # поля нет вариантов, пока не выбрано то, от чего оно зависит.
+            "lookup": not opts,
+            # Что нужно Nova, чтобы разобрать это поле позже: за какими полями
+            # оно следит и какой ключ её собственная форма шлёт как `component`.
+            "depends_on": f.get("dependsOn") or {},
+            "component_key": f.get("dependentComponentKey") or "",
+            "shape": (f"component={f.get('component')} "
+                      f"rel={f.get('relationshipType') or f.get('belongsToRelationship') or '—'} "
+                      f"keys={sorted(f.keys())[:14]}")[:250] if not opts else "",
+        })
+    return True, {"key": a.get("uriKey"), "name": a.get("name") or "Премиум",
+                  "item_id": str(item_id), "fields": out_fields}
+
+
+_URL_RE = re.compile(r"https?://[^\s\"'<>\\]{6,300}")
+
+
+def _find_url(node) -> str:
+    """Первая http(s)-ссылка где угодно в разобранном ответе.
+
+    Ссылку на оплату искали под собственными ключами Nova — redirect,
+    openInNewTab, download, — и её там не оказалось: форма ответа этой панели
+    не совпадает со стандартной. Вместо того чтобы гадать следующее имя ключа,
+    обыскивается вся структура.
+    """
+    if isinstance(node, str):
+        m = _URL_RE.search(node)
+        return m.group(0) if m else ""
+    if isinstance(node, dict):
+        # Ключи, прямо называющие ссылку, важнее упомянутой где-то в тексте
+        for k, v in node.items():
+            if isinstance(v, str) and any(
+                    t in str(k).lower() for t in
+                    ("url", "link", "redirect", "pay", "invoice", "href")):
+                m = _URL_RE.search(v)
+                if m:
+                    return m.group(0)
+        for v in node.values():
+            found = _find_url(v)
+            if found:
+                return found
+    if isinstance(node, list):
+        for v in node:
+            found = _find_url(v)
+            if found:
+                return found
+    return ""
+
+
+# На отвергнутое действие Nova отвечает HTTP 200, а причину кладёт в тело, —
+# то есть код ответа не говорит о том, случилось ли хоть что-нибудь.
+_REFUSAL_KWS = (
+    "нет прав", "не авторизов", "запрещ", "недоступ", "не удалось",
+    "невозможно", "ошибк", "not authorized", "not allowed", "sorry",
+)
+
+
+def _action_result(resp, fallback: str) -> tuple[bool, str]:
+    """Whether a Nova action actually did anything, and what it said.
+
+    «Премиум» is paid through an external payment system, so a real success
+    means an invoice was created and the answer carries a link to it. A refusal
+    arrives as 200 too — under `danger`, or as a message that plainly says no —
+    and must not be reported as a promotion that went through.
+    """
+    raw = (resp.text or "").strip()
+    try:
+        data = _json.loads(raw or "{}")
+    except Exception:
+        data = None
+
+    url = _find_url(data) if data is not None else ""
+    if not url:
+        m = _URL_RE.search(raw)
+        url = m.group(0) if m else ""
+
+    text, refused = "", False
+    if isinstance(data, dict):
+        if data.get("danger"):
+            text, refused = str(data["danger"]), True
+        else:
+            text = str(data.get("message") or "")
+    if not refused and text and any(k in text.lower() for k in _REFUSAL_KWS):
+        refused = True
+
+    if refused:
+        return False, text
+    if url:
+        return True, f"{text or fallback}\n🔗 Оплата: {url}"
+    if text:
+        return True, text
+    # Ни ссылки, ни сообщения: показываем, что вернулось, иначе продвижение,
+    # тихо не сделавшее ничего, выглядит точно так же, как сработавшее.
+    body = raw[:250] if raw else f"пустой ответ, код {resp.status_code}"
+    return False, f"панель ничего не вернула. Ответ: {body}"
+
+
+def panel_bump_item_sync(
+    cookie_string: str, item_id: str, uid: int | None = None,
+    confirm: bool = False, params: dict | None = None,
+) -> tuple[bool, str]:
+    """Blocking: promote one listing via the panel's «Премиум» Nova action.
+
+    This is a PAID action on Yoomarket, so it refuses to run unless the caller
+    passes confirm=True. If the action needs parameters, they are reported
+    rather than guessed — submitting arbitrary values could buy the wrong
+    placement.
+
+    Returns (ok, message_or_diagnostics).
     """
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
     trace: list[str] = []
 
-    for res in _STOCK_RESOURCES:
-        try:
-            r = session.get(
-                f"{PANEL_URL}/nova-api/{res}/creation-fields"
-                f"?editing=true&editMode=create",
-                headers=hdrs, timeout=(6, 12), allow_redirects=False,
+    actions: list[dict] = []
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/items/actions",
+            params={"resources": str(item_id)},
+            headers=hdrs, timeout=(6, 10), allow_redirects=False,
+        )
+        trace.append(f"actions: {r.status_code}")
+        if (dead := _panel_expired(r)):
+            return False, dead
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                actions = [a for a in (data.get("actions") or [])
+                           if isinstance(a, dict)]
+    except Exception as e:
+        return False, f"не получил список действий: {str(e)[:60]}"
+
+    names = [(a.get("name") or a.get("uriKey") or "?") for a in actions]
+    for a in actions:
+        name = str(a.get("name") or "").lower()
+        key = str(a.get("uriKey") or "")
+        if not key:
+            continue
+        blob = name + " " + key.lower()
+        if any(kw in blob for kw in _DANGEROUS_KWS + _UNPUBLISH_KWS):
+            continue
+        if not any(kw in blob for kw in _BUMP_KWS):
+            continue
+
+        if not confirm:
+            return False, (
+                f"«{a.get('name') or key}» — платное действие. "
+                f"Запуск только с подтверждением."
             )
-        except Exception as e:
-            trace.append(f"{res}: {str(e)[:40]}")
-            continue
-        if r.status_code == 401:
-            return False, "401: сессия панели истекла — войдите снова"
-        if r.status_code != 200:
-            trace.append(f"{res}: {r.status_code}")
-            continue
-        try:
-            cf = r.json()
-        except Exception:
-            trace.append(f"{res}: bad JSON")
-            continue
-        if not isinstance(cf, dict):
-            continue
-        fields = _parse_nova_fields_payload(cf)
-        if not fields:
-            trace.append(f"{res}: пустые поля")
-            continue
-        out = []
+
+        # Обязательные параметры не выдумываются никогда — это покупка. Они
+        # приходят из тарифа, выбранного продавцом; нет их — так и говорим.
+        fields = [f for f in (a.get("fields") or []) if isinstance(f, dict)]
+        chosen = {k: v for k, v in (params or {}).items() if v not in (None, "")}
+        # И не только те поля, что Nova помечает обязательными: у «Оплаты»
+        # такого признака нет, а требует её панель на своей стороне. Всё, что
+        # действие спрашивает и на что у него нет своего значения по умолчанию,
+        # обязано прийти из выбранного тарифа.
+        missing = [
+            f.get("name") or f.get("attribute")
+            for f in fields
+            if f.get("attribute") not in chosen
+            and f.get("value") in (None, "")
+        ]
+        if missing:
+            return False, (
+                f"«{a.get('name') or key}»: не выбран тариф ({', '.join(map(str, missing))}). "
+                f"Открой «⭐ Премиум продвижение» → «⚙️ Тариф»."
+            )
+
+        payload = {"resources": str(item_id)}
         for f in fields:
             attr = f.get("attribute")
-            if not attr:
-                continue
-            out.append({
-                "attribute": attr,
-                "label": f.get("name") or attr,
-                "required": "required" in str(f.get("rules", [])),
-                "component": f.get("component", ""),
-                "options": _normalize_options(f),
-                "relationship": f.get("relationshipType")
-                or f.get("belongsToRelationship") or "",
-            })
-        return True, {"resource": res, "fields": out,
-                      "trace": "; ".join(trace)[:200]}
+            val = f.get("value")
+            if attr and val not in (None, ""):
+                payload[attr] = val
+        payload.update(chosen)
+        try:
+            resp = session.post(
+                f"{PANEL_URL}/nova-api/items/action?action={key}",
+                data=payload, headers=hdrs, timeout=(6, 15),
+            )
+            trace.append(f"action {key}: {resp.status_code}")
+            if resp.status_code in (200, 201, 204):
+                _save_refreshed_cookies(uid, cookie_string, session)
+                return _action_result(resp, str(a.get("name") or key))
+            if resp.status_code in (402, 422, 500):
+                try:
+                    msg = (_json.loads(resp.text) or {}).get("message") or ""
+                except Exception:
+                    msg = resp.text[:200]
+                # Кончившиеся деньги — обычный исход, а не поломка: говорим об
+                # этом прямо, а не цитируем свалку проверок.
+                if any(k in msg.lower() for k in
+                       ("недостаточно", "не хватает", "средств", "баланс",
+                        "insufficient", "not enough")):
+                    return False, f"💸 не хватает денег на балансе: {msg[:150]}"
+            if resp.status_code == 422:
+                # Действию нужны параметры. Описываем их, а не подставляем
+                # выдуманные значения: это действие тратит деньги.
+                spec = []
+                for f in fields:
+                    opts = _normalize_options(f)
+                    spec.append(
+                        f"{f.get('attribute')} | {f.get('name')}"
+                        + (f" | варианты: {[o['label'] for o in opts][:6]}"
+                           if opts else "")
+                        + (" | обязательное" if "required" in str(f.get("rules", ""))
+                           else ""))
+                return False, (
+                    f"«{a.get('name') or key}» требует данные.\n"
+                    f"Ответ: {msg[:200]}\n"
+                    f"Поля действия: {spec or 'не описаны'}")
+        except Exception as e:
+            trace.append(f"action {key}: {str(e)[:40]}")
 
-    return False, ("не нашёл ресурс остатков.\n"
-                   f"Проверено: <code>{', '.join(_STOCK_RESOURCES)}</code>\n"
-                   f"Лог: <code>{'; '.join(trace)[:300]}</code>")
+    _save_refreshed_cookies(uid, cookie_string, session)
+    return False, (f"действие продвижения не найдено. "
+                   f"Доступные: {names or 'нет'}; лог: {'; '.join(trace)[:200]}")
 
 
-def panel_add_stock_sync(
-    cookie_string: str, item_id: str, lines: list[str],
-    uid: int | None = None,
-) -> tuple[bool, str]:
-    """
-    Blocking: add stock rows (остатки) to an item. `lines` is the product data
-    the seller pasted — one row per line (keys/accounts/etc). Returns (ok, msg).
-    """
-    ok, form = panel_discover_stock_sync(cookie_string)
+def panel_bump_all_sync(
+    cookie_string: str, uid: int | None = None, confirm: bool = False,
+    params: dict | None = None, limit: int = 0,
+    only_ids: list | None = None,
+) -> tuple[int, str]:
+    """Блокирующая: поднять товары через панель → (сколько, сообщение)."""
+    ok, items = panel_list_items_sync(cookie_string)
     if not ok:
-        return False, str(form)
-    resource = form["resource"]
-    fields = form["fields"]
+        return 0, f"⚠️ {items}"
+    if not items:
+        return 0, "ℹ️ Нет объявлений"
+    if only_ids:
+        wanted = {str(i) for i in only_ids}
+        items = [it for it in items if str(it.get("id")) in wanted]
+        if not items:
+            return 0, ("ℹ️ Выбранных товаров нет в панели — обнови выбор "
+                       "в «Премиум продвижении»")
 
-    # the field that links a stock row to its item (belongsTo ad/item)
-    link_attr = next(
-        (f["attribute"] for f in fields
-         if f.get("relationship") or f["attribute"] in ("ad", "item", "ad_id", "item_id")),
-        None,
-    )
-    # the field that holds the actual product text
-    text_attr = next(
-        (f["attribute"] for f in fields
-         if any(k in f["attribute"].lower() or k in str(f["label"]).lower()
-                for k in _STOCK_TEXT_KWS)),
-        None,
-    )
-    if not text_attr:
-        attrs = [f["attribute"] for f in fields]
-        return False, (f"не понял, в какое поле писать товар.\n"
-                       f"Ресурс: <code>{resource}</code>\n"
-                       f"Поля: <code>{attrs}</code>")
+    count = 0
+    refused = 0
+    last = ""
+    links: list[str] = []
+    for it in items:
+        item_id = it.get("id")
+        if not item_id:
+            continue
+        if limit and count >= limit:
+            last = f"остановился на {limit} — упёрся в потолок трат"
+            break
+        done, msg = panel_bump_item_sync(cookie_string, item_id, uid, confirm,
+                                         params)
+        if done:
+            count += 1
+            # Каждое поднятие оплачивается отдельно, поэтому важна каждая ссылка
+            for line in str(msg).splitlines():
+                if "http" in line:
+                    links.append(f"{it.get('title') or item_id}: {line.strip()}")
+        else:
+            last = msg
+            # Nova разрешает действие по каждой записи отдельно, поэтому отказ на
+            # одном товаре ничего не говорит о следующем: такие считаются и
+            # пропускаются. Проход останавливает только поломка, которая повторится
+            # на каждом товаре.
+            if "нет прав" in msg.lower() or "не авторизов" in msg.lower():
+                refused += 1
+                continue
+            if any(k in msg for k in ("не найдено", "401", "подтвержд",
+                                      "требует", "тариф", "не хватает")):
+                break
+    if count:
+        out = f"✅ Оформлено: {count}"
+        if refused:
+            out += f"\n⛔ Панель отказала по {refused} объявлениям"
+        if last and not refused:
+            out += f"\n{last}"
+        if links:
+            out += "\n\n" + "\n".join(links[:10])
+        return count, out
+    if refused:
+        return 0, (f"⛔ Панель отказала по всем {refused} объявлениям: {last}\n"
+                   f"Обычно так бывает, пока профиль магазина не прошёл "
+                   f"проверку или объявления не активны.")
+    return 0, f"⚠️ Не удалось поднять: {last}"
+
+
+# ---------------------------------------------------------------------------
+# Вывод средств через панель
+#
+# В Integration API адреса вывода нет вовсе — все пути /withdraw, которые бот
+# перебирал, были догадками и отвечали 404. На Юмаркете выплата делается в
+# панели и, вероятнее всего, создаётся как запись Nova (сумма + способ +
+# реквизиты) — так же, как создаётся товар. Точная её форма неизвестна,
+# поэтому о ней ничего не гадается: сперва структура читается из самой панели
+# (`panel_finance_probe_sync`, команда `/withdraw_debug`), и только потом
+# собирается настоящий запрос. Вывод УНОСИТ ДЕНЬГИ, поэтому
+# `panel_withdraw_sync` отказывается работать без confirm=True и не выдумывает
+# значение ни одного поля.
+# ---------------------------------------------------------------------------
+
+_FINANCE_RES = ("withdrawals", "withdrawal", "withdraws", "withdraw", "payouts",
+                "payout", "finances", "finance", "wallet", "wallets", "balance",
+                "balances", "transactions", "transaction", "payments",
+                "operations", "vyvod", "vyvody", "cashout", "cashouts")
+_WITHDRAW_KWS = ("вывод", "вывести", "withdraw", "payout", "cash", "вывода",
+                 "снятие", "выплат")
+# Какой раздел баланса и какое действие панель использует на самом деле.
+# Подтверждено самой панелью через /withdraw_debug: вывод — это действие Nova
+# «Вывести» (uriKey «вывести») на разделе `balances`, того же рода, что
+# «Премиум» на `items`, а не создаваемая запись.
+_BALANCE_RES = "balances"
+_WITHDRAW_ACTION_KWS = ("вывести", "вывод", "withdraw", "payout")
+_EXCHANGE_KWS = ("обмен", "обменять", "exchange", "convert")
+
+
+def _find_withdraw_action(actions: list[dict]) -> dict | None:
+    """The «Вывести» action, never the «Обменять» one next to it."""
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        key = str(a.get("uriKey") or "")
+        blob = str(a.get("name") or "").lower() + " " + key.lower()
+        if any(k in blob for k in _EXCHANGE_KWS):
+            continue
+        if any(k in blob for k in _WITHDRAW_ACTION_KWS):
+            return a
+    return None
+
+
+def panel_balances_sync(cookie_string: str) -> tuple[bool, object]:
+    """Блокирующая: строки баланса продавца — номер, валюта, сумма.
+
+    Вывод средств — это действие над одной из этих строк, поэтому её номер
+    нужен, чтобы его выполнить, а суммы говорят, в какой строке лежат деньги.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    try:
+        r = session.get(f"{PANEL_URL}/nova-api/{_BALANCE_RES}",
+                        params={"perPage": "50"}, headers=hdrs,
+                        timeout=(6, 12), allow_redirects=False)
+    except Exception as e:
+        return False, str(e)[:80]
+    if (dead := _panel_expired(r)):
+        return False, dead
+    if r.status_code != 200:
+        return False, f"balances → {r.status_code}"
+    try:
+        rows = (r.json() or {}).get("resources") or []
+    except Exception:
+        return False, "не разобрал ответ панели"
+
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rid = row.get("id")
+        if isinstance(rid, dict):
+            rid = rid.get("value", rid.get("id"))
+        currency = amount = ""
+        for f in (row.get("fields") or []):
+            if not isinstance(f, dict):
+                continue
+            fn = str(f.get("name") or "").lower()
+            fa = str(f.get("attribute") or "").lower()
+            val = _strip_html(f.get("value"))
+            if any(t in fn + fa for t in ("валют", "currency", "тип", "type")):
+                currency = currency or val
+            elif any(t in fn + fa for t in ("сумм", "amount", "баланс",
+                                            "balance", "остат", "value")):
+                amount = amount or val
+        out.append({"id": str(rid), "currency": currency, "amount": amount,
+                    "raw": row})
+    return True, out
+
+
+def panel_withdraw_fields_sync(
+    cookie_string: str, balance_id: str, chosen: dict | None = None,
+) -> tuple[bool, object]:
+    """Blocking: describe the «Вывести» action so a payout can be filled in.
+
+    Returns (True, {"key", "name", "balance_id", "fields": [...]}) or
+    (False, error). `chosen` (e.g. {"system": 56}) is passed to Nova so the
+    form reshapes to that choice — after a payment system is picked, the
+    requisites it needs (card / wallet / phone / bank) turn visible and
+    required, and a dependent select like «Банк» gains its options. Reading the
+    form again with the choice made is how those become known, rather than
+    hardcoding which method needs what.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    params = {"resources": str(balance_id)}
+    for k, v in (chosen or {}).items():
+        if v not in (None, ""):
+            params[k] = v
+    try:
+        r = session.get(f"{PANEL_URL}/nova-api/{_BALANCE_RES}/actions",
+                        params=params, headers=hdrs,
+                        timeout=(6, 10), allow_redirects=False)
+    except Exception as e:
+        return False, f"не получил действия баланса: {str(e)[:60]}"
+    if (dead := _panel_expired(r)):
+        return False, dead
+    if r.status_code != 200:
+        return False, f"actions: {r.status_code}"
+    try:
+        actions = [a for a in ((r.json() or {}).get("actions") or [])
+                   if isinstance(a, dict)]
+    except Exception:
+        return False, "не разобрал ответ панели"
+
+    a = _find_withdraw_action(actions)
+    if not a:
+        names = [(x.get("name") or x.get("uriKey") or "?") for x in actions]
+        return False, f"действие вывода не найдено. Доступные: {names}"
+
+    # Это не отправляем никогда: сумму спрашивают в момент вывода, а «к
+    # получению» вычисляется и доступно только на чтение.
+    _SKIP = ("amount", "к_получению", "к_получения", "to_receive")
+    out_fields = []
+    for f in (a.get("fields") or []):
+        if not isinstance(f, dict):
+            continue
+        attr = f.get("attribute")
+        if not attr:
+            continue
+        extra = f.get("extraAttributes") or {}
+        readonly = bool(f.get("readonly") or extra.get("readonly"))
+        out_fields.append({
+            "attribute": attr,
+            "label": f.get("name") or attr,
+            "component": f.get("component", ""),
+            "options": _normalize_options(f),
+            "required": bool(f.get("required")),
+            "visible": bool(f.get("visible")),
+            "readonly": readonly,
+            "value": f.get("value"),
+            "placeholder": f.get("placeholder") or "",
+            "help": _strip_html(f.get("helpText")),
+            "is_amount": attr == "amount",
+            "skip": attr in _SKIP or readonly,
+            "depends_on": f.get("dependsOn") or {},
+            "component_key": f.get("dependentComponentKey") or "",
+        })
+    return True, {"key": a.get("uriKey"), "name": a.get("name") or "Вывести",
+                  "balance_id": str(balance_id), "fields": out_fields}
+
+
+def withdraw_limits(fields: list) -> dict:
+    """Per-payout limits, read from the form's own help text.
+
+    The «Сумма» field explains itself: «Минимальная сумма: 40 ₽»,
+    «Максимальная сумма: 75 000 ₽», «Комиссия: 3% от суммы (мин. 30 ₽)».
+    Auto-withdraw was submitting the entire balance, which a shop holding more
+    than the per-payout ceiling can never pass — so the ceiling is read rather
+    than assumed, and read from the panel so a change to it follows along.
+
+    Returns {"min": float, "max": float, "fee_pct": float, "fee_min": float};
+    a value the text does not state comes back 0.
+    """
+    import re as _re
+    text = " ".join(str(f.get("help") or "") + " " + str(f.get("label") or "")
+                    for f in (fields or []) if isinstance(f, dict))
+    text = text.replace("\u00a0", " ")
+
+    def num(pattern: str) -> float:
+        m = _re.search(pattern, text, _re.I)
+        if not m:
+            return 0.0
+        try:
+            return float(m.group(1).replace(" ", "").replace(",", "."))
+        except (TypeError, ValueError):
+            return 0.0
+
+    return {
+        "min": num(r"минимальн\w*\s+сумм\w*\s*:?\s*([\d\s.,]+)"),
+        "max": num(r"максимальн\w*\s+сумм\w*\s*:?\s*([\d\s.,]+)"),
+        "fee_pct": num(r"комисси\w*\s*:?\s*([\d.,]+)\s*%"),
+        "fee_min": num(r"мин\.?\s*([\d\s.,]+)\s*₽"),
+    }
+
+
+def panel_withdraw_limits_sync(cookie_string: str, balance_id: str,
+                               chosen: dict | None = None) -> tuple[bool, object]:
+    """Blocking: the payout limits the panel states for this balance.
+
+    The choice of payment system has to be passed in. Read without it, the
+    «Сумма» field comes back `visible: false` with `helpText: null` and
+    `dependsOn: {"system": null}` — the limits simply are not in the form yet.
+    They appear once the system is chosen, which is also when they can differ
+    between СБП, Steam and crypto, so reading them per-system is not merely a
+    workaround but the correct question.
+    """
+    ok, got = panel_withdraw_fields_sync(cookie_string, balance_id, chosen)
+    if not ok or not isinstance(got, dict):
+        return False, got
+    return True, withdraw_limits(got.get("fields") or [])
+
+
+def _finance_resource_names(session, hdrs) -> tuple[list[str], list[str]]:
+    """(все uriKey разделов панели, из них похожие на финансовые)."""
+    keys: list[str] = []
+    for path in ("/nova-api/resources", "/nova-api/navigation"):
+        try:
+            r = session.get(PANEL_URL + path, headers=hdrs, timeout=(6, 12),
+                            allow_redirects=False)
+            if r.status_code == 200:
+                keys += re.findall(r'"uriKey"\s*:\s*"([^"]+)"', r.text)
+        except Exception:
+            continue
+    keys = sorted(set(keys))
+    finance = [k for k in keys
+               if any(t in k.lower() for t in
+                      ("withdraw", "payout", "finance", "wallet", "balance",
+                       "transaction", "payment", "vyvod", "cash"))]
+    return keys, finance
+
+
+def panel_finance_probe_sync(cookie_string: str) -> tuple[bool, str]:
+    """Блокирующая: показать, что панель даёт для вывода средств.
+
+    Это разведка, а не действие: денег не двигает. Перечисляет разделы Nova,
+    помечает похожие на финансовые и для каждого пробует прочитать форму
+    «создать вывод», чтобы её поля — сумма, способ, реквизиты — были увидены
+    точно, а не додуманы.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    out: list[str] = []
+
+    keys, finance = _finance_resource_names(session, hdrs)
+    out.append(f"ресурсов панели: {len(keys)}")
+    if keys:
+        out.append("все: " + ", ".join(keys)[:400])
+    out.append(f"похожие на финансы: {finance or 'нет по названию'}")
+
+    # Пробуем вероятные имена разделов, даже если навигация их не назвала:
+    # разделы Nova часто доступны, не появляясь в меню.
+    seen = []
+    for res in list(dict.fromkeys(finance + list(_FINANCE_RES))):
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/{res}",
+                            params={"perPage": "1"}, headers=hdrs,
+                            timeout=(5, 9), allow_redirects=False)
+        except Exception as e:
+            continue
+        if r.status_code in (404,):
+            continue
+        seen.append(f"{res}→{r.status_code}")
+        if r.status_code != 200:
+            continue
+        # Он есть — читаем его форму создания и все действия
+        out.append(f"\n=== /nova-api/{res} → 200 ===")
+        try:
+            rows = (r.json() or {}).get("resources") or []
+            out.append(f"записей: {len(rows)}")
+        except Exception:
+            pass
+        for cf_path in (f"/nova-api/{res}/creation-fields",):
+            try:
+                cr = session.get(PANEL_URL + cf_path,
+                                 params={"editing": "true", "editMode": "create"},
+                                 headers=hdrs, timeout=(6, 10),
+                                 allow_redirects=False)
+                out.append(f"{cf_path} → {cr.status_code}")
+                if cr.status_code == 200:
+                    fields = _parse_nova_fields_payload(cr.json())
+                    for f in fields:
+                        opts = _normalize_options(f)
+                        out.append(
+                            f"  • {f.get('attribute')} | {f.get('name')} | "
+                            f"{f.get('component')}"
+                            + (f" | обязат." if "required" in str(f.get('rules', '')) else "")
+                            + (f" | варианты: {[o['label'] for o in opts][:6]}" if opts else ""))
+            except Exception as e:
+                out.append(f"{cf_path}: {str(e)[:50]}")
+        # Actions on the resource (withdrawal could be an action, like «Премиум»)
+        try:
+            ar = session.get(f"{PANEL_URL}/nova-api/{res}/actions",
+                             headers=hdrs, timeout=(6, 10), allow_redirects=False)
+            if ar.status_code == 200:
+                acts = [(a.get("name"), a.get("uriKey"))
+                        for a in ((ar.json() or {}).get("actions") or [])
+                        if isinstance(a, dict)]
+                if acts:
+                    out.append(f"  действия: {acts}")
+        except Exception:
+            pass
+
+    out.append(f"\nпроверено ресурсов: {seen or 'ничего не ответило'}")
+
+    # Действие «Вывести» и есть настоящий механизм: печатаем его поля сырьём,
+    # так же как /promo_debug делает для «Премиума», — чтобы форма вывода
+    # (сумма, способ, реквизиты) была увидена точно до того, как к ней что-то
+    # подключат.
+    ok_b, balances = panel_balances_sync(cookie_string)
+    if ok_b and isinstance(balances, list) and balances:
+        out.append("\n=== БАЛАНСЫ ===")
+        for bl in balances:
+            out.append(f"  id={bl['id']} | {bl['currency']} | {bl['amount']}")
+        bid = None
+        for bl in balances:                     # prefer a row that holds money
+            try:
+                if float(str(bl["amount"]).replace(" ", "").replace(",", ".") or 0) > 0:
+                    bid = bl["id"]
+                    break
+            except ValueError:
+                continue
+        bid = bid or balances[0]["id"]
+        try:
+            ar = session.get(f"{PANEL_URL}/nova-api/{_BALANCE_RES}/actions",
+                             params={"resources": str(bid)}, headers=hdrs,
+                             timeout=(6, 10), allow_redirects=False)
+            out.append(f"\n=== действие «Вывести» (balance #{bid}) → "
+                       f"{ar.status_code} ===")
+            if ar.status_code == 200:
+                acts = [a for a in ((ar.json() or {}).get("actions") or [])
+                        if isinstance(a, dict)]
+                a = _find_withdraw_action(acts)
+                if not a:
+                    out.append(f"не нашёл среди {[x.get('uriKey') for x in acts]}")
+                else:
+                    out.append(f"uriKey: {a.get('uriKey')}")
+                    for f in (a.get("fields") or []):
+                        if isinstance(f, dict):
+                            out.append("• " + _json.dumps(f, ensure_ascii=False)[:900])
+        except Exception as e:
+            out.append(f"действие: {str(e)[:60]}")
+
+    return True, "\n".join(out)
+
+
+def panel_withdraw_sync(
+    cookie_string: str, balance_id: str, action_key: str, values: dict,
+    uid: int | None = None, confirm: bool = False,
+) -> tuple[bool, str]:
+    """Blocking: run the «Вывести» action on a balance — MOVES MONEY OUT.
+
+    Refuses without confirm=True, and submits only the field values it was
+    given, plus the balance id the action runs on: no money-moving field is
+    ever invented. `values` is what the seller filled from
+    panel_withdraw_fields_sync (amount, method, requisites).
+    """
+    if not confirm:
+        return False, "вывод не подтверждён"
+    if not values:
+        return False, "не заданы поля вывода — сначала настрой способ и сумму"
+    if not action_key:
+        return False, "не известен ключ действия вывода"
 
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
-    added = 0
-    last_err = ""
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        payload = {text_attr: line}
-        if link_attr:
-            payload[link_attr] = str(item_id)
+    payload = {"resources": str(balance_id)}
+    payload.update({k: v for k, v in values.items() if v not in (None, "")})
+    try:
+        r = session.post(
+            f"{PANEL_URL}/nova-api/{_BALANCE_RES}/action?action={action_key}",
+            data=payload, headers=hdrs, timeout=(6, 20), allow_redirects=False)
+    except Exception as e:
+        return False, f"запрос не прошёл: {str(e)[:80]}"
+
+    if (dead := _panel_expired(r)):
+        return False, dead
+    if r.status_code in (200, 201, 204):
+        # Отвергнутое действие тоже отвечает 200, а причина лежит в теле —
+        # та же ловушка, что была с «Премиумом», поэтому смотрим на ответ, а не
+        # на код.
+        ok, text = _action_result(r, "Заявка на вывод создана")
+        if ok:
+            _save_refreshed_cookies(uid, cookie_string, session)
+        return ok, text
+    if r.status_code == 422:
         try:
-            r = session.post(
-                f"{PANEL_URL}/nova-api/{resource}?editing=true&editMode=create",
-                json=payload, headers=hdrs, timeout=(6, 15),
-            )
+            body = r.json()
+            msg = body.get("message") or ""
+            errs = body.get("errors") or {}
+        except Exception:
+            msg, errs = r.text[:200], {}
+        detail = "; ".join(f"{k}: {v[0] if isinstance(v, list) else v}"
+                           for k, v in list(errs.items())[:5])
+        return False, f"панель не приняла: {msg} {detail}".strip()
+    return False, f"панель ответила {r.status_code}: {r.text[:150]}"
+
+
+# ---------------------------------------------------------------------------
+# Чат поддержки и модерации — ответ через панель
+#
+# Integration API отказывается писать в чат без активного заказа
+# (`no_active_orders_in_chat`), а это любая переписка с поддержкой. Значит
+# отправлять надо через панель, где прошлый перебор получил 401 — скорее всего
+# потому, что чату нужен Bearer-токен, вшитый в страницу, а не куки Laravel.
+# Проба ниже находит этот токен и настоящий адрес отправки, ничего при этом не
+# отправляя; сам ответ шлёт `panel_chat_send_sync`.
+# ---------------------------------------------------------------------------
+
+def _extract_bearer(html: str) -> str:
+    """Токен чат-API, вшитый в страницу панели, если он там есть."""
+    for pat in (r'"api_token"\s*:\s*"([^"]{20,})"',
+                r'"access_token"\s*:\s*"([^"]{20,})"',
+                r'"bearer"\s*:\s*"([^"]{20,})"',
+                r'"token"\s*:\s*"([A-Za-z0-9._\-]{30,})"',
+                r'Bearer\s+([A-Za-z0-9._\-]{30,})'):
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def panel_chat_probe_sync(cookie_string: str, chat_id: str,
+                          api_token: str = "") -> tuple[bool, str]:
+    """Блокирующая, только чтение: выяснить, как панель отправляет письмо в чат.
+
+    Ничего не отправляет. Читает страницу чата, выкапывает Bearer-токен, если он
+    там есть, пробует вероятные адреса отправки куками (а если куки отвечают
+    401 — то токеном) и просматривает скрипты страницы в поисках адреса POST,
+    куда уходит ответ.
+
+    `api_token` — это тот самый bearer Integration API, которым чат уже
+    читается: он пробуется против чат-API панели, потому что именно его,
+    скорее всего, и хранит приложение.
+    """
+    cid = "".join(ch for ch in str(chat_id) if ch.isdigit()) or str(chat_id)
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    # Sanctum считает запрос с куками вошедшим, только если тот выглядит как
+    # запрос от приложения, — а это означает заголовок Origin, а не один Referer.
+    stateful = {**hdrs, "Origin": PANEL_URL, "Referer": f"{PANEL_URL}/chats/{cid}"}
+    out: list[str] = []
+
+    have = sorted({c.name for c in session.cookies})
+    out.append("куки: " + (", ".join(have) or "нет"))
+    out.append("есть laravel_session: "
+               + ("да" if any("session" in c.lower() for c in have) else "НЕТ"))
+    out.append("есть XSRF-TOKEN: "
+               + ("да" if any("xsrf" in c.lower() for c in have) else "НЕТ"))
+
+    token = ""
+    page_js: list[str] = []
+    for page in ("/", f"/chats/{cid}"):
+        try:
+            r = session.get(PANEL_URL + page, timeout=(6, 15))
         except Exception as e:
-            last_err = str(e)[:80]
+            out.append(f"{page}: {str(e)[:50]}")
             continue
-        if r.status_code in (200, 201):
-            added += 1
-        elif r.status_code == 422:
-            last_err = f"422: {r.text[:200]}"
-            break  # same error will repeat for every row
-        else:
-            last_err = f"HTTP {r.status_code}: {r.text[:120]}"
-    _save_refreshed_cookies(uid, cookie_string, session)
-    if added:
-        msg = f"добавлено позиций: {added}"
-        if last_err:
-            msg += f" (часть с ошибкой: {last_err})"
-        return True, msg
-    return False, last_err or "ничего не добавлено"
+        if not token:
+            token = _extract_bearer(r.text)
+        page_js += re.findall(r'src="(/[^"]+\.js[^"]*)"', r.text)
+    out.append(f"Bearer на странице: {'найден' if token else 'нет'}")
+
+    def _get(path, extra=None):
+        try:
+            r = session.get(PANEL_URL + path, headers={**hdrs, **(extra or {})},
+                            timeout=(5, 10), allow_redirects=False)
+        except Exception as e:
+            return f"{path}: {str(e)[:40]}"
+        if r.status_code == 404:
+            return ""
+        return f"{path} → {r.status_code}: {r.text[:80].strip()}"
+
+    out.append("\n— чтение с куками —")
+    for p in (f"/api/chats/{cid}/messages", f"/api/chats/{cid}"):
+        line = _get(p)
+        if line:
+            out.append(line)
+
+    # Решающая проверка: тот же вызов, но помеченный как запрос от приложения.
+    out.append("\n— то же, но с Origin (Sanctum stateful) —")
+    for p in (f"/api/chats/{cid}/messages", f"/api/chats/{cid}"):
+        line = _get(p, stateful)
+        if line:
+            out.append(line)
+
+    # Пробуем ещё хост Nova и путь под веб-охраной — на случай, если чат
+    # вообще не /api/-ресурс.
+    out.append("\n— другие хосты/гварды —")
+    for p in (f"/nova-api/chats/{cid}", f"/nova-vendor/chat/{cid}/messages",
+              f"/chats/{cid}/messages"):
+        line = _get(p, stateful)
+        if line:
+            out.append(line)
+
+    # Bearer Integration API, которым этот чат уже читается, — самый вероятный
+    # токен из тех, что приложение держит в localStorage. Пробуем его и против
+    # API панели, и напрямую против хоста API маркетплейса.
+    if api_token:
+        out.append("\n— с интеграционным Bearer —")
+        bearer = {**stateful, "Authorization": f"Bearer {api_token}"}
+        for p in (f"/api/chats/{cid}/messages", f"/api/chats/{cid}"):
+            line = _get(p, bearer)
+            if line:
+                out.append(line)
+        import requests as _rq
+        for base in ("https://api.yoo.market", "https://api.yoo.market/v1",
+                     "https://api.yoo.market/app/v1"):
+            for p in (f"/chats/{cid}/messages", f"/chats/{cid}"):
+                try:
+                    rr = _rq.get(base + p, headers={
+                        "Authorization": f"Bearer {api_token}",
+                        "Accept": "application/json"},
+                        timeout=(5, 10), verify=False)
+                except Exception as e:
+                    continue
+                if rr.status_code == 404:
+                    continue
+                out.append(f"{base}{p} → {rr.status_code}: {rr.text[:80].strip()}")
+
+    # Просматриваем основные сборки: где адреса чата и как к ним цепляют доступ.
+    out.append("\n— в JS —")
+    sends, auth = set(), set()
+    for src in list(dict.fromkeys(page_js))[:8]:
+        try:
+            js = session.get(PANEL_URL + src, timeout=(6, 20)).text
+        except Exception:
+            continue
+        for m in re.findall(r'[`"\']([^`"\']*chats?/[^`"\']*)[`"\']', js, re.I):
+            if 4 < len(m) < 70:
+                sends.add(m)
+        for m in re.findall(r'(Authorization|Bearer|sanctum|localStorage\.\w+'
+                            r'|withCredentials)', js, re.I):
+            auth.add(m.lower())
+    out.append(f"адреса с 'chat': {sorted(sends)[:15] or 'ничего'}")
+    out.append(f"признаки авторизации: {sorted(auth)[:10] or 'ничего'}")
+    return True, "\n".join(out)
+
+
+def panel_chat_send_sync(
+    cookie_string: str, chat_id: str, text: str,
+    chat_token: str = "", endpoint: str = "",
+) -> tuple[bool, str]:
+    """Блокирующая: отправить письмо в чат поддержки или модерации.
+
+    Чат-API проверяет доступ по Bearer-токену, который панель кладёт в
+    localStorage при входе (куки там отвечают 401). `chat_token` — это он,
+    снятый при входе и переданный сюда из сохранённых данных. Без него
+    подтвердить доступ нечем, и функция так и говорит, а не пытается угадать.
+    """
+    if not chat_token:
+        return False, ("нет токена чата — войди в панель заново, чтобы бот "
+                       "получил его (кнопка «Войти по email»)")
+
+    import requests as _rq
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    _rq.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    cid = "".join(ch for ch in str(chat_id) if ch.isdigit()) or str(chat_id)
+    hdrs = {
+        "Authorization": f"Bearer {chat_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": PANEL_URL,
+        "Referer": f"{PANEL_URL}/chats/{cid}",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+    }
+    # Оба хоста, с которых отдаётся чат-API; панель первой.
+    targets = []
+    if endpoint:
+        targets.append(PANEL_URL + (endpoint if endpoint.startswith("/") else "/" + endpoint))
+    targets += [
+        f"{PANEL_URL}/api/chats/{cid}/messages",
+        f"{PANEL_URL}/api/chats/{cid}/send",
+        f"https://api.yoo.market/chats/{cid}/messages",
+        f"https://api.yoo.market/v1/chats/{cid}/messages",
+    ]
+    payloads = ({"text": text}, {"message": text}, {"body": text})
+    last = ""
+    for url in targets:
+        for body in payloads:
+            try:
+                r = _rq.post(url, json=body, headers=hdrs,
+                             timeout=(6, 15), verify=False, allow_redirects=False)
+            except Exception as e:
+                last = str(e)[:80]
+                continue
+            if r.status_code in (200, 201, 204):
+                return True, "✅ Отправлено в поддержку"
+            if r.status_code == 404:
+                break                      # this url is wrong, next url
+            last = f"{r.status_code}: {r.text[:100]}"
+            if r.status_code in (401, 403):
+                return False, ("токен чата не подошёл (401). Войди в панель "
+                               "заново, чтобы бот обновил токен.")
+    return False, f"не удалось отправить: {last or 'адрес не найден'}"
 
 
 def panel_list_categories_sync(cookie_string: str) -> tuple[bool, object]:
-    """Blocking: seller's categories derived from their items.
-    Returns (True, [{"name": str, "count": int}]) or (False, error)."""
-    ok, items = panel_list_items_sync(cookie_string, with_category=True)
+    """Блокирующая: разделы продавца, выведенные из его же товаров.
+
+    Отдаёт (True, [{"name": str, "count": int}]) либо (False, ошибка).
+    """
+    ok, items = panel_list_items_sync(cookie_string)
     if not ok:
         return False, items
     counts: dict[str, int] = {}
@@ -1005,9 +2559,43 @@ def panel_list_categories_sync(cookie_string: str) -> tuple[bool, object]:
     return True, cats
 
 
-def panel_list_items_sync(cookie_string: str, with_category: bool = False) -> tuple[bool, object]:
-    """Blocking: list items from the panel. Returns (True, [{id,title,price}])
-    or (False, error)."""
+# Атрибуты, прямо называющие раздел; всякий другой belongsTo принимается как
+# более слабый запасной признак для группировки.
+_CAT_ATTRS = ("category", "subcategory", "categories", "type", "ad", "game",
+              "group", "adGroup", "ad_group", "product")
+
+
+def _strip_html(value) -> str:
+    """Простой текст из Nova ComputedField, который рисует сырой HTML."""
+    if not isinstance(value, str):
+        return "" if value is None else str(value)
+    text = re.sub(r"<[^>]+>", " ", value)
+    import html as _h
+    return " ".join(_h.unescape(text).split())
+
+
+def _html_badges(value) -> list[str]:
+    """Texts of the <span> badges inside a ComputedField.
+
+    The listing rows carry no category field; what a seller reads as the
+    category lives in these badges of the «Детали» column.
+    """
+    if not isinstance(value, str):
+        return []
+    import html as _h
+    out = []
+    for chunk in re.findall(r"<span[^>]*>(.*?)</span>", value, re.S | re.I):
+        txt = " ".join(_h.unescape(re.sub(r"<[^>]+>", " ", chunk)).split())
+        if txt:
+            out.append(txt)
+    return out
+
+
+def panel_list_items_sync(cookie_string: str) -> tuple[bool, object]:
+    """Блокирующая: список товаров из панели.
+
+    Отдаёт (True, [{id, title, price}]) либо (False, ошибка).
+    """
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
     try:
@@ -1018,8 +2606,8 @@ def panel_list_items_sync(cookie_string: str, with_category: bool = False) -> tu
         )
     except Exception as e:
         return False, f"ошибка запроса: {str(e)[:60]}"
-    if r.status_code == 401:
-        return False, "401: сессия панели истекла — войдите снова"
+    if (dead := _panel_expired(r)):
+        return False, dead
     if r.status_code != 200:
         return False, f"HTTP {r.status_code}: {r.text[:150]}"
     try:
@@ -1037,8 +2625,15 @@ def panel_list_items_sync(cookie_string: str, with_category: bool = False) -> tu
         raw_fields = res.get("fields")
         if isinstance(raw_fields, dict):
             raw_fields = list(raw_fields.values())
-        info = {"id": str(rid), "title": "", "price": "", "public": None,
-                "category": "", "stock": None}
+        # Отображаемое имя строки Nova держит на самом разделе; опора только на
+        # поле с именем «title» оставляла каждый товар подписанным «Товар <номер>».
+        row_title = res.get("title") or res.get("display") or ""
+        if isinstance(row_title, dict):
+            row_title = row_title.get("value") or ""
+        info = {"id": str(rid), "title": str(row_title or ""), "price": "",
+                "public": None, "category": "", "stock": None, "badges": []}
+        cat_rank = 99  # lower = better source for the grouping label
+        seen_attrs: list[str] = []
         _vis_kws = ("public", "visible", "active", "published", "status",
                     "hidden", "публич", "видим", "актив", "показ", "скрыт")
         for f in raw_fields or []:
@@ -1046,25 +2641,53 @@ def panel_list_items_sync(cookie_string: str, with_category: bool = False) -> tu
                 continue
             fa = str(f.get("attribute", ""))
             fn = str(f.get("name", ""))
-            if fa == "title":
-                info["title"] = str(f.get("value") or "")
-            elif fa == "price":
-                info["price"] = str(f.get("value") or "")
-            elif fa in ("category", "subcategory") or "категор" in fn.lower():
-                # belongsTo → value may be an object/label
+            if fa:
+                seen_attrs.append(fa)
+            if not info["title"] and (
+                    fa in ("title", "name", "naimenovanie")
+                    or "title" in fa.lower() or "name" in fa.lower()
+                    or "назван" in fn.lower() or "наимен" in fn.lower()):
+                v = f.get("value")
+                if isinstance(v, dict):
+                    v = v.get("title") or v.get("name") or v.get("display")
+                if v not in (None, ""):
+                    info["title"] = str(v)
+            elif not info["price"] and (
+                    "price" in fa.lower() or "цен" in fn.lower()
+                    or "стоим" in fn.lower()):
+                # ComputedField рисует это как HTML: "<div …>149 ₽</div>"
+                txt = _strip_html(f.get("value")).replace("₽", "").strip()
+                if txt:
+                    info["price"] = txt
+            elif "детал" in fn.lower() or "detail" in fa.lower():
+                # В значках лежит то, что продавец читает как раздел
+                badges = _html_badges(f.get("value"))
+                if badges and cat_rank > 1:
+                    info["category"] = badges[0]
+                    cat_rank = 1
+                    info["badges"] = badges[:6]
+            elif (fa in _CAT_ATTRS or "категор" in fn.lower()
+                  or f.get("belongsToRelationship") or f.get("belongsToId")):
+                # Значение для группировки — это belongsTo. На этой панели товар
+                # висит на родительском объявлении (игре, продукте), а не на поле,
+                # буквально названном «category», поэтому годится любой belongsTo —
+                # но с приоритетом, чтобы настоящий раздел всё же побеждал родителя.
                 v = f.get("value")
                 label = ""
                 if isinstance(v, dict):
-                    label = str(v.get("title") or v.get("name") or v.get("display") or "")
+                    label = str(v.get("title") or v.get("name")
+                                or v.get("display") or v.get("label") or "")
                 elif v not in (None, ""):
                     label = str(v)
-                if label and not info["category"]:
-                    info["category"] = label
+                if label:
+                    rank = 0 if fa in _CAT_ATTRS or "категор" in fn.lower() else 1
+                    if rank < cat_rank:
+                        info["category"] = label
+                        cat_rank = rank
             elif any(k in fa.lower() or k in fn.lower()
                      for k in ("count", "quantity", "stock", "остат", "количеств")):
-                v = f.get("value")
                 try:
-                    info["stock"] = int(float(str(v)))
+                    info["stock"] = int(float(str(f.get("value"))))
                 except (TypeError, ValueError):
                     pass
             elif info["public"] is None and any(
@@ -1079,6 +2702,10 @@ def panel_list_items_sync(cookie_string: str, with_category: bool = False) -> tu
                     info["public"] = (not on) if inverted else on
                 elif isinstance(val, (int, float)):
                     info["public"] = (not bool(val)) if inverted else bool(val)
+        if not info["category"] or not info["title"]:
+            logger.info(
+                "item %s: title=%r category=%r; attrs=%s",
+                info["id"], info["title"], info["category"], seen_attrs[:20])
         if info["id"] and info["id"] != "None":
             items.append(info)
     return True, items
@@ -1087,7 +2714,7 @@ def panel_list_items_sync(cookie_string: str, with_category: bool = False) -> tu
 def panel_delete_item_sync(
     cookie_string: str, item_id: str, uid: int | None = None,
 ) -> tuple[bool, str]:
-    """Blocking: delete an item via the standard Nova delete endpoint."""
+    """Блокирующая: удалить товар обычным адресом удаления Nova."""
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
     try:
@@ -1105,7 +2732,7 @@ def panel_delete_item_sync(
 
 
 def _find_image_url(value) -> str:
-    """Dig a usable http image URL out of a media field value."""
+    """Выкопать пригодный http-адрес картинки из значения поля медиа."""
     if isinstance(value, list):
         for item in value:
             url = _find_image_url(item)
@@ -1127,10 +2754,13 @@ def _find_image_url(value) -> str:
 
 
 def _field_submit_value(f: dict):
-    """Get a resubmittable scalar for a Nova field value.
-    BelongsTo/select fields expose the chosen id in `belongsToId` or as a nested
-    object in `value` — a plain str(value) would send the label and break the
-    create (this is why clone lost category/subcategory/type → 422)."""
+    """Скаляр, пригодный к повторной отправке, из значения поля Nova.
+
+    Поля BelongsTo и списки держат выбранный номер в `belongsToId` либо
+    вложенным объектом в `value`: простой `str(value)` отправил бы НАДПИСЬ и
+    сломал создание. Именно из-за этого копия теряла раздел, подраздел и тип и
+    получала 422.
+    """
     if f.get("belongsToId") is not None:
         return f.get("belongsToId")
     rel = str(f.get("relationshipType") or f.get("belongsToRelationship") or "")
@@ -1148,8 +2778,11 @@ def _field_submit_value(f: dict):
 def panel_clone_item_sync(
     cookie_string: str, item_id: str, uid: int | None = None,
 ) -> tuple[bool, str]:
-    """Blocking: create a copy of an item — same fields, photo re-downloaded
-    from the panel and re-uploaded to the new item."""
+    """Блокирующая: создать копию товара.
+
+    Поля те же; фотография скачивается из панели заново и загружается к новому
+    товару.
+    """
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
     fields, err = _get_update_fields(session, hdrs, item_id)
@@ -1210,6 +2843,152 @@ def panel_clone_item_sync(
     return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
 
 
+# Панель запрещает ссылки в описании товара, кроме короткого белого списка.
+# Узнано живым отказом 19.08:
+#   {"content": ["Ссылки запрещены. Разрешены только: Warface, YouTube,
+#    Rutube, VKVideo, Google Диск, Яндекс Диск, Майл Диск"]}
+# Проверка нужна заранее: без неё продавец проходит все пять шагов мастера и
+# получает отказ на последнем, когда всё уже введено.
+PANEL_LINK_ALLOWED = ("warface", "youtube.com", "youtu.be", "rutube",
+                      "vkvideo", "vk.video", "drive.google", "disk.yandex",
+                      "cloud.mail", "mail.ru")
+
+# Домены ловим по концу: «roblox.com» — ссылка, «1.500 руб» — нет.
+# Хост берётся ЦЕЛИКОМ, вместе с поддоменами: из «disk.yandex.ru» иначе
+# доставалось «yandex.ru», и белый список не срабатывал — то есть разрешённый
+# сервис объявлялся запрещённым.
+_LINK_RE = re.compile(
+    r"(https?://\S+|www\.\S+|\b[a-z0-9][a-z0-9.-]*\.(?:com|ru|net|org|io|gg"
+    r"|me|tv|app|dev|xyz|site|online|shop|store|club|pro|info|biz|cc|to)\b)",
+    re.IGNORECASE)
+
+
+def link_trouble(text: str) -> str:
+    """Ссылка в тексте, которую панель не примет. Пусто — таких нет.
+
+    Возвращает саму находку, а не «да/нет»: продавцу надо показать, что
+    именно править, иначе он будет искать её в своём же описании глазами.
+    """
+    for found in _LINK_RE.findall(str(text or "")):
+        low = str(found).lower()
+        if any(good in low for good in PANEL_LINK_ALLOWED):
+            continue
+        return str(found)
+    return ""
+
+
+# Как панель называет поля и как их называет продавец.
+_PANEL_FIELDS = {
+    "content": "описание", "title": "название", "price": "цена",
+    "images": "фото", "category": "категория", "subcategory": "подкатегория",
+    "type": "тип товара", "has_points": "остатки",
+}
+
+
+# Разметка, которой мы сами размечаем отчёты. Чужой текст внутри них
+# экранируется, а вместе с ним буквами вылезали и эти теги: продавец видел
+# «Ресурс <b>items</b> найден» — в его сообщении так и было написано,
+# угловыми скобками. Убираем их, а не экранируем: отчёт нужен читаемым, а не
+# точным до символа. Что осталось похожим на тег — уйдёт под `html.escape`.
+_OUR_TAGS = re.compile(r"</?(?:b|i|u|s|code|pre|tg-spoiler)>", re.I)
+
+
+def as_plain(raw: str, limit: int = 0) -> str:
+    """Отчёт как простой текст: без нашей разметки и без чужих тегов.
+
+    Обрезка — по границе слова, а не по счёту символов. Прежняя обрывала
+    посреди слова («…"subcategor»), и продавец, пересылая это в поддержку,
+    отправлял огрызок.
+    """
+    text = _OUR_TAGS.sub("", str(raw or ""))
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if limit and len(text) > limit:
+        cut = text[:limit]
+        space = max(cut.rfind(" "), cut.rfind("\n"))
+        text = (cut[:space] if space > limit * 0.6 else cut).rstrip() + "…"
+    return text
+
+
+def _first_json_object(text: str) -> dict | None:
+    """Первый полный объект JSON в тексте отчёта.
+
+    Берём именно первый, а не «от первой скобки до последней»: в отчёте их
+    два — отказ панели и наше «Отправлено: {…}», — и жадный захват давал
+    невалидный JSON, то есть молчание вместо объяснения.
+    """
+    decoder = _json.JSONDecoder()
+    at = str(text or "").find("{")
+    while at >= 0:
+        try:
+            body, _end = decoder.raw_decode(text[at:])
+            if isinstance(body, dict):
+                return body
+        except ValueError:
+            pass
+        at = text.find("{", at + 1)
+    return None
+
+
+def validation_fields(raw: str) -> list[str]:
+    """Какие поля панель назвала в отказе — их имена, а не объяснение.
+
+    Отдельно от `explain_validation`, потому что ответы на этом разные:
+    продавцу нужен текст, мастеру — список полей, которые надо спросить и
+    отправить заново. Отказ 422 называет недостающее поле прямым текстом
+    (`{"filter__8": ["Поле Регион обязательно для заполнения."]}`), и не
+    спросить после этого — значит оставить продавца в тупике, зная выход.
+    """
+    body = _first_json_object(raw)
+    if not body:
+        return []
+    out: list[str] = []
+    for field, complaints in body.items():
+        name = str(field)
+        # Значения отказа — список жалоб или строка. Всё прочее (наше
+        # «Отправлено», где по ключам лежат значения товара) — не отказ.
+        if isinstance(complaints, list) and complaints and all(
+                isinstance(c, str) for c in complaints):
+            out.append(name)
+    return out
+
+
+def explain_validation(raw: str) -> str:
+    """Отказ панели по полям — по-русски и по делу. Пусто, если не разобрали.
+
+    Панель отвечает `{"content": ["Ссылки запрещены. …"]}`, а продавец видел
+    это как есть, внутри отладочной простыни: сообщение на экране было, а
+    прочитать в нём, что делать, было нельзя.
+    """
+    body = _first_json_object(str(raw or ""))
+    if not body:
+        return ""
+    out: list[str] = []
+    for field, complaints in body.items():
+        if isinstance(complaints, str):
+            complaints = [complaints]
+        if not isinstance(complaints, list):
+            continue
+        known = _PANEL_FIELDS.get(str(field), str(field))
+        for complaint in complaints[:2]:
+            said = str(complaint).strip()
+            # Имя поля впереди нужно не всегда. «filter__8: Поле Регион
+            # обязательно для заполнения» читается как заикание: панель уже
+            # назвала поле по-русски, и техническое имя только мешает —
+            # найти его можно в подробностях отчёта.
+            #
+            # А вот «filter__7: Обязательное» без имени не значит ничего, и
+            # такое поле лучше показать по-английски, чем промолчать.
+            # Различает их сама панель: своё имя поля она пишет словом
+            # «Поле» в начале жалобы.
+            names_itself = said.lower().startswith("поле ")
+            already = known.lower() in said.lower()
+            if names_itself or already:
+                out.append(f"• {said}")
+            else:
+                out.append(f"• {known}: {said}")
+    return "\n".join(out)
+
+
 def panel_create_product_sync(
     cookie_string: str,
     title: str,
@@ -1221,12 +3000,15 @@ def panel_create_product_sync(
     extra: dict | None = None,
     photo_path: str | None = None,
 ) -> tuple[bool, str]:
-    """
-    Blocking function — call via loop.run_in_executor().
-    Creates a product via the Laravel Nova API using `requests` with socket timeouts.
-    If uid is given, refreshed session cookies are saved back to storage.
-    `extra` — exact Nova attribute values (e.g. category/subcategory/type ids
-    chosen by the user) merged into the payload last, overriding the mapping.
+    """Блокирующая — вызывать через loop.run_in_executor().
+
+    Создаёт товар через Laravel Nova API, ходя `requests` с таймаутами на
+    сокете. Если задан `uid`, обновившиеся куки сессии сохраняются обратно в
+    хранилище.
+
+    `extra` — точные значения атрибутов Nova (например, номера раздела,
+    подраздела и типа, выбранные продавцом); подмешиваются в тело последними и
+    перекрывают сопоставление.
     """
     import urllib.parse
     import requests
@@ -1239,7 +3021,7 @@ def panel_create_product_sync(
     session = requests.Session()
     session.verify = False
 
-    # Load cookies from the stored cookie string
+    # Загружаем куки из сохранённой строки
     for part in cookie_string.split(";"):
         part = part.strip()
         if "=" in part:
@@ -1264,9 +3046,10 @@ def panel_create_product_sync(
         pass
 
     xsrf = ""
-    # Don't use cookies.get(): it raises CookieConflictError when the token
-    # exists for several domains (our preset cookie + a fresh server one).
-    # Iterate and prefer the last (freshest) match instead.
+    # Не пользуемся cookies.get(): он бросает CookieConflictError, когда
+    # токен существует для нескольких доменов — наша заранее поставленная
+    # кука и свежая серверная. Вместо этого идём перебором и берём
+    # последнее, то есть самое свежее совпадение.
     raw_xsrf = ""
     for c in session.cookies:
         if c.name in ("XSRF-TOKEN", "CSRF-TOKEN") and c.value:
@@ -1274,7 +3057,7 @@ def panel_create_product_sync(
     if raw_xsrf:
         xsrf = urllib.parse.unquote(raw_xsrf)
     if not xsrf:
-        # fallback: parse from original cookie string
+        # запасной путь: разбираем исходную строку кук
         for part in cookie_string.split(";"):
             part = part.strip()
             if "=" in part:
@@ -1289,9 +3072,10 @@ def panel_create_product_sync(
 
     debug: list[str] = [f"XSRF: {'✓' if xsrf else '✗'}"]
 
-    # Discover Nova resources.
-    # NOTE: 401/403 here is recorded but NOT fatal — 403 can mean "no access to
-    # this endpoint" while resource endpoints still work fine.
+    # Ищем разделы Nova.
+    # ВАЖНО: 401 и 403 здесь записываются, но НЕ считаются приговором — 403
+    # может означать «нет доступа к этому адресу», а сами разделы при этом
+    # прекрасно отвечают.
     resources: list[str] = []
     for nav_path in ("/nova-api/navigation", "/nova-api/resources"):
         try:
@@ -1305,8 +3089,9 @@ def panel_create_product_sync(
         except Exception as e:
             debug.append(f"{nav_path}: {str(e)[:50]}")
 
-    # Scan SPA HTML for resource uriKeys (navigation endpoint 404s on this panel,
-    # but resource names leak into the page config / router paths)
+    # Ищем uriKey разделов в HTML приложения: адрес навигации на этой панели
+    # отвечает 404, зато имена разделов просачиваются в настройки страницы и в
+    # пути роутера
     if not resources:
         try:
             html_resp = session.get(
@@ -1324,8 +3109,9 @@ def panel_create_product_sync(
         except Exception as e:
             debug.append(f"HTML scan: {str(e)[:40]}")
 
-    # Candidates to try FIRST: on this panel ad-items belongsTo "ad", so the
-    # product entity is almost certainly the "ads" resource
+    # Кандидаты, которые надо пробовать ПЕРВЫМИ: на этой панели позиции
+    # объявления висят belongsTo на «ad», значит сам товар почти наверняка —
+    # раздел «ads»
     priority = ["ads", "ad", "items", "goods", "products"]
     for d in reversed(priority):
         if d in resources:
@@ -1335,8 +3121,8 @@ def panel_create_product_sync(
         if d not in resources:
             resources.append(d)
 
-    # Remove resources that can't be the product form:
-    # groups/values/admin panels/events etc.
+    # Убираем разделы, которые формой товара быть не могут: группы, значения,
+    # админские панели, события и прочее.
     def _is_junk(name: str) -> bool:
         n = name.lower()
         if n in ("ad-groups", "ad-group", "categories", "tags", "users",
@@ -1366,14 +3152,14 @@ def panel_create_product_sync(
             debug.append(f"{res}: connect error {str(e)[:40]}")
             continue
 
-        if cf_resp.status_code == 401:
+        if _panel_expired(cf_resp):
             return False, (
                 "⚠️ <b>Панель не принимает сохранённые куки</b> "
                 f"(401 на <code>{res}/creation-fields</code>).\n\n"
-                "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
+                "Зайди в <b>Настройки → Панель продавца</b> и войди снова через email."
             )
         if cf_resp.status_code == 403:
-            # No permission for THIS resource — not a dead session, keep looking
+            # Нет прав на ЭТОТ раздел — сессия жива, ищем дальше
             debug.append(f"{res}: 403 нет доступа")
             continue
         if cf_resp.status_code == 404:
@@ -1386,15 +3172,15 @@ def panel_create_product_sync(
         try:
             cf = cf_resp.json()
         except Exception:
-            debug.append(f"{res}: bad JSON: {cf_resp.text[:100]}")
+            debug.append(f"{res}: bad JSON: {_esc(cf_resp.text[:100])}")
             continue
 
         if not isinstance(cf, dict):
             debug.append(f"{res}: not a dict ({type(cf).__name__})")
             continue
 
-        # Nova can return fields as a list, as a numeric-keyed dict
-        # ({"fields":{"2":{...}}} — seen on this panel), or nested inside panels
+        # Nova отдаёт поля списком, словарём с числовыми ключами
+        # ({"fields":{"2":{…}}} — так на этой панели) или вложенными в панели
         raw = cf.get("fields")
         if isinstance(raw, dict):
             raw_fields = list(raw.values())
@@ -1411,20 +3197,20 @@ def panel_create_product_sync(
                     raw_fields.extend(pf)
         fields = [f for f in raw_fields if isinstance(f, dict)]
         if not fields:
-            # Show raw body so we can see the actual response shape
+            # Показываем сырое тело, чтобы была видна настоящая форма ответа
             debug.append(f"{res}: no fields, body={cf_resp.text[:200]}")
             continue
 
         attrs = [f.get("attribute") for f in fields if f.get("attribute")]
 
-        # Skip resources without a price field — not a product form
+        # Раздел без поля цены пропускаем — это не форма товара
         if not any(any(kw in (a or "").lower() for kw in _PRICE_KWS) for a in attrs):
             debug.append(f"⏭ {res}: no price field ({attrs})")
             continue
 
         debug.append(f"✅ {res}: {attrs}")
 
-        # Build payload respecting max:N rules
+        # Собираем тело с оглядкой на правила вида max:N
         payload: dict = {}
         for f in fields:
             attr = f.get("attribute", "")
@@ -1455,7 +3241,7 @@ def panel_create_product_sync(
                 payload[attr] = val
         payload.setdefault("title", values["title"])
         payload.setdefault("price", values["price"])
-        # User-chosen select values (category/subcategory/type ids) win over guesses
+        # Выбранное продавцом (номера раздела, подраздела, типа) важнее догадок
         if extra:
             for k, v in extra.items():
                 if v is not None:
@@ -1465,7 +3251,7 @@ def panel_create_product_sync(
         try:
             import os as _os
             if photo_path and _os.path.exists(photo_path):
-                # Multipart: Nova file fields only accept real uploads
+                # Multipart: файловые поля Nova принимают только настоящую загрузку
                 form_data = {}
                 for k, v in payload.items():
                     if v is None:
@@ -1478,9 +3264,9 @@ def panel_create_product_sync(
                     img_bytes = fh.read()
                 fname = _os.path.basename(photo_path) or "photo.jpg"
                 post_resp = None
-                # advanced-media-library-field (Spatie Media Library for Nova)
-                # expects uploads as __media__[attribute][index]; try that first,
-                # then plain Nova file-field key formats as fallbacks
+                # advanced-media-library-field (Spatie Media Library для Nova) ждёт
+                # загрузку как __media__[атрибут][номер] — пробуем сначала это, а
+                # обычные форматы файловых полей Nova оставляем запасными
                 for file_key in ("__media__[images][0]", "images",
                                  "images[]", "images[0]"):
                     files = {file_key: (fname, img_bytes, "image/jpeg")}
@@ -1528,7 +3314,7 @@ def panel_create_product_sync(
                 f.get("attribute") for f in fields
                 if f.get("attribute") and "required" in str(f.get("rules", []))
             ]
-            # If images failed — show the field definition to identify the component
+            # Если картинки не прошли — показываем описание поля, чтобы опознать компонент
             img_diag = ""
             if "images" in err_str:
                 import os as _os2
@@ -1562,11 +3348,11 @@ def panel_create_product_sync(
                 f"Отправлено: <code>{_json.dumps(payload, ensure_ascii=False)[:200]}</code>"
             )
 
-        if post_resp.status_code == 401:
+        if _panel_expired(post_resp):
             return False, (
                 "⚠️ <b>Панель не принимает сохранённые куки</b> "
                 f"(401 на POST <code>{res}</code>).\n\n"
-                "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова."
+                "Зайди в <b>Настройки → Панель продавца</b> и войди снова."
             )
         if post_resp.status_code == 403:
             debug.append(f"POST {res}: 403 нет доступа")
@@ -1583,9 +3369,10 @@ def panel_create_product_sync(
 
 
 def panel_check_session_sync(cookie_string: str) -> tuple[bool, str]:
-    """
-    Blocking session check via requests — call through run_in_executor.
-    Returns (ok, detail) where detail lists each probe and its HTTP status.
+    """Блокирующая проверка сессии через requests — вызывать через executor.
+
+    Отдаёт (ok, подробности), где подробности перечисляют каждую пробу и её
+    код ответа.
     """
     import requests
     from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -1622,7 +3409,7 @@ def panel_check_session_sync(cookie_string: str) -> tuple[bool, str]:
             details.append(f"{path.split('?')[0]}: {str(e)[:40]}")
 
     if not ok:
-        # Last probe: does the panel root redirect to /login?
+        # Последняя проба: перебрасывает ли корень панели на /login?
         try:
             r = session.get(PANEL_URL + "/", timeout=(6, 10), allow_redirects=True)
             final = r.url or ""
@@ -1635,9 +3422,9 @@ def panel_check_session_sync(cookie_string: str) -> tuple[bool, str]:
 
 
 class PanelSession:
-    """
-    HTTP client authenticated with panel.yoomarket.net session cookies.
-    Uses the panel's internal (non-public) API — no browser needed.
+    """HTTP-клиент, работающий на сессионных куках panel.yoomarket.net.
+
+    Ходит по внутреннему, непубличному API панели — браузер не нужен.
     """
 
     def __init__(self, cookie_string: str) -> None:
@@ -1675,7 +3462,7 @@ class PanelSession:
 
     def _xsrf(self) -> str:
         import urllib.parse
-        # From cookie jar (set by server responses, e.g. /sanctum/csrf-cookie)
+        # Из набора кук — их ставят ответы сервера, например /sanctum/csrf-cookie
         try:
             jar = self._session.cookie_jar.filter_cookies(PANEL_URL)
             for name, cookie in jar.items():
@@ -1683,7 +3470,7 @@ class PanelSession:
                     return urllib.parse.unquote(cookie.value)
         except Exception:
             pass
-        # Fallback: parse from original Playwright cookie string
+        # Запасной путь: разбираем исходную строку кук от Playwright
         for part in self.cookie_string.split(";"):
             part = part.strip()
             if "=" in part:
@@ -1702,9 +3489,9 @@ class PanelSession:
         allow_redirects: bool = False,
         deadline: float = 7.0,
     ) -> tuple[int, str]:
-        """
-        Make an HTTP request with a hard asyncio deadline so TCP hangs can't block forever.
-        Returns (status_code, response_text) or (-1, error_str) on timeout/error.
+        """Запрос с жёстким сроком через asyncio, чтобы зависший TCP не держал вечно.
+
+        Отдаёт (код ответа, текст) либо (-1, текст ошибки) при таймауте или сбое.
         """
         async def _do() -> tuple[int, str]:
             kw: dict = {
@@ -1736,14 +3523,14 @@ class PanelSession:
         quantity: int = 1,
         category: str = "",
     ) -> tuple[bool, str]:
-        """
-        Create a product via the Laravel Nova API (panel is built on Nova).
-        Returns (True, product_id) or (False, error/diagnostic).
+        """Создать товар через Laravel Nova API — панель построена на Nova.
+
+        Отдаёт (True, номер товара) либо (False, ошибка или диагностика).
         """
         if not self._session:
             return False, "Сессия не запущена"
 
-        # Quick CSRF cookie grab (non-fatal if it times out)
+        # Быстро берём куку CSRF; таймаут здесь не смертелен
         await self._request("GET", PANEL_URL + "/sanctum/csrf-cookie", deadline=5.0)
 
         values = {
@@ -1756,7 +3543,7 @@ class PanelSession:
         return await self._nova_create_product(values)
 
     async def _nova_create_product(self, values: dict) -> tuple[bool, str]:
-        """Discover the Nova product resource and create it via /nova-api."""
+        """Найти раздел товаров Nova и создать товар через /nova-api."""
         xsrf = self._xsrf()
         hdrs = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
         if xsrf:
@@ -1765,7 +3552,7 @@ class PanelSession:
         debug: list[str] = []
         debug.append(f"XSRF: {'✓' if xsrf else '✗ (нет токена)'}")
 
-        # 1. Enumerate Nova resources via navigation endpoint
+        # 1. Перечисляем разделы Nova через адрес навигации
         resources: list[str] = []
         for nav_path in ("/nova-api/navigation", "/nova-api/resources"):
             status, txt = await self._request("GET", PANEL_URL + nav_path, headers=hdrs)
@@ -1780,18 +3567,19 @@ class PanelSession:
             elif status in (401, 403):
                 return False, (
                     "⚠️ <b>Сессия в панели истекла.</b>\n\n"
-                    "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
+                    "Зайди в <b>Настройки → Панель продавца</b> и войди снова через email."
                 )
 
         debug.append(f"Ресурсы из navigation: {resources or '(не найдено)'}")
 
-        # 2. Hardcoded fallbacks — goods first (SPA route is /goods → uriKey='goods')
+        # 2. Зашитые запасные варианты — товары первыми (путь приложения /goods,
+        # значит uriKey='goods')
         for d in ("goods", "products", "offers", "items", "lots", "adverts",
                   "listings", "seller-goods", "seller-products", "advertisements"):
             if d not in resources:
                 resources.append(d)
 
-        # Remove resources that are definitely not product forms
+        # Убираем разделы, которые заведомо не формы товара
         _NON_PRODUCT = {"ad-groups", "ad-group", "categories", "tags", "users",
                         "roles", "permissions", "settings", "logs", "reviews",
                         "orders", "chats", "messages", "notifications"}
@@ -1799,7 +3587,7 @@ class PanelSession:
 
         debug.append(f"Всего ресурсов для проверки: {len(resources)}")
 
-        # 3. For each candidate: check creation-fields, then POST with JSON
+        # 3. По каждому кандидату: смотрим creation-fields, потом шлём POST с JSON
         for res in resources[:6]:
             cf_url = f"{PANEL_URL}/nova-api/{res}/creation-fields"
             cf_status, cf_text = await self._request("GET", cf_url, headers=hdrs)
@@ -1807,7 +3595,7 @@ class PanelSession:
             if cf_status == 401:
                 return False, (
                     "⚠️ <b>Сессия в панели истекла.</b>\n\n"
-                    "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова через email."
+                    "Зайди в <b>Настройки → Панель продавца</b> и войди снова через email."
                 )
             if cf_status == 403:
                 debug.append(f"{res}: 403 нет доступа")
@@ -1830,7 +3618,7 @@ class PanelSession:
                 continue
 
             fields = cf.get("fields") or []
-            # Filter out non-dict entries (some Nova versions return field names as strings)
+            # Отсеиваем не-словари: часть версий Nova отдаёт имена полей строками
             fields = [f for f in fields if isinstance(f, dict)]
             if not fields:
                 debug.append(f"{res}: пустые поля")
@@ -1842,8 +3630,9 @@ class PanelSession:
                 if f.get("attribute") and "required" in str(f.get("rules", []))
             ]
 
-            # Skip non-product resources: a product form MUST have a price-like field.
-            # Resources like ad-groups (title/public_title only) are not product forms.
+            # Пропускаем разделы, которые не про товар: у формы товара ОБЯЗАНО быть
+            # поле, похожее на цену. Разделы вроде ad-groups (только title и
+            # public_title) формой товара не являются.
             _PRICE_KEYWORDS = ("price", "cost", "cena", "amount", "sum", "стоим")
             has_price_field = any(
                 any(kw in (a or "").lower() for kw in _PRICE_KEYWORDS)
@@ -1893,7 +3682,7 @@ class PanelSession:
             elif post_status in (401, 403):
                 return False, (
                     "⚠️ <b>Сессия в панели истекла.</b>\n\n"
-                    "Зайдите в <b>Настройки → Панель продавца</b> и войдите снова."
+                    "Зайди в <b>Настройки → Панель продавца</b> и войди снова."
                 )
             else:
                 debug.append(f"POST {res}: {post_status} → {text[:80]}")
@@ -1903,7 +3692,7 @@ class PanelSession:
 
     @staticmethod
     def _map_nova_fields(fields: list[dict], values: dict) -> dict:
-        """Map our title/price/description/quantity onto Nova field attributes."""
+        """Разложить наши название, цену, описание и количество по атрибутам Nova."""
         payload: dict = {}
         for f in fields:
             if not isinstance(f, dict):
@@ -1924,12 +3713,12 @@ class PanelSession:
             elif "categ" in al or "kategor" in al:
                 val = values.get("category") or None
             else:
-                # Pre-fill any existing default value Nova provides
+                # Заранее подставляем значение по умолчанию, если Nova его даёт
                 dv = f.get("value")
                 if dv not in (None, ""):
                     val = dv
             if val is not None and val != "":
-                # Respect max:N validation rule from Nova field definition
+                # Соблюдаем правило проверки max:N из описания поля Nova
                 if isinstance(val, str):
                     for rule in (f.get("rules") or []):
                         if isinstance(rule, str) and rule.startswith("max:"):
@@ -1938,8 +3727,9 @@ class PanelSession:
                             except (ValueError, IndexError):
                                 pass
                 payload[attr] = val
-        # Ensure core fields present even if Nova naming differs (no truncation needed here
-        # since these only fire when the field wasn't found by name — Nova will reject anyway)
+        # Досылаем основные поля, даже если Nova называет их иначе. Обрезать
+        # здесь незачем: это срабатывает только тогда, когда поле не нашлось по
+        # имени, — а такое Nova всё равно отвергнет.
         if "title" not in payload and values.get("title"):
             payload["title"] = values["title"]
         if "price" not in payload and values.get("price") is not None:
@@ -1947,12 +3737,12 @@ class PanelSession:
         return payload
 
     async def _discover_product_paths(self) -> tuple[list[str], str]:
-        """Download the SPA JS bundles and extract product-creation API paths."""
+        """Скачать сборки приложения и вытащить из них адреса создания товара."""
         timeout = aiohttp.ClientTimeout(total=15)
         discovered: list[str] = []
         debug: list[str] = []
         try:
-            # Fetch the SPA shell from the root
+            # Забираем каркас приложения с корня
             html = ""
             for page_path in ("/", "/goods", "/products"):
                 try:
@@ -1964,7 +3754,8 @@ class PanelSession:
                     continue
             debug.append(f"HTML {len(html)}б")
 
-            # Catch JS refs in <script src>, <link href=*.js>, modulepreload, and bare /assets/*.js
+            # Ловим ссылки на JS в <script src>, <link href=*.js>, modulepreload и
+            # в голых /assets/*.js
             js_files: list[str] = []
             js_files += re.findall(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', html, re.I)
             js_files += re.findall(r'<link[^>]+href=["\']([^"\']+\.js[^"\']*)["\']', html, re.I)
@@ -1974,7 +3765,7 @@ class PanelSession:
             debug.append(f"JS: {len(js_files)} {[s.split('/')[-1][:20] for s in js_files[:3]]}")
 
             kws = ("product", "goods", "offer", "item", "lot")
-            # Capture arguments to .post()/.put()/.patch() AND any product-ish string literal
+            # Снимаем аргументы .post()/.put()/.patch() И любые строки, похожие на товар
             post_re = re.compile(r'\.(?:post|put|patch)\(\s*["\'`]([^"\'`]{2,80})["\'`]')
             lit_re = re.compile(r'["\'`]([a-zA-Z0-9/_{}$.\-]*(?:product|goods|offer|item|lot)[a-zA-Z0-9/_{}$.\-]*)["\'`]', re.I)
             base_re = re.compile(r'baseURL\s*[:=]\s*["\'`]([^"\'`]+)["\'`]')
@@ -2003,12 +3794,12 @@ class PanelSession:
                         lit_paths.add(m)
 
             debug.append(f"JS {total_js_bytes}б base={base_url or '?'}")
-            # POST targets that mention a product keyword are the strongest candidates
+            # Адреса POST, в которых есть слово про товар, — самые сильные кандидаты
             prod_posts = [p for p in post_paths if any(k in p.lower() for k in kws)]
             debug.append(f"POST-вызовы: {sorted(post_paths)[:8]}")
             debug.append(f"Товарные литералы: {sorted(lit_paths)[:10]}")
 
-            # Build absolute /api candidate paths
+            # Собираем полные пути-кандидаты вида /api
             def _norm(p: str) -> str:
                 p = p.strip()
                 if p.startswith("http"):
@@ -2029,7 +3820,7 @@ class PanelSession:
         return discovered[:15], " | ".join(debug)
 
     async def check_session(self) -> bool:
-        """Verify cookies are still valid via authenticated API calls."""
+        """Проверить, живы ли ещё куки, — вызовами API, требующими входа."""
         if not self._session:
             return False
         timeout = aiohttp.ClientTimeout(total=10)
@@ -2038,7 +3829,7 @@ class PanelSession:
         if xsrf:
             hdrs["X-XSRF-TOKEN"] = xsrf
         try:
-            # Nova navigation endpoint — 200 = authenticated
+            # Адрес навигации Nova: 200 означает, что мы вошли
             async with self._session.get(
                 PANEL_URL + "/nova-api/navigation",
                 headers=hdrs, timeout=timeout, allow_redirects=False,
@@ -2047,7 +3838,7 @@ class PanelSession:
                     return True
                 if resp.status in (401, 403):
                     return False
-            # /api/user — standard Sanctum auth check
+            # /api/user — обычная проверка входа у Sanctum
             async with self._session.get(
                 PANEL_URL + "/api/user",
                 headers=hdrs, timeout=timeout, allow_redirects=False,
@@ -2056,7 +3847,7 @@ class PanelSession:
                     return True
                 if resp.status in (401, 403):
                     return False
-            # Fallback: redirect check (SPA may give false positive)
+            # Запасное: проверка перенаправления. Приложение может дать ложный «да»
             async with self._session.get(
                 PANEL_URL + "/", timeout=timeout, allow_redirects=True,
             ) as resp:
@@ -2066,624 +3857,897 @@ class PanelSession:
             return False
 
 
-class YooMarketPanel:
-    """Headless Chromium automation for the YooMarket seller panel."""
+def panel_item_actions_sync(cookie_string: str, item_id: str) -> str:
+    """Только чтение: какие действия Nova панель предлагает для одного товара.
 
-    def __init__(self, cookie_string: str = "") -> None:
-        self.cookie_string = cookie_string
-        self._playwright = None
-        self._browser = None
+    Нужно `/restore_debug`, чтобы установить два факта, на которые Integration
+    API ответить не может: знает ли панель этот номер вообще (номера объявлений
+    в API и номера товаров в панели не обязаны быть из одного пространства) и
+    какое действие его публикует.
 
-    async def start(self) -> None:
-        from playwright.async_api import async_playwright
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+    Ничего не выполняет — только перечисляет.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/items/actions",
+            params={"resources": str(item_id)},
+            headers=hdrs, timeout=(6, 10), allow_redirects=False,
         )
+    except Exception as e:
+        return f"запрос не удался: {str(e)[:80]}"
+    if r.status_code != 200:
+        return f"HTTP {r.status_code} — панель не отдала действия"
+    try:
+        actions = (r.json() or {}).get("actions") or []
+    except Exception:
+        return "ответ не разобран"
+    if not actions:
+        return "действий нет (id не знаком панели?)"
+    names = [f"{a.get('name') or '?'}[{a.get('uriKey') or '?'}]"
+             for a in actions if isinstance(a, dict)]
+    return ", ".join(names)[:400]
 
-    async def close(self) -> None:
+
+def panel_resource_census_sync(cookie_string: str, needle: str = "") -> str:
+    """Только чтение: все разделы панели с числом строк и парой имён.
+
+    След ошибок обрезается на нескольких сотнях знаков, поэтому проход,
+    обошедший десяток разделов, показывал первые два и прятал ответ. Здесь
+    обходится тот же список и печатается целиком, а раздел, в строках которого
+    встретилось `needle`, помечается: он-то и говорит, где лежат товары.
+    """
+    import re as _re
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+
+    def key(t) -> str:
+        return _re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", "", str(t or "")).lower()
+
+    want = key(needle)
+    names = list(_ITEM_RESOURCES)
+    for r in panel_discover_resources_sync(cookie_string):
+        if r not in names:
+            names.append(r)
+
+    lines: list[str] = []
+    for res in names:
         try:
-            if self._browser:
-                await self._browser.close()
+            r = session.get(f"{PANEL_URL}/nova-api/{res}",
+                            params={"perPage": "100"}, headers=hdrs,
+                            timeout=(6, 12), allow_redirects=False)
         except Exception as e:
-            logger.warning("Error closing browser: %s", e)
+            lines.append(f"{res}: ошибка {str(e)[:30]}")
+            continue
+        if r.status_code != 200:
+            continue                      # 404 is noise; only what exists matters
         try:
-            if self._playwright:
-                await self._playwright.stop()
-        except Exception as e:
-            logger.warning("Error stopping playwright: %s", e)
-
-    async def _new_authenticated_page(self):
-        """Create a page with session cookies pre-loaded."""
-        if not self._browser:
-            await self.start()
-        context = await self._browser.new_context()
-        if self.cookie_string:
-            cookies = _parse_cookies(self.cookie_string)
-            if cookies:
-                await context.add_cookies(cookies)
-        return await context.new_page(), context
-
-    # ------------------------------------------------------------------
-    # Email OTP login flow (interactive — called step by step from handlers)
-    # ------------------------------------------------------------------
-
-    async def open_login_page(self) -> tuple[object, object]:
-        """Open a fresh browser context at the login page. Returns (page, context)."""
-        if not self._browser:
-            await self.start()
-        context = await self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Mobile Safari/537.36"
-            ),
-        )
-        page = await context.new_page()
-        try:
-            await page.goto(PANEL_URL + "/login", timeout=20000, wait_until="domcontentloaded")
+            rows = [x for x in ((r.json() or {}).get("resources") or [])
+                    if isinstance(x, dict)]
         except Exception:
-            pass
-        # Let the SPA render the form
-        await asyncio.sleep(3)
-        return page, context
-
-    async def submit_email(self, page, email: str) -> tuple[bool, str]:
-        """
-        Fill the email field and click "Получить код".
-        Returns (True, '') on success, (False, error) on failure.
-        """
-        try:
-            # Fill email — first try standard selectors, then JS fallback
-            filled = await _fill_first(page, _EMAIL_SELECTORS, email)
-            if not filled:
-                try:
-                    ok = await page.evaluate(
-                        """(email) => {
-                            const inputs = [...document.querySelectorAll('input')];
-                            for (const inp of inputs) {
-                                const t = inp.type.toLowerCase();
-                                const p = (inp.placeholder || '').toLowerCase();
-                                if (t === 'email' || p.includes('почт') || p.includes('mail')) {
-                                    inp.focus();
-                                    inp.value = email;
-                                    inp.dispatchEvent(new Event('input', {bubbles:true}));
-                                    inp.dispatchEvent(new Event('change', {bubbles:true}));
-                                    return true;
-                                }
-                            }
-                            return false;
-                        }""",
-                        email,
-                    )
-                    filled = bool(ok)
-                except Exception:
-                    pass
-
-            if not filled:
-                html = await page.content()
-                return False, f"Поле email не найдено.\nHTML: <code>{html[:300]}</code>"
-
-            # Small pause so Vue can register the value before we click
-            await asyncio.sleep(0.4)
-
-            # Click button or press Enter
-            clicked = await _click_first(page, _SEND_CODE_SELECTORS)
-            if not clicked:
-                try:
-                    await page.keyboard.press("Enter")
-                    clicked = True
-                except Exception:
-                    pass
-
-            if not clicked:
-                html = await page.content()
-                return False, f"Кнопка «Получить код» не найдена.\nHTML: <code>{html[:300]}</code>"
-
-            # Wait for the browser to finish the form-submission network request,
-            # then give the SPA a moment to re-render the code input.
-            try:
-                await page.wait_for_load_state("networkidle", timeout=8000)
-            except Exception:
-                pass
-            await asyncio.sleep(1)
-
-            # If already navigated away from login — logged in without code
-            if "/login" not in page.url:
-                return True, "__already_logged_in__"
-
-            logger.info("Email submitted OK, url=%s", page.url)
-            return True, ""
-
-        except Exception as e:
-            logger.error("submit_email error: %s", e)
-            return False, str(e)
-
-    async def submit_code(self, page, context, code: str) -> tuple[bool, str]:
-        """
-        Enter OTP code and submit. Handles both single-input and multi-digit inputs.
-        Returns (True, cookie_string) on success, (False, error) otherwise.
-        """
-        try:
-            code = code.strip()
-            filled = False
-
-            # Strategy 1: standard selectors (single input field)
-            filled = await _fill_first(page, _CODE_SELECTORS, code)
-
-            if not filled:
-                # Strategy 2: multi-digit OTP (separate <input maxlength="1"> per digit)
-                try:
-                    digit_inputs = await page.query_selector_all('input[maxlength="1"]')
-                    if len(digit_inputs) >= 4:
-                        for i, el in enumerate(digit_inputs):
-                            if i < len(code):
-                                await el.click()
-                                await el.type(code[i])
-                        filled = True
-                except Exception:
-                    pass
-
-            if not filled:
-                # Strategy 3: JavaScript — fill any visible code-like input,
-                # dispatching Vue/React events so the reactive form updates
-                try:
-                    ok = await page.evaluate(
-                        """(code) => {
-                            const inputs = [...document.querySelectorAll(
-                                'input:not([type="email"]):not([type="hidden"])')];
-                            const visible = inputs.filter(i => i.offsetParent !== null);
-                            if (!visible.length) return false;
-                            // Prefer inputs that look like OTP
-                            let target = visible.find(i => {
-                                const p = (i.placeholder || '').toLowerCase();
-                                const n = (i.name || '').toLowerCase();
-                                return p.includes('код') || p.includes('code') ||
-                                       n === 'code' || n === 'otp' || n === 'token';
-                            }) || visible[0];
-                            target.focus();
-                            target.value = code;
-                            target.dispatchEvent(new Event('input', {bubbles:true}));
-                            target.dispatchEvent(new Event('change', {bubbles:true}));
-                            return true;
-                        }""",
-                        code,
-                    )
-                    if ok:
-                        filled = True
-                except Exception:
-                    pass
-
-            if not filled:
-                # Strategy 4: keyboard type (last resort)
-                try:
-                    await page.keyboard.type(code)
-                    filled = True
-                except Exception:
-                    pass
-
-            if not filled:
-                # Collect diagnostics for the user
-                try:
-                    inputs_info = await page.evaluate(
-                        "() => [...document.querySelectorAll('input')].map(i=>"
-                        "({type:i.type,name:i.name,placeholder:i.placeholder,maxlength:i.maxLength}))"
-                    )
-                except Exception:
-                    inputs_info = []
-                html = await page.content()
-                return False, (
-                    f"Поле для кода не найдено.\n"
-                    f"Inputs: <code>{str(inputs_info)[:300]}</code>\n"
-                    f"HTML: <code>{html[:200]}</code>"
-                )
-
-            await asyncio.sleep(0.5)
-
-            # Submit: click button or press Enter
-            submitted = await _click_first(page, _CONFIRM_SELECTORS)
-            if not submitted:
-                try:
-                    await page.keyboard.press("Enter")
-                except Exception:
-                    pass
-
-            # Wait for SPA router to navigate away from /login
-            try:
-                await page.wait_for_function(
-                    "() => !window.location.pathname.includes('/login')",
-                    timeout=12000,
-                )
-            except Exception:
-                pass
-
-            await asyncio.sleep(1.5)
-            cur_url = page.url
-
-            if "/login" not in cur_url and "/auth" not in cur_url and "/signin" not in cur_url:
-                cookies = await context.cookies()
-                cookie_string = "; ".join(
-                    f"{c['name']}={c['value']}" for c in cookies
-                    if c.get("domain", "").endswith("yoomarket.net")
-                )
-                if not cookie_string:
-                    cookie_string = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-                logger.info("Login OK: %d cookies, url=%s", len(cookies), cur_url)
-                return True, cookie_string
-
-            # Still on login — extract error message via JS
-            try:
-                err_text = await page.evaluate(
-                    """() => {
-                        const sels = ['.error','.alert','[class*="error" i]',
-                                      '.v-alert','[role="alert"]','.notification',
-                                      'p[class*="red"]','span[class*="red"]'];
-                        for (const s of sels) {
-                            const el = document.querySelector(s);
-                            if (el && el.textContent.trim())
-                                return el.textContent.trim().slice(0,200);
-                        }
-                        return null;
-                    }"""
-                )
-            except Exception:
-                err_text = None
-
-            if err_text:
-                return False, f"❌ {err_text}"
-
-            html = await page.content()
-            return False, f"Код не принят (html={len(html)}б, url={cur_url})"
-
-        except Exception as e:
-            logger.error("submit_code error: %s", e)
-            return False, str(e)
-
-    # ------------------------------------------------------------------
-    # Session check
-    # ------------------------------------------------------------------
-
-    async def check_session(self) -> bool:
-        """Returns True if the session cookies are still valid."""
-        page, context = await self._new_authenticated_page()
-        try:
-            await page.goto(PANEL_URL + "/", timeout=15000)
-            await page.wait_for_load_state("networkidle", timeout=15000)
-            url = page.url
-            if "/login" in url or "/auth" in url or "/signin" in url:
-                return False
-            login_input = await page.query_selector('input[type="email"], input[name="login"]')
-            return login_input is None
-        except Exception as e:
-            logger.warning("check_session error: %s", e)
-            return False
-        finally:
-            await page.close()
-            await context.close()
-
-    # ------------------------------------------------------------------
-    # Automation actions
-    # ------------------------------------------------------------------
-
-    async def bump_all_ads(self) -> tuple[int, str]:
-        page, context = await self._new_authenticated_page()
-        try:
-            await page.goto(PANEL_URL + "/goods", timeout=15000)
-            await page.wait_for_load_state("networkidle", timeout=15000)
-
-            if "/login" in page.url or "/auth" in page.url:
-                return 0, "❌ Сессия истекла — войди заново через бота"
-
-            bump_buttons = []
-            for selector in ['button:has-text("Поднять")', 'a:has-text("Поднять")',
-                             '[data-action="bump"]', '.bump-btn']:
-                try:
-                    buttons = await page.query_selector_all(selector)
-                    if buttons:
-                        bump_buttons = buttons
-                        break
-                except Exception:
-                    continue
-
-            if not bump_buttons:
-                return 0, "ℹ️ Кнопки поднятия не найдены"
-
-            count = 0
-            for btn in bump_buttons:
-                try:
-                    await btn.click()
-                    count += 1
-                    await asyncio.sleep(1.5)
-                except Exception as e:
-                    logger.warning("Bump click error: %s", e)
-
-            return count, (f"✅ Поднято: {count}" if count else "⚠️ Не удалось поднять")
-        except Exception as e:
-            logger.error("bump_all_ads error: %s", e)
-            return 0, f"❌ Ошибка: {e}"
-        finally:
-            await page.close()
-            await context.close()
-
-    async def restore_sold_ads(self) -> tuple[int, str]:
-        page, context = await self._new_authenticated_page()
-        try:
-            await page.goto(PANEL_URL + "/goods", timeout=15000)
-            await page.wait_for_load_state("networkidle", timeout=15000)
-
-            if "/login" in page.url or "/auth" in page.url:
-                return 0, "❌ Сессия истекла — войди заново через бота"
-
-            restore_buttons = []
-            for selector in ['button:has-text("Восстановить")', 'button:has-text("Активировать")',
-                             '[data-action="restore"]', 'a:has-text("Восстановить")']:
-                try:
-                    buttons = await page.query_selector_all(selector)
-                    if buttons:
-                        restore_buttons = buttons
-                        break
-                except Exception:
-                    continue
-
-            if not restore_buttons:
-                return 0, "ℹ️ Нет товаров для восстановления"
-
-            count = 0
-            for btn in restore_buttons:
-                try:
-                    await btn.click()
-                    count += 1
-                    await asyncio.sleep(1.5)
-                except Exception as e:
-                    logger.warning("Restore click error: %s", e)
-
-            return count, (f"✅ Восстановлено: {count}" if count else "⚠️ Не удалось восстановить")
-        except Exception as e:
-            logger.error("restore_sold_ads error: %s", e)
-            return 0, f"❌ Ошибка: {e}"
-        finally:
-            await page.close()
-            await context.close()
-
-    async def withdraw_balance(self, min_amount: int) -> tuple[bool, str]:
-        page, context = await self._new_authenticated_page()
-        try:
-            current_balance = 0.0
-            balance_found = False
-
-            for path in ["/finance", "/wallet", "/balance"]:
-                try:
-                    await page.goto(PANEL_URL + path, timeout=15000)
-                    await page.wait_for_load_state("networkidle", timeout=15000)
-                    if "/login" in page.url or "/auth" in page.url:
-                        return False, "❌ Сессия истекла — войди заново через бота"
-                    page_text = await page.inner_text("body")
-                    for pattern in [r"([\d\s]+[,.]?\d*)\s*₽", r"([\d\s]+[,.]?\d*)\s*RUB",
-                                    r"Баланс[:\s]+([\d\s]+[,.]?\d*)"]:
-                        matches = re.findall(pattern, page_text)
-                        if matches:
-                            raw = matches[0].replace(" ", "").replace(",", ".").strip()
-                            try:
-                                current_balance = float(raw)
-                                balance_found = True
-                                break
-                            except ValueError:
-                                continue
-                    if balance_found:
-                        break
-                except Exception as e:
-                    logger.warning("Balance load error on %s: %s", path, e)
-
-            if not balance_found:
-                return False, "❌ Не удалось найти баланс"
-            if current_balance < min_amount:
-                return False, f"ℹ️ Баланс {current_balance:.0f} ₽ ниже порога {min_amount} ₽"
-
-            for selector in ['button:has-text("Вывести")', 'button:has-text("Вывод")',
-                             'a:has-text("Вывести")', '[data-action="withdraw"]']:
-                try:
-                    btn = await page.query_selector(selector)
-                    if btn:
-                        await btn.click()
-                        await asyncio.sleep(1.5)
-                        break
-                except Exception:
-                    continue
-
-            try:
-                amount_input = await page.query_selector('input[type="number"], input[name="amount"]')
-                if amount_input:
-                    await amount_input.fill(str(int(current_balance)))
-                    await asyncio.sleep(0.5)
-            except Exception:
-                pass
-
-            for selector in ['button[type="submit"]', 'button:has-text("Подтвердить")', 'button:has-text("OK")']:
-                try:
-                    btn = await page.query_selector(selector)
-                    if btn:
-                        await btn.click()
-                        await asyncio.sleep(1.5)
-                        return True, f"✅ Вывод {current_balance:.0f} ₽ выполнен"
-                except Exception:
-                    continue
-
-            return True, f"⚠️ Запрос вывода отправлен ({current_balance:.0f} ₽)"
-        except Exception as e:
-            logger.error("withdraw_balance error: %s", e)
-            return False, f"❌ Ошибка: {e}"
-        finally:
-            await page.close()
-            await context.close()
-
-    async def create_product_browser(
-        self,
-        title: str,
-        price: int,
-        description: str,
-        quantity: int = 1,
-    ) -> tuple[bool, str]:
-        """Create a product by navigating the panel UI in Playwright."""
-        page, context = await self._new_authenticated_page()
-        captured: list[str] = []
-
-        async def on_request(request):
-            if request.method in ("POST", "PUT", "PATCH"):
-                captured.append(f"{request.method} {request.url}")
-
-        page.on("request", on_request)
-
-        try:
-            # 1. Go to goods list page
-            await page.goto(PANEL_URL + "/goods", timeout=20000, wait_until="domcontentloaded")
-
-            # Let JS execute and make auth API calls
-            try:
-                await page.wait_for_load_state("networkidle", timeout=12000)
-            except Exception:
-                pass
-
-            await asyncio.sleep(1)
-            cur_url = page.url
-
-            if "/login" in cur_url or "/auth" in cur_url:
-                return False, "❌ Сессия панели истекла — обнови cookies в разделе «Панель продавца»"
-
-            # Check if something rendered
-            html = await page.content()
-            try:
-                await page.wait_for_selector("button, a[href], input, [role='button']", timeout=8000)
-            except Exception:
-                return False, (
-                    f"Страница /goods не отрисовала элементы\n"
-                    f"URL: {cur_url} | html: {len(html)}б\n"
-                    f"Скорее всего cookies истекли — войдите заново в «Панель продавца»"
-                )
-
-            # 2. Find and click the "create" / "add" button
-            create_clicked = False
-            for sel in [
-                'button:has-text("Создать")', 'button:has-text("Добавить")',
-                'a:has-text("Создать")', 'a:has-text("Добавить")',
-                'button:has-text("+ ")', 'a[href*="create"]', 'a[href*="add"]',
-                '[data-action="create"]', '.create-btn', '.add-btn',
-                'button:has-text("Новый")', 'a:has-text("Новый")',
-            ]:
-                el = await page.query_selector(sel)
-                if el:
-                    await el.click()
-                    create_clicked = True
-                    logger.info("Clicked create button with selector: %s", sel)
+            lines.append(f"{res}: ответ не разобран")
+            continue
+        titles = [_row_title(x) or "?" for x in rows]
+        hit = ""
+        if want:
+            for t in titles:
+                if want[:20] in key(t) or key(t)[:20] in want:
+                    hit = f"  ⬅️ СОВПАЛО: {t[:40]}"
                     break
+        lines.append(f"{res}: {len(rows)} — "
+                     + ", ".join(t[:26] for t in titles[:3]) + hit)
+    return "\n".join(lines) or "панель не отдала ни одного ресурса"
 
-            if not create_clicked:
-                # Dump all buttons for diagnostics
-                buttons = await page.query_selector_all("button, a")
-                texts = []
-                for b in buttons[:20]:
-                    try:
-                        t = (await b.inner_text()).strip()[:30]
-                        if t:
-                            texts.append(t)
-                    except Exception:
-                        pass
-                return False, f"Кнопка создания не найдена на /goods\nЭлементы: {', '.join(repr(t) for t in texts[:15])}"
 
-            # 3. Wait for form to appear (modal or new page)
-            await asyncio.sleep(2)
-            try:
-                await page.wait_for_selector("input, textarea", timeout=12000)
-            except Exception:
-                html = await page.content()
-                buttons = await page.query_selector_all("button")
-                btns = []
-                for b in buttons[:10]:
-                    try:
-                        btns.append((await b.inner_text()).strip()[:30])
-                    except Exception:
-                        pass
-                return False, (
-                    f"Форма не появилась после клика (url={page.url}, html={len(html)}б)\n"
-                    f"Кнопки: {', '.join(repr(t) for t in btns)}"
-                )
+def _row_label(row: dict) -> str:
+    """Как строка списка называет себя — заголовком или полем с именем."""
+    title = str(row.get("title") or "").strip()
+    if title:
+        return _strip_html(title)
+    for f in _fields_of(row):
+        attr = str(f.get("attribute") or "").lower()
+        if attr in ("name", "title", "shop_name"):
+            got = _field_text(f)
+            if got:
+                return got
+    return ""
 
-            # 4. Fill fields
-            for sel in ['input[name="title"]', 'input[name="name"]',
-                        'input[placeholder*="азвани"]', 'input[placeholder*="аименовани"]']:
-                el = await page.query_selector(sel)
-                if el:
-                    await el.click()
-                    await el.fill(title)
-                    break
+
+def panel_shop_balance_sync(cookie_string: str, shop_id: str = "",
+                            shop_name: str = "") -> tuple[bool, object]:
+    """Blocking: the shop's balance, read where the panel actually shows it.
+
+    The seller's own screenshot settled this: the figure lives on the shop's
+    page — /resources/shops/{id} — not in a `balances` resource, which is what
+    the code had been asking for. Returns (True, {"amount": float, "field":
+    name, "shop": id, "shop_name": …}) or (False, reason).
+
+    The detail record is fetched rather than the list row: Nova's index omits
+    most fields, and the balance is one of the omitted ones on this panel.
+
+    **Магазин выбирается, а не угадывается.** Раньше перебирались все
+    магазины подряд и бралась первая же страница с полем баланса. Пока
+    магазин один, это незаметно; у продавца с двумя аккаунтами бот показал
+    бы под вторым магазином деньги первого. Цифра из чужого магазина хуже
+    прочерка: прочерк видно, а её нет. Поэтому имя магазина приходит из
+    `/check` того же аккаунта, и если по нему не сошлось ни одного —
+    возвращается отказ со списком найденных, а не первый попавшийся.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+
+    ids = [str(shop_id)] if shop_id else []
+    labels: dict[str, str] = {}
+    if not ids:
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/shops",
+                            params={"perPage": "50"}, headers=hdrs,
+                            timeout=(6, 12), allow_redirects=False)
+        except Exception as e:
+            return False, f"shops: {str(e)[:60]}"
+        if (dead := _panel_expired(r)):
+            return False, dead
+        if r.status_code != 200:
+            return False, f"shops → {r.status_code}"
+        try:
+            rows = (r.json() or {}).get("resources") or []
+        except Exception:
+            return False, "shops: ответ не разобран"
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            rid = row.get("id")
+            if isinstance(rid, dict):
+                rid = rid.get("value", rid.get("id"))
+            if rid is not None:
+                ids.append(str(rid))
+                labels[str(rid)] = _row_label(row)
+        if not ids:
+            return False, "в панели нет ни одного магазина"
+
+        if len(ids) > 1:
+            want = str(shop_name or "").strip().lower()
+            hit = [i for i in ids if want and want in labels.get(i, "").lower()]
+            if len(hit) == 1:
+                ids = hit
             else:
-                inputs = await page.query_selector_all('input[type="text"], input:not([type])')
-                if inputs:
-                    await inputs[0].fill(title)
+                # Один аккаунт — один магазин. Не знаем который — молчим об
+                # этом вслух, а не подставляем чужие деньги.
+                found = ", ".join(f"«{labels.get(i) or i}»" for i in ids[:6])
+                return False, (
+                    f"в панели {len(ids)} магазина ({found}), а какой из них "
+                    f"«{shop_name or '—'}» — непонятно. Показывать чужой "
+                    f"баланс нельзя. Проверь /accounts_debug.")
 
-            for sel in ['input[name="price"]', 'input[name="cost"]',
-                        'input[placeholder*="цен"]', 'input[type="number"]']:
-                el = await page.query_selector(sel)
-                if el:
-                    await el.fill(str(price))
-                    break
-
-            for sel in ['textarea[name="description"]', 'textarea', 'div[contenteditable="true"]']:
-                el = await page.query_selector(sel)
-                if el:
-                    await el.fill(description)
-                    break
-
-            if quantity != 1:
-                for sel in ['input[name="count"]', 'input[name="quantity"]', 'input[name="amount"]']:
-                    el = await page.query_selector(sel)
-                    if el:
-                        await el.fill(str(quantity))
-                        break
-
-            # 5. Submit
-            submitted = False
-            for sel in ['button[type="submit"]', 'button:has-text("Создать")',
-                        'button:has-text("Добавить")', 'button:has-text("Сохранить")',
-                        'button:has-text("Опубликовать")', 'input[type="submit"]']:
-                el = await page.query_selector(sel)
-                if el:
-                    await el.click()
-                    submitted = True
-                    break
-
-            if not submitted:
-                buttons = await page.query_selector_all("button")
-                btns = []
-                for b in buttons[:15]:
-                    try:
-                        t = (await b.inner_text()).strip()[:30]
-                        if t:
-                            btns.append(t)
-                    except Exception:
-                        pass
-                return False, f"Кнопка отправки не найдена. Кнопки в форме: {', '.join(repr(t) for t in btns)}"
-
-            await asyncio.sleep(4)
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=8000)
-            except Exception:
-                pass
-
-            logger.info("Captured requests: %s", captured)
-
-            # 6. Check success / error
-            err_el = await page.query_selector('.error, .alert-danger, [class*="error"]')
-            if err_el:
-                err_text = (await err_el.inner_text()).strip()[:200]
-                return False, f"Ошибка на странице: {err_text}"
-
-            reqs = "; ".join(r.split("/")[-1] for r in captured[-5:]) or "нет"
-            return True, f"создан (запросы: {reqs})"
-
+    tried = []
+    for sid in ids[:5]:
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/shops/{sid}",
+                            headers=hdrs, timeout=(6, 12),
+                            allow_redirects=False)
         except Exception as e:
-            logger.error("create_product_browser error: %s", e)
-            return False, str(e)
-        finally:
-            await page.close()
-            await context.close()
+            tried.append(f"{sid}: {str(e)[:30]}")
+            continue
+        if r.status_code != 200:
+            tried.append(f"{sid}: {r.status_code}")
+            continue
+        try:
+            fields = ((r.json() or {}).get("resource") or {}).get("fields") or []
+        except Exception:
+            tried.append(f"{sid}: ответ не разобран")
+            continue
+        for f in fields:
+            if not isinstance(f, dict):
+                continue
+            label = (str(f.get("name") or "") + " "
+                     + str(f.get("attribute") or "")).lower()
+            # «Сумма продаж» и «оплаченные заказы» — это показатели на той же
+            # странице; баланс — то поле, которое так и называется балансом.
+            if not any(t in label for t in ("баланс", "balance", "средства")):
+                continue
+            if any(t in label for t in ("продаж", "заказ", "sales", "order")):
+                continue
+            raw = _strip_html(f.get("value"))
+            if raw in (None, ""):
+                # Пустое поле баланса — не «поля нет». У нового магазина с
+                # нулём на счету панель отдаёт пусто, и молчаливый пропуск
+                # заканчивался отчётом «поля — …», то есть «баланса не
+                # нашлось» там, где он нашёлся и пуст.
+                tried.append(f"{sid}: поле «{f.get('name')}» пустое")
+                continue
+            # Разбор один на весь бот. Здешний убирал пробелы, «₽» и запятые
+            # по списку — и спотыкался обо всё остальное: «руб.», узкий
+            # пробел, разряды точкой. Поле «Баланс» находилось, значение не
+            # разбиралось, и продавец видел прочерк.
+            from orderfields import parse_amount
+            amount = parse_amount(raw)
+            if amount is None:
+                # Найденное, но неразобранное — самое обидное молчание:
+                # поле то самое, а сумма потеряна. Называем значение.
+                tried.append(f"{sid}: поле «{f.get('name')}» = «{raw[:40]}» "
+                             "не разобрано как число")
+                continue
+            return True, {"amount": amount,
+                          "field": str(f.get("name") or f.get("attribute")),
+                          "shop": sid, "shop_name": labels.get(sid, "")}
+        # Не совпало ничего: показываем, что страница вообще предлагает, — чтобы
+        # поле можно было назвать, а не гадать о нём заново.
+        names = [str(f.get("name") or f.get("attribute"))
+                 for f in fields if isinstance(f, dict)][:14]
+        tried.append(f"{sid}: поля — {', '.join(n for n in names if n)}")
+    return False, "; ".join(tried)[:400] or "магазин не прочитан"
+
+
+def panel_withdraw_probe_sync(cookie_string: str) -> str:
+    """Read-only: where the «Вывести» action actually lives.
+
+    Withdrawal asks /nova-api/balances/actions — the same resource that turned
+    out to hold no balance, which is on the shop's own record instead. This
+    reports, for the shop and for `balances`, what each answers and which
+    actions each offers, so the payout is aimed from evidence rather than from
+    the guess that was inherited. Runs nothing: it lists actions only.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    out: list[str] = []
+
+    shop_ids: list[str] = []
+    try:
+        r = session.get(f"{PANEL_URL}/nova-api/shops", params={"perPage": "20"},
+                        headers=hdrs, timeout=(6, 12), allow_redirects=False)
+        out.append(f"shops → {r.status_code}")
+        if r.status_code == 200:
+            for row in (r.json() or {}).get("resources") or []:
+                rid = row.get("id") if isinstance(row, dict) else None
+                if isinstance(rid, dict):
+                    rid = rid.get("value", rid.get("id"))
+                if rid is not None:
+                    shop_ids.append(str(rid))
+            out.append(f"магазины: {', '.join(shop_ids) or 'нет'}")
+    except Exception as e:
+        out.append(f"shops: {str(e)[:50]}")
+
+    for res, ids in (("shops", shop_ids[:2]), (_BALANCE_RES, [""])):
+        for rid in ids or [""]:
+            params = {"resources": rid} if rid else {}
+            try:
+                r = session.get(f"{PANEL_URL}/nova-api/{res}/actions",
+                                params=params, headers=hdrs,
+                                timeout=(6, 10), allow_redirects=False)
+            except Exception as e:
+                out.append(f"{res}/actions: {str(e)[:50]}")
+                continue
+            label = f"{res}{'#' + rid if rid else ''}/actions → {r.status_code}"
+            if r.status_code != 200:
+                out.append(label)
+                continue
+            try:
+                acts = (r.json() or {}).get("actions") or []
+            except Exception:
+                out.append(f"{label}: ответ не разобран")
+                continue
+            names = [f"{a.get('name') or '?'}[{a.get('uriKey') or '?'}]"
+                     for a in acts if isinstance(a, dict)]
+            out.append(f"{label}: {', '.join(names) or 'действий нет'}")
+    return "\n".join(out)[:1800]
+
+
+# ─────────────────────────────── статистика ───────────────────────────────
+#
+# Статистика бота собиралась целиком из `known_orders` — из заказов, которые
+# опрос успел увидеть, пока работал. Всё, что продалось до запуска бота или
+# пока он лежал, просто не существовало, и пересобранный контейнер отчитывался
+# пустым магазином. Настоящий журнал держит панель — значит цифры читаются
+# оттуда, а локальная история остаётся лишь запасным путём.
+
+_SPACES = "    "
+
+
+def _num(value) -> float | None:
+    """Число со знаком из того, что нарисовала панель.
+
+    Деньги приходят текстом: «1 234,56 ₽», «−300 ₽», «+50». Запятая здесь —
+    десятичный разделитель (баланс «605,226 ₽» — это 605 рублей 226, выяснено с
+    продавцом), а разделитель тысяч — пробел.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if value is None:
+        return None
+    text = _strip_html(value)
+    if not text:
+        return None
+    for ch in _SPACES:
+        text = text.replace(ch, "")
+    text = (text.replace(" ", "").replace("₽", "").replace("руб", "")
+            .replace("−", "-").replace("–", "-").replace("+", ""))
+    m = re.search(r"-?\d+(?:[.,]\d+)?", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", "."))
+    except ValueError:
+        return None
+
+
+_DT_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y %H:%M:%S",
+               "%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d")
+
+
+def _ts(value) -> float | None:
+    """Секунды эпохи из даты панели, в любом из видов, которыми она пользуется."""
+    from datetime import datetime, timezone
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Встречаются и миллисекунды; всё, что дальше 5000 года, — это они.
+        v = float(value)
+        return v / 1000 if v > 1e11 else v
+    text = _strip_html(value).strip()
+    if not text:
+        return None
+    iso = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(iso)
+        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+    except ValueError:
+        pass
+    for fmt in _DT_FORMATS:
+        try:
+            return datetime.strptime(text[:19], fmt).replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _fields_of(row) -> list[dict]:
+    """Поля строки Nova списком — в каком бы контейнере они ни приехали."""
+    fields = row.get("fields") if isinstance(row, dict) else None
+    if isinstance(fields, dict):
+        fields = list(fields.values())
+    return [f for f in (fields or []) if isinstance(f, dict)]
+
+
+def _field_text(f: dict) -> str:
+    """Читаемое значение поля; BelongsTo приходит вложенным словарём."""
+    val = f.get("value")
+    if isinstance(val, dict):
+        val = (val.get("title") or val.get("name") or val.get("display")
+               or val.get("value") or "")
+    if isinstance(val, list):
+        val = ", ".join(str(x) for x in val if not isinstance(x, (dict, list)))
+    if isinstance(val, bool):
+        return "да" if val else "нет"
+    return _strip_html(val)
+
+
+def _row_id(row: dict):
+    rid = row.get("id")
+    if isinstance(rid, dict):
+        rid = rid.get("value", rid.get("id"))
+    return rid
+
+
+# Что означает денежная строка. Читается из её собственных слов, потому что
+# направление панель не подписывает: и выплата, и продажа — просто «операция».
+_OUT_KWS = ("вывод", "вывел", "выплат", "списан", "списыв", "withdraw", "payout",
+            "премиум", "премк", "поднят", "продвиж", "реклам", "комисс",
+            "штраф", "расход", "оплата услуг", "покупк", "debit", "минус")
+_IN_KWS = ("продаж", "продан", "заказ", "пополн", "начисл", "зачисл", "доход",
+           "приход", "поступ", "sale", "order", "deposit", "credit", "плюс",
+           "возврат средств")
+
+
+def _direction(haystack: str, amount: float | None) -> str:
+    """«in» | «out» | «?» — что эта операция сделала с балансом."""
+    if amount is not None and amount < 0:
+        return "out"
+    low = haystack.lower()
+    for kw in _OUT_KWS:
+        if kw in low:
+            return "out"
+    for kw in _IN_KWS:
+        if kw in low:
+            return "in"
+    return "?"
+
+
+_SALE_KWS = ("продаж", "продан", "заказ", "sale", "order")
+_BUMP_KWS_OPS = ("премиум", "премк", "поднят", "продвиж", "реклам", "vip",
+                 "выделен", "закреп")
+_PAYOUT_KWS = ("вывод", "вывел", "выплат", "withdraw", "payout")
+
+
+def _op_kind(haystack: str, direction: str) -> str:
+    """Точнее направления: продажа, поднятие, выплата, прочее."""
+    low = haystack.lower()
+    if any(k in low for k in _PAYOUT_KWS):
+        return "payout"
+    if any(k in low for k in _BUMP_KWS_OPS):
+        return "bump"
+    if any(k in low for k in _SALE_KWS):
+        return "sale"
+    return "in" if direction == "in" else ("out" if direction == "out" else "other")
+
+
+def _parse_operation(row: dict) -> dict:
+    """Одна строка журнала → {id, ts, amount, kind, direction, title, status, text}."""
+    ts = amount = None
+    title = status = ""
+    kind_bits: list[str] = []
+    all_text: list[str] = []
+
+    for f in _fields_of(row):
+        label = (str(f.get("name") or "") + " "
+                 + str(f.get("attribute") or "")).lower()
+        comp = str(f.get("component") or "").lower()
+        text = _field_text(f)
+        if not text:
+            continue
+        all_text.append(text)
+        if ts is None and ("date" in comp or any(
+                t in label for t in ("created", "дата", "date", "время", "time"))):
+            got = _ts(f.get("value") if not isinstance(f.get("value"), dict) else text)
+            if got:
+                ts = got
+                continue
+        if amount is None and any(t in label for t in (
+                "сумм", "amount", "цена", "price", "total", "итог", "money",
+                "стоим", "value")):
+            got = _num(f.get("value"))
+            if got is not None:
+                amount = got
+                continue
+        if any(t in label for t in ("тип", "type", "операц", "operation",
+                                    "назнач", "kind", "категор", "commen",
+                                    "коммент", "описан", "descr")):
+            kind_bits.append(text)
+        elif any(t in label for t in ("статус", "status", "состоян", "state")):
+            status = status or text
+        elif any(t in label for t in ("товар", "наимен", "назван", "title",
+                                      "name", "объявл", "лот", "item")):
+            title = title or text
+
+    haystack = " ".join(kind_bits + [title, status, _row_title(row)])
+    if not haystack.strip():
+        haystack = " ".join(all_text)
+    direction = _direction(haystack, amount)
+    return {
+        "id": _row_id(row),
+        "ts": ts,
+        "amount": abs(amount) if amount is not None else None,
+        "signed": amount,
+        "direction": direction,
+        "kind": _op_kind(haystack, direction),
+        "title": title or _row_title(row),
+        "status": status,
+        "type": " / ".join(b for b in kind_bits if b)[:80],
+    }
+
+
+_OPS_RESOURCES = ("operations", "operation", "transactions", "payments",
+                  "orders", "sales", "deals")
+
+
+def panel_operations_sync(cookie_string: str, resource: str = "operations",
+                          pages: int = 6, per_page: int = 100,
+                          since: float = 0.0) -> tuple[bool, object]:
+    """Блокирующая: денежный журнал магазина из панели, от свежих к старым.
+
+    Отдаёт (True, [операция, …]) либо (False, причина). `since` (секунды эпохи,
+    0 — всё) и фильтрует результат, и прекращает листать, когда целая страница
+    оказалась старше него. Но ранняя остановка работает только пока строки
+    действительно идут от свежих к старым: панель, сортирующая наоборот, была
+    бы обрезана со своего старого конца — то есть ровно там, где лежат нужные
+    данные.
+    """
+    try:
+        session = _make_panel_requests_session(cookie_string)
+        hdrs = _panel_xsrf_headers(session, cookie_string)
+    except Exception as e:
+        return False, f"сессия панели: {str(e)[:80]}"
+
+    ops: list[dict] = []
+    descending = True
+    last_ts: float | None = None
+    reason = ""
+    read_a_page = False
+
+    for page in range(1, max(1, pages) + 1):
+        params = {"perPage": str(per_page), "page": str(page),
+                  "orderBy": "id", "orderByDirection": "desc"}
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/{resource}", params=params,
+                            headers=hdrs, timeout=(6, 20), allow_redirects=False)
+        except Exception as e:
+            reason = f"{resource}: {str(e)[:60]}"
+            break
+        if (dead := _panel_expired(r)):
+            return False, dead
+        if r.status_code != 200:
+            reason = f"{resource} → {r.status_code}"
+            break
+        try:
+            body = r.json() or {}
+        except Exception:
+            reason = f"{resource}: ответ не разобран"
+            break
+        rows = [x for x in (body.get("resources") or []) if isinstance(x, dict)]
+        read_a_page = True
+        if not rows:
+            break
+
+        page_max_ts = 0.0
+        for row in rows:
+            op = _parse_operation(row)
+            if op["ts"]:
+                if last_ts is not None and op["ts"] > last_ts + 60:
+                    descending = False
+                last_ts = op["ts"]
+                page_max_ts = max(page_max_ts, op["ts"])
+            if since and (op["ts"] or 0) < since:
+                continue
+            ops.append(op)
+
+        if since and descending and page_max_ts and page_max_ts < since:
+            break
+        if not body.get("next_page_url"):
+            break
+
+    # Пустой результат после действительно прочитанной страницы — это ответ
+    # («операций в этом отрезке нет»), а не неудача добраться до панели.
+    # Объявив его ошибкой, мы бы молча столкнули экран на локальный запасной
+    # путь и объявили верные цифры ненадёжными.
+    if not ops and not read_a_page:
+        return False, reason or f"{resource}: пусто"
+    return True, ops
+
+
+# Где панель держит отзывы. Как и с книгой операций, имя ресурса угадать
+# нельзя — оно у каждой панели своё, поэтому кандидаты перебираются.
+_REVIEW_RESOURCES = ("reviews", "review", "feedbacks", "feedback",
+                     "comments", "ratings", "shop-reviews", "otzyvy")
+
+_RATING_KEYS = ("rating", "stars", "score", "mark", "ball", "оценк")
+_TEXT_KEYS = ("text", "comment", "body", "message", "content", "отзыв")
+_AUTHOR_KEYS = ("user", "author", "buyer", "customer", "client", "покупател")
+_TITLE_KEYS = ("ad", "item", "product", "lot", "товар")
+
+
+def _parse_review(row: dict) -> dict:
+    """Одна строка отзыва: оценка, текст, автор, дата, товар.
+
+    Текст ищется по именам полей — а имена у панели свои, и угадать их
+    списком не вышло: отзывы приходили без текста при том, что текст в
+    строке был. Поэтому две правки. Первая: поле, похожее сразу на автора
+    и на текст (`user_comment` подходит под оба списка), больше не
+    съедается автором молча — сначала пробуется как текст. Вторая: если по
+    именам не нашлось ничего, берётся самое длинное строковое поле строки.
+    Отзыв — это самый длинный текст в своей записи; хуже пустоты не будет.
+
+    Имена полей — не единственный признак. У Nova есть `component`, и он
+    говорит о поле больше, чем его название: `belongs-to` и `morph-to` —
+    это **ссылка на другую запись** (на покупателя, на товар), а не текст;
+    `textarea` и `markdown` — наоборот, свободный текст, как бы поле ни
+    звалось. Без этого отзыв без текста приходил продавцу так:
+
+        👤 Покупатель ⭐⭐⭐⭐⭐
+        «Andrej Prokopjew»
+
+    — имя покупателя, выданное за текст отзыва, потому что запасной
+    вариант брал самое длинное поле, а им оказалась ссылка на автора.
+    """
+    out = {"id": _row_id(row), "rating": None, "text": "", "author": "",
+           "ts": None, "title": ""}
+    spare: list[tuple[int, str]] = []
+    for f in _fields_of(row):
+        attr = str(f.get("attribute") or "").lower()
+        comp = str(f.get("component") or "").lower()
+        value = _field_text(f)
+        if out["rating"] is None and any(k in attr for k in _RATING_KEYS):
+            num = _num(value)
+            # Оценка — это 1..5. Число из поля «rating_count» ею не является.
+            if num is not None and 0 <= num <= 5:
+                out["rating"] = num
+                continue
+        if not out["ts"]:
+            ts = _ts(value) if any(k in attr for k in
+                                   ("created", "date", "time", "дата")) else None
+            if ts:
+                out["ts"] = ts
+                continue
+        # Ссылка на другую запись. Текстом отзыва она быть не может ни при
+        # каком имени поля, поэтому в запасные кандидаты не попадает.
+        if "belongs-to" in comp or "morph-to" in comp:
+            if not out["author"] and any(k in attr for k in _AUTHOR_KEYS):
+                out["author"] = value[:40]
+            elif not out["title"] and any(k in attr for k in _TITLE_KEYS):
+                out["title"] = value[:60]
+            elif not out["author"]:
+                out["author"] = value[:40]
+            elif not out["title"]:
+                out["title"] = value[:60]
+            continue
+        # Свободный текст по устройству поля, а не по названию: у отзыва это
+        # обычно `textarea`, и назвать его панель может как угодно.
+        if not out["text"] and ("textarea" in comp or "markdown" in comp):
+            out["text"] = value[:400]
+            continue
+        # Текст — раньше автора: `user_comment` подходит под оба списка, и
+        # при прежнем порядке уходил в автора, а отзыв оставался пустым.
+        if not out["text"] and any(k in attr for k in _TEXT_KEYS):
+            out["text"] = value[:400]
+            continue
+        if not out["author"] and any(k in attr for k in _AUTHOR_KEYS):
+            out["author"] = value[:40]
+            continue
+        if not out["title"] and any(k in attr for k in _TITLE_KEYS):
+            out["title"] = value[:60]
+            continue
+        if value and not _num(value):
+            spare.append((len(value), value))
+    # Запасной вариант — только для строки, которая уже опознана как отзыв
+    # по оценке. Иначе любая строка любого ресурса получает «текст» из
+    # своего самого длинного поля, и категория с полем `name` начинает
+    # считаться отзывом: ровно та ошибка, из-за которой раньше принимали за
+    # отзывы что попало.
+    if not out["text"] and out["rating"] is not None and spare:
+        out["text"] = max(spare)[1][:400]
+    return out
+
+
+def panel_review_fields_sync(cookie_string: str,
+                             resource: str = "") -> tuple[bool, object]:
+    """Какие поля панель кладёт в строку отзыва — именами и значениями.
+
+    Отзывы пришли без текста, а имена полей у панели свои. Угадывать их
+    списком мы уже попробовали; читать, что там на самом деле, дешевле.
+    Только чтение: одна страница, одна строка.
+    """
+    try:
+        session = _make_panel_requests_session(cookie_string)
+        hdrs = _panel_xsrf_headers(session, cookie_string)
+    except Exception as e:
+        return False, f"сессия панели: {str(e)[:80]}"
+    tried: list[str] = []
+    for res in ([resource] if resource else list(_REVIEW_RESOURCES)):
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/{res}",
+                            params={"perPage": "1", "page": "1"},
+                            headers=hdrs, timeout=(6, 20),
+                            allow_redirects=False)
+        except Exception as e:
+            tried.append(f"{res}: {str(e)[:40]}")
+            continue
+        if (dead := _panel_expired(r)):
+            return False, dead
+        if r.status_code != 200:
+            tried.append(f"{res}: HTTP {r.status_code}")
+            continue
+        try:
+            rows = (r.json() or {}).get("resources") or []
+        except Exception:
+            tried.append(f"{res}: ответ не разобран")
+            continue
+        if not rows:
+            tried.append(f"{res}: пусто")
+            continue
+        out = []
+        for f in _fields_of(rows[0]):
+            value = _field_text(f)
+            out.append({"attribute": str(f.get("attribute") or ""),
+                        "component": str(f.get("component") or "")[:30],
+                        "len": len(value), "value": value[:120]})
+        return True, {"resource": res, "fields": out}
+    return False, "; ".join(tried)[:300] or "ни один ресурс не ответил"
+
+
+def panel_reviews_sync(cookie_string: str, resource: str = "",
+                       pages: int = 2, per_page: int = 50,
+                       ) -> tuple[bool, object]:
+    """Blocking: отзывы магазина из панели, новые первыми.
+
+    В Integration API отзывов нет — прежний код перебирал /reviews, /feedback
+    и /ratings, получал 404 и молча возвращал пустой список. Тумблер
+    «Новые отзывы» при этом включался и не делал ничего.
+
+    Returns (True, {"resource": …, "reviews": [...]}) или (False, почему).
+    """
+    try:
+        session = _make_panel_requests_session(cookie_string)
+        hdrs = _panel_xsrf_headers(session, cookie_string)
+    except Exception as e:
+        return False, f"сессия панели: {str(e)[:80]}"
+
+    candidates = [resource] if resource else list(_REVIEW_RESOURCES)
+    tried: list[str] = []
+    for res in candidates:
+        rows: list[dict] = []
+        # Дочитали ли до конца. Без этого «1 из 100» на магазине с тысячей
+        # отзывов — вранье в чистом виде: столько мы прочитали, а не столько
+        # их есть.
+        more = False
+        for page in range(1, max(1, pages) + 1):
+            try:
+                r = session.get(
+                    f"{PANEL_URL}/nova-api/{res}",
+                    params={"perPage": str(per_page), "page": str(page),
+                            "orderBy": "id", "orderByDirection": "desc"},
+                    headers=hdrs, timeout=(6, 20), allow_redirects=False)
+            except Exception as e:
+                tried.append(f"{res}: {str(e)[:40]}")
+                break
+            if (dead := _panel_expired(r)):
+                return False, dead
+            if r.status_code != 200:
+                tried.append(f"{res}: HTTP {r.status_code}")
+                break
+            try:
+                chunk = [x for x in ((r.json() or {}).get("resources") or [])
+                         if isinstance(x, dict)]
+            except Exception:
+                tried.append(f"{res}: ответ не разобран")
+                break
+            if not chunk:
+                break
+            rows.extend(chunk)
+            if len(chunk) < per_page:
+                break
+            # Страница пришла полной, а страницы кончились — значит дальше
+            # ещё есть.
+            more = page >= max(1, pages)
+        if not rows:
+            if not any(res in x for x in tried):
+                tried.append(f"{res}: пусто")
+            continue
+        reviews = [_parse_review(x) for x in rows]
+        # Ресурс с оценками или текстами — отзывы. Иначе это что-то другое,
+        # что просто откликнулось на похожее имя.
+        real = [x for x in reviews if x["rating"] is not None or x["text"]]
+        tried.append(f"{res}: {len(rows)} строк, похожих на отзыв {len(real)}")
+        if real:
+            return True, {"resource": res, "reviews": real, "more": more}
+    return False, "; ".join(tried)[:400] or "ни один ресурс не ответил"
+
+
+def panel_find_ledger_sync(cookie_string: str) -> tuple[bool, object]:
+    """Блокирующая: в каком разделе панели на самом деле лежат денежные строки с датами.
+
+    Эта панель использует `operations`, но назвать его в одном месте и гадать
+    во всех остальных — это и есть то, из-за чего поиски баланса ходили по
+    кругу. Здесь перебираются известные кандидаты и отдаётся первый, ответивший
+    строками, у которых есть и дата, и сумма → (True, (раздел, операции)).
+    """
+    best: tuple[str, list] | None = None
+    tried: list[str] = []
+    for res in _OPS_RESOURCES:
+        ok, got = panel_operations_sync(cookie_string, resource=res, pages=1,
+                                        per_page=50)
+        if not ok or not isinstance(got, list):
+            tried.append(f"{res}: {str(got)[:40]}")
+            continue
+        dated = [o for o in got if o.get("ts") and o.get("amount") is not None]
+        tried.append(f"{res}: {len(got)} строк, с датой и суммой {len(dated)}")
+        if dated and (best is None or len(dated) > len(best[1])):
+            best = (res, got)
+        if best and len(dated) >= 5:
+            break
+    if best:
+        return True, best
+    return False, "; ".join(tried)[:400] or "ни один ресурс не ответил"
+
+
+def panel_shop_metrics_sync(cookie_string: str,
+                            shop_id: str = "") -> tuple[bool, object]:
+    """Blocking: the numbers the panel prints on the shop's own page.
+
+    «Оплаченные заказы», «Сумма продаж», rating, review count — all-time totals
+    the seller can check against with their own eyes. Returns
+    (True, {"shop": id, "metrics": {name: {"text","value"}}}) or (False, why).
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+
+    ids = [str(shop_id)] if shop_id else []
+    if not ids:
+        try:
+            r = session.get(f"{PANEL_URL}/nova-api/shops", params={"perPage": "50"},
+                            headers=hdrs, timeout=(6, 12), allow_redirects=False)
+        except Exception as e:
+            return False, f"shops: {str(e)[:60]}"
+        if (dead := _panel_expired(r)):
+            return False, dead
+        if r.status_code != 200:
+            return False, f"shops → {r.status_code}"
+        try:
+            for row in (r.json() or {}).get("resources") or []:
+                rid = _row_id(row) if isinstance(row, dict) else None
+                if rid is not None:
+                    ids.append(str(rid))
+        except Exception:
+            return False, "shops: ответ не разобран"
+    if not ids:
+        return False, "в панели нет ни одного магазина"
+
+    sid = ids[0]
+    try:
+        r = session.get(f"{PANEL_URL}/nova-api/shops/{sid}", headers=hdrs,
+                        timeout=(6, 15), allow_redirects=False)
+    except Exception as e:
+        return False, f"shops/{sid}: {str(e)[:60]}"
+    if r.status_code != 200:
+        return False, f"shops/{sid} → {r.status_code}"
+    try:
+        fields = ((r.json() or {}).get("resource") or {}).get("fields") or []
+    except Exception:
+        return False, f"shops/{sid}: ответ не разобран"
+
+    metrics: dict[str, dict] = {}
+    for f in fields:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("name") or f.get("attribute") or "").strip()
+        if not name:
+            continue
+        text = _field_text(f)
+        if not text:
+            continue
+        metrics[name] = {"text": text, "value": _num(f.get("value"))}
+    if not metrics:
+        return False, f"shops/{sid}: страница без полей"
+    return True, {"shop": sid, "metrics": metrics}
+
+
+def panel_stats_probe_sync(cookie_string: str) -> str:
+    """Только чтение: как на самом деле выглядят строки журнала панели.
+
+    Каждый настоящий ответ в этом проекте получался тем, что печатался ответ
+    сервера, а не догадка о нём. Здесь видно, какой раздел держит денежные
+    строки, какие у строки имена полей и как поняты первые несколько строк, —
+    чтобы неверное прочтение было заметно, а не усреднялось молча в итог.
+    """
+    from datetime import datetime, timezone
+    out: list[str] = []
+
+    ok, got = panel_find_ledger_sync(cookie_string)
+    if not ok:
+        out.append(f"журнал операций не найден: {got}")
+        res = "operations"
+        ops: list[dict] = []
+    else:
+        res, ops = got
+        out.append(f"журнал: {res}, строк на первой странице: {len(ops)}")
+
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    try:
+        r = session.get(f"{PANEL_URL}/nova-api/{res}", params={"perPage": "5"},
+                        headers=hdrs, timeout=(6, 15), allow_redirects=False)
+        body = r.json() or {}
+        out.append(f"{res} → {r.status_code}, всего: {body.get('total', '?')}")
+        rows = [x for x in (body.get("resources") or []) if isinstance(x, dict)]
+        if rows:
+            names = [f"{f.get('name') or '?'}[{f.get('attribute') or '?'}"
+                     f"·{f.get('component') or '?'}]" for f in _fields_of(rows[0])]
+            out.append("поля строки: " + ", ".join(names)[:600])
+            out.append("значения 1-й строки: " + ", ".join(
+                f"{f.get('name') or f.get('attribute')}={_field_text(f)[:28]}"
+                for f in _fields_of(rows[0]))[:600])
+    except Exception as e:
+        out.append(f"{res}: {str(e)[:80]}")
+
+    for op in ops[:5]:
+        import localtime as _lt
+        when = _lt.fmt(op.get("ts"), None) or "без даты"
+        out.append(f"  · {when} | {op.get('kind')} / {op.get('direction')} | "
+                   f"{op.get('amount')} ₽ | {str(op.get('type') or '')[:24]} | "
+                   f"{str(op.get('title') or '')[:24]}")
+
+    ok_m, m = panel_shop_metrics_sync(cookie_string)
+    if ok_m and isinstance(m, dict):
+        out.append("поля магазина: " + ", ".join(
+            f"{k}={v['text'][:20]}" for k, v in (m.get("metrics") or {}).items())[:700])
+    else:
+        out.append(f"магазин: {m}")
+
+    return "\n".join(out)[:3000]

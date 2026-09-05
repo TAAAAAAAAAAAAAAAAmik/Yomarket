@@ -1,9 +1,10 @@
-"""Multi-account management: several YooMarket shops in one bot."""
+"""Несколько магазинов Юмаркета в одном боте: список, добавление, выбор."""
 from __future__ import annotations
 
 import logging
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -33,18 +34,41 @@ def _names(user_id: int) -> list[str]:
     return sorted(get_accounts(user_id).keys())
 
 
+def _shop_of(user_id: int, account: str) -> str:
+    """Название магазина, сохранённое для одного аккаунта.
+
+    Настройки разложены по аккаунтам, поэтому имя берётся из ключа СВОЕГО
+    аккаунта, а не активного: иначе все строки списка показывали бы один и
+    тот же магазин.
+    """
+    try:
+        from storage import _load_settings, _merge_defaults
+        raw = _load_settings().get(f"{user_id}::{account}", {})
+        return str(_merge_defaults(raw).get("shop_name") or "")
+    except Exception:
+        return ""
+
+
 async def _render_menu(msg, user_id: int, edit: bool = True) -> None:
     accounts = _names(user_id)
     active = get_active_account(user_id)
     b = InlineKeyboardBuilder()
     lines = ["👥 <b>Аккаунты YooMarket</b>\n"]
     if not accounts:
-        lines.append("Нет добавленных аккаунтов. Отправьте /start и введите токен.")
+        lines.append("Нет добавленных аккаунтов. Отправь /start и введи токен.")
     else:
-        lines.append("Нажмите на аккаунт, чтобы переключиться:")
+        lines.append("Жми на аккаунт, чтобы переключиться:\n")
+        # Название аккаунта ничего не говорит о том, какой магазин открывает его
+        # токен, поэтому выбор был угадыванием — а промах здесь и есть та причина,
+        # по которой панель и токен начинают показывать разные магазины.
         for i, name in enumerate(accounts):
             mark = " ✅" if name == active else ""
-            b.button(text=f"🏪 {name}{mark}", callback_data=f"acc:switch:{i}")
+            shop = _shop_of(user_id, name)
+            lines.append(f"• <b>{name}</b>{mark}"
+                         + (f" — магазин «{shop}»" if shop else
+                            " — <i>магазин не определён</i>"))
+            b.button(text=f"🏪 {name}{(' · ' + shop[:18]) if shop else ''}{mark}",
+                     callback_data=f"acc:switch:{i}")
     b.button(text="➕ Добавить аккаунт", callback_data="acc:add")
     if len(accounts) > 1:
         b.button(text="🗑 Удалить текущий", callback_data="acc:del")
@@ -76,9 +100,92 @@ async def switch_account(callback: CallbackQuery) -> None:
         await callback.answer("Уже активен")
         return
     set_active_account(uid, name)
-    shop = get_shop_name(uid) or name
-    await callback.answer(f"✅ Переключено на «{shop}»", show_alert=True)
+    # Спрашиваем у маркетплейса, чей это токен, вместо того чтобы верить
+    # давно сохранённому имени: как раз устаревшее имя и делает чужой аккаунт
+    # похожим на нужный.
+    shop = await _refresh_shop(uid)
+    await callback.answer(f"✅ Переключено на «{shop or name}»", show_alert=True)
     await _render_menu(callback.message, uid)
+
+
+async def _refresh_shop(uid: int) -> str:
+    """Перечитать у маркетплейса, какому магазину принадлежит активный токен."""
+    from storage import get_token, save_shop_name
+    token = get_token(uid)
+    if not token:
+        return ""
+    try:
+        from api.yoomarket import YooMarketAPI
+        api = YooMarketAPI(token)
+        await api.start()
+        try:
+            info = await api.check()
+        finally:
+            await api.close()
+        shop = info.get("shop") or info.get("data") or info
+        name = ""
+        if isinstance(shop, dict):
+            name = str(shop.get("name") or shop.get("shop_name")
+                       or shop.get("title") or "")
+        if name:
+            save_shop_name(uid, name)
+        return name
+    except Exception:
+        return get_shop_name(uid) or ""
+
+
+def _esc(t) -> str:
+    return (str(t or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+@router.message(Command("accounts_debug"))
+async def accounts_debug(message: Message) -> None:
+    """/accounts_debug — что на самом деле лежит под каждым аккаунтом.
+
+    Продавец добавил второй магазин, а в меню осталось название первого.
+    Гадать, чьи данные под каким ключом, здесь нельзя: у трёх хранилищ
+    (настройки, куки панели, Fragment) свои ключи, и разъехаться они могут
+    по-разному. Команда только читает и **значений секретов не печатает** —
+    ни куки, ни seed-фразу: видно лишь, есть они или нет.
+    """
+    import storage as S
+
+    uid = message.from_user.id
+    accounts = list(S.get_accounts(uid))
+    active = S.get_active_account(uid)
+    settings_blob = S._load_settings()
+    panel_blob = S._load_panel_creds()
+    frag_blob = S._load_fragment_creds()
+
+    lines = [f"👥 <b>Аккаунты</b> — {len(accounts)}, активен "
+             f"<code>{_esc(active) or '—'}</code>", ""]
+    for name in accounts:
+        key = f"{uid}::{name}"
+        raw = settings_blob.get(key) or {}
+        shop = str(raw.get("shop_name") or "")
+        panel = (panel_blob.get(key) or {}).get("cookies")
+        frag = frag_blob.get(key) or {}
+        lines.append(f"{'✅' if name == active else '▫️'} <b>{_esc(name)}</b>"
+                     f"  <code>{_esc(key)}</code>")
+        lines.append(f"   магазин: {_esc(shop) or '<i>не определён</i>'}")
+        lines.append(f"   настройки: {'есть' if key in settings_blob else 'нет'}"
+                     f" · панель: {'есть' if panel else 'нет'}"
+                     f" · Fragment: {'куки' if frag.get('cookies') else 'нет'}"
+                     f"{' + seed' if frag.get('mnemonic') else ''}")
+
+    # Долистовая запись: она и разъезжалась. Перенос теперь идёт первому
+    # аккаунту, а не активному, но старую разъехавшуюся картину надо видеть.
+    stray = [b for b, blob in (("настройки", settings_blob),
+                               ("панель", panel_blob),
+                               ("Fragment", frag_blob))
+             if str(uid) in blob]
+    lines += ["", ("⚠️ Есть записи под голым номером (до аккаунтов): "
+                   + ", ".join(stray) + ". Они уйдут первому аккаунту."
+                   ) if stray else "Записей до аккаунтов не осталось."]
+    lines += ["", "<i>Значения кук и seed-фразы здесь не печатаются — "
+              "только есть они или нет.</i>"]
+    await message.answer("\n".join(lines)[:3900])
 
 
 @router.callback_query(F.data == "acc:add")
@@ -88,7 +195,7 @@ async def add_account_start(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data="acc:menu")
     await callback.message.edit_text(
         "➕ <b>Новый аккаунт</b>\n\n"
-        "Введите название (например: «Магазин 2»):",
+        "Введи название (например: «Магазин 2»):",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -101,7 +208,7 @@ async def add_account_name(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Название не может быть пустым:")
         return
     if name in get_accounts(message.from_user.id):
-        await message.answer("❌ Аккаунт с таким названием уже есть. Введите другое:")
+        await message.answer("❌ Аккаунт с таким названием уже есть. Введи другое:")
         return
     await state.update_data(acc_name=name)
     await state.set_state(AccountState.waiting_token)
@@ -109,7 +216,7 @@ async def add_account_name(message: Message, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data="acc:menu")
     await message.answer(
         f"✅ Название: <b>{name}</b>\n\n"
-        "Теперь отправьте <b>API токен</b> этого магазина:\n"
+        "Теперь отправь <b>API токен</b> этого магазина:\n"
         "<i>Мой магазин → Интеграции → API токен</i>",
         reply_markup=b.as_markup(),
     )
@@ -133,7 +240,7 @@ async def add_account_token(message: Message, state: FSMContext, **data) -> None
         info = await api.check()
     except Exception as e:
         await status.edit_text(
-            f"❌ Токен не подошёл: <code>{str(e)[:150]}</code>\n\nОтправьте другой токен:"
+            f"❌ Токен не подошёл: <code>{str(e)[:150]}</code>\n\nОтправь другой токен:"
         )
         return
     finally:
@@ -146,8 +253,12 @@ async def add_account_token(message: Message, state: FSMContext, **data) -> None
     uid = message.from_user.id
     add_account(uid, name, token, make_active=True)
 
+    # `title` — то самое имя: /check отвечает {status, shop:{id,title}, …}.
+    # Без него сюда попадало название аккаунта, придуманное продавцом, и в
+    # меню магазин назывался «Магазин 2» вместо своего настоящего имени.
     shop = info.get("shop") or info.get("data") or info
-    shop_name = (shop.get("name") or shop.get("shop_name") or name) if isinstance(shop, dict) else name
+    shop_name = (shop.get("name") or shop.get("shop_name") or shop.get("title")
+                 or name) if isinstance(shop, dict) else name
     save_shop_name(uid, str(shop_name))
 
     task_manager = data.get("task_manager")

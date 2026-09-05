@@ -1,41 +1,79 @@
-"""Product management through the seller panel (Nova API): list, edit,
-hide/show, clone, delete. Works even when the Integration API can't."""
+"""Работа с товарами через панель продавца (Nova API): список, правка,
+показать/скрыть, копия, удаление. Работает и тогда, когда Integration API
+не может."""
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from storage import get_panel_creds
+import ui
+
+from api.yoomarket import YooMarketAPI
+from storage import get_panel_creds, get_settings, save_settings
 
 router = Router()
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 40
 _CAT_CACHE: dict[int, list[str]] = {}
+_CATS_NAMES: dict[int, dict[int, str]] = {}   # uid -> {category_id: name}
+
+# Товары, удалённые из панели, ещё какое-то время возвращаются из GET /ads,
+# поэтому их номера запоминаются и отсеиваются — иначе у снятого товара
+# остаётся кнопка, и он продолжает считаться. Живёт это в настройках, а не в
+# памяти: контейнер пересобирается при каждом выкате, и множество в памяти
+# стиралось вместе с ним — после обновления все удалённые появлялись заново.
+# Статусы, которыми сам маркетплейс помечает удалённый товар: по ним он
+# отсеивается, даже если номер не записан, — так ловятся удалённые прямо
+# на сайте.
+_GONE_STATUSES = {"deleted", "removed", "trashed", "trash", "destroyed"}
+
+
+def _deleted_ids(uid: int) -> set[str]:
+    return {str(x) for x in (get_settings(uid).get("deleted_ads") or [])}
+
+
+def _mark_deleted(uid: int, item_id) -> None:
+    s = get_settings(uid)
+    lst = s.setdefault("deleted_ads", [])
+    if str(item_id) not in lst:
+        lst.append(str(item_id))
+        del lst[:-1000]          # keep the set bounded
+        save_settings(uid, s)
+
+
+def _esc(text) -> str:
+    return (str(text or "").replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _is_gone(ad: dict) -> bool:
+    return str(ad.get("status", "")).lower() in _GONE_STATUSES
 
 
 class PanelItemState(StatesGroup):
-    waiting_price = State()
     waiting_title = State()
-    waiting_stock = State()   # остатки перед отправкой на модерацию
+    waiting_stock = State()
 
 
 def _no_session_kb():
     b = InlineKeyboardBuilder()
     b.button(text="🌐 Войти в панель", callback_data="panel:sms_start")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
-    b.adjust(1)
+    ui.lay(b)
     return b.as_markup()
 
 
 async def _run(uid: int, fn, *args):
-    """Run a blocking panel function in a thread with a hard deadline."""
+    """Выполнить блокирующий вызов панели в отдельном потоке, с жёстким сроком."""
     creds = get_panel_creds(uid)
     if not creds or not creds.get("cookies"):
         return None, "no_session"
@@ -52,204 +90,246 @@ async def _run(uid: int, fn, *args):
 
 
 @router.callback_query(F.data == "pitems:cats")
-async def list_categories(callback: CallbackQuery) -> None:
-    """Show the seller's categories; picking one lists its items."""
-    from automation.panel import panel_list_categories_sync
+async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    """Разделы продавца, собранные по данным API.
 
-    await callback.message.edit_text("⏳ Загружаю категории...")
-    result, err = await _run(callback.from_user.id, panel_list_categories_sync)
-    if err == "no_session":
+    В строках товаров у панели раздела нет вовсе — он есть только в API, как
+    `category_id`, а справочник превращает его в название.
+    """
+    if not api:
         await callback.message.edit_text(
-            "❌ Нет сессии панели. Войдите через email.",
-            reply_markup=_no_session_kb())
-        await callback.answer()
-        return
-    if result is None or not result[0]:
-        detail = result[1] if result else err
-        await callback.message.edit_text(
-            f"❌ Не удалось получить категории:\n{detail}",
-            reply_markup=_no_session_kb())
+            "⚠️ Не настроен API-токен.", reply_markup=_no_session_kb())
         await callback.answer()
         return
 
-    cats = result[1]
-    _CAT_CACHE[callback.from_user.id] = [c["name"] for c in cats]
+    from handlers.ads import _safe_edit
+    await callback.answer()
+    await _safe_edit(callback.message, "⏳ Загружаю категории...")
+    try:
+        data = await api.get_ads()
+        ads = data.get("data") or data.get("items") or []
+        names = await _category_names(
+            api, callback.from_user.id, _wanted_cats(ads))
+    except Exception as e:
+        from handlers.ads import _load_error
+        b = InlineKeyboardBuilder()
+        b.button(text="🔄 Повторить", callback_data="pitems:cats")
+        b.button(text="⬅️ Назад", callback_data="menu:ads")
+        ui.lay(b)
+        await _safe_edit(callback.message, _load_error(e), b.as_markup())
+        return
+
+    gone = _deleted_ids(callback.from_user.id)
+    ads = [a for a in ads
+           if str(a.get("id")) not in gone and not _is_gone(a)]
+
+    groups: dict[str, int] = {}
+    for ad in ads:
+        groups[_ad_category(ad, names)] = groups.get(_ad_category(ad, names), 0) + 1
+
+    if not groups:
+        await callback.message.edit_text(
+            "📦 Товаров пока нет.", reply_markup=_no_session_kb())
+        await callback.answer()
+        return
+
+    ordered = sorted(groups.items(), key=lambda kv: (-kv[1], kv[0]))
+    _CAT_CACHE[callback.from_user.id] = [name for name, _ in ordered]
+
     b = InlineKeyboardBuilder()
-    for i, c in enumerate(cats[:40]):
-        b.button(text=f"📂 {c['name'][:24]} ({c['count']})",
-                 callback_data=f"pcat:{i}")
-    b.adjust(1)
-    b.button(text="📋 Все товары", callback_data="pitems:list")
+    for i, (name, cnt) in enumerate(ordered[:40]):
+        b.button(text=f"📂 {name[:24]} ({cnt})", callback_data=f"pcat:{i}")
+    ui.lay(b)
+    b.button(text="📋 Все товары", callback_data="pitems:allads")
     b.button(text="🔄 Обновить", callback_data="pitems:cats")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
     b.adjust(2, 1)
     await callback.message.edit_text(
         f"📦 <b>Товары по категориям</b>\n\n"
-        f"Категорий: <b>{len(cats)}</b>\nВыберите категорию:",
+        f"Всего товаров: <b>{len(ads)}</b>\n"
+        f"Категорий: <b>{len(ordered)}</b>\n\nВыбери категорию:",
         reply_markup=b.as_markup())
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("pcat:"))
-async def list_category_items(callback: CallbackQuery) -> None:
-    """Items of one category."""
-    uid = callback.from_user.id
+async def list_category_items(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    names_cache = _CAT_CACHE.get(callback.from_user.id) or []
     try:
-        idx = int(callback.data.split(":")[-1])
-    except ValueError:
-        await callback.answer()
-        return
-    names = _CAT_CACHE.get(uid) or []
-    if idx >= len(names):
-        await callback.answer("Категория устарела, обновите список",
+        idx = int(callback.data.split(":", 1)[1])
+        wanted = names_cache[idx]
+    except (ValueError, IndexError):
+        await callback.answer("Список устарел — обнови категории",
                               show_alert=True)
         return
-    await _render_items(callback, category=names[idx])
+    await _render_ads(callback, api, category=wanted)
 
 
-@router.callback_query(F.data == "pitems:list")
-async def list_items(callback: CallbackQuery) -> None:
-    await _render_items(callback, category=None)
+@router.callback_query(F.data == "pitems:allads")
+async def list_all_ads(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    await _render_ads(callback, api, category=None)
 
 
-async def _render_items(callback: CallbackQuery, category: str | None) -> None:
-    from automation.panel import panel_list_items_sync
+_STATUS_LABELS = {
+    "active": "🟢", "published": "🟢", "moderate": "🕓", "moderation": "🕓",
+    "draft": "📝", "inactive": "🔴", "hidden": "🙈", "sold": "💤",
+    "archived": "📦", "fraud": "⛔",
+}
 
-    await callback.message.edit_text("⏳ Загружаю товары из панели...")
-    result, err = await _run(callback.from_user.id, panel_list_items_sync, True)
-    if err == "no_session":
-        await callback.message.edit_text(
-            "❌ Нет сессии панели. Войдите через email.",
-            reply_markup=_no_session_kb(),
-        )
-        await callback.answer()
+
+async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
+                      category: str | None) -> None:
+    """Список товаров, при желании — только по одному разделу."""
+    if not api:
+        await callback.answer("⚠️ Не настроен API-токен", show_alert=True)
         return
-    if result is None:
-        await callback.message.edit_text(f"❌ {err}", reply_markup=_no_session_kb())
-        await callback.answer()
-        return
-
-    ok, items = result
-    if not ok:
-        await callback.message.edit_text(
-            f"❌ Не удалось получить товары:\n{items}",
-            reply_markup=_no_session_kb(),
-        )
-        await callback.answer()
-        return
-
-    if category:
-        items = [it for it in items
-                 if (it.get("category") or "Без категории") == category]
-
-    hidden = [it for it in items if it.get("public") is False]
-    b = InlineKeyboardBuilder()
-    for it in items[:40]:
-        pub = it.get("public")
-        mark = "🌍 " if pub is True else ("🙈 " if pub is False else "")
-        stock = it.get("stock")
-        stock_mark = "⚠️" if stock == 0 else ""
-        label = f"{mark}{stock_mark}{(it['title'] or ('Товар ' + it['id']))[:24]}"
-        if it.get("price"):
-            label += f" — {it['price']} ₽"
-        b.button(text=label, callback_data=f"pitem:{it['id']}")
-    b.adjust(1)
-    if hidden:
-        b.button(text=f"🌍 Опубликовать все скрытые ({len(hidden)})",
-                 callback_data="pitems:pubhidden")
-        b.adjust(1)
-    b.button(text="📂 По категориям", callback_data="pitems:cats")
-    b.button(text="➕ Добавить товар", callback_data="create_ad:start")
-    b.button(text="🔄 Обновить",
-             callback_data="pitems:list" if not category else "pitems:cats")
-    b.button(text="⬅️ Назад", callback_data="menu:ads")
-    b.adjust(2, 2)
-    status_hint = ""
-    if any(it.get("public") is not None for it in items):
-        status_hint = "\n🌍 = виден, 🙈 = скрыт, ⚠️ = нет остатков"
-    head = (f"📂 <b>{category}</b>" if category
-            else "🛠 <b>Товары в панели</b>")
-    await callback.message.edit_text(
-        f"{head} (всего: {len(items)})"
-        f"{status_hint}\n\n"
-        "Нажмите на товар для управления:",
-        reply_markup=b.as_markup(),
-    )
+    from handlers.ads import _safe_edit
     await callback.answer()
+    await _safe_edit(callback.message, "⏳ Загружаю товары...")
+    try:
+        data = await api.get_ads()
+        ads = data.get("data") or data.get("items") or []
+        names = await _category_names(
+            api, callback.from_user.id, _wanted_cats(ads))
+    except Exception as e:
+        from handlers.ads import _load_error
+        b = InlineKeyboardBuilder()
+        b.button(text="🔄 Повторить", callback_data="pitems:cats")
+        b.button(text="⬅️ Назад", callback_data="menu:ads")
+        ui.lay(b)
+        await _safe_edit(callback.message, _load_error(e), b.as_markup())
+        return
+
+    gone = _deleted_ids(callback.from_user.id)
+    ads = [a for a in ads
+           if str(a.get("id")) not in gone and not _is_gone(a)]
+    if category:
+        ads = [a for a in ads if _ad_category(a, names) == category]
+
+    b = InlineKeyboardBuilder()
+    lines = []
+    for ad in ads[:40]:
+        mark = _STATUS_LABELS.get(str(ad.get("status", "")).lower(), "•")
+        title = str(ad.get("title") or f"Товар {ad.get('id')}")
+        price = _ad_price(ad)
+        stock = ad.get("stock")
+        # Названия приходят с маркетплейса; неэкранированный «<» уронил бы
+        # правку, и заглушка «⏳ Загружаю товары...» осталась бы на экране навсегда.
+        lines.append(
+            f"{mark} <b>{_esc(title)}</b> — {price} ₽"
+            + (f" · остаток {stock}" if stock is not None else ""))
+        b.button(text=f"{mark} {title[:26]} — {price} ₽",
+                 callback_data=f"pitem:{ad.get('id')}")
+    b.adjust(1)
+    b.button(text="📂 По категориям", callback_data="pitems:cats")
+    b.button(text="⬅️ Назад", callback_data="menu:ads")
+    b.adjust(2)
+
+    header = f"📂 <b>{_esc(category)}</b>" if category else "📋 <b>Все товары</b>"
+    body = "\n".join(lines) if lines else "Здесь пока пусто."
+    await _safe_edit(
+        callback.message,
+        f"{header}\n\nТоваров: <b>{len(ads)}</b>\n\n{body[:3000]}",
+        b.as_markup())
 
 
 def _item_kb(item_id: str):
     b = InlineKeyboardBuilder()
-    b.button(text="📥 Остатки", callback_data=f"pitem_stock:{item_id}")
-    b.button(text="🌍 Опубликовать", callback_data=f"pitem_show:{item_id}")
-    b.button(text="✏️ Цена", callback_data=f"pitem_price:{item_id}")
     b.button(text="✏️ Название", callback_data=f"pitem_title:{item_id}")
+    b.button(text="📦 Остатки", callback_data=f"pitem_stock:{item_id}")
+    b.button(text="🚀 На модерацию", callback_data=f"pitem_show:{item_id}")
     b.button(text="🙈 Скрыть", callback_data=f"pitem_hide:{item_id}")
     b.button(text="🗑 Удалить", callback_data=f"pitem_del:{item_id}")
+    # Продвижение жило только в другом списке товаров, и из карточки,
+    # открытой через «📦 Товары», до него было не добраться
+    b.button(text="⭐ Премиум продвижение", callback_data=f"ad_bump:{item_id}")
     b.button(text="⬅️ К товарам", callback_data="pitems:list")
-    b.adjust(2, 2, 2, 1)
+    b.adjust(2, 2, 1, 1, 1)
     return b.as_markup()
 
 
+@router.callback_query(F.data == "pitems:list")
+async def list_items(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    """Flat list of every listing — same view as «Все товары»."""
+    await _render_ads(callback, api, category=None)
+
+
+_TYPE_LABELS = {
+    "simple": "Ограниченная выдача",
+    "unlimited": "Безлимитная",
+    "auto-delivery": "Авто-выдача",
+    "auto-value": "Авто-выбор",
+}
+_STATUS_TEXT = {
+    "active": "🟢 активен", "published": "🟢 опубликован",
+    "moderate": "🕓 на модерации", "moderation": "🕓 на модерации",
+    "draft": "📝 черновик", "inactive": "🔴 неактивен",
+    "hidden": "🙈 скрыт", "sold": "💤 продан", "archived": "📦 в архиве",
+    "fraud": "⛔ заблокирован",
+}
+
+
 @router.callback_query(F.data.startswith("pitem:"))
-async def item_detail(callback: CallbackQuery, state: FSMContext) -> None:
+async def item_detail(callback: CallbackQuery, state: FSMContext,
+                      api: YooMarketAPI) -> None:
+    """Show the listing itself, not just its id.
+
+    Everything here comes from GET /ads/{id}; without it the screen was a bare
+    "Товар #219206" with buttons, which tells the seller nothing.
+    """
     await state.clear()  # "Отмена" из ввода цены/названия ведёт сюда
     item_id = callback.data.split(":", 1)[1]
-    await callback.message.edit_text(
-        f"🛠 <b>Товар #{item_id}</b>\n\nВыберите действие:",
-        reply_markup=_item_kb(item_id),
-    )
     await callback.answer()
 
+    text = f"🛠 <b>Товар #{item_id}</b>"
+    if api:
+        try:
+            ad = await api.get_ad(item_id)
+            ad = ad.get("data") or ad
+            title = str(ad.get("title") or f"Товар #{item_id}")
+            price = _ad_price(ad)
+            stock = ad.get("stock")
+            status = _STATUS_TEXT.get(str(ad.get("status", "")).lower(),
+                                      str(ad.get("status") or "—"))
+            kind = _TYPE_LABELS.get(str(ad.get("type", "")),
+                                    str(ad.get("type") or "—"))
+            lines = [
+                f"📦 <b>{title}</b>",
+                "",
+                f"💰 Цена: <b>{price} ₽</b>",
+                f"📊 Статус: {status}",
+                f"⚙️ Тип: {kind}",
+            ]
+            if stock is not None:
+                lines.append(f"📥 Остаток: <b>{stock}</b>")
+            if ad.get("views") is not None:
+                lines.append(f"👁 Просмотров: {ad['views']}")
+            lines.append(f"\n<code>#{item_id}</code>")
+            text = "\n".join(lines)
+        except Exception as e:
+            logger.info("get_ad(%s) failed: %s", item_id, e)
+            text = (f"🛠 <b>Товар #{item_id}</b>\n\n"
+                    f"<i>Детали не загрузились: {str(e)[:120]}</i>")
 
-# ── Цена / Название ─────────────────────────────────────────────────────────
-
-@router.callback_query(F.data.startswith("pitem_price:"))
-async def edit_price_start(callback: CallbackQuery, state: FSMContext) -> None:
-    item_id = callback.data.split(":", 1)[1]
-    await state.set_state(PanelItemState.waiting_price)
-    await state.update_data(item_id=item_id)
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data=f"pitem:{item_id}")
-    await callback.message.edit_text(
-        f"✏️ Товар #{item_id} — введите новую цену (₽):",
-        reply_markup=b.as_markup(),
-    )
-    await callback.answer()
+    await _safe_edit_item(callback, text, _item_kb(item_id))
 
 
-@router.message(PanelItemState.waiting_price)
-async def edit_price_save(message: Message, state: FSMContext) -> None:
-    from automation.panel import panel_update_item_sync
+async def _safe_edit_item(callback: CallbackQuery, text: str, markup) -> None:
+    """Правка сообщения, а если старое править нельзя — отправка нового.
 
-    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
+    Нельзя, например, у сообщения с фотографией или когда текст совпал.
+    """
     try:
-        price = int(float(raw))
-        if price <= 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите цену числом, например: <b>500</b>")
-        return
-    data = await state.get_data()
-    item_id = data.get("item_id", "")
-    await state.clear()
-    uid = message.from_user.id
+        await callback.message.edit_text(text, reply_markup=markup)
+    except Exception as e:
+        logger.info("item edit failed (%s), sending new", e)
+        try:
+            await callback.message.answer(text, reply_markup=markup)
+        except Exception:
+            logger.exception("item message could not be sent")
 
-    status = await message.answer("⏳ Меняю цену...")
-    result, err = await _run(uid, panel_update_item_sync, item_id,
-                             {"price": price}, uid)
-    if result and result[0]:
-        await status.edit_text(
-            f"✅ Цена товара #{item_id} обновлена: <b>{price} ₽</b>",
-            reply_markup=_item_kb(item_id),
-        )
-    else:
-        detail = result[1] if result else err
-        await status.edit_text(
-            f"❌ Не удалось изменить цену:\n{detail}",
-            reply_markup=_item_kb(item_id),
-        )
 
+# ── Название ───────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("pitem_title:"))
 async def edit_title_start(callback: CallbackQuery, state: FSMContext) -> None:
@@ -259,7 +339,7 @@ async def edit_title_start(callback: CallbackQuery, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data=f"pitem:{item_id}")
     await callback.message.edit_text(
-        f"✏️ Товар #{item_id} — введите новое название (макс. 32 символа):",
+        f"✏️ Товар #{item_id} — введи новое название (макс. 32 символа):",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -296,16 +376,98 @@ async def edit_title_save(message: Message, state: FSMContext) -> None:
 
 # ── Показать / Скрыть ───────────────────────────────────────────────────────
 
-async def _toggle(callback: CallbackQuery, public: bool) -> None:
+async def _stock_left(api: YooMarketAPI, item_id: str,
+                      ad: dict | None = None) -> tuple[bool, str]:
+    """Сколько у товара остатка → (есть ли, пояснение человеку).
+
+    Публиковать товар, которому нечего продавать, маркетплейс отказывается,
+    поэтому проверка идёт ДО вызова публикации: иначе продавец получает
+    отказ и не понимает, что чинить.
+
+    При любой ошибке отвечает «есть»: сорвавшаяся проверка не должна
+    запрещать действие.
+    """
+    try:
+        if ad is None:
+            ad = await api.get_ad(item_id)
+        inner = ad.get("data") or ad
+        ad_type = str(inner.get("type") or "")
+
+        if ad_type == "auto-delivery":
+            data = await api.get_ad_items(item_id)
+            rows = data.get("data") or data.get("items") or []
+            free = [r for r in rows
+                    if str((r or {}).get("status", "available")) == "available"]
+            return bool(free), f"позиций в наличии: {len(free)}"
+
+        if ad_type == "auto-value":
+            val = await api.get_ad_value(item_id)
+            inner_v = val.get("data") or val
+            stock = inner_v.get("stock")
+            return bool(stock), f"остаток: {stock}"
+
+        stock = inner.get("stock")
+        if stock is None:
+            return True, ""
+        return bool(stock), f"остаток: {stock}"
+    except Exception as e:
+        logger.info("stock check skipped for %s: %s", item_id, e)
+        return True, ""
+
+
+async def _toggle(callback: CallbackQuery, public: bool,
+                  api: YooMarketAPI | None = None) -> None:
     from automation.panel import panel_publish_item_sync
 
     item_id = callback.data.split(":", 1)[1]
     uid = callback.from_user.id
+
+    if public and api:
+        # Одного чтения хватает на обе проверки ниже.
+        try:
+            ad = await api.get_ad(item_id)
+        except Exception as e:
+            logger.info("get_ad(%s) failed: %s", item_id, e)
+            ad = None
+
+        # Уже в очереди или уже в продаже? Скажем об этом, а не отправим повторно.
+        status = str(((ad or {}).get("data") or ad or {}).get("status", "")).lower()
+        if status in ("moderate", "moderation", "pending", "review"):
+            await callback.answer(
+                "🕓 Товар уже отправлен на модерацию", show_alert=True)
+            return
+        if status in ("active", "published"):
+            await callback.answer("🟢 Товар уже опубликован", show_alert=True)
+            return
+
+        # Пустой товар публиковать не даём — предлагаем сперва наполнить.
+        has_stock, note = await _stock_left(api, item_id, ad)
+        if not has_stock:
+            b = InlineKeyboardBuilder()
+            b.button(text="📦 Добавить остатки",
+                     callback_data=f"pitem_stock:{item_id}")
+            b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
+            ui.lay(b)
+            await callback.answer("Нет остатков", show_alert=True)
+            await callback.message.edit_text(
+                f"📦 <b>Нельзя опубликовать — нет остатков</b>\n\n"
+                f"Товар #{item_id}: {note}.\n\n"
+                f"Сначала добавь позиции, потом публикуй.",
+                reply_markup=b.as_markup(),
+            )
+            return
+
     await callback.answer("⏳ Выполняю...")
     result, err = await _run(uid, panel_publish_item_sync, item_id, uid, public)
-    verb = "показан" if public else "скрыт"
     if result and result[0]:
-        text = f"✅ Товар #{item_id} {verb} ({result[1]})"
+        if public:
+            # Публикация не выставляет товар на продажу: она ставит его в очередь
+            # на проверку, и в продажу он попадает, только когда проверку пройдёт.
+            text = (f"✅ Товар #{item_id} отправлен на модерацию "
+                    f"({result[1]})\n\n"
+                    f"🕓 Появится в маркете после проверки.")
+        else:
+            text = f"✅ Товар #{item_id} скрыт ({result[1]})"
     else:
         detail = result[1] if result else err
         text = f"❌ Товар #{item_id}: не удалось.\n\n{detail}"
@@ -313,8 +475,8 @@ async def _toggle(callback: CallbackQuery, public: bool) -> None:
 
 
 @router.callback_query(F.data.startswith("pitem_show:"))
-async def item_show(callback: CallbackQuery) -> None:
-    await _toggle(callback, public=True)
+async def item_show(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    await _toggle(callback, public=True, api=api)
 
 
 @router.callback_query(F.data.startswith("pitem_hide:"))
@@ -323,8 +485,8 @@ async def item_hide(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data == "pitems:pubhidden")
-async def publish_all_hidden(callback: CallbackQuery) -> None:
-    """Publish every currently-hidden item in one tap."""
+async def publish_all_hidden(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    """Опубликовать все скрытые товары одним нажатием."""
     from automation.panel import panel_list_items_sync, panel_publish_item_sync
     uid = callback.from_user.id
     await callback.answer("⏳")
@@ -341,8 +503,16 @@ async def publish_all_hidden(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         f"⏳ Публикую {len(hidden)} скрытых товаров…")
     ok = fail = 0
+    empty: list[str] = []
     last_err = ""
     for it in hidden:
+        # Товары, которым нечего продавать, пропускаем, а не отправляем в
+        # заведомый отказ. О них сообщается отдельно — чтобы их наполнили.
+        if api:
+            has_stock, _note = await _stock_left(api, it["id"])
+            if not has_stock:
+                empty.append(str(it["id"]))
+                continue
         r, e = await _run(uid, panel_publish_item_sync, it["id"], uid, True)
         if r and r[0]:
             ok += 1
@@ -353,7 +523,12 @@ async def publish_all_hidden(callback: CallbackQuery) -> None:
     b.button(text="🔄 К товарам", callback_data="pitems:list")
     b.button(text="⬅️ Назад", callback_data="menu:ads")
     b.adjust(2)
-    text = f"🌍 <b>Публикация завершена</b>\n\n✅ Опубликовано: <b>{ok}</b>"
+    text = (f"🌍 <b>Отправлено на модерацию</b>\n\n"
+            f"✅ Товаров: <b>{ok}</b>\n"
+            f"<i>Появятся в маркете после проверки.</i>")
+    if empty:
+        text += (f"\n📦 Пропущено без остатков: <b>{len(empty)}</b>"
+                 f"\n<i>#{', #'.join(empty[:10])}</i>")
     if fail:
         text += f"\n❌ Не удалось: <b>{fail}</b>"
         if last_err:
@@ -379,94 +554,1360 @@ async def item_delete_confirm(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("pitem_del2:"))
-async def item_delete_do(callback: CallbackQuery) -> None:
+async def item_delete_do(callback: CallbackQuery, api: YooMarketAPI) -> None:
     from automation.panel import panel_delete_item_sync
 
     item_id = callback.data.split(":", 1)[1]
     uid = callback.from_user.id
     await callback.answer("⏳ Удаляю...")
     result, err = await _run(uid, panel_delete_item_sync, item_id, uid)
-    b = InlineKeyboardBuilder()
-    b.button(text="⬅️ К товарам", callback_data="pitems:list")
+
     if result and result[0]:
-        await callback.message.edit_text(
-            f"✅ Товар #{item_id} удалён.", reply_markup=b.as_markup())
-    else:
-        detail = result[1] if result else err
-        await callback.message.edit_text(
-            f"❌ Не удалось удалить:\n{detail}", reply_markup=b.as_markup())
-
-
-# ── Остатки (нужны перед отправкой на модерацию) ────────────────────────────
-
-@router.callback_query(F.data.startswith("pitem_stock:"))
-async def stock_start(callback: CallbackQuery, state: FSMContext) -> None:
-    """Ask the seller for the product data that fills the item's stock."""
-    from automation.panel import panel_discover_stock_sync
-
-    item_id = callback.data.split(":", 1)[1]
-    uid = callback.from_user.id
-    await callback.answer("⏳ Смотрю форму остатков…")
-    await callback.message.edit_text("⏳ Определяю формат остатков в панели…")
-
-    result, err = await _run(uid, panel_discover_stock_sync)
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data=f"pitem:{item_id}")
-
-    if not (result and result[0]):
-        detail = result[1] if result else err
-        await callback.message.edit_text(
-            f"❌ <b>Не нашёл, куда писать остатки</b>\n\n{detail}\n\n"
-            "Пришлите этот текст разработчику — подстрою под вашу панель.",
-            reply_markup=b.as_markup())
+        # Запоминаем всерьёз, а не в памяти: API какое-то время продолжает
+        # отдавать удалённый товар, а контейнер пересобирается при каждом
+        # выкате — заметка в памяти пропала бы, и товар вернулся бы на экран.
+        _mark_deleted(uid, item_id)
+        await callback.answer(f"✅ Товар #{item_id} удалён", show_alert=True)
+        # Сразу назад в обновлённый список, чтобы строка действительно исчезла
+        await _render_ads(callback, api, category=None)
         return
 
-    form = result[1]
-    fields = form.get("fields", [])
-    req = [f["label"] for f in fields if f.get("required")]
-    await state.set_state(PanelItemState.waiting_stock)
-    await state.update_data(stock_item_id=item_id)
-    hint = f"\n\n📋 Обязательные поля панели: <code>{req}</code>" if req else ""
+    detail = result[1] if result else err
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ К товарам", callback_data="pitems:list")
     await callback.message.edit_text(
-        f"📥 <b>Остатки товара #{item_id}</b>\n\n"
-        "Пришлите товар <b>одним сообщением</b> — каждая позиция с новой строки.\n\n"
-        "<i>Например:\nlogin1:pass1\nlogin2:pass2\nlogin3:pass3</i>\n\n"
-        "Сколько строк — столько позиций добавится в остатки."
-        f"{hint}",
-        reply_markup=b.as_markup())
+        f"❌ Не удалось удалить:\n{detail}", reply_markup=b.as_markup())
+
+
+# ---------------------------------------------------------------------------
+# Остаток — без него товар в продажу не выставить
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("pitem_stock:"))
+async def item_stock_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Спросить, сколько остатка добавить.
+
+    Идёт через Integration API, а не через панель: /ads/{id}/items и
+    /ads/{id}/value — это описанные в документации пути.
+    """
+    item_id = callback.data.split(":", 1)[1]
+    await state.update_data(item_id=item_id)
+    await state.set_state(PanelItemState.waiting_stock)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data=f"pitem:{item_id}")
+    await callback.message.edit_text(
+        "📦 <b>Добавить остатки</b>\n\n"
+        "<b>Авто-выдача</b> — пришли позиции, <b>по одной в строке</b>:\n"
+        "<code>KEY-1111\nKEY-2222\nKEY-3333</code>\n\n"
+        "<b>Авто-выбор</b> — пришли просто число, на сколько пополнить:\n"
+        "<code>500</code>\n\n"
+        "<i>Тип товара определю сам.</i>",
+        reply_markup=b.as_markup(),
+    )
+    await callback.answer()
 
 
 @router.message(PanelItemState.waiting_stock)
-async def stock_save(message: Message, state: FSMContext) -> None:
-    from automation.panel import panel_add_stock_sync
-
-    raw = message.text or ""
-    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    data = await state.get_data()
-    item_id = data.get("stock_item_id", "")
-    if not lines:
-        await message.answer("❌ Пусто. Пришлите позиции — каждая с новой строки.")
+async def item_stock_save(message: Message, state: FSMContext,
+                          api: YooMarketAPI) -> None:
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("❌ Пришли позиции или число")
         return
-    await state.clear()
-    uid = message.from_user.id
+    if not api:
+        await state.clear()
+        await message.answer("⚠️ Не настроен API-токен — остатки идут через него")
+        return
 
-    status = await message.answer(f"⏳ Добавляю {len(lines)} позиций в остатки…")
-    result, err = await _run(uid, panel_add_stock_sync, item_id, lines, uid)
-    b = InlineKeyboardBuilder()
-    if result and result[0]:
-        b.button(text="🌍 Опубликовать", callback_data=f"pitem_show:{item_id}")
-        b.button(text="📦 К товару", callback_data=f"pitem:{item_id}")
-        b.adjust(1)
+    data = await state.get_data()
+    item_id = data.get("item_id", "")
+    await state.clear()
+    status = await message.answer("⏳ Добавляю остатки...")
+
+    try:
+        ad = await api.get_ad(item_id)
+        inner = ad.get("data") or ad
+        ad_type = str(inner.get("type") or "")
+
+        if ad_type == "auto-value" or (text.isdigit() and ad_type != "auto-delivery"):
+            await api.refill_ad_value(item_id, float(text))
+            done = f"остаток пополнен на {text}"
+        else:
+            items = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            await api.add_ad_items(item_id, items)
+            done = f"добавлено позиций: {len(items)}"
+
+        b = InlineKeyboardBuilder()
+        b.button(text="🚀 Отправить на модерацию",
+                 callback_data=f"pitem_show:{item_id}")
+        b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
+        ui.lay(b)
         await status.edit_text(
-            f"✅ <b>Остатки добавлены</b> ({result[1]})\n\n"
-            "Теперь можно отправить товар на модерацию — жмите "
-            "<b>🌍 Опубликовать</b>.",
-            reply_markup=b.as_markup())
+            f"✅ <b>Готово</b> — {done}.\n\n"
+            f"Теперь товар можно отправить на модерацию.",
+            reply_markup=b.as_markup(),
+        )
+    except Exception as e:
+        b = InlineKeyboardBuilder()
+        b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
+        await status.edit_text(
+            f"❌ Не удалось добавить остатки:\n<code>{str(e)[:300]}</code>",
+            reply_markup=b.as_markup(),
+        )
+
+
+def _ad_price(ad: dict) -> int:
+    """Цена товара.
+
+    GET /ads отдаёт её вложенной: {"amount": 149, "base_amount": 149,
+    "currency": "RUB"}. Чтение её как простого числа молча пропускало каждый
+    товар в групповых действиях.
+    """
+    p = ad.get("price")
+    if isinstance(p, dict):
+        p = p.get("amount", p.get("base_amount", 0))
+    try:
+        return int(float(str(p or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _category_names(api: YooMarketAPI, uid: int,
+                          wanted: set[int] | None = None) -> dict[int, str]:
+    """category_id → название, с запоминанием по продавцу.
+
+    Плоский справочник покрывает только верх дерева, поэтому номера, которые
+    на самом деле стоят у товаров, спрашиваются поимённо, а не обходом всех
+    ветвей.
+    """
+    names = _CATS_NAMES.setdefault(uid, {})
+    if not names:
+        try:
+            for c in await api.get_categories():
+                cid = c.get("id")
+                label = c.get("name") or c.get("title")
+                if cid is not None and label:
+                    names[int(cid)] = str(label)
+        except Exception as e:
+            logger.info("categories fetch failed: %s", e)
+
+    missing = {c for c in (wanted or ()) if c not in names}
+    for cid in sorted(missing):
+        try:
+            label = await api.resolve_category(cid)
+        except Exception as e:
+            logger.info("resolve_category(%s) failed: %s", cid, e)
+            label = ""
+        if label:
+            names[cid] = label
+
+    # Всё, что не разошлось по названиям, лежит глубже в дереве: обходим его
+    # с ограничением и только ради тех номеров, которые действительно нужны.
+    missing = {c for c in (wanted or ()) if c not in names}
+    if missing:
+        try:
+            names.update(await api.find_categories(missing))
+        except Exception as e:
+            logger.info("find_categories failed: %s", e)
+    return names
+
+
+def _wanted_cats(ads: list[dict]) -> set[int]:
+    """Номера разделов, которые эти товары действительно используют.
+
+    Разбирать имеет смысл только их: остальное дерево к делу не относится.
+    """
+    out: set[int] = set()
+    for ad in ads:
+        cid = ad.get("category_id")
+        try:
+            if cid not in (None, "", 0):
+                out.add(int(cid))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+# Названия выглядят как «100 звезд» — количество плюс товар в родительном
+# падеже. Снятое число оставляет этот падеж («Звезд»), а это не название
+# раздела, поэтому обычные для этого маркетплейса товары приводятся обратно
+# к именительному.
+_GOODS_FORMS = {
+    # Английское и русское название одного товара идут одной группой
+    "звезд": "Звезды", "звёзд": "Звезды", "звезды": "Звезды",
+    "звёзды": "Звезды", "stars": "Звезды", "star": "Звезды",
+    "подписчиков": "Подписчики", "подписчика": "Подписчики",
+    "просмотров": "Просмотры", "просмотра": "Просмотры",
+    "лайков": "Лайки", "лайка": "Лайки",
+    "монет": "Монеты", "монеты": "Монеты",
+    "ключей": "Ключи", "ключа": "Ключи",
+    "аккаунтов": "Аккаунты", "аккаунта": "Аккаунты",
+    "робуксов": "Робуксы", "гемов": "Гемы", "алмазов": "Алмазы",
+    "кристаллов": "Кристаллы", "рублей": "Рубли", "донатов": "Донат",
+    "бустов": "Бусты", "реакций": "Реакции", "премиума": "Премиум",
+}
+
+
+def _label_from_title(title: str) -> str:
+    """A category label derived from the ad's own title.
+
+    Titles carry decoration and quantities — "💠100 ЗВЕЗД💠⚡МОМЕНТАЛЬНО⚡",
+    "100 звезд", "500 звезд №219206" — so symbols and numbers are dropped and
+    the goods word is looked for anywhere in what remains. All three land on
+    «Звезды» instead of each becoming its own category.
+    """
+    # Снимаем эмодзи и знаки препинания, оставляем буквы и цифры
+    text = re.sub(r"[^\w\s]", " ", str(title or ""), flags=re.UNICODE)
+    words = [w for w in text.split() if not w.isdigit()]
+    # Убираем количество, приклеенное к слову («100зв» остаётся, «100» уходит)
+    words = [re.sub(r"^\d+", "", w) for w in words]
+    words = [w for w in words if w]
+    if not words:
+        return "Прочее"
+
+    lowered = [w.lower() for w in words]
+    for w in lowered:
+        form = _GOODS_FORMS.get(w)
+        if form:
+            return form
+    # Названия из двух слов («telegram stars»)
+    for i in range(len(lowered) - 1):
+        form = _GOODS_FORMS.get(f"{lowered[i]} {lowered[i + 1]}")
+        if form:
+            return form
+
+    # Ничего не узнали — оставляем как написано, минус слова-шум
+    _NOISE = {"моментально", "быстро", "дешево", "новый", "акция", "хит",
+              "лучшая", "цена", "instant", "fast", "cheap"}
+    kept = [w for w in words if w.lower() not in _NOISE] or words
+    text = " ".join(kept)[:30]
+    # `capitalize()` опустил бы остальное и превратил «Telegram Stars» в
+    # «Telegram stars»
+    return text[0].upper() + text[1:]
+
+
+def _ad_category(ad: dict, names: dict[int, str]) -> str:
+    """Название раздела товара.
+
+    Сначала настоящее имя; если его нет — выведенное из названия товара, а не
+    голый номер: номер не говорит продавцу ничего.
+    """
+    cid = ad.get("category_id")
+    if cid not in (None, "", 0):
+        try:
+            label = names.get(int(cid))
+        except (TypeError, ValueError):
+            label = None
+        if label:
+            return label
+    return _label_from_title(ad.get("title", ""))
+
+
+@router.message(Command("ads_debug"))
+async def ads_debug(message: Message, api: YooMarketAPI) -> None:
+    """Показать один товар ровно так, как его отдаёт Integration API.
+
+    В строках панели раздела нет вовсе, поэтому группировка берётся из API —
+    здесь печатаются имена его полей, а не догадки о них.
+    """
+    if not api:
+        await message.answer("⚠️ Не настроен API-токен")
+        return
+
+    import html as _html
+    import json as _json
+
+    status = await message.answer("⏳ Читаю объявление из API...")
+    try:
+        data = await api.get_ads()
+        rows = data.get("data") or data.get("items") or []
+        if not rows:
+            report = f"API вернул пусто: {_json.dumps(data, ensure_ascii=False)[:400]}"
+        else:
+            ad = rows[0]
+            lines = [f"всего объявлений: {len(rows)}",
+                     f"ключи: {list(ad.keys())}", ""]
+            for k, v in ad.items():
+                if isinstance(v, (dict, list)):
+                    v = _json.dumps(v, ensure_ascii=False)
+                lines.append(f"• {k} = {str(v)[:100]}")
+            # Заодно проверяем, что справочник вообще разбирает раздел этого
+            # товара: показанный сырой номер означает, что поиск ничего не нашёл.
+            _CATS_NAMES.pop(message.from_user.id, None)
+            cid = ad.get("category_id")
+            names = await _category_names(
+                api, message.from_user.id, {int(cid)} if cid else set())
+            lines += ["", f"категорий в справочнике: {len(names)}",
+                      f"category_id {cid} → {names.get(int(cid)) if cid else None!r}"]
+            # Форма самого справочника: дерево ли это, есть ли страницы?
+            try:
+                raw = await api.categories_raw()
+                rows = raw.get("data") or raw.get("items") or []
+                lines.append(f"meta: {_json.dumps(raw.get('meta'), ensure_ascii=False)[:120]}")
+                lines.append(f"links: {_json.dumps(raw.get('links'), ensure_ascii=False)[:120]}")
+                if rows:
+                    lines.append(f"пример категории: "
+                                 f"{_json.dumps(rows[0], ensure_ascii=False)[:200]}")
+            except Exception as e:
+                lines.append(f"categories_raw: {str(e)[:120]}")
+            report = "\n".join(lines)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:250]}"
+    await status.edit_text(
+        f"🔍 <b>Объявление в API</b>\n\n<code>{_html.escape(report)[:3500]}</code>")
+
+
+@router.message(Command("items_debug"))
+async def items_debug(message: Message) -> None:
+    """Show how the panel actually describes an item.
+
+    Field names differ per panel, and guessing them is what left items showing
+    as "Товар <id>" with no category. This prints the real ones.
+    """
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет сессии панели — войди в «Панель продавца»")
+        return
+
+    import json as _json
+
+    from automation.panel import PANEL_URL, _make_panel_requests_session
+
+    def _fetch() -> str:
+        session = _make_panel_requests_session(creds["cookies"])
+        r = session.get(f"{PANEL_URL}/nova-api/items",
+                        params={"perPage": "1"}, timeout=(6, 12))
+        if r.status_code != 200:
+            return f"HTTP {r.status_code}: {r.text[:200]}"
+        rows = (r.json() or {}).get("resources") or []
+        if not rows:
+            return "Панель вернула пустой список"
+        row = rows[0]
+        out = [f"ключи записи: {list(row.keys())}",
+               f"title записи: {row.get('title')!r}"]
+        fields = row.get("fields")
+        if isinstance(fields, dict):
+            fields = list(fields.values())
+        from automation.panel import _html_badges, _strip_html
+
+        for f in (fields or [])[:14]:
+            if not isinstance(f, dict):
+                continue
+            val = f.get("value")
+            if isinstance(val, (dict, list)):
+                val = _json.dumps(val, ensure_ascii=False)[:80]
+            name = str(f.get("name") or "")
+            line = f"• {f.get('attribute')} | {name} = {str(val)[:80]}"
+            # В этих колонках рисуется HTML — показываем, что из них читается на деле
+            if isinstance(val, str) and "<" in val:
+                badges = _html_badges(val)
+                line += (f"\n   → бейджи: {badges}" if badges
+                         else f"\n   → текст: {_strip_html(val)[:80]}")
+            out.append(line)
+        return "\n".join(out)
+
+    status = await message.answer("⏳ Читаю структуру товара...")
+    try:
+        loop = asyncio.get_event_loop()
+        report = await asyncio.wait_for(loop.run_in_executor(None, _fetch),
+                                        timeout=40)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    import html as _html
+    await status.edit_text(
+        f"🔍 <b>Структура товара</b>\n\n<code>{_html.escape(report)[:3500]}</code>")
+
+
+@router.message(Command("scan"))
+async def scan_page(message: Message) -> None:  # noqa: C901
+    """/scan /support — прочитать страницу панели и найти адреса, которые она зовёт.
+
+    Страница, показывающая сообщения, обязана откуда-то их брать; наведя это
+    на чат поддержки, получаем нужный адрес без всякого браузера.
+    """
+    import re as _re_mod
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Укажи страницу панели, например:\n<code>/scan /support</code>\n\n"
+            "Адрес возьми из строки браузера, когда открыт нужный чат.")
+        return
+    page_path = parts[1].strip()
+    # Принимаем и адрес целиком, скопированный из строки браузера, не только путь
+    page_path = _re_mod.sub(r"^https?://[^/]+", "", page_path)
+    if not page_path.startswith("/"):
+        page_path = "/" + page_path
+
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет сессии панели — войди в «Панель продавца»")
+        return
+
+    import html as _html
+    import re as _re
+
+    from automation.panel import PANEL_URL, _make_panel_requests_session
+
+    def _fetch() -> str:
+        session = _make_panel_requests_session(creds["cookies"])
+        out = []
+        try:
+            r = session.get(PANEL_URL + page_path, timeout=(6, 15))
+        except Exception as e:
+            return f"не открылась: {str(e)[:120]}"
+        html = r.text
+        out.append(f"{page_path} → {r.status_code}, {len(html)}б")
+
+        # Адреса, названные прямо на странице
+        inline = set(_re.findall(
+            r'["\'`](/[a-z0-9/_-]*(?:chat|support|message|ticket|dialog)[a-z0-9/_-]*)["\'`]',
+            html, _re.I))
+        if inline:
+            out.append(f"в HTML: {sorted(inline)[:12]}")
+
+        srcs = list(dict.fromkeys(
+            _re.findall(r'src="(/[^"]+\.js[^"]*)"', html)
+            + _re.findall(r'"(/[^"]+\.js)"', html)))[:6]
+        out.append(f"скриптов: {len(srcs)}")
+        hits = set()
+        for src in srcs:
+            try:
+                js = session.get(PANEL_URL + src, timeout=(6, 20)).text
+            except Exception:
+                continue
+            for m in _re.findall(
+                    r'["\'`](/[a-z0-9/_-]*(?:chat|support|message|ticket|dialog|notif)[a-z0-9/_-]*)["\'`]',
+                    js, _re.I):
+                if len(m) < 60:
+                    hits.add(m)
+        out.append(f"в JS: {sorted(hits)[:20] or 'ничего'}")
+
+        # Для страницы вида /chats/1076867 сообщения лежат по соседнему
+        # адресу — пробуем обычные формы напрямую.
+        m = _re.match(r"^/([a-z-]+)/(\d+)", page_path)
+        if m:
+            section, oid = m.group(1), m.group(2)
+            out.append("\n— проверка адресов сообщений —")
+            for cand in (
+                f"/api/{section}/{oid}/messages",
+                f"/{section}/{oid}/messages",
+                f"/api/{section}/{oid}",
+                f"/nova-api/{section}/{oid}",
+                f"/{section}/{oid}/list",
+                f"/api/{section}/{oid}/list",
+            ):
+                try:
+                    rr = session.get(PANEL_URL + cand, timeout=(5, 10),
+                                     allow_redirects=False)
+                except Exception:
+                    continue
+                if rr.status_code in (404, 405):
+                    continue
+                body = rr.text[:130].replace("\n", " ")
+                out.append(f"{cand} → {rr.status_code}: {body}")
+        return "\n".join(out)
+
+    status = await message.answer(f"⏳ Читаю {page_path}...")
+    try:
+        loop = asyncio.get_event_loop()
+        report = await asyncio.wait_for(loop.run_in_executor(None, _fetch),
+                                        timeout=90)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    await status.edit_text(
+        f"🔍 <b>{_html.escape(page_path)}</b>\n\n"
+        f"<code>{_html.escape(report)[:3500]}</code>")
+
+
+@router.message(Command("panel_debug"))
+async def panel_debug(message: Message) -> None:
+    """Что панель отдаёт наружу — чтобы найти чаты поддержки.
+
+    Чаты заказов приходят из Integration API, а он списка чатов не отдаёт
+    вовсе: только чтение одного по номеру. Значит всё, что вне заказа —
+    поддержка, модерация, — может прийти только из панели, если она это вообще
+    показывает.
+    """
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет сессии панели — войди в «Панель продавца»")
+        return
+
+    import html as _html
+    import re as _re
+
+    from automation.panel import PANEL_URL, _make_panel_requests_session
+
+    def _fetch() -> str:
+        session = _make_panel_requests_session(creds["cookies"])
+        out = []
+        for path in ("/nova-api/navigation", "/nova-api/resources"):
+            try:
+                r = session.get(PANEL_URL + path, timeout=(6, 12))
+                keys = sorted(set(_re.findall(r'"uriKey"\s*:\s*"([^"]+)"', r.text)))
+                out.append(f"{path} → {r.status_code}, ресурсов: {len(keys)}")
+                if keys:
+                    out.append("  " + ", ".join(keys))
+            except Exception as e:
+                out.append(f"{path}: {str(e)[:80]}")
+
+        # Всё, что похоже на чат, — это и есть искомое
+        # «notifies» — самое вероятное место для писем поддержки и модерации
+        for guess in ("notifies", "chats", "messages", "dialogs", "tickets",
+                      "support", "emails"):
+            try:
+                r = session.get(f"{PANEL_URL}/nova-api/{guess}",
+                                params={"perPage": "2"}, timeout=(6, 10),
+                                allow_redirects=False)
+                if r.status_code == 404:
+                    continue
+                out.append(f"\n/nova-api/{guess} → {r.status_code}")
+                if r.status_code == 200:
+                    rows = (r.json() or {}).get("resources") or []
+                    out.append(f"  записей: {len(rows)}")
+                    if rows:
+                        row = rows[0]
+                        out.append(f"  title: {row.get('title')!r}")
+                        fields = row.get("fields")
+                        if isinstance(fields, dict):
+                            fields = list(fields.values())
+                        for f in (fields or [])[:8]:
+                            if isinstance(f, dict):
+                                val = str(f.get("value"))[:60]
+                                out.append(f"  • {f.get('attribute')} | "
+                                           f"{f.get('name')} = {val}")
+                else:
+                    out.append(f"  {r.text[:120]}")
+            except Exception as e:
+                out.append(f"/nova-api/{guess}: {str(e)[:60]}")
+
+        # Чат поддержки — не раздел Nova, поэтому ищем собственный адрес
+        # панели: тем же способом когда-то нашёлся и путь входа.
+        out.append("\n— свои адреса панели —")
+        for path in ("/api/chats", "/api/support", "/chats", "/support",
+                     "/api/messages", "/api/tickets", "/api/chat/messages",
+                     "/nova-vendor/chat", "/api/notifications"):
+            try:
+                r = session.get(PANEL_URL + path, timeout=(5, 8),
+                                allow_redirects=False)
+                if r.status_code in (404, 405):
+                    continue
+                body = r.text[:100].replace("\n", " ")
+                out.append(f"{path} → {r.status_code}: {body}")
+            except Exception:
+                continue
+
+        # И то, что зовут скрипты самой панели
+        try:
+            html = session.get(PANEL_URL + "/", timeout=(6, 12)).text
+            srcs = _re.findall(r'src="(/[^"]+\.js[^"]*)"', html)[:4]
+            hits = set()
+            for src in srcs:
+                js = session.get(PANEL_URL + src, timeout=(6, 15)).text
+                for m in _re.findall(
+                        r'["\'`](/[a-z0-9/_-]*(?:chat|support|message|ticket)[a-z0-9/_-]*)["\'`]',
+                        js, _re.I):
+                    if len(m) < 60:
+                        hits.add(m)
+            out.append(f"в JS панели: {sorted(hits)[:15] or 'ничего'}")
+        except Exception as e:
+            out.append(f"JS: {str(e)[:60]}")
+        return "\n".join(out) or "пусто"
+
+    status = await message.answer("⏳ Смотрю ресурсы панели...")
+    try:
+        loop = asyncio.get_event_loop()
+        report = await asyncio.wait_for(loop.run_in_executor(None, _fetch),
+                                        timeout=60)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    await status.edit_text(
+        f"🔍 <b>Ресурсы панели</b>\n\n<code>{_html.escape(report)[:3500]}</code>")
+
+
+@router.message(Command("promo_debug"))
+async def promo_debug(message: Message) -> None:
+    """Dump the «Премиум» action exactly as the panel describes it.
+
+    Every earlier attempt read a summary of these fields, and the summary drops
+    precisely the keys that would say what «Оплата» is. This prints the raw
+    JSON so the answer stops being a guess.
+    """
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет сессии панели — войди в «Панель продавца»")
+        return
+
+    import html as _html
+    import json as _json
+
+    from automation.panel import (PANEL_URL, _find_promo_action,
+                                  _make_panel_requests_session,
+                                  _normalize_options, _panel_xsrf_headers,
+                                  panel_list_items_sync)
+
+    def _fetch() -> str:
+        ok, items = panel_list_items_sync(creds["cookies"])
+        if not ok:
+            return f"объявления не прочитались: {items}"
+        ids = [i.get("id") for i in items if i.get("id")]
+        if not ids:
+            return "в панели нет объявлений"
+        item_id = str(ids[0])
+
+        session = _make_panel_requests_session(creds["cookies"])
+        hdrs = _panel_xsrf_headers(session, creds["cookies"])
+        r = session.get(f"{PANEL_URL}/nova-api/items/actions",
+                        params={"resources": item_id}, headers=hdrs,
+                        timeout=(6, 12), allow_redirects=False)
+        if r.status_code != 200:
+            return f"actions → {r.status_code}: {r.text[:200]}"
+        actions = [a for a in ((r.json() or {}).get("actions") or [])
+                   if isinstance(a, dict)]
+        a = _find_promo_action(actions)
+        if not a:
+            return f"действие не найдено среди {[x.get('name') for x in actions]}"
+
+        out = [f"объявление #{item_id}", f"action: {a.get('uriKey')}"]
+        fields = [f for f in (a.get("fields") or []) if isinstance(f, dict)]
+        for f in fields:
+            out.append("\n— " + str(f.get("attribute")) + " —")
+            out.append(_json.dumps(f, ensure_ascii=False)[:1400])
+
+        # Поле без вариантов — зависимое: показываем, что на самом деле
+        # отвечает панель на просьбу его разобрать, чтобы путь был виден, а не
+        # додуман.
+        from automation.panel import panel_action_field_options_sync
+
+        picked = {}
+        for f in fields:
+            if _normalize_options(f) and f.get("value") not in (None, ""):
+                picked[f.get("attribute")] = f.get("value")
+        for f in fields:
+            if _normalize_options(f):
+                continue
+            opts, trace = panel_action_field_options_sync(
+                creds["cookies"], item_id, a.get("uriKey") or "",
+                f.get("attribute") or "", picked,
+                f.get("dependentComponentKey") or "", f.get("dependsOn") or {})
+            out.append(f"\n— синхронизация {f.get('attribute')} —")
+            out.append(f"значения: {picked}")
+            out.append(f"варианты: {opts or 'нет'}")
+            out.append(f"лог: {trace}")
+        return "\n".join(out)
+
+    status = await message.answer("⏳ Читаю действие «Премиум»...")
+    try:
+        loop = asyncio.get_event_loop()
+        report = await asyncio.wait_for(loop.run_in_executor(None, _fetch),
+                                        timeout=90)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+
+    # JSON одного поля сам по себе может не влезть в сообщение Telegram —
+    # шлём частями
+    text = _html.escape(report)
+    for i in range(0, min(len(text), 12000), 3500):
+        await message.answer(f"<code>{text[i:i + 3500]}</code>")
+    await status.delete()
+
+
+def _pos_raw_sync(url: str, shop: str) -> str:
+    """Блокирующая: где страница витрины держит свои предложения.
+
+    Только чтение и без входа. Отвечает на вопрос, на который снаружи ответить
+    больше нечем: есть ли выдача в самом HTML? Если название магазина есть в
+    байтах — данные там, и виноват разбор; если нет — страница дозаполняет
+    себя позже, и читать HTML бесполезно, как его ни разбирай.
+    """
+    import requests
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+    from automation.market import (MARKET_URL, _json_blobs, _normalize,
+                                   _offer_lists, _offers_from_text, _offers_in,
+                                   _seller_of, _visible_text, find_position,
+                                   get_page, with_page)
+
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+    if not url.startswith("http"):
+        url = MARKET_URL + ("" if url.startswith("/") else "/") + url
+    try:
+        r = requests.get(url, timeout=(6, 25), verify=False, headers={
+            "User-Agent": ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"),
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+        })
+    except Exception as e:
+        return f"запрос не прошёл: {str(e)[:200]}"
+    html = r.text
+    out = [f"HTTP {r.status_code}, {len(html)}б, "
+           f"тип: {r.headers.get('content-type', '?')[:40]}"]
+
+    # 1. Где страница на Next.js могла бы его держать
+    nd = re.search(r'id="__NEXT_DATA__"', html)
+    chunks = re.findall(r'__next_f\.push\(\[\d+,\s*"((?:[^"\\]|\\.)*)"\]\)', html)
+    out.append(f"__NEXT_DATA__: {'есть' if nd else 'нет'}; "
+               f"RSC-чанков: {len(chunks)}, в них {sum(len(c) for c in chunks)}б")
+    blobs = _json_blobs(html)
+    lists = []
+    for b in blobs:
+        lists.extend(_offer_lists(b))
+    out.append(f"распознано JSON-блоков: {len(blobs)}, "
+               f"списков-офферов: {len(lists)}"
+               + (f", длиннейший: {max(len(x) for x in lists)}" if lists else ""))
+    out.append(f"карточек по разметке: {len(_offers_from_text(html))}")
+
+    # 2. Есть ли товар в байтах ответа вообще?
+    text = _visible_text(html)
+    marks = [m for m in (shop, "отзыв", "₽") if m]
+    found = {m: (m in html) for m in marks}
+    out.append("в HTML: " + ", ".join(f"{k}={'да' if v else 'НЕТ'}"
+                                      for k, v in found.items()))
+    out.append(f"видимого текста: {len(text.strip())}б")
+
+    # 3. Сколько списка пришло одним ответом и где в нём мы. Продавцу
+    # приходилось прокручивать до собственной карточки, поэтому вопрос не
+    # только «разобралось ли», но и «весь ли список приехал»: выдача,
+    # подгружающаяся частями, оставила бы его за краем видимого.
+    rows = _normalize(_offers_from_text(html)) if not lists else \
+        _normalize(max(lists, key=len))
+    if rows:
+        mine = find_position(rows, seller=shop) if shop else None
+        out.append(f"разобрано карточек: {len(rows)}; "
+                   f"наше место: {mine['pos'] if mine else 'НЕ НАЙДЕНО'}")
+        out.append("продавцы: " + ", ".join(r["seller"][:14] or "?"
+                                            for r in rows[:12])
+                   + (" …" if len(rows) > 12 else ""))
+    lazy = sorted(set(re.findall(
+        r'(?i)(page=\d+|[?&]offset=|показать ещё|показать еще|load[_-]?more'
+        r'|infinite|IntersectionObserver|useInfiniteQuery|hasNextPage)', html)))
+    out.append("признаки подгрузки порциями: "
+               + (", ".join(lazy[:8]) if lazy else "не вижу"))
+
+    # Даёт ли ?page=2 на самом деле другую выдачу? Если ответ приходит тот
+    # же, до позиций за первым экраном надо добираться иначе, — и никакой
+    # разбор первой страницы об этом не скажет.
+    ok2, html2 = get_page(with_page(url, 2))
+    if ok2:
+        rows2, _ = (_offers_in(html2) if lists else
+                    (_offers_from_text(html2), ""))
+        first_of = lambda rr: ", ".join(  # noqa: E731
+            (_seller_of(x) if isinstance(x, dict) else "")[:12] for x in rr[:4])
+        out.append(f"страница 2: {len(html2)}б, карточек: {len(rows2)}, "
+                   f"начало: {first_of(rows2) or '—'}")
+        out.append("  → " + ("та же страница, page= не работает"
+                             if first_of(rows2) == first_of(rows)
+                             else "другая — постраничное чтение работает"))
     else:
-        detail = result[1] if result else err
-        b.button(text="🔁 Повторить", callback_data=f"pitem_stock:{item_id}")
-        b.button(text="📦 К товару", callback_data=f"pitem:{item_id}")
-        b.adjust(1)
-        await status.edit_text(
-            f"❌ <b>Не удалось добавить остатки</b>\n\n{detail}",
-            reply_markup=b.as_markup())
+        out.append(f"страница 2: {html2[:80]}")
+
+    # 4. Как выглядит кусок ответа вокруг нашего магазина — форма для разбора
+    if shop and shop in html:
+        i = html.index(shop)
+        out.append("")
+        out.append(f"--- окрестности «{shop}» ---")
+        out.append(html[max(0, i - 300):i + 300])
+
+    # 5. Адрес, отдающий JSON, лучше любого разбора разметки
+    apis = sorted(set(re.findall(
+        r'["\'](/api/[\w/\-.]+|https?://[\w.\-]*(?:api|graphql)[\w/\-.]*)["\']',
+        html)))
+    if apis:
+        out.append("")
+        out.append("адреса API на странице: " + ", ".join(apis[:12]))
+    return "\n".join(out)
+
+
+@router.message(Command("pos_raw"))
+async def pos_raw(message: Message) -> None:
+    """/pos_raw <ссылка> — показать, где на странице витрины лежат предложения.
+
+    Read-only. Существует потому, что страницу нельзя посмотреть из среды
+    разработки — вывод этой команды заменяет взгляд на реальную разметку.
+    """
+    import html as _html
+
+    from storage import get_shop_name
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Укажи страницу витрины:\n"
+            "<code>/pos_raw https://yoomarket.net/categories/...</code>")
+        return
+    shop = get_shop_name(message.from_user.id) or ""
+    status = await message.answer("⏳ Смотрю, что отдаёт страница...")
+    loop = asyncio.get_event_loop()
+    try:
+        report = await asyncio.wait_for(
+            loop.run_in_executor(None, _pos_raw_sync, parts[1].strip(), shop),
+            timeout=90)
+    except Exception as e:
+        report = f"не удалось: {str(e)[:200]}"
+    text = _html.escape(report)
+    for i in range(0, min(len(text), 10500), 3500):
+        await message.answer(f"<code>{text[i:i + 3500]}</code>")
+    await status.delete()
+
+
+def _pos_api_sync(url: str, shop: str) -> str:
+    """Блокирующая: найти запрос, которым витрина наполняет свою выдачу.
+
+    Страница раздела не отдаёт ни одного предложения — 81 КБ каркаса
+    приложения, — то есть список приезжает отдельным вызовом из браузера. Этот
+    вызов надо найти, и он находим: его адрес вкомпилирован в JavaScript самой
+    страницы. Тем же приёмом когда-то нашлось чат-API (`panel_chat_debug_sync`).
+
+    Только чтение: здесь всё GET, и ничего не сохраняется.
+    """
+    import json as _json
+    from urllib.parse import parse_qsl, urlparse
+
+    import requests
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+    from automation.market import MARKET_URL, _json_blobs, _offer_lists
+
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+    if not url.startswith("http"):
+        url = MARKET_URL + ("" if url.startswith("/") else "/") + url
+    parts = urlparse(url)
+    slugs = [p for p in parts.path.split("/") if p and p != "categories"]
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    hdrs = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": url, "Origin": MARKET_URL,
+            "Accept-Language": "ru-RU,ru;q=0.9"}
+    out = [f"путь: {slugs}", f"параметры: {params}"]
+
+    try:
+        html = requests.get(url, timeout=(6, 25), verify=False, headers={
+            "User-Agent": hdrs["User-Agent"],
+            "Accept": "text/html"}).text
+    except Exception as e:
+        return f"страница не открылась: {str(e)[:150]}"
+
+    # --- 1. Что странице отдали при загрузке ---------------------------------
+    build_id = ""
+    m = re.search(r'id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if m:
+        try:
+            nd = _json.loads(m.group(1))
+            build_id = str(nd.get("buildId") or "")
+            props = (nd.get("props") or {}).get("pageProps") or {}
+            out.append(f"buildId: {build_id or '—'}; "
+                       f"pageProps: {sorted(props)[:12]}")
+            # Всё, что похоже на адрес или на номер, годный к переиспользованию
+            flat = _json.dumps(nd, ensure_ascii=False)
+            urls = sorted(set(re.findall(
+                r'"(https?://[\w.\-]+[^"]{0,40})"', flat)))
+            if urls:
+                out.append("адреса в __NEXT_DATA__: " + ", ".join(urls[:8]))
+            ids = re.findall(r'"(category_?id|categoryId|id)":\s*(\d+)', flat)
+            if ids:
+                out.append(f"идентификаторы: {ids[:6]}")
+        except Exception as e:
+            out.append(f"__NEXT_DATA__ не разобрался: {str(e)[:60]}")
+
+    # --- 2. Адрес, вкомпилированный в JavaScript страницы --------------------
+    scripts = re.findall(r'<script[^>]+src="([^"]+)"', html)
+    bases, paths = set(), set()
+    for src in list(dict.fromkeys(scripts))[:12]:
+        full = src if src.startswith("http") else MARKET_URL + src
+        try:
+            js = requests.get(full, timeout=(6, 20), verify=False,
+                              headers={"User-Agent": hdrs["User-Agent"]}).text
+        except Exception:
+            continue
+        for b in re.findall(r'["\'`](https?://[\w.\-]*api[\w.\-]*)["\'`/]', js):
+            bases.add(b)
+        for p in re.findall(
+                r'["\'`](/(?:api|v\d)/[\w/\-{}$.]{2,60})["\'`]', js):
+            paths.add(p)
+        for p in re.findall(
+                r'["\'`](/[\w/\-]*(?:categor|offer|product|search|catalog'
+                r'|item|lot|filter)[\w/\-{}$.]{0,40})["\'`]', js, re.I):
+            if len(p) < 70:
+                paths.add(p)
+        if "graphql" in js.lower():
+            bases.add("(в бандле есть graphql)")
+    out.append(f"базы из JS: {sorted(bases)[:10] or 'ничего'}")
+    out.append(f"пути из JS: {sorted(paths)[:24] or 'ничего'}")
+
+    # --- 3. Пробуем их и говорим, какой отвечает выдачей ---------------------
+    def _try(full_url: str, label: str = "") -> str:
+        try:
+            r = requests.get(full_url, headers=hdrs, timeout=(6, 20),
+                             verify=False, allow_redirects=False)
+        except Exception as e:
+            return f"  {full_url[:90]} → {str(e)[:50]}"
+        body = r.text or ""
+        mark = ""
+        if shop and shop in body:
+            mark = "  ★★★ ЕСТЬ НАШ МАГАЗИН"
+        elif "отзыв" in body or '"price"' in body:
+            mark = "  ★ похоже на выдачу"
+        offers = 0
+        try:
+            for blob in ([r.json()] if "json" in
+                         r.headers.get("content-type", "") else
+                         _json_blobs(body)):
+                for lst in _offer_lists(blob):
+                    offers = max(offers, len(lst))
+        except Exception:
+            pass
+        if offers:
+            mark += f"  [офферов: {offers}]"
+        return (f"  {label or full_url[:90]} → {r.status_code}, "
+                f"{len(body)}б{mark}\n     {body[:160].strip()}")
+
+    out.append("\n— пробую —")
+    tried = set()
+
+    # Pages Router у Next.js отдаёт свойства страницы как JSON
+    if build_id and len(out) < 60:
+        path = parts.path.strip("/")
+        nd_url = f"{MARKET_URL}/_next/data/{build_id}/{path}.json"
+        if parts.query:
+            nd_url += "?" + parts.query
+        out.append(_try(nd_url, f"/_next/data/{build_id}/…"))
+
+    # То, что назвали сборки, — с параметрами этой самой страницы
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    for base in list(sorted(bases))[:3] + [MARKET_URL, "https://api.yoo.market"]:
+        if not base.startswith("http"):
+            continue
+        for p in sorted(paths)[:12]:
+            if "{" in p or "$" in p:
+                continue
+            full = base.rstrip("/") + p
+            if slugs and p.rstrip("/").endswith(("categories", "category")):
+                full += "/" + "/".join(slugs)
+            full += ("&" if "?" in full else "?") + query if query else ""
+            if full in tried or len(tried) > 22:
+                continue
+            tried.add(full)
+            out.append(_try(full))
+
+    # И обычные формы такого API — на случай, если сборки свою спрятали
+    if slugs:
+        guesses = [
+            f"/api/categories/{'/'.join(slugs)}/offers",
+            f"/api/categories/{'/'.join(slugs)}/products",
+            f"/api/categories/{'/'.join(slugs)}",
+            f"/api/offers?category={slugs[-1]}",
+            f"/api/products?category={slugs[-1]}",
+            f"/api/search?category={slugs[-1]}",
+        ]
+        for base in (MARKET_URL, "https://api.yoo.market",
+                     "https://api.yoo.market/v1"):
+            for g in guesses:
+                full = base + g
+                full += ("&" if "?" in full else "?") + query if query else ""
+                if full in tried or len(tried) > 40:
+                    continue
+                tried.add(full)
+                line = _try(full)
+                if "→ 404" not in line and "→ 403" not in line:
+                    out.append(line)
+    return "\n".join(out)
+
+
+@router.message(Command("pos_api"))
+async def pos_api(message: Message) -> None:
+    """/pos_api <ссылка> — найти запрос, которым витрина набирает список.
+
+    Read-only. Нужна потому, что страница категории не содержит предложений:
+    их подгружает браузер отдельным запросом, и его адрес зашит в JS страницы.
+    """
+    import html as _html
+
+    from storage import get_shop_name
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Укажи страницу витрины:\n"
+            "<code>/pos_api https://yoomarket.net/categories/...</code>")
+        return
+    shop = get_shop_name(message.from_user.id) or ""
+    status = await message.answer("⏳ Ищу, откуда витрина берёт список...")
+    loop = asyncio.get_event_loop()
+    try:
+        report = await asyncio.wait_for(
+            loop.run_in_executor(None, _pos_api_sync, parts[1].strip(), shop),
+            timeout=240)
+    except Exception as e:
+        report = f"не удалось: {str(e)[:200]}"
+    text = _html.escape(report)
+    for i in range(0, min(len(text), 14000), 3500):
+        await message.answer(f"<code>{text[i:i + 3500]}</code>")
+    await status.delete()
+
+
+@router.message(Command("cat_debug"))
+async def cat_debug(message: Message) -> None:
+    """/cat_debug — что витрина отвечает на запрос каталога разделов.
+
+    Продавец: «разделы не выходят». Экран говорил «каталог витрины сейчас
+    не читается» и ничего больше. Каталог нужен обеим дорогам к разделу —
+    и кнопкам, и автоматике, — так что одна нечитаемая строчка ломала всё
+    слежение за позицией разом.
+
+    Только чтение: публичный каталог, ничего не меняется.
+    """
+    import html as _html
+
+    from automation.market import category_children, category_tree_probe
+
+    status = await message.answer("⏳ Спрашиваю каталог витрины…")
+    loop = asyncio.get_event_loop()
+    try:
+        tries = await asyncio.wait_for(
+            loop.run_in_executor(None, category_tree_probe), timeout=120)
+    except Exception as e:
+        await status.edit_text(f"❌ {_html.escape(str(e)[:200])}")
+        return
+
+    lines = ["🗂 <b>Каталог витрины</b>", ""]
+    for t in tries:
+        lines.append(f"{t['path']} → {t.get('status')} "
+                     f"({t.get('bytes', 0)} байт)")
+        lines.append(f"   форма: {t.get('shape')}")
+        if t.get("found"):
+            lines.append(f"   похоже на разделы: {t['found']}")
+            lines.append(f"   первый: {t.get('first')}")
+        if t.get("sample"):
+            lines.append(f"   начало: {t['sample']}")
+    try:
+        top = await asyncio.wait_for(
+            loop.run_in_executor(None, category_children, ""), timeout=60)
+    except Exception as e:
+        top = []
+        lines.append(f"верхний уровень: ошибка {str(e)[:60]}")
+    lines += ["", f"кнопок на первом экране получилось: {len(top)}"]
+    for r in top[:8]:
+        lines.append(f"  {r['slug']} — {r['title'][:28]}"
+                     + (" ▸" if r["has_children"] else ""))
+    # Подразделы верхний уровень не отдаёт — их надо спрашивать отдельно, и
+    # именно на этом шаге выбор раздела упирался в игру целиком.
+    if top:
+        from automation.market import fetch_category_children
+        probe_slug = next((r["slug"] for r in top
+                           if r["slug"] in ("telegram", "tg")), top[0]["slug"])
+        trace: list = []
+        try:
+            kids = await asyncio.wait_for(
+                loop.run_in_executor(None, fetch_category_children,
+                                     probe_slug, None, trace), timeout=90)
+        except Exception as e:
+            kids, trace = [], [str(e)[:80]]
+        lines += ["", f"подразделы «{probe_slug}»: {len(kids)}"]
+        lines += [f"  {t}" for t in trace[:6]]
+        for k in kids[:8]:
+            lines.append(f"  · {k.get('slug')} — "
+                         f"{str(k.get('title') or k.get('name'))[:28]}")
+    await status.edit_text(f"<code>{_html.escape(chr(10).join(lines))[:3800]}</code>")
+
+
+@router.message(Command("pos_find"))
+async def pos_find(message: Message) -> None:
+    """/pos_find <часть названия> — как витрина отвечает на поиск нашего товара.
+
+    Продавец: «бот не может найти сам объявления». Дальше начиналась
+    догадка — и это ровно тот случай, когда её надо заменить фактами.
+    Печатается: какие слова бот пробовал, сколько строк вернула витрина, и
+    какие у этих строк номера, магазины и названия. По ним сразу видно
+    главное: совпадает ли номер объявления с номером строки на витрине.
+
+    Только чтение: обычный поиск, ничего не меняется и не тратится.
+    """
+    import html as _html
+
+    from automation.market import search_own_listing
+    from storage import get_shop_name
+
+    query = (message.text or "").split(maxsplit=1)
+    query = query[1].strip() if len(query) > 1 else ""
+    ads = await _my_ads_for(message.from_user.id)
+    if not ads:
+        await message.answer("Не смог прочитать список объявлений — нужен "
+                             "API-токен: /start")
+        return
+    picked = [a for a in ads
+              if not query or query.lower() in a["title"].lower()
+              or query == a["id"]]
+    if not picked:
+        await message.answer(
+            f"Среди {len(ads)} объявлений нет ни одного со словом "
+            f"«{_html.escape(query)}». Без слова возьму первое.")
+        return
+    ad = picked[0]
+
+    status = await message.answer(f"⏳ Ищу на витрине «{_html.escape(ad['title'][:40])}»…")
+    shop = get_shop_name(message.from_user.id) or ""
+    try:
+        got, facts = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, search_own_listing, ad["id"], ad["title"], shop),
+            timeout=120)
+    except Exception as e:
+        await status.edit_text(f"❌ {_html.escape(str(e)[:200])}")
+        return
+
+    # Путь через раздел объявления — главный, и печатается первым: если он
+    # сработал, поиск по витрине вообще не нужен.
+    from automation.market import category_slugs_by_title, category_slugs_for
+    loop = asyncio.get_event_loop()
+    by_id = await loop.run_in_executor(None, category_slugs_for,
+                                       ad.get("category_id"))
+    by_name = await loop.run_in_executor(None, category_slugs_by_title,
+                                         ad.get("category") or "")
+
+    lines = [f"объявление: {ad['id']} — {ad['title'][:50]}",
+             f"магазин в боте: {shop or '— (не определён)'}",
+             "",
+             f"раздел из API: id={ad.get('category_id')} "
+             f"название={ad.get('category') or '—'}",
+             f"  по номеру → {'/'.join(by_id) if by_id else 'НЕТ в каталоге витрины'}",
+             f"  по названию → {'/'.join(by_name) if by_name else 'НЕТ'}",
+             "",
+             f"слова поиска: {', '.join(facts['keys']) or '—'}",
+             f"строк вернулось: {facts['rows']}",
+             f"нашли по: {facts['by'] or 'НЕ НАШЛИ'}",
+             f"соседей по товару: {facts.get('neighbours') or 0}"
+             f" (совпало по: {facts.get('matched_by') or '—'})",
+             f"из них с разделом: {facts.get('with_section') or 0}",
+             f"раздел по соседям: {facts.get('section') or '—'}"
+             f" (голосов: {facts.get('section_votes') or 0})",
+             f"поля строки витрины: {', '.join(facts.get('row_keys') or []) or '—'}",
+             f"раздел в строке витрины: {facts.get('row_section') or '—'}",
+             f"  сырое поле category: {facts.get('row_category_raw') or '—'}",
+             f"  у соседа: {facts.get('neighbour_section_raw') or '—'}",
+             ""]
+    if facts.get("error"):
+        lines += [f"ошибка запроса: {facts['error']}", ""]
+    if got:
+        lines += [f"наша строка: id={got.get('id')} "
+                  f"slug={got.get('slug') or '—'}"]
+    else:
+        shops = facts.get("shops") or []
+        lines.append(f"магазинов в выдаче: {len(shops)}, "
+                     f"наш среди них: {'ДА' if facts.get('ours_seen') else 'НЕТ'}")
+        lines.append("")
+        lines.append("магазины выдачи:")
+        for sh in shops[:14]:
+            lines.append(f"  {sh}")
+        if len(shops) > 14:
+            lines.append(f"  …и ещё {len(shops) - 14}")
+        lines += ["", "первые строки (номер | магазин):"]
+        for rid, sel in zip(facts["ids"], facts["sellers"]):
+            lines.append(f"  {rid} | {sel or '—'}")
+        lines += ["",
+                  "Наш магазин в списке ЕСТЬ → номера витрины и API из разных "
+                  "пространств, ищем по магазину.",
+                  "Наш магазин в списке НЕТ → либо на витрине он назван иначе "
+                  "(сравни имена выше с «магазин в боте»), либо слова "
+                  "поиска слишком общие и мы глубже в выдаче."]
+    text = _html.escape("\n".join(lines))
+    await status.edit_text(f"<code>{text[:3800]}</code>")
+
+
+async def _my_ads_for(uid: int) -> list:
+    """Объявления магазина — тем же путём, что и экран позиций."""
+    from handlers.selenium_settings import _my_ads
+    return await _my_ads(uid)
+
+
+async def _pos_debug_watches(message: Message) -> None:
+    """Сухой прогон всех слежений: позиция, пороги и решение — без списаний.
+
+    `evaluate` вызывается на выброшенной копии каждого слежения: диагностика не
+    имеет права сдвинуть настоящее состояние (пометить тревогу отправленной,
+    начать паузу) и тем изменить поведение следующего настоящего прохода.
+    """
+    import copy
+    import html as _html
+    import time as _time
+
+    from automation.market import fetch_listing
+    from automation.position import evaluate, is_due, watches
+    from storage import get_settings, get_shop_name
+
+    s = get_settings(message.from_user.id)
+    pp = s.setdefault("promo_position", {})
+    ws = watches(pp)
+    if not ws:
+        await message.answer(
+            "Наблюдений нет. Добавь товар в «Объявления» → «Премиум "
+            "продвижение» → «По позиции», либо укажи адрес:\n"
+            "<code>/pos_debug https://yoomarket.net/...</code>")
+        return
+
+    shop = get_shop_name(message.from_user.id) or ""
+    status = await message.answer(f"⏳ Проверяю {len(ws)} наблюдений...")
+    now = _time.time()
+    out = [f"магазин: {shop or '—'}",
+           f"режим: {'поднимать' if pp.get('auto_promote') else 'только сигнал'}",
+           f"интервал: {pp.get('interval_hours', 1)} ч, "
+           f"пауза: {pp.get('cooldown_hours', 6)} ч, "
+           f"лимит/сутки: {pp.get('daily_limit', 3)}", ""]
+    loop = asyncio.get_event_loop()
+    for i, w in enumerate(ws, 1):
+        out.append(f"{i}. {(w.get('title') or w.get('url'))[:46]}")
+        out.append(f"   порог места: {w.get('max_position')}, "
+                   f"порог цены: {w.get('undercut_guard') or '—'}, "
+                   f"сигнал цены: {w.get('min_price') or '—'}")
+        out.append(f"   товар в панели: {w.get('item_id') or 'НЕ ПРИВЯЗАН'}, "
+                   f"по расписанию: {'да' if is_due(w, pp, now) else 'ещё рано'}")
+        try:
+            ok, res = await asyncio.wait_for(
+                loop.run_in_executor(None, fetch_listing, w.get("url", ""),
+                                     shop, w.get("category_id")),
+                timeout=120)
+        except Exception as e:
+            ok, res = False, str(e)[:120]
+        if not ok:
+            out.append(f"   ❌ {res}")
+            out.append("")
+            continue
+        probe = copy.deepcopy(w)
+        v = evaluate(probe, res["offers"], shop=shop, pp=pp, now=now)
+        out.append(f"   предложений: {len(res['offers'])}, "
+                   f"наше место: {v.pos if v.found else 'не нашёл'}, "
+                   f"дешевле всех: {v.cheapest}")
+        out.append(f"   решение: {'ПОДНЯЛ БЫ' if v.promote else 'не поднимать'}"
+                   f" — {v.reason}")
+        for line in v.lines:
+            out.append(f"   сказал бы: {re.sub(r'<[^>]+>', '', line)[:90]}")
+        out.append("")
+    text = _html.escape("\n".join(out))
+    for j in range(0, min(len(text), 7000), 3500):
+        await message.answer(f"<code>{text[j:j + 3500]}</code>")
+    await status.delete()
+
+
+@router.message(Command("pos_debug"))
+async def pos_debug(message: Message) -> None:
+    """/pos_debug <ссылка> — прочитать список предложений и наши позиции.
+
+    Read-only. Position is not in the seller API — it exists only on the public
+    storefront — so the page the buyer sees is parsed and reported here before
+    anything is wired to it.
+    """
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        # Без адреса: прогоняем все настроенные слежения и показываем, что
+        # решило бы каждое прямо сейчас. Денег не тратится — это ответ на
+        # «почему не поднял», полученный без траты на выяснение.
+        await _pos_debug_watches(message)
+        return
+    url = parts[1].strip()
+
+    import html as _html
+
+    from automation.market import cheapest, fetch_listing, find_position
+    from storage import get_shop_name
+
+    shop = get_shop_name(message.from_user.id) or ""
+    status = await message.answer("⏳ Читаю список предложений...")
+    try:
+        loop = asyncio.get_event_loop()
+        ok, res = await asyncio.wait_for(
+            loop.run_in_executor(None, fetch_listing, url, shop), timeout=120)
+    except Exception as e:
+        ok, res = False, str(e)[:200]
+    if not ok:
+        await status.edit_text(f"❌ {_html.escape(str(res))[:600]}")
+        return
+
+    offers = res["offers"]
+    mine = find_position(offers, seller=shop) if shop else None
+    lines = [f"страница: {res['note']}", f"предложений: {len(offers)}",
+             f"магазин в боте: {shop or '—'}",
+             f"дешевле всех: {cheapest(offers)}", ""]
+    for row in offers[:15]:
+        mark = "👉" if mine and row["pos"] == mine["pos"] else "  "
+        lines.append(f"{mark}{row['pos']:>2}. {row['price']} ₽ | "
+                     f"{row['seller'][:18]} | {row['title'][:34]}")
+    lines.append("")
+    lines.append(f"наша позиция: {mine['pos'] if mine else 'не нашёл по магазину'}")
+    text = _html.escape("\n".join(lines))
+    for i in range(0, min(len(text), 7000), 3500):
+        await message.answer(f"<code>{text[i:i + 3500]}</code>")
+    await status.delete()
+
+
+@router.message(Command("chat_send_probe"))
+async def chat_send_probe(message: Message) -> None:
+    """/chat_send_probe 1076867 — find how the panel sends a support message.
+
+    Раньше называлась /chat_debug и перехватывала это имя у диагностики в
+    handlers/chats.py: panel_items подключается раньше, так что нужная
+    команда просто не срабатывала. Имена команд обязаны быть уникальными.
+
+    Read-only: sends nothing. Reveals the token, the reachable endpoints and
+    the send route, so replying to support can be wired to the real request.
+    """
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Укажи номер чата: <code>/chat_send_probe 1076867</code>")
+        return
+    chat_id = parts[1].strip().rstrip("/").split("/")[-1]
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет сессии панели — войди в «Панель продавца»")
+        return
+    import html as _html
+    from automation.panel import panel_chat_probe_sync
+    from storage import get_token
+    api_token = get_token(message.from_user.id) or ""
+    status = await message.answer("⏳ Разбираю, как панель шлёт сообщения...")
+    try:
+        loop = asyncio.get_event_loop()
+        _ok, report = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_chat_probe_sync,
+                                 creds["cookies"], chat_id, api_token),
+            timeout=90)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+    text = _html.escape(str(report))
+    for i in range(0, min(len(text), 10000), 3500):
+        await message.answer(f"<code>{text[i:i + 3500]}</code>")
+    await status.delete()
+
+
+@router.message(Command("withdraw_debug"))
+async def withdraw_debug(message: Message) -> None:
+    """Показать, что панель даёт для вывода средств, — проба только на чтение.
+
+    В Integration API вывода нет вовсе, значит выплата идёт через панель, а её
+    точная форма неизвестна. Здесь печатаются финансовые разделы и форма
+    создания вывода — чтобы настоящий запрос был снят, а не придуман.
+
+    Денег не двигает.
+    """
+    creds = get_panel_creds(message.from_user.id)
+    if not creds or not creds.get("cookies"):
+        await message.answer("⚠️ Нет сессии панели — войди в «Панель продавца»")
+        return
+
+    import html as _html
+
+    from automation.panel import panel_finance_probe_sync
+
+    status = await message.answer("⏳ Ищу, где в панели вывод средств...")
+    try:
+        loop = asyncio.get_event_loop()
+        ok, report = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_finance_probe_sync, creds["cookies"]),
+            timeout=90)
+    except Exception as e:
+        report = f"ошибка: {str(e)[:200]}"
+
+    text = _html.escape(str(report))
+    for i in range(0, min(len(text), 12000), 3500):
+        await message.answer(f"<code>{text[i:i + 3500]}</code>")
+    await status.delete()
