@@ -3077,15 +3077,31 @@ _FORBIDDEN_WORD = re.compile(
 def forbidden_words(raw: str) -> list[str]:
     """Слова, которые панель запретила, — её же словами.
 
-    Нужны, чтобы отказ можно было ИСПРАВИТЬ в одно нажатие, а не заставлять
-    продавца перенабирать описание целиком. Слово панель называет сама, так
-    что здесь не догадка: без него убирать было бы нечего.
+    Нужны, чтобы отказ можно было исправить, а не заставлять продавца
+    перенабирать описание целиком. Слово панель называет сама, так что
+    здесь не догадка.
+
+    Ищем ТОЛЬКО в жалобах панели, а не по всему тексту отказа. В отчёт
+    попадает и наш собственный дамп «Отправлено: {…}» — с кавычками,
+    словами и запятыми, — и поиск по нему выхватывал случайный кусок,
+    который потом молча вырезался из описания продавца.
     """
+    body = _first_json_object(str(raw or ""))
     out: list[str] = []
-    for m in _FORBIDDEN_WORD.finditer(str(raw or "")):
-        word = m.group(1).strip()
-        if word and word.lower() not in [w.lower() for w in out]:
-            out.append(word)
+    if not isinstance(body, dict):
+        return out
+    for complaints in body.values():
+        if isinstance(complaints, str):
+            complaints = [complaints]
+        if not isinstance(complaints, list):
+            continue
+        for said in complaints:
+            if not isinstance(said, str):
+                continue
+            for m in _FORBIDDEN_WORD.finditer(said):
+                word = m.group(1).strip()
+                if word and word.lower() not in [w.lower() for w in out]:
+                    out.append(word)
     return out
 
 

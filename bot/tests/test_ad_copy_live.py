@@ -87,6 +87,7 @@ class Nova(BaseHTTPRequestHandler):
 
     posted: list = []
     refuse_first: dict | None = None
+    refuse_always: dict | None = None
 
     def log_message(self, *a):
         pass
@@ -133,6 +134,9 @@ class Nova(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         ctype = self.headers.get("Content-Type") or ""
         Nova.posted.append({"path": self.path, "ctype": ctype, "raw": raw})
+        if Nova.refuse_always is not None:
+            self._json(422, Nova.refuse_always)
+            return
         if Nova.refuse_first is not None:
             body, Nova.refuse_first = Nova.refuse_first, None
             self._json(422, body)
@@ -162,6 +166,7 @@ class Bench(unittest.TestCase):
     def setUp(self):
         Nova.posted = []
         Nova.refuse_first = None
+        Nova.refuse_always = None
 
     def read(self):
         return P.panel_item_values_sync("session=1", "219206", uid=None)
@@ -391,6 +396,7 @@ class TheWholeCopyRunsEndToEnd(Bench):
         features.ad_templates_shown = lambda uid: True
         Nova.posted = []
         Nova.refuse_first = None
+        Nova.refuse_always = None
 
     def tearDown(self):
         self.storage.get_panel_creds = self._creds
@@ -476,7 +482,12 @@ class TheWholeCopyRunsEndToEnd(Bench):
         return cb
 
     def created_body(self) -> dict:
-        for row in Nova.posted:
+        """ПОСЛЕДНЯЯ отправка создания — та, которая и создала товар.
+
+        Первая может быть отвергнутой: панель отказывает по запрещённому
+        слову, бот убирает его и шлёт заново. Смотреть на первую значит
+        проверять то, что как раз и не создалось."""
+        for row in reversed(Nova.posted):
             if "/nova-api/items?" in row["path"] and "editMode=create" in row["path"]:
                 return _parse_body(row)
         return {}
@@ -585,101 +596,85 @@ class TheWholeCopyRunsEndToEnd(Bench):
         said = " ".join(cb.message.texts)
         self.assertIn("Платформа", said)
 
-    def test_a_forbidden_word_can_be_fixed_in_one_tap(self):
-        """Живой отказ 02.09: «Запрещено использовать «розыгрыш» в тексте».
-        Слово панель называет сама — заставлять после этого перенабирать
-        описание целиком значит требовать работы на ровном месте."""
-        import asyncio
-        from handlers import create_ad as C
-
-        Nova.refuse_first = {"content": [
-            "Запрещено использовать «валютой» в тексте. Уберите это слово."]}
-        cb = self.press()
-        data = [x.callback_data
-                for row in cb.message.kbs[-1].inline_keyboard for x in row]
-        self.assertIn("create_ad:strip", data, "кнопки исправления нет")
-
-        # Нажимаем её — и товар уходит заново, уже без слова.
-        Nova.posted = []
-
-        class Tap(cb.__class__):
-            pass
-
-        cb2 = cb.__class__("create_ad:strip")
-        cb2.message = cb.message
-        asyncio.run(C.strip_and_create(cb2, self.fsm, None))
-        body = self.created_body()
-        self.assertTrue(body, "второй заход до панели не дошёл")
-        self.assertNotIn("валют", str(body.get("content", "")).lower())
-        self.assertIn("Аккаунт", str(body.get("content", "")))
-
-    def test_the_removed_word_is_named_not_swallowed(self):
-        """Правка чужого текста молча — не то, за что нажимали.
-
-        Смотрим ИМЕННО сообщение чистки: слово есть и в тексте отказа выше,
-        и проверка по всей переписке проходила бы при любом молчании."""
-        import asyncio
-        from handlers import create_ad as C
-
+    def test_a_forbidden_word_is_removed_and_the_item_created_at_once(self):
+        """Панель не примет товар с этим словом НИКОГДА — ждать нажатия
+        значит остановить копию на том, что бот может сделать сам."""
         Nova.refuse_first = {"content": [
             "Запрещено использовать «валютой» в тексте."]}
         cb = self.press()
-        before = len(cb.message.texts)
-        cb2 = cb.__class__("create_ad:strip")
-        cb2.message = cb.message
-        asyncio.run(C.strip_and_create(cb2, self.fsm, None))
-        told = " ".join(cb.message.texts[before:])
-        self.assertIn("Убрал из описания", told)
-        self.assertIn("валютой", told)
+        said = cb.message.texts[-1]
+        self.assertIn("создан", said.lower(), said)
+        body = self.created_body()
+        self.assertNotIn("валют", str(body.get("content", "")).lower())
+
+    def test_and_says_what_it_removed(self):
+        """Молчаливая правка чужого текста — не то, за что нажимали."""
+        Nova.refuse_first = {"content": [
+            "Запрещено использовать «валютой» в тексте."]}
+        cb = self.press()
+        self.assertIn("Из описания убрано", cb.message.texts[-1])
+        self.assertIn("валютой", cb.message.texts[-1])
+
+    def test_it_does_not_loop_when_the_word_keeps_coming_back(self):
+        """Один заход. Панель, отказывающая одним и тем же словом, иначе
+        крутила бы копию по кругу."""
+        class Always(Nova):
+            pass
+
+        was = Nova.refuse_first
+        try:
+            # Отказывает КАЖДЫЙ раз, а не только первый.
+            Nova.refuse_first = {"content": [
+                "Запрещено использовать «Аккаунт» в тексте."]}
+            cb = self.press()
+        finally:
+            Nova.refuse_first = was
+        # Второго отказа быть не должно: заход один, дальше отчёт.
+        self.assertIn("не приняла", cb.message.texts[-1])
+
+    def test_the_refusal_does_not_read_as_a_form_to_fill(self):
+        """Перечень полей формы панели продавец прочитал как список того,
+        что он должен заполнить сам («и так же просит категории»)."""
+        Nova.refuse_first = {"filter__9": ["Поле Платформа обязательно."]}
+        cb = self.press()
+        said = " ".join(cb.message.texts)
+        self.assertIn("Заполнять ничего не нужно", said)
 
     def test_endings_go_with_the_word(self):
         """Панель ищет подстроку, а не словоформу. Убрав ровно «валют», мы
         оставили бы «валютой» — и получили бы тот же отказ вторым заходом,
-        то есть кнопка выглядела бы работающей, не работая."""
-        import asyncio
-        from handlers import create_ad as C
-
+        то есть чистка выглядела бы работающей, не работая."""
         Nova.refuse_first = {"content": [
             "Запрещено использовать «валют» в тексте."]}
-        cb = self.press()
-        data = [x.callback_data
-                for row in cb.message.kbs[-1].inline_keyboard for x in row]
-        self.assertIn("create_ad:strip", data)
-        Nova.posted = []
-        cb2 = cb.__class__("create_ad:strip")
-        cb2.message = cb.message
-        asyncio.run(C.strip_and_create(cb2, self.fsm, None))
+        self.press()
         sent = str(self.created_body().get("content", "")).lower()
         self.assertNotIn("валют", sent, "окончание осталось — панель откажет")
 
-    def test_no_button_when_the_word_survives_inside_another(self):
-        """Запрещённое может сидеть ВНУТРИ другого слова — целиком его не
-        выкинешь. Предлагать «убрать и создать», не убрав, значит обещать
-        исход, которого не будет."""
-        Nova.refuse_first = {"content": [
-            "Запрещено использовать «нутриигров» в тексте."]}
-        cb = self.press()
-        data = [x.callback_data
-                for row in cb.message.kbs[-1].inline_keyboard for x in row]
-        self.assertNotIn("create_ad:strip", data,
-                         "обещали убрать то, что убрать нечем")
+    def test_it_does_not_loop_when_the_word_keeps_coming_back(self):
+        """Чистка идёт ОДИН раз за создание. Панель, отказывающая одним и
+        тем же словом снова, иначе крутила бы копию по кругу."""
+        Nova.refuse_always = {"content": [
+            "Запрещено использовать «валютой» в тексте."]}
+        try:
+            cb = self.press()
+        finally:
+            Nova.refuse_always = None
+        creates = [r for r in Nova.posted
+                   if "/nova-api/items?" in r["path"]
+                   and "editMode=create" in r["path"]]
+        self.assertEqual(len(creates), 2, "заходов должно быть ровно два")
+        self.assertIn("не приняла", cb.message.texts[-1])
 
-    def test_no_button_when_nothing_would_be_left(self):
-        """Пустое описание — не исправленный товар."""
-        for f in ITEM_FIELDS:
-            if f["attribute"] == "content":
-                was, f["value"] = f["value"], "розыгрыш"
-                try:
-                    Nova.refuse_first = {"content": [
-                        "Запрещено использовать «розыгрыш» в тексте."]}
-                    cb = self.press()
-                    data = [x.callback_data for row in
-                            cb.message.kbs[-1].inline_keyboard for x in row]
-                    self.assertNotIn("create_ad:strip", data)
-                finally:
-                    f["value"] = was
-                return
-        self.fail("в образце нет описания")
+    def test_nothing_is_stripped_from_our_own_dump(self):
+        """Слово ищется только в жалобах панели. В отчёт попадает и наш
+        дамп «Отправлено: {…}» — с кавычками и словами, — и поиск по нему
+        выхватывал случайный кусок, который потом молча вырезался из
+        описания продавца."""
+        Nova.refuse_first = {"content": ["Ссылки запрещены. Разрешены: YouTube"]}
+        cb = self.press()
+        said = cb.message.texts[-1]
+        self.assertIn("не приняла", said, "молча вырезал кусок и создал товар")
+        self.assertNotIn("Из описания убрано", said)
 
     def test_a_dead_panel_does_not_report_success(self):
         old = P.PANEL_URL

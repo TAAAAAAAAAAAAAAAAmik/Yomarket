@@ -1198,8 +1198,11 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
                                    extra: dict | None,
                                    picked: list | None = None,
                                    state: FSMContext | None = None,
-                                   api=None) -> None:
+                                   api=None, cleaned: list | None = None) -> None:
     """Run panel_create_product_sync in a thread with live progress, then report.
+
+    `cleaned` — слова, уже убранные из описания на прошлом заходе. Оно же
+    и предохранитель от круга: чистка идёт ОДИН раз за создание.
 
     `picked` — разделы, выбранные ботом без спроса (создание из плагина).
     Печатаются в отчёте: продавец должен видеть, где оказался товар, а не
@@ -1330,11 +1333,44 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
             f"📝 {html.escape(str(values['title']))}\n"            f"💰 {values['price']} ₽"
             f"{chr(10) + '🆔 ' + item_id if item_id else ''}"
             f"{_picked_note(picked)}"
-            f"{stock_note}"
+            + (("\n✂️ Из описания убрано: "
+                + ", ".join(f"«{html.escape(w)}»" for w in cleaned)
+                + " — панель это слово не принимает.") if cleaned else "")
+            + f"{stock_note}"
             f"{pub_note}",
             reply_markup=b.as_markup(),
         )
         return
+
+    # ── Запрещённое слово — убираем и отправляем заново, без вопросов ─────
+    #
+    # Панель называет слово прямо в отказе, и другого пути у товара нет:
+    # с этим словом она его не примет никогда. Показать отказ и ждать
+    # нажатия значит остановить копию на том, что бот может сделать сам.
+    #
+    # Молчаливой правки при этом не происходит: убранное названо в отчёте.
+    # И ровно один заход — `cleaned` не даёт кругу повториться.
+    from automation.panel import (forbidden_words as _banned_words,
+                                  strip_words as _strip,
+                                  words_are_gone as _gone)
+
+    if not cleaned:
+        banned_now = _banned_words(result_msg)
+        if banned_now:
+            clean = _strip(values.get("description") or "", banned_now)
+            if clean and _gone(clean, banned_now):
+                try:
+                    await status_msg.edit_text(
+                        "✂️ Панель не принимает слово "
+                        + ", ".join(f"«{html.escape(w)}»" for w in banned_now)
+                        + " — убираю и отправляю заново…")
+                except Exception:
+                    pass
+                await _panel_create_and_report(
+                    msg, uid, dict(values, description=clean), extra=extra,
+                    picked=picked, state=state, api=api,
+                    cleaned=list(banned_now))
+                return
 
     # ── Отказ по недостающему полю — спрашиваем его, а не сдаёмся ──────────
     # Панель называет поле прямым текстом: «filter__8: Поле Регион
@@ -1373,9 +1409,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
     # строк дампа, причём наша собственная разметка внутри дампа вылезала
     # буквами — «Ресурс <b>items</b> найден» продавец видел именно так,
     # угловыми скобками.
-    from automation.panel import (as_plain, explain_validation,
-                                  forbidden_words, strip_words,
-                                  validation_fields, words_are_gone)
+    from automation.panel import as_plain, explain_validation, validation_fields
 
     why = explain_validation(result_msg)
     # Панель называет запрещённое слово прямо в отказе. Заставлять после
@@ -1385,14 +1419,6 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
     # Кнопка появляется, только если убранное ДЕЙСТВИТЕЛЬНО пропало:
     # предлагать «убрать и создать», не убедившись, что убрали, значит
     # обещать исход, которого не будет.
-    banned = forbidden_words(result_msg)
-    if banned and state is not None:
-        clean = strip_words(values.get("description") or "", banned)
-        if clean and words_are_gone(clean, banned):
-            await state.update_data(
-                pending=dict(values, description=clean), chosen=dict(extra or {}),
-                strip_words=banned)
-            b.button(text="✂️ Убрать и создать", callback_data="create_ad:strip")
     header = ("⚠️ <b>Панель не приняла товар</b>" if why or is_found
               else "❌ <b>Не удалось создать товар</b>")
 
@@ -1406,9 +1432,16 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
         parts.append(advice)
     # Подробности — под спойлером: они нужны раз в сто отказов, а место
     # занимают всегда. Внутри чужой текст, поэтому экранируется.
+    #
+    # И подписаны они прямо: внутри лежит перечень полей ФОРМЫ панели, и
+    # продавец прочитал его как список того, что он должен заполнить сам
+    # («и так же просит категории»). Отказ, который читается как требование
+    # работы, — хуже отказа: он посылает делать лишнее.
     details = html.escape(as_plain(result_msg, 1200))
     if details:
         parts.append("")
+        parts.append("<i>Заполнять ничего не нужно — раздел, подраздел и тип "
+                     "бот отправил сам. Ниже ответ панели, для разбора:</i>")
         parts.append(f"<tg-spoiler>{details}</tg-spoiler>")
 
     await _edit_safely(msg, "\n".join(parts), b.as_markup())
@@ -1793,30 +1826,4 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
     await state.update_data(pending=values, chosen=dict(extra),
                             select_queue=[])
     await _panel_create_and_report(callback.message, uid, values, extra=extra,
-                                   state=state, api=api)
-
-
-@router.callback_query(F.data == "create_ad:strip")
-async def strip_and_create(callback: CallbackQuery, state: FSMContext,
-                           api: YooMarketAPI = None) -> None:
-    """Убрать запрещённое слово из описания и отправить товар заново.
-
-    Слово называет сама панель, вычищенное описание уже лежит в форме — и
-    оно ПОКАЗЫВАЕТСЯ: правка чужого текста молча, пусть и по кнопке, это
-    не то, за что нажимали.
-    """
-    data = await state.get_data()
-    values = dict(data.get("pending") or {})
-    banned = list(data.get("strip_words") or [])
-    if not values or not banned:
-        await callback.answer("Список устарел — попробуй копию заново",
-                              show_alert=True)
-        return
-    await callback.answer()
-    await callback.message.edit_text(
-        "✂️ Убрал из описания: "
-        + ", ".join(f"«{html.escape(w)}»" for w in banned)
-        + "\n\n⏳ Отправляю товар заново…")
-    await _panel_create_and_report(callback.message, callback.from_user.id,
-                                   values, extra=dict(data.get("chosen") or {}),
                                    state=state, api=api)
