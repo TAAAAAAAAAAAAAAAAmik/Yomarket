@@ -22,6 +22,11 @@ from storage import get_settings, save_settings
 router = Router()
 logger = logging.getLogger(__name__)
 
+# Сколько товаров показывать в списке для копии. Панель отдаёт до
+# пятидесяти, а клавиатура из пятидесяти кнопок — это не выбор, а
+# свалка: копируют обычно последнее, а не то, что заведено год назад.
+_COPY_LIMIT = 12
+
 
 class CreateAdState(StatesGroup):
     title = State()
@@ -161,19 +166,24 @@ async def create_ad_start(callback: CallbackQuery, state: FSMContext) -> None:
     единственным настоящим действием.
     """
     from features import ad_templates_shown
-    from storage import ad_templates
+    from storage import get_panel_creds
 
     await state.clear()
     uid = callback.from_user.id
     # Копия — только админам (решение владельца). Развилки у продавца нет
     # вовсе: кнопка, отвечающая отказом, хуже, чем её отсутствие.
-    made = ad_templates(uid) if ad_templates_shown(uid) else []
-    if not made:
+    #
+    # Второе условие — куки панели: копируется ТОВАР ИЗ ПАНЕЛИ, и без входа
+    # в неё список брать неоткуда. Показать кнопку и ответить «войди в
+    # панель» значит обещать то, чего за ней нет.
+    can_copy = (ad_templates_shown(uid)
+                and bool((get_panel_creds(uid) or {}).get("cookies")))
+    if not can_copy:
         await _ask_title(callback, state)
         return
     b = InlineKeyboardBuilder()
     b.button(text="✍️ Создать товар", callback_data="create_ad:new")
-    b.button(text=f"📋 Шаблонная копия ({len(made)})",
+    b.button(text="📋 Шаблонная копия",
              callback_data="create_ad:templates_list")
     b.button(text="❌ Отмена", callback_data="menu:ads")
     await callback.message.edit_text(ui.screen("➕ <b>Новый товар</b>", [
@@ -1190,18 +1200,6 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
         if state is not None:
             await state.clear()
         item_id = result_msg if str(result_msg).isdigit() else ""
-        # Образец для копии пишется по факту СОЗДАНИЯ, а не по нажатию
-        # «сохранить как шаблон»: копия есть у всех, а не только у того,
-        # кто заранее догадался её сохранить. И пишется здесь, потому что
-        # сюда сходятся оба пути — мастер и повтор после отказа по полю, —
-        # а значит `values` и `extra` тут окончательные.
-        try:
-            from storage import note_ad_made
-            note_ad_made(uid, values, extra, item_id)
-        except Exception as e:                            # noqa: BLE001
-            # Товар уже создан. Не записанный образец — потеря удобства,
-            # а поднятое отсюда исключение съело бы отчёт о создании.
-            logger.warning("образец товара не записан: %s", e)
         pub_note = ""
         stock_note = ""
         if item_id:
@@ -1387,106 +1385,150 @@ async def publish_item(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "create_ad:templates_list")
 async def templates_list(callback: CallbackQuery) -> None:
-    """Список созданных товаров: выбор здесь и есть подтверждение.
+    """Список товаров, которые уже стоят в панели. Копировать — их.
 
-    Отдельного «точно создать?» нет намеренно: в строке уже написано, что
-    именно уйдёт в панель — название и цена, — а лишний экран между
-    решением и действием и есть то, ради чего копию заводили.
+    Список берётся из ПАНЕЛИ, а не из наших записей. Записывать созданное
+    самими собой означало бы, что скопировать можно только товар, заведённый
+    после обновления бота, — а у продавца их семь, и все прежние. Снаружи
+    это выглядит как «кнопка не работает».
+
+    Выбор в списке и есть подтверждение: отдельного «точно создать?» нет
+    намеренно — лишний экран между решением и действием и был тем, ради чего
+    копию заводили.
     """
     from features import ad_templates_shown
-    from storage import ad_template_ready, ad_templates
+    from storage import get_panel_creds
+    from automation.panel import panel_list_items_sync
 
+    uid = callback.from_user.id
     # Заслон и на самом экране, а не только на кнопке: кнопка осталась в
     # прежних сообщениях, а нажатие создаёт настоящий товар на витрине.
-    if not ad_templates_shown(callback.from_user.id):
+    if not ad_templates_shown(uid):
         await callback.answer("Этого раздела сейчас нет", show_alert=True)
         return
-    made = ad_templates(callback.from_user.id)
-    if not made:
-        await callback.answer("Копировать пока нечего — ни одного товара "
-                              "ещё не создано", show_alert=True)
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
+        await callback.answer("Копия читает товар из панели — войди в неё",
+                              show_alert=True)
         return
+
+    await callback.answer()
+    await callback.message.edit_text("⏳ Читаю товары из панели…")
+    loop = asyncio.get_event_loop()
+    try:
+        ok, items = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_list_items_sync,
+                                 creds["cookies"]),
+            timeout=30)
+    except Exception as e:                                # noqa: BLE001
+        ok, items = False, f"панель не ответила: {str(e)[:120]}"
+
     b = InlineKeyboardBuilder()
+    if not ok or not isinstance(items, list):
+        # Отказ панели печатаем её же словами: «не вышло» без причины —
+        # отписка, а разбирать её продавцу нечем.
+        b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
+        b.button(text="❌ Отмена", callback_data="menu:ads")
+        ui.lay(b)
+        await callback.message.edit_text(ui.screen(
+            "📋 <b>Шаблонная копия</b>",
+            ["Список товаров прочитать не вышло.", "",
+             f"<i>{html.escape(str(items)[:200])}</i>"]),
+            reply_markup=b.as_markup())
+        return
+    if not items:
+        b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
+        b.button(text="❌ Отмена", callback_data="menu:ads")
+        ui.lay(b)
+        await callback.message.edit_text(ui.screen(
+            "📋 <b>Шаблонная копия</b>",
+            ["В панели нет ни одного товара — копировать пока нечего."]),
+            reply_markup=b.as_markup())
+        return
+
     rows = []
-    for i, t in enumerate(made):
-        title = str(t.get("title") or "")
-        # Метка у образцов без раздела: они созданы прежней кнопкой
-        # «сохранить как шаблон» и раздела не помнят — панель спросит его
-        # снова. Сказать это надо ДО нажатия, а не после.
-        slow = "" if ad_template_ready(t) else " ·  спросит раздел"
-        b.button(text=f"📋 {title[:28]} — {t.get('price', 0)} ₽",
-                 callback_data=f"create_ad:use_template:{i}")
+    for it in items[:_COPY_LIMIT]:
+        # `or ""` здесь было бы ошибкой: у товара с номером 0 ноль ложен,
+        # и товар молча пропал бы из списка.
+        raw = it.get("id")
+        iid = "" if raw is None else str(raw).strip()
+        title = str(it.get("title") or "без названия")
+        if not iid:
+            continue
+        b.button(text=f"📋 {title[:30]}",
+                 callback_data=f"create_ad:copy:{iid}"[:64])
         rows.append(f"• <b>{html.escape(title[:40])}</b> — "
-                    f"{t.get('price', 0)} ₽{slow}")
+                    f"{it.get('price', 0)} ₽")
     b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
     b.button(text="❌ Отмена", callback_data="menu:ads")
     ui.lay(b)
     await callback.message.edit_text(ui.screen(
         "📋 <b>Шаблонная копия</b>",
-        ["Товар уйдёт в панель точно таким же — с разделом, полями и "
-         "описанием. Вопросов не будет.", ""] + rows),
+        ["Панель создаст такой же товар: те же поля, тот же раздел, то же "
+         "фото. Вопросов не будет.", ""] + rows),
         reply_markup=b.as_markup())
-    await callback.answer()
 
 
-@router.callback_query(F.data.startswith("create_ad:use_template:"))
-async def use_template(callback: CallbackQuery, state: FSMContext,
-                       api: YooMarketAPI = None) -> None:
-    """Копия уходит в панель сразу — за тем её и заводили.
+@router.callback_query(F.data.startswith("create_ad:copy:"))
+async def copy_item(callback: CallbackQuery) -> None:
+    """Копия товара — одним запросом к панели.
 
-    Образец без раздела (прежняя кнопка «сохранить как шаблон») копией «за
-    секунды» быть не может: раздел панель спросит. Тогда мастер
-    открывается на предпросмотре с уже заполненными полями — это честнее,
-    чем отправить заведомо неполный товар и показать продавцу отказ 422.
+    Копирует ПАНЕЛЬ, а не бот: она читает у товара его собственные поля,
+    вместе с `filter__N`, которых у нас нет и взяться им неоткуда. Свой
+    повтор мастера означал бы, что скопировать можно только то, что бот
+    сам когда-то создал.
+
+    «Создал» — не доказательство: панель отвечает 200 и на отказ, поэтому
+    в отчёт идёт номер, который она вернула, а отказ печатается её же
+    словами.
     """
-    import os
-
     from features import ad_templates_shown
-    from storage import ad_template, ad_template_ready
+    from storage import get_panel_creds
+    from automation.panel import panel_clone_item_sync
 
-    if not ad_templates_shown(callback.from_user.id):
+    uid = callback.from_user.id
+    if not ad_templates_shown(uid):
         await callback.answer("Этого раздела сейчас нет", show_alert=True)
         return
-    idx = int(callback.data.split(":")[-1])
-    t = ad_template(callback.from_user.id, idx)
-    if not t:
-        await callback.answer("Такого товара в списке нет", show_alert=True)
+    item_id = callback.data.split(":")[-1]
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
+        await callback.answer("Куки панели не найдены — войди снова",
+                              show_alert=True)
         return
 
-    photo_path = t.get("photo_path")
-    # Файл мог пропасть: на Railway каталог данных стирается при редеплое.
-    # Молча создать товар без картинки значит выдать копию за точную.
-    lost = bool(photo_path) and not os.path.exists(str(photo_path))
-    values = {
-        "title": t.get("title", ""),
-        "price": t.get("price", 0),
-        "description": t.get("description", ""),
-        "quantity": t.get("quantity", 1),
-        "category": t.get("category", ""),
-        "photo_path": None if lost else photo_path,
-    }
-    extra = dict(t.get("extra") or {})
+    await callback.answer("Создаю копию…")
+    await callback.message.edit_text("⏳ Панель делает копию товара…")
+    loop = asyncio.get_event_loop()
+    try:
+        ok, said = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_clone_item_sync,
+                                 creds["cookies"], item_id, uid),
+            timeout=60)
+    except Exception as e:                                # noqa: BLE001
+        ok, said = False, f"панель не ответила: {str(e)[:150]}"
 
-    # Про пропавшее фото говорим до развилки: молчаливая пропажа выглядит
-    # как забывчивость образца — поля на месте, картинки нет, и почему,
-    # непонятно. А панель товар без картинки не принимает вовсе.
-    photo_note = ("Фото образца не нашлось — приложи заново. "
-                  if lost else "")
-
-    if not ad_template_ready(t):
-        await state.clear()
-        await state.update_data(**{k: v for k, v in values.items()
-                                   if k != "category"})
-        await _show_preview(callback.message, state, edit=True)
-        await callback.answer(
-            photo_note + "Этот образец сохранён без раздела — панель "
-            "спросит его. Остальное уже заполнено.", show_alert=True)
+    new_id = said if str(said).isdigit() else ""
+    b = InlineKeyboardBuilder()
+    if ok and new_id:
+        b.button(text="📦 Остатки", callback_data=f"pitem_stock:{new_id}")
+        b.button(text="🚀 На модерацию", callback_data=f"cadpub:{new_id}")
+    b.button(text="📋 Ещё копию", callback_data="create_ad:templates_list")
+    b.button(text="📦 Мои товары", callback_data="menu:ads")
+    ui.lay(b)
+    if ok:
+        await callback.message.edit_text(ui.screen(
+            "✅ <b>Копия создана</b>",
+            [f"🆔 {html.escape(new_id)}" if new_id else
+             f"<i>{html.escape(str(said)[:150])}</i>",
+             "",
+             "Остаток у копии свой: у товара с кодами они одноразовые, и "
+             "панель их не копирует. Добавь и отправь на модерацию."]),
+            reply_markup=b.as_markup())
         return
-
-    await callback.answer(photo_note + "Создаю копию…", show_alert=lost)
-    # Состояние живое: отказ панели по недостающему полю станет вопросом, а
-    # не тупиком — раздел мог поменяться с прошлого раза.
-    await state.set_state(CreateAdState.panel_select)
-    await state.update_data(pending=values, chosen=extra, select_queue=[])
-    await _panel_create_and_report(callback.message, callback.from_user.id,
-                                   values, extra=extra, state=state, api=api)
+    await callback.message.edit_text(ui.screen(
+        "❌ <b>Копия не создалась</b>",
+        ["Панель ответила:", f"<i>{html.escape(str(said)[:400])}</i>", "",
+         "Если она просит заполнить поле — заведи товар мастером: он "
+         "спросит недостающее и дошлёт."]),
+        reply_markup=b.as_markup())
