@@ -53,6 +53,9 @@ ITEM_FIELDS = [
     {"attribute": "subcategory", "value": {"display": "Standoff 2"},
      "belongsToId": 44, "relationshipType": "belongsTo",
      "component": "belongs-to-field"},
+    {"attribute": "type", "value": {"display": "Мгновенная выдача"},
+     "belongsToId": 2, "relationshipType": "belongsTo",
+     "component": "belongs-to-field"},
     {"attribute": "filter__8", "value": "Россия"},
     {"attribute": "filter__3", "value": 7},
     {"attribute": "images", "component": "advanced-media-library-field",
@@ -72,6 +75,7 @@ CREATION_FIELDS = [
     {"attribute": "quantity", "rules": []},
     {"attribute": "category", "rules": ["required"]},
     {"attribute": "subcategory", "rules": []},
+    {"attribute": "type", "rules": []},
     {"attribute": "filter__8", "rules": []},
     {"attribute": "filter__3", "rules": []},
     {"attribute": "images", "rules": []},
@@ -305,6 +309,12 @@ class TheCopyGoesOutAsARealCreation(Bench):
         self.assertEqual(str(body.get("category")), "12")
         self.assertEqual(str(body.get("subcategory")), "44")
 
+    def test_the_delivery_type_travels_too(self):
+        """Раздел, подраздел и тип выдачи продавец у копии не заполняет:
+        у товара они есть, копия их и несёт."""
+        self.make()
+        self.assertEqual(str(self.sent().get("type")), "2")
+
     def test_the_filters_reach_the_panel(self):
         self.make()
         body = self.sent()
@@ -458,7 +468,7 @@ class TheWholeCopyRunsEndToEnd(Bench):
 
         fsm, api = FSM(), Api()
         Api.asked = []
-        self.api = api
+        self.api, self.fsm = api, fsm
         asyncio.run(self.C.templates_list(CB("create_ad:templates_list"),
                                           fsm, api))
         cb = CB("create_ad:copy:0:0")
@@ -492,6 +502,9 @@ class TheWholeCopyRunsEndToEnd(Bench):
         self.assertEqual(str(body.get("quantity")), "3")
         self.assertEqual(str(body.get("category")), "12")
         self.assertEqual(str(body.get("subcategory")), "44")
+        # Тип выдачи — тоже BelongsTo, и тоже уходит номером. Продавцу его
+        # заполнять не нужно: у товара он есть, копия его и несёт.
+        self.assertEqual(str(body.get("type")), "2")
         self.assertEqual(body.get("filter__8"), "Россия")
         self.assertEqual(str(body.get("filter__3")), "7")
 
@@ -571,6 +584,102 @@ class TheWholeCopyRunsEndToEnd(Bench):
         cb = self.press()
         said = " ".join(cb.message.texts)
         self.assertIn("Платформа", said)
+
+    def test_a_forbidden_word_can_be_fixed_in_one_tap(self):
+        """Живой отказ 02.09: «Запрещено использовать «розыгрыш» в тексте».
+        Слово панель называет сама — заставлять после этого перенабирать
+        описание целиком значит требовать работы на ровном месте."""
+        import asyncio
+        from handlers import create_ad as C
+
+        Nova.refuse_first = {"content": [
+            "Запрещено использовать «валютой» в тексте. Уберите это слово."]}
+        cb = self.press()
+        data = [x.callback_data
+                for row in cb.message.kbs[-1].inline_keyboard for x in row]
+        self.assertIn("create_ad:strip", data, "кнопки исправления нет")
+
+        # Нажимаем её — и товар уходит заново, уже без слова.
+        Nova.posted = []
+
+        class Tap(cb.__class__):
+            pass
+
+        cb2 = cb.__class__("create_ad:strip")
+        cb2.message = cb.message
+        asyncio.run(C.strip_and_create(cb2, self.fsm, None))
+        body = self.created_body()
+        self.assertTrue(body, "второй заход до панели не дошёл")
+        self.assertNotIn("валют", str(body.get("content", "")).lower())
+        self.assertIn("Аккаунт", str(body.get("content", "")))
+
+    def test_the_removed_word_is_named_not_swallowed(self):
+        """Правка чужого текста молча — не то, за что нажимали.
+
+        Смотрим ИМЕННО сообщение чистки: слово есть и в тексте отказа выше,
+        и проверка по всей переписке проходила бы при любом молчании."""
+        import asyncio
+        from handlers import create_ad as C
+
+        Nova.refuse_first = {"content": [
+            "Запрещено использовать «валютой» в тексте."]}
+        cb = self.press()
+        before = len(cb.message.texts)
+        cb2 = cb.__class__("create_ad:strip")
+        cb2.message = cb.message
+        asyncio.run(C.strip_and_create(cb2, self.fsm, None))
+        told = " ".join(cb.message.texts[before:])
+        self.assertIn("Убрал из описания", told)
+        self.assertIn("валютой", told)
+
+    def test_endings_go_with_the_word(self):
+        """Панель ищет подстроку, а не словоформу. Убрав ровно «валют», мы
+        оставили бы «валютой» — и получили бы тот же отказ вторым заходом,
+        то есть кнопка выглядела бы работающей, не работая."""
+        import asyncio
+        from handlers import create_ad as C
+
+        Nova.refuse_first = {"content": [
+            "Запрещено использовать «валют» в тексте."]}
+        cb = self.press()
+        data = [x.callback_data
+                for row in cb.message.kbs[-1].inline_keyboard for x in row]
+        self.assertIn("create_ad:strip", data)
+        Nova.posted = []
+        cb2 = cb.__class__("create_ad:strip")
+        cb2.message = cb.message
+        asyncio.run(C.strip_and_create(cb2, self.fsm, None))
+        sent = str(self.created_body().get("content", "")).lower()
+        self.assertNotIn("валют", sent, "окончание осталось — панель откажет")
+
+    def test_no_button_when_the_word_survives_inside_another(self):
+        """Запрещённое может сидеть ВНУТРИ другого слова — целиком его не
+        выкинешь. Предлагать «убрать и создать», не убрав, значит обещать
+        исход, которого не будет."""
+        Nova.refuse_first = {"content": [
+            "Запрещено использовать «нутриигров» в тексте."]}
+        cb = self.press()
+        data = [x.callback_data
+                for row in cb.message.kbs[-1].inline_keyboard for x in row]
+        self.assertNotIn("create_ad:strip", data,
+                         "обещали убрать то, что убрать нечем")
+
+    def test_no_button_when_nothing_would_be_left(self):
+        """Пустое описание — не исправленный товар."""
+        for f in ITEM_FIELDS:
+            if f["attribute"] == "content":
+                was, f["value"] = f["value"], "розыгрыш"
+                try:
+                    Nova.refuse_first = {"content": [
+                        "Запрещено использовать «розыгрыш» в тексте."]}
+                    cb = self.press()
+                    data = [x.callback_data for row in
+                            cb.message.kbs[-1].inline_keyboard for x in row]
+                    self.assertNotIn("create_ad:strip", data)
+                finally:
+                    f["value"] = was
+                return
+        self.fail("в образце нет описания")
 
     def test_a_dead_panel_does_not_report_success(self):
         old = P.PANEL_URL

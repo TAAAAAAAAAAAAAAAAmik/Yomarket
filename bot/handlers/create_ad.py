@@ -1373,9 +1373,26 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
     # строк дампа, причём наша собственная разметка внутри дампа вылезала
     # буквами — «Ресурс <b>items</b> найден» продавец видел именно так,
     # угловыми скобками.
-    from automation.panel import as_plain, explain_validation, validation_fields
+    from automation.panel import (as_plain, explain_validation,
+                                  forbidden_words, strip_words,
+                                  validation_fields, words_are_gone)
 
     why = explain_validation(result_msg)
+    # Панель называет запрещённое слово прямо в отказе. Заставлять после
+    # этого перенабирать описание целиком — работа на ровном месте: слово
+    # известно, убрать его и отправить заново можно одним нажатием.
+    #
+    # Кнопка появляется, только если убранное ДЕЙСТВИТЕЛЬНО пропало:
+    # предлагать «убрать и создать», не убедившись, что убрали, значит
+    # обещать исход, которого не будет.
+    banned = forbidden_words(result_msg)
+    if banned and state is not None:
+        clean = strip_words(values.get("description") or "", banned)
+        if clean and words_are_gone(clean, banned):
+            await state.update_data(
+                pending=dict(values, description=clean), chosen=dict(extra or {}),
+                strip_words=banned)
+            b.button(text="✂️ Убрать и создать", callback_data="create_ad:strip")
     header = ("⚠️ <b>Панель не приняла товар</b>" if why or is_found
               else "❌ <b>Не удалось создать товар</b>")
 
@@ -1776,4 +1793,30 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
     await state.update_data(pending=values, chosen=dict(extra),
                             select_queue=[])
     await _panel_create_and_report(callback.message, uid, values, extra=extra,
+                                   state=state, api=api)
+
+
+@router.callback_query(F.data == "create_ad:strip")
+async def strip_and_create(callback: CallbackQuery, state: FSMContext,
+                           api: YooMarketAPI = None) -> None:
+    """Убрать запрещённое слово из описания и отправить товар заново.
+
+    Слово называет сама панель, вычищенное описание уже лежит в форме — и
+    оно ПОКАЗЫВАЕТСЯ: правка чужого текста молча, пусть и по кнопке, это
+    не то, за что нажимали.
+    """
+    data = await state.get_data()
+    values = dict(data.get("pending") or {})
+    banned = list(data.get("strip_words") or [])
+    if not values or not banned:
+        await callback.answer("Список устарел — попробуй копию заново",
+                              show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_text(
+        "✂️ Убрал из описания: "
+        + ", ".join(f"«{html.escape(w)}»" for w in banned)
+        + "\n\n⏳ Отправляю товар заново…")
+    await _panel_create_and_report(callback.message, callback.from_user.id,
+                                   values, extra=dict(data.get("chosen") or {}),
                                    state=state, api=api)
