@@ -361,6 +361,39 @@ class TheAdIsCreatedAgainThroughTheApi(Bench):
         self.assertEqual(self.api.created, [])
         self.assertIn("картинк", cb.message.texts[-1])
 
+    def test_it_says_at_which_step_the_picture_was_lost(self):
+        """«Копия не создалась» без указания шага отправляет продавца
+        гадать: картинки в карточке не было, не скачалась, или дело вообще
+        не в ней. А если она там под незнакомым именем — по перечню полей
+        это видно сразу."""
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        self.api.card = {"id": 11, "title": "Без фото", "price": 10,
+                         "category_id": 512, "type": "simple",
+                         # Адреса картинки тут нет: `_find_image_url` роет
+                         # по всей карточке и нашёл бы даже вложенный — а
+                         # относительный путь ему не годится.
+                         "attachments": [{"src": "/media/x"}]}
+        cb = self.tap()
+        said = cb.message.texts[-1]
+        self.assertIn("нет адреса картинки", said)
+        self.assertIn("attachments", said, "не назвал поля карточки")
+
+    def test_a_picture_that_will_not_download_says_so(self):
+        """Адрес в карточке был, а картинка не пришла — это другая беда, и
+        лечится она иначе."""
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        self.api.session = Session(status=403)
+        cb = self.tap()
+        self.assertEqual(self.api.created, [])
+        self.assertIn("403", cb.message.texts[-1])
+
+    def test_an_empty_picture_is_not_passed_off_as_one(self):
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        self.api.session = Session(body=b"")
+        cb = self.tap()
+        self.assertEqual(self.api.created, [])
+        self.assertIn("пуст", cb.message.texts[-1])
+
     def test_it_is_not_published_by_itself(self):
         """Публикация без остатка отвергается, а остаток у копии свой."""
         self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]

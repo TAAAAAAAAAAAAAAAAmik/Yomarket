@@ -1606,29 +1606,39 @@ async def open_section(callback: CallbackQuery, state: FSMContext) -> None:
     await _show_section(callback, state, idx)
 
 
-async def _photo_of(api, ad: dict) -> list:
-    """Картинка объявления, скачанная по адресу из его же карточки.
+async def _photo_of(api, ad: dict) -> tuple[list, str]:
+    """Картинка объявления по адресу из его же карточки. → (файлы, причина).
 
     Адрес ищется по всей карточке (`_find_image_url`), а не по угаданному
-    имени поля: как маркетплейс называет картинку, живьём не проверялось, и
-    ошибиться именем значит молча создать товар без фото — а без него
-    публикация отвергается с `empty_images`.
+    имени поля: как маркетплейс называет картинку, живьём не проверялось.
+
+    Вторым значением — почему не вышло, и это не для красоты. Без картинки
+    маркетплейс объявление не принимает (живой отказ 02.09, поле `files`),
+    и «копия не создалась» без указания шага отправляет продавца гадать:
+    картинки в карточке не было, не скачалась, или дело вообще не в ней.
     """
     from automation.panel import _find_image_url
 
     url = _find_image_url(ad)
-    if not url or not getattr(api, "session", None):
-        return []
+    if not url:
+        # Называем, что в карточке было: если картинка там лежит под
+        # незнакомым именем, это видно сразу и чинится одной строкой.
+        keys = ", ".join(sorted(str(k) for k in ad.keys())[:20])
+        return [], f"в карточке объявления нет адреса картинки. Поля: {keys}"
+    if not getattr(api, "session", None):
+        return [], "нет соединения с маркетплейсом"
     try:
         async with api.session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as r:
             if r.status != 200:
-                return []
+                return [], f"картинка не отдалась: HTTP {r.status}"
             data = await r.read()
     except Exception as e:                                # noqa: BLE001
         logger.warning("картинка объявления не скачалась: %s", e)
-        return []
+        return [], f"картинку не удалось скачать: {str(e)[:120]}"
+    if not data:
+        return [], "картинка пришла пустой"
     name = url.rsplit("/", 1)[-1].split("?")[0] or "photo.jpg"
-    return [(data, name)]
+    return [(data, name)], ""
 
 
 async def _copy_ad_via_api(api, ad_id: str) -> tuple[bool, str, list[str]]:
@@ -1668,13 +1678,14 @@ async def _copy_ad_via_api(api, ad_id: str) -> tuple[bool, str, list[str]]:
         except (TypeError, ValueError):
             stock = 0
 
-    photos = await _photo_of(api, ad)
+    photos, why = await _photo_of(api, ad)
     if not photos:
         # Живой отказ 02.09: `errors: {"files": ["Поле files обязательно"]}`.
         # Отправлять объявление без картинки значит заведомо получить его
-        # ещё раз — лучше сказать сразу и назвать, чего не хватило.
-        return False, ("не удалось взять картинку у объявления, а без неё "
-                       "маркетплейс объявление не принимает"), []
+        # ещё раз — лучше сказать сразу и назвать ШАГ, на котором она
+        # потерялась.
+        return False, (f"без картинки маркетплейс объявление не примет, "
+                       f"а взять её не вышло: {why}"), []
 
     new_id, said = await api.create_and_publish(
         title=title, price=int(price),
