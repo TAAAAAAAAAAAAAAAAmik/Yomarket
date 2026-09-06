@@ -42,7 +42,9 @@ ITEM_FIELDS = [
     {"attribute": "public", "value": 1},
     {"attribute": "moderation_status", "value": "approved"},
     {"attribute": "title", "value": "Аккаунт Standoff 2 с виртами"},
-    {"attribute": "price", "value": 1490},
+    # Цены здесь НЕТ намеренно: у товара в панели поля цены не существует
+    # (давняя запись в CLAUDE.md, из-за неё же снята правка цены из бота).
+    # Живой отказ 02.09: копия читала ноль и вставала.
     {"attribute": "content", "value": "Аккаунт с внутриигровой валютой."},
     {"attribute": "quantity", "value": 3},
     {"attribute": "category", "value": {"display": "Аккаунты"},
@@ -197,10 +199,16 @@ class TheSourceItemIsReadAsCreationExpectsIt(Bench):
         ok, values, _extra, _url, err = self.read()
         self.assertTrue(ok, err)
         self.assertEqual(values["title"], "Аккаунт Standoff 2 с виртами")
-        self.assertEqual(values["price"], 1490)
         self.assertEqual(values["description"],
                          "Аккаунт с внутриигровой валютой.")
         self.assertEqual(values["quantity"], 3)
+
+    def test_a_missing_price_is_none_not_zero(self):
+        """У товара в панели поля цены НЕТ. Ноль по умолчанию уехал бы на
+        витрину ценой; `None` означает «поля не было», и вызывающий берёт
+        цену из второго источника."""
+        _ok, values, _extra, _url, _err = self.read()
+        self.assertIsNone(values["price"])
 
     def test_the_section_is_a_number_not_a_label(self):
         """`str(value)` отправил бы «Аккаунты» — и панель ответила бы 422
@@ -252,32 +260,6 @@ class TheSourceItemIsReadAsCreationExpectsIt(Bench):
         data = P.panel_fetch_image_sync("session=1", url)
         self.assertTrue(data.startswith(b"\xff\xd8"), "это не картинка")
 
-    def test_a_price_that_did_not_parse_is_a_refusal(self):
-        """Молчаливый ноль здесь — товар, отданный даром. У Nova цена
-        бывает денежным полем, и вложенное значение читается как ничто."""
-        for f in ITEM_FIELDS:
-            if f["attribute"] == "price":
-                was, f["value"] = f["value"], {"amount": 1490}
-                try:
-                    ok, _v, _e, _u, err = self.read()
-                finally:
-                    f["value"] = was
-                self.assertFalse(ok, "товар ушёл бы с нулевой ценой")
-                self.assertIn("цена", err.lower())
-                return
-        self.fail("в образце нет цены — проверка ничего не проверяет")
-
-    def test_a_zero_price_is_a_refusal_too(self):
-        for f in ITEM_FIELDS:
-            if f["attribute"] == "price":
-                was, f["value"] = f["value"], 0
-                try:
-                    ok, _v, _e, _u, err = self.read()
-                finally:
-                    f["value"] = was
-                self.assertFalse(ok)
-                return
-
     def test_a_panel_that_says_nothing_is_a_refusal(self):
         """«Пустые поля» — не пустой товар, а неудачное чтение."""
         old = ITEM_FIELDS[:]
@@ -305,7 +287,7 @@ class TheCopyGoesOutAsARealCreation(Bench):
                 fh.write(data)
         try:
             return P.panel_create_product_sync(
-                "session=1", values["title"], values["price"],
+                "session=1", values["title"], values["price"] or 1490,
                 values["description"], values["quantity"],
                 values["category"], None, extra, path or None)
         finally:
@@ -451,12 +433,22 @@ class TheWholeCopyRunsEndToEnd(Bench):
                 s.data, s.state = {}, None
 
         class Api:
-            """Только список: создание идёт через панель."""
+            """Список и ЦЕНА: у товара в панели поля цены нет вовсе, и
+            взять её можно только здесь. Маркетплейс отдаёт её объектом."""
+
+            asked: list = []
+
+            async def get_ad(s, ad_id):
+                Api.asked.append(str(ad_id))
+                return {"data": {"id": ad_id, "stock": 3,
+                                 "price": {"amount": 1490,
+                                           "currency": "RUB"}}}
 
             async def get_ads(s, cursor=None):
                 return {"data": [{"id": 219206,
                                   "title": "Аккаунт Standoff 2 с виртами",
-                                  "price": 1490, "category_id": 12}]}
+                                  "price": {"amount": 1490},
+                                  "category_id": 12}]}
 
             async def resolve_category(s, cid):
                 return "Аккаунты"
@@ -465,6 +457,8 @@ class TheWholeCopyRunsEndToEnd(Bench):
                 return [{"id": 12, "name": "Аккаунты"}]
 
         fsm, api = FSM(), Api()
+        Api.asked = []
+        self.api = api
         asyncio.run(self.C.templates_list(CB("create_ad:templates_list"),
                                           fsm, api))
         cb = CB("create_ad:copy:0:0")
@@ -511,6 +505,35 @@ class TheWholeCopyRunsEndToEnd(Bench):
     def test_the_source_id_never_goes_out(self):
         self.press()
         self.assertNotIn("id", self.created_body())
+
+    def test_the_stock_is_taken_from_the_marketplace_when_the_panel_lacks_it(self):
+        """У товара может не быть и количества — как нет цены. Молчаливая
+        единица вместо трёх это копия, отличающаяся от образца остатком."""
+        keep = [f for f in ITEM_FIELDS if f["attribute"] == "quantity"]
+        for f in keep:
+            ITEM_FIELDS.remove(f)
+        try:
+            self.press()
+            self.assertEqual(str(self.created_body().get("quantity")), "3")
+        finally:
+            ITEM_FIELDS.extend(keep)
+
+    def test_the_price_is_taken_from_the_marketplace(self):
+        """Живой отказ 02.09: «цена товара не прочиталась (в полях панели
+        0)». У товара в панели поля цены НЕТ — она есть только в API, и
+        объектом: прочитанная как скаляр, она превращается в ноль."""
+        self.press()
+        self.assertTrue(self.api.asked, "за ценой в маркетплейс не ходили")
+        self.assertEqual(str(self.created_body().get("price")), "1490")
+
+    def test_without_the_marketplace_it_refuses_instead_of_giving_it_away(self):
+        """Бесплатный товар на витрине хуже несозданной копии."""
+        import asyncio
+        from handlers import create_ad as C
+        values, _extra, why = asyncio.run(
+            C._copy_source_values(7, "219206", None))
+        self.assertEqual(values, {})
+        self.assertIn("бесплатной", why)
 
     def test_the_new_number_is_shown(self):
         cb = self.press()

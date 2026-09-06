@@ -2845,7 +2845,11 @@ def panel_item_values_sync(
     if not fields:
         return False, {}, {}, "", (err or "панель не отдала поля товара")
 
-    values = {"title": "", "price": 0, "description": "", "quantity": 1,
+    # `None` — «поля не было», а не «пусто». Разница здесь существенная:
+    # у товара в панели ЦЕНЫ НЕТ ВОВСЕ (давняя запись в CLAUDE.md), и
+    # подставленный ноль уехал бы на витрину ценой. Чем заполнить пропуск,
+    # решает вызывающий — у него есть второй источник, Integration API.
+    values = {"title": "", "price": None, "description": "", "quantity": None,
               "category": ""}
     extra: dict = {}
     image_url = ""
@@ -2884,17 +2888,6 @@ def panel_item_values_sync(
             extra[attr] = sub
     if not values["title"]:
         return False, {}, {}, "", "в полях товара нет названия"
-    # Цена — деньги, и молчаливый ноль здесь означает товар, отданный
-    # даром. Она может прийти вложенной (у Nova это денежное поле), и
-    # тогда `_field_submit_value` вернёт None, а ноль по умолчанию доедет
-    # до витрины ценой.
-    try:
-        if float(values["price"]) <= 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        return False, {}, {}, "", (
-            f"цена товара не прочиталась (в полях панели "
-            f"{values['price']!r}) — копия ушла бы бесплатной")
     return True, values, extra, image_url, ""
 
 

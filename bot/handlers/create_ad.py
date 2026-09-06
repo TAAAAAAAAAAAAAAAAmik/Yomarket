@@ -1623,7 +1623,36 @@ async def open_section(callback: CallbackQuery, state: FSMContext) -> None:
     await _show_section(callback, state, idx)
 
 
-async def _copy_source_values(uid: int, ad_id: str) -> tuple[dict, dict, str]:
+async def _ad_card(api, ad_id: str) -> dict:
+    """Карточка объявления из Integration API. Пустая — значит не вышло."""
+    if not api:
+        return {}
+    try:
+        raw = await api.get_ad(str(ad_id))
+    except Exception as e:                                # noqa: BLE001
+        logger.warning("карточка объявления %s не прочиталась: %s", ad_id, e)
+        return {}
+    return (raw.get("data") or raw) if isinstance(raw, dict) else {}
+
+
+async def _price_from_api(api, ad_id: str):
+    """Цена объявления. Читается `ad_price` — маркетплейс отдаёт её
+    объектом, и прочитанная как скаляр она превращается в ноль."""
+    from orderfields import ad_price
+
+    return ad_price(await _ad_card(api, ad_id))
+
+
+async def _stock_from_api(api, ad_id: str):
+    card = await _ad_card(api, ad_id)
+    try:
+        return int(float(card.get("stock") or 0)) or None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _copy_source_values(uid: int, ad_id: str,
+                              api=None) -> tuple[dict, dict, str]:
     """Значения исходного товара для нового. → (values, extra, причина).
 
     Копия — это пробег по тем же шагам создания, но с готовыми значениями:
@@ -1652,6 +1681,23 @@ async def _copy_source_values(uid: int, ad_id: str) -> tuple[dict, dict, str]:
         None, panel_item_values_sync, cookies, str(ad_id), uid)
     if not ok:
         return {}, {}, err or "панель не отдала поля товара"
+
+    # Каждое поле берётся оттуда, где оно есть. У товара в панели ЦЕНЫ НЕТ
+    # ВОВСЕ — давняя запись в CLAUDE.md, из-за неё же снята и правка цены
+    # из бота, — зато она есть в Integration API, объектом. Ноль,
+    # подставленный по умолчанию, уехал бы на витрину ценой.
+    if values.get("price") in (None, "", 0):
+        values["price"] = await _price_from_api(api, ad_id)
+    if values.get("quantity") in (None, ""):
+        values["quantity"] = await _stock_from_api(api, ad_id)
+    try:
+        if float(values["price"]) <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return {}, {}, ("цену товара не отдали ни панель, ни маркетплейс — "
+                        "копия ушла бы бесплатной")
+    values["price"] = int(float(values["price"]))
+    values["quantity"] = int(values.get("quantity") or 1)
 
     if not url:
         return {}, {}, ("у товара в панели не нашлось картинки, а без неё "
@@ -1710,7 +1756,7 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
 
     await callback.answer("Создаю копию…")
     await callback.message.edit_text("⏳ Читаю товар в панели…")
-    values, extra, why = await _copy_source_values(uid, ad_id)
+    values, extra, why = await _copy_source_values(uid, ad_id, api)
     if why:
         b = InlineKeyboardBuilder()
         b.button(text="📋 Ещё копию", callback_data="create_ad:templates_list")
