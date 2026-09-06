@@ -2775,6 +2775,151 @@ def _field_submit_value(f: dict):
     return val
 
 
+# Поля, которые в копию не переносятся ни при каких условиях: они
+# принадлежат КОНКРЕТНОМУ товару, а не его содержанию. Отправленный вместе с
+# остальным `id` означал бы попытку создать товар с чужим номером.
+_ITEM_OWN_FIELDS = frozenset({
+    "id", "uuid", "slug", "created_at", "updated_at", "deleted_at",
+    "views", "views_count", "sold", "sold_count", "rating", "position",
+})
+
+
+def _media_url_of(value) -> str:
+    """Адрес картинки из значения медиа-поля, в том числе относительный.
+
+    `_find_image_url` берёт только абсолютные: относительный `/storage/…`
+    он отвергает, и копия вставала с «у товара не нашлось картинки» на
+    товаре, у которого картинка есть. Относительный путь может вести
+    только на саму панель — её адрес и подставляем.
+    """
+    url = _find_image_url(value)
+    if url:
+        return url
+
+    found = ""
+
+    def dig(node):
+        nonlocal found
+        if found:
+            return
+        if isinstance(node, dict):
+            for v in node.values():
+                dig(v)
+        elif isinstance(node, list):
+            for v in node:
+                dig(v)
+        elif isinstance(node, str) and node.startswith("/") and any(
+                ext in node.lower()
+                for ext in (".jpg", ".jpeg", ".png", ".webp")):
+            found = node
+
+    dig(value)
+    return (PANEL_URL.rstrip("/") + found) if found else ""
+
+
+def panel_item_values_sync(
+    cookie_string: str, item_id: str, uid: int | None = None,
+) -> tuple[bool, dict, dict, str, str]:
+    """Значения товара в том виде, в каком их ждёт СОЗДАНИЕ нового.
+
+    → (получилось, values, extra, адрес картинки, причина отказа)
+
+    Копия — это пробег по тем же шагам создания, но с готовыми значениями.
+    Поэтому здесь не свой формат, а ровно тот, который принимает
+    `panel_create_product_sync`: `values` с названием, ценой, описанием и
+    количеством, и `extra` — наложение «атрибут → значение» поверх формы.
+
+    В `extra` уходит ВСЁ остальное, что у товара есть: раздел, подраздел,
+    тип, `filter__1`…`filter__11`. Перечислять их поимённо нельзя — какие
+    из них обязательны, зависит от раздела, и форма создания об этом
+    молчит (у гифт-карт это `filter__8` «Регион», живой отказ 20.08).
+
+    Номера разделов берутся через `_field_submit_value`: у полей BelongsTo
+    выбранное лежит в `belongsToId`, а `str(value)` отправил бы НАДПИСЬ —
+    именно из-за этого копия теряла раздел и получала 422.
+    """
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+    fields, err = _get_update_fields(session, hdrs, str(item_id))
+    _save_refreshed_cookies(uid, cookie_string, session)
+    if not fields:
+        return False, {}, {}, "", (err or "панель не отдала поля товара")
+
+    values = {"title": "", "price": 0, "description": "", "quantity": 1,
+              "category": ""}
+    extra: dict = {}
+    image_url = ""
+    for f in fields:
+        attr = str(f.get("attribute") or "")
+        if not attr or attr in _ITEM_OWN_FIELDS:
+            continue
+        al = attr.lower()
+        comp = str(f.get("component") or "")
+        if "media" in comp or "file" in comp or al in ("images", "image"):
+            image_url = image_url or _media_url_of(f.get("value"))
+            continue
+        sub = _field_submit_value(f)
+        if sub is None or sub == "" or isinstance(sub, (dict, list)):
+            continue
+        # Те же слова, по которым форма создания раскладывает значения, —
+        # иначе прочитанное и отправленное разошлись бы уже на названии.
+        if any(k in al for k in ("title", "name", "header", "naimenov")):
+            values["title"] = str(sub)
+        elif any(k in al for k in ("price", "cost", "cena")):
+            values["price"] = sub
+        elif any(k in al for k in ("desc", "opis", "text", "content")):
+            values["description"] = str(sub)
+        elif any(k in al for k in ("count", "quantity", "qty", "stock")):
+            try:
+                values["quantity"] = int(float(sub))
+            except (TypeError, ValueError):
+                pass
+        else:
+            # ТОЧНОЕ имя, а не вхождение: «subcategory» тоже содержит
+            # «categ», идёт следом и затирала раздел — вместо 12 уезжало 44,
+            # то есть товар лёг бы в чужой раздел. В `extra` попадают оба,
+            # каждый под своим именем, и там путаницы нет.
+            if al in ("category", "category_id", "kategoriya"):
+                values["category"] = sub
+            extra[attr] = sub
+    if not values["title"]:
+        return False, {}, {}, "", "в полях товара нет названия"
+    # Цена — деньги, и молчаливый ноль здесь означает товар, отданный
+    # даром. Она может прийти вложенной (у Nova это денежное поле), и
+    # тогда `_field_submit_value` вернёт None, а ноль по умолчанию доедет
+    # до витрины ценой.
+    try:
+        if float(values["price"]) <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return False, {}, {}, "", (
+            f"цена товара не прочиталась (в полях панели "
+            f"{values['price']!r}) — копия ушла бы бесплатной")
+    return True, values, extra, image_url, ""
+
+
+def panel_fetch_image_sync(cookie_string: str, url: str) -> bytes:
+    """Скачать картинку товара сессией ПАНЕЛИ.
+
+    Своей сессией, а не общей: картинка лежит на панели и отдаётся только
+    вошедшему. Пустые байты означают «не вышло» — вызывающий обязан это
+    проверить, потому что без картинки товар не создастся.
+    """
+    if not url:
+        return b""
+    session = _make_panel_requests_session(cookie_string)
+    try:
+        # Числа, а не имена: CONNECT_TIMEOUT и READ_TIMEOUT объявлены ВНУТРИ
+        # `panel_create_product_sync`, снаружи их нет — и `NameError` отсюда
+        # молча становился «картинки нет», потому что ловится он тем же
+        # `except`, что и обрыв связи.
+        r = session.get(url, timeout=(6, 20))
+        return r.content if r.status_code == 200 else b""
+    except Exception as e:                                # noqa: BLE001
+        logger.warning("картинка товара не скачалась: %s", e)
+        return b""
+
+
 def panel_clone_item_sync(
     cookie_string: str, item_id: str, uid: int | None = None,
 ) -> tuple[bool, str]:
@@ -3241,10 +3386,16 @@ def panel_create_product_sync(
                 payload[attr] = val
         payload.setdefault("title", values["title"])
         payload.setdefault("price", values["price"])
-        # Выбранное продавцом (номера раздела, подраздела, типа) важнее догадок
+        # Выбранное продавцом (номера раздела, подраздела, типа) важнее догадок.
+        # Но только то, что форма СОЗДАНИЯ знает: мастер иначе и не берёт —
+        # он читает `chosen` из этой же формы, — а копия несёт поля товара
+        # целиком, и среди них есть такие, которых при создании нет вовсе
+        # (`public`, `moderation_status`). Отправленные, они дали бы отказ
+        # по полю, которого продавец не заполнял и заполнить не может.
         if extra:
+            known_attrs = set(attrs)
             for k, v in extra.items():
-                if v is not None:
+                if v is not None and k in known_attrs:
                     payload[k] = v
 
         store_url = f"{PANEL_URL}/nova-api/{res}?editing=true&editMode=create"

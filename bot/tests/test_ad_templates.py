@@ -1,21 +1,27 @@
-"""Копия товара: то же объявление, заведённое заново по API.
+"""Копия товара: пробег по тем же шагам создания, но с готовыми значениями.
 
 Мастер спрашивает название, цену, описание, количество, фото — а потом
 раздел панели и её `filter__N`, и вот их пять-шесть штук, причём про
 половину панель до выбора категории молчит вовсе. Второй такой же товар
 проходил весь этот круг заново.
 
-Здесь два живых отказа подряд, и оба про то, ОТКУДА берутся данные.
+Три живых отказа подряд, и все три про то, ОТКУДА берутся данные и КУДА
+уходят.
 
-Первая версия помнила товары, созданные самим ботом: у продавца их семь,
-все заведены раньше, и развилка не появлялась вовсе — снаружи «кнопка не
-работает». Вторая копировала формой панели, и панель отказала 422 на
-четырёх полях сразу: её клон не умеет пересылать вложенные значения, а
-раздел у товара как раз такое.
+1. Первая версия помнила товары, созданные самим ботом: у продавца их семь,
+   все заведены раньше, и развилка не появлялась вовсе — снаружи «кнопка не
+   работает».
+2. Вторая копировала формой панели (`panel_clone_item_sync`), и панель
+   отказала 422 на четырёх полях сразу: её клон не пересылает вложенные
+   значения, а раздел у товара как раз такое.
+3. Третья заводила объявление через Integration API — и упёрлась в
+   `files`: путь `create_and_publish` + `upload_media` не выполнялся ни
+   разу и живьём не работает.
 
-Теперь объявление заводится заново через Integration API: раздел лежит в
-самом объявлении, полем `category_id`. И список читается ТЕМ ЖЕ API — у
-панели свои номера товаров, и номер из её списка указал бы не туда.
+Теперь копия идёт ТЕМ ЖЕ вызовом, что и мастер, — им заведены все товары
+продавца. Здесь проверяются экраны и заслоны; сам путь до панели, вместе с
+разбором полей и сборкой multipart, проверяется по настоящему HTTP в
+`test_ad_copy_live.py`.
 """
 from __future__ import annotations
 
@@ -309,175 +315,147 @@ class TheListIsGroupedBySection(Bench):
         self.assertIn("нечего", cb.message.texts[-1])
 
 
-class TheAdIsCreatedAgainThroughTheApi(Bench):
+class TheCopyIsARunThroughTheSameCreation(Bench):
+    """Копия идёт ТЕМ ЖЕ вызовом, что и мастер, — путь, которым заведены
+    все товары продавца. Свой второй путь через Integration API
+    (`create_and_publish` + `upload_media`) не выполнялся ни разу и упирался
+    в отказ по полю `files`; здесь он снят целиком.
+
+    Живьём этот путь проверяется в `test_ad_copy_live.py`: там поднимается
+    настоящая подставная панель и по ней ходит тот же код.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from automation import panel as PANEL
+        self.PANEL = PANEL
+        self._values = PANEL.panel_item_values_sync
+        self._image = PANEL.panel_fetch_image_sync
+        self._create = C._panel_create_and_report
+        self._creds = storage.get_panel_creds
+        storage.get_panel_creds = lambda uid: {"cookies": "c=1"}
+
+        self.read = (True,
+                     {"title": "Аккаунт с виртами", "price": 1490,
+                      "description": "описание", "quantity": 3,
+                      "category": 12},
+                     {"category": 12, "subcategory": 44,
+                      "filter__8": "Россия"},
+                     "https://panel/media/x.jpg", "")
+        self.image = b"\xff\xd8JPEG"
+        self.sent: list[dict] = []
+
+        PANEL.panel_item_values_sync = lambda ck, iid, uid=None: self.read
+        PANEL.panel_fetch_image_sync = lambda ck, url: self.image
+
+        async def fake_create(msg, uid, values, extra=None, picked=None,
+                              state=None, api=None):
+            self.sent.append({"values": dict(values), "extra": dict(extra or {}),
+                              "state": state})
+            await msg.edit_text("✅ Товар создан")
+
+        C._panel_create_and_report = fake_create
+
+    def tearDown(self):
+        self.PANEL.panel_item_values_sync = self._values
+        self.PANEL.panel_fetch_image_sync = self._image
+        C._panel_create_and_report = self._create
+        storage.get_panel_creds = self._creds
+        super().tearDown()
 
     def tap(self, where="create_ad:copy:0:0"):
         """Пройти путь целиком: разделы → объявления → копия."""
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
         fsm = FSM()
         run(C.templates_list(CB("create_ad:templates_list"), fsm, self.api))
         cb = CB(where)
         run(C.copy_item(cb, fsm, self.api))
-        return cb
+        return cb, fsm
 
-    def test_the_same_fields_go_out(self):
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+    def test_the_same_creation_call_is_used(self):
         self.tap()
-        self.assertEqual(len(self.api.created), 1, "объявление не создано")
-        got = self.api.created[0]
-        self.assertEqual(got["title"], "1000 Robux")
-        self.assertEqual(got["price"], 990)
-        self.assertEqual(got["description"], "код сразу")
-        self.assertEqual(got["category_id"], 512)
-        self.assertEqual(got["ad_type"], "simple")
+        self.assertEqual(len(self.sent), 1, "товар в панель не ушёл")
 
-    def test_the_section_is_taken_from_the_ad_itself(self):
-        """Ради этого всё и переписано: у панели раздел лежал вложенным
-        значением, и её клон его не отправлял — отказ 422 по `category`."""
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        self.api.card = dict(self.api.CARD, category_id=777)
+    def test_the_plain_fields_go_out(self):
         self.tap()
-        self.assertEqual(self.api.created[0]["category_id"], 777)
+        got = self.sent[0]["values"]
+        self.assertEqual(got["title"], "Аккаунт с виртами")
+        self.assertEqual(got["price"], 1490)
+        self.assertEqual(got["description"], "описание")
+        self.assertEqual(got["quantity"], 3)
 
-    def test_the_stock_comes_along(self):
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+    def test_the_section_and_its_filters_go_out(self):
+        """Ради этого всё и переписано: раздел уходит номером, и вместе с
+        ним все `filter__N` — какие из них обязательны, зависит от раздела,
+        и форма создания об этом молчит."""
         self.tap()
-        self.assertEqual(self.api.created[0]["stock"], 4)
+        extra = self.sent[0]["extra"]
+        self.assertEqual(extra["category"], 12)
+        self.assertEqual(extra["subcategory"], 44)
+        self.assertEqual(extra["filter__8"], "Россия")
 
-    def test_the_photo_comes_along(self):
-        """Маркетплейс требует картинку полем `files` и без неё отказывает
-        (живой отказ 02.09)."""
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+    def test_the_picture_goes_as_a_file(self):
+        """Панель принимает картинку только настоящей загрузкой."""
+        import os
         self.tap()
-        self.assertTrue(self.api.created[0]["photos"], "ушло без картинки")
-        self.assertTrue(self.api.session.asked, "картинку даже не скачивали")
+        path = self.sent[0]["values"].get("photo_path")
+        self.assertTrue(path, "картинка не приложена")
+        self.assertTrue(os.path.exists(path), "файла картинки нет")
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), self.image)
+
+    def test_the_picture_survives_for_the_second_attempt(self):
+        """Отказ по полю превращается в вопрос, после ответа товар уходит
+        заново — и файл нужен во второй раз. Удалённый сразу, он оставил бы
+        повтор без картинки."""
+        import os
+        self.tap()
+        self.assertTrue(os.path.exists(self.sent[0]["values"]["photo_path"]))
+
+    def test_the_form_stays_alive_so_a_refusal_becomes_a_question(self):
+        _cb, fsm = self.tap()
+        self.assertEqual(fsm.state, C.CreateAdState.panel_select)
+        self.assertEqual(fsm.data.get("chosen", {}).get("filter__8"), "Россия")
+
+    def test_a_panel_that_cannot_read_the_item_says_why(self):
+        self.read = (False, {}, {}, "", "update-fields: 419")
+        cb, _fsm = self.tap()
+        self.assertEqual(self.sent, [])
+        self.assertIn("419", cb.message.texts[-1])
 
     def test_without_a_picture_it_does_not_even_try(self):
-        """Отправлять заведомо отвергаемое значит показать продавцу отказ
-        вместо понятной причины."""
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        self.api.card = {"id": 11, "title": "Без фото", "price": 10,
-                         "category_id": 512, "type": "simple"}
-        cb = self.tap()
-        self.assertEqual(self.api.created, [])
+        """Без картинки объявление не создастся — отправлять заведомо
+        отвергаемое значит показать продавцу отказ вместо причины."""
+        self.read = (True, self.read[1], self.read[2], "", "")
+        cb, _fsm = self.tap()
+        self.assertEqual(self.sent, [])
         self.assertIn("картинк", cb.message.texts[-1])
 
-    def test_it_says_at_which_step_the_picture_was_lost(self):
-        """«Копия не создалась» без указания шага отправляет продавца
-        гадать: картинки в карточке не было, не скачалась, или дело вообще
-        не в ней. А если она там под незнакомым именем — по перечню полей
-        это видно сразу."""
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        self.api.card = {"id": 11, "title": "Без фото", "price": 10,
-                         "category_id": 512, "type": "simple",
-                         # Адреса картинки тут нет: `_find_image_url` роет
-                         # по всей карточке и нашёл бы даже вложенный — а
-                         # относительный путь ему не годится.
-                         "attachments": [{"src": "/media/x"}]}
-        cb = self.tap()
-        said = cb.message.texts[-1]
-        self.assertIn("нет адреса картинки", said)
-        self.assertIn("attachments", said, "не назвал поля карточки")
-
     def test_a_picture_that_will_not_download_says_so(self):
-        """Адрес в карточке был, а картинка не пришла — это другая беда, и
-        лечится она иначе."""
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        self.api.session = Session(status=403)
-        cb = self.tap()
-        self.assertEqual(self.api.created, [])
-        self.assertIn("403", cb.message.texts[-1])
+        """Адрес был, а картинка не пришла — это другая беда."""
+        self.image = b""
+        cb, _fsm = self.tap()
+        self.assertEqual(self.sent, [])
+        self.assertIn("скачать", cb.message.texts[-1])
 
-    def test_an_empty_picture_is_not_passed_off_as_one(self):
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        self.api.session = Session(body=b"")
-        cb = self.tap()
-        self.assertEqual(self.api.created, [])
-        self.assertIn("пуст", cb.message.texts[-1])
+    def test_without_panel_cookies_it_says_so(self):
+        storage.get_panel_creds = lambda uid: {}
+        cb, _fsm = self.tap()
+        self.assertEqual(self.sent, [])
+        self.assertIn("панел", cb.message.texts[-1].lower())
 
-    def test_it_is_not_published_by_itself(self):
-        """Публикация без остатка отвергается, а остаток у копии свой."""
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        self.tap()
-        self.assertFalse(self.api.created[0]["publish"])
-
-    def test_codes_are_never_copied_and_it_says_so(self):
-        """Остаток товара с авто-выдачей — сами ключи, одноразовые. Взять
-        их из образца значит продать один код дважды."""
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        self.api.card = dict(self.api.CARD, type="auto-delivery")
-        cb = self.tap()
-        said = cb.message.texts[-1]
-        self.assertIn("одноразов", said)
-        self.assertIn("Не скопировалось", said)
-
-    def test_a_missing_section_refuses_and_names_it(self):
-        """«Не вышло» без причины продавцу разбирать нечем."""
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        self.api.card = {"id": 11, "title": "Есть", "price": 10}
-        cb = self.tap()
-        self.assertEqual(self.api.created, [])
-        self.assertIn("раздел", cb.message.texts[-1])
-
-    def test_the_new_number_is_reported(self):
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        cb = self.tap()
-        said = cb.message.texts[-1]
-        self.assertIn("55", said)
-        self.assertIn("Копия создана", said)
-
-    def test_the_stock_and_moderation_are_offered_right_there(self):
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        cb = self.tap()
-        data = self.kb(cb)
-        self.assertIn("pitem_stock:55", data)
-        self.assertIn("cadpub:55", data)
-
-    def test_a_refusal_is_shown_in_words_not_in_escape_codes(self):
-        """Живой отказ уехал на экран как `\\u041f\\u043e\\u043b\\u0435` —
-        прочитать это нельзя, то есть отказ есть, а причины нет."""
-        import json
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        self.api.create_raises = RuntimeError("HTTP 422: " + json.dumps(
-            {"error": {"status": 422, "message": "The given data was invalid.",
-                       "errors": {"files": ["Поле files обязательно."]}}}))
-        cb = self.tap()
-        said = cb.message.texts[-1]
-        self.assertIn("files", said)
-        self.assertNotIn("u041f", said)
-
-    def test_a_refusal_is_never_called_a_success(self):
-        """Бодрый отчёт об успехе там, где ничего не создалось, — самая
-        дорогая поломка этого проекта."""
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        self.api.create_raises = RuntimeError("422: нет раздела")
-        cb = self.tap()
-        said = cb.message.texts[-1]
-        self.assertIn("не создалась", said)
-        self.assertNotIn("Копия создана", said)
-
-    def test_a_refusal_offers_no_buttons_for_an_ad_that_does_not_exist(self):
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        self.api.create_raises = RuntimeError("422")
-        cb = self.tap()
-        data = " ".join(self.kb(cb))
-        self.assertNotIn("pitem_stock:", data)
-        self.assertNotIn("cadpub:", data)
+    def test_a_failure_offers_a_way_out(self):
+        """Экран, с которого нечего нажать, — тупик."""
+        self.image = b""
+        cb, _fsm = self.tap()
+        self.assertIn("create_ad:new", self.kb(cb))
 
     def test_a_stale_button_does_not_copy_the_wrong_ad(self):
         """Кнопка осталась в старом сообщении, а список с тех пор другой.
         Скопировать «что-то похожее по счёту» хуже, чем не скопировать."""
-        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
-        cb = self.tap("create_ad:copy:9:9")
-        self.assertEqual(self.api.created, [])
+        cb, _fsm = self.tap("create_ad:copy:9:9")
+        self.assertEqual(self.sent, [])
         self.assertTrue(cb.alerts)
-
-    def test_without_a_token_it_says_so_and_does_not_try(self):
-        cb = CB("create_ad:copy:0:0")
-        run(C.copy_item(cb, FSM(), None))
-        self.assertTrue(any("токен" in a.lower() for a in cb.alerts),
-                        cb.alerts)
-        self.assertEqual(cb.message.texts, [], "полез создавать без токена")
-        self.assertEqual(self.api.created, [])
 
 
 class TheCopyIsForAdminsOnly(Bench):
@@ -527,11 +505,23 @@ class TheCopyIsForAdminsOnly(Bench):
 
     def test_and_so_is_the_copy_itself(self):
         """Нажатие создаёт настоящее объявление — заслон обязателен и
-        здесь, а не только на списке."""
-        cb = CB("create_ad:copy:0:0")
-        run(C.copy_item(cb, FSM(), self.api))
-        self.assertEqual(self.api.created, [],
-                         "посторонний создал объявление копией")
+        здесь, а не только на списке.
+
+        Проверяется, что панель даже не читалась: `api.created` тут ни при
+        чём — копия давно идёт не через него, и проверка по нему проходила
+        бы при любом заслоне."""
+        from automation import panel as PANEL
+        touched = []
+        was = PANEL.panel_item_values_sync
+        PANEL.panel_item_values_sync = lambda *a, **kw: (
+            touched.append(a), (False, {}, {}, "", "x"))[1]
+        try:
+            cb = CB("create_ad:copy:0:0")
+            run(C.copy_item(cb, FSM(), self.api))
+        finally:
+            PANEL.panel_item_values_sync = was
+        self.assertEqual(touched, [], "посторонний добрался до панели")
+        self.assertTrue(cb.alerts)
 
 
 class ARefusalIsReadable(unittest.TestCase):

@@ -6,8 +6,6 @@ import html
 import logging
 import re
 
-import aiohttp
-
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -1094,7 +1092,19 @@ async def _ask_for_refused_fields(msg, uid: int, values: dict,
         fields, resource = form["fields"], form["resource"]
 
     known = {f["attribute"] for f in fields}
-    queue = [a for a in refused if a in known]
+    # Поля, значение которых мы УЖЕ отправили: название, цена, описание,
+    # количество. Панель жалуется на них не «выбери», а «не годится» —
+    # «content: Ссылки запрещены». Спрашивать их списком нечего: вариантов
+    # у текстового поля нет, и продавец получал отладку «Пришли этот текст
+    # разработчику» вместо русской причины, которую панель назвала сама.
+    #
+    # Слова те же, по которым форма создания раскладывает `values`: другой
+    # набор однажды разошёлся бы с ней, и поле стало бы спрашиваться дважды.
+    _SENT = ("title", "name", "header", "naimenov", "price", "cost", "cena",
+             "desc", "opis", "text", "content", "count", "quantity", "qty",
+             "stock")
+    queue = [a for a in refused if a in known
+             and not any(w in a.lower() for w in _SENT)]
     if not queue:
         return False
 
@@ -1538,9 +1548,16 @@ async def templates_list(callback: CallbackQuery, state: FSMContext,
     rows, b, order = _section_screen(groups, "menu:ads")
     # Разложенные объявления кладём в форму, а не в память процесса: она
     # пересобирается при каждом выкате, и список «устарел» у всех разом.
-    await state.update_data(copy_groups=order,
-                            copy_ads={name: [a for a in ads]
-                                      for name, ads in groups.items()})
+    #
+    # Кладём ТОЛЬКО номер, название и цену: форма может лежать в Redis, и
+    # хранить там карточки целиком — это чужие килобайты на каждое нажатие
+    # при том, что для копии нужен один номер.
+    await state.update_data(
+        copy_groups=order,
+        copy_ads={name: [{"id": a.get("id"),
+                          "title": a.get("title") or a.get("name"),
+                          "price": a.get("price")} for a in ads]
+                  for name, ads in groups.items()})
     # Раздел один — показывать выбор из одного не из чего: сразу объявления.
     if len(order) == 1:
         await _show_section(callback, state, 0)
@@ -1606,103 +1623,65 @@ async def open_section(callback: CallbackQuery, state: FSMContext) -> None:
     await _show_section(callback, state, idx)
 
 
-async def _photo_of(api, ad: dict) -> tuple[list, str]:
-    """Картинка объявления по адресу из его же карточки. → (файлы, причина).
+async def _copy_source_values(uid: int, ad_id: str) -> tuple[dict, dict, str]:
+    """Значения исходного товара для нового. → (values, extra, причина).
 
-    Адрес ищется по всей карточке (`_find_image_url`), а не по угаданному
-    имени поля: как маркетплейс называет картинку, живьём не проверялось.
+    Копия — это пробег по тем же шагам создания, но с готовыми значениями:
+    читаем товар в панели ровно в том виде, в каком форма создания их ждёт,
+    и картинку кладём файлом — панель принимает её только настоящей
+    загрузкой.
 
-    Вторым значением — почему не вышло, и это не для красоты. Без картинки
-    маркетплейс объявление не принимает (живой отказ 02.09, поле `files`),
-    и «копия не создалась» без указания шага отправляет продавца гадать:
-    картинки в карточке не было, не скачалась, или дело вообще не в ней.
+    Картинка НЕ удаляется по дороге: отказ панели по недостающему полю
+    превращается в вопрос, после ответа товар уходит заново — и файл нужен
+    во второй раз. Лежит она там же, где фото мастера, и переживает
+    перезапуск.
     """
-    from automation.panel import _find_image_url
+    import os
 
-    url = _find_image_url(ad)
+    from automation.panel import (panel_fetch_image_sync,
+                                  panel_item_values_sync)
+    from storage import _DATA_DIR, get_panel_creds
+
+    creds = get_panel_creds(uid) or {}
+    cookies = creds.get("cookies")
+    if not cookies:
+        return {}, {}, "куки панели не найдены — войди в панель заново"
+
+    loop = asyncio.get_event_loop()
+    ok, values, extra, url, err = await loop.run_in_executor(
+        None, panel_item_values_sync, cookies, str(ad_id), uid)
+    if not ok:
+        return {}, {}, err or "панель не отдала поля товара"
+
     if not url:
-        # Называем, что в карточке было: если картинка там лежит под
-        # незнакомым именем, это видно сразу и чинится одной строкой.
-        keys = ", ".join(sorted(str(k) for k in ad.keys())[:20])
-        return [], f"в карточке объявления нет адреса картинки. Поля: {keys}"
-    if not getattr(api, "session", None):
-        return [], "нет соединения с маркетплейсом"
-    try:
-        async with api.session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as r:
-            if r.status != 200:
-                return [], f"картинка не отдалась: HTTP {r.status}"
-            data = await r.read()
-    except Exception as e:                                # noqa: BLE001
-        logger.warning("картинка объявления не скачалась: %s", e)
-        return [], f"картинку не удалось скачать: {str(e)[:120]}"
+        return {}, {}, ("у товара в панели не нашлось картинки, а без неё "
+                        "объявление не создать")
+    data = await loop.run_in_executor(None, panel_fetch_image_sync,
+                                      cookies, url)
     if not data:
-        return [], "картинка пришла пустой"
-    name = url.rsplit("/", 1)[-1].split("?")[0] or "photo.jpg"
-    return [(data, name)], ""
+        return {}, {}, "картинку товара скачать не вышло"
 
-
-async def _copy_ad_via_api(api, ad_id: str) -> tuple[bool, str, list[str]]:
-    """Завести объявление заново по API. → (получилось, отчёт, что не влезло).
-
-    По API, а не через форму панели: панель отказала 422 на четырёх полях
-    сразу (`category` и ещё три) — её клон не умеет пересылать вложенные
-    значения, а раздел у товара как раз такое. У Integration API раздел
-    лежит прямо в объявлении, полем `category_id`.
-
-    Третьим значением — то, что скопировать НЕЛЬЗЯ. Молчание здесь читалось
-    бы как «копия готова к продаже», а она не готова: у товара с кодами
-    остаток — сами ключи, они одноразовые.
-    """
-    from orderfields import ad_price
-
-    raw = await api.get_ad(ad_id)
-    ad = raw.get("data") or raw
-    title = str(ad.get("title") or ad.get("name") or "").strip()
-    cid = ad.get("category_id") or ad.get("categoryId")
-    if not title or not cid:
-        # Чего не хватило — называем. «Не вышло» без причины продавцу
-        # разбирать нечем.
-        missing = ", ".join(w for w, ok in (("название", title),
-                                            ("раздел", cid)) if not ok)
-        return False, f"в карточке товара нет: {missing}", []
-
-    price = ad_price(ad) or 0
-    kind = str(ad.get("type") or "simple")
-    left: list[str] = []
-    stock = 0
-    if kind == "auto-delivery":
-        left.append("коды — они одноразовые, панель их не копирует")
-    else:
-        try:
-            stock = int(float(ad.get("stock") or 0))
-        except (TypeError, ValueError):
-            stock = 0
-
-    photos, why = await _photo_of(api, ad)
-    if not photos:
-        # Живой отказ 02.09: `errors: {"files": ["Поле files обязательно"]}`.
-        # Отправлять объявление без картинки значит заведомо получить его
-        # ещё раз — лучше сказать сразу и назвать ШАГ, на котором она
-        # потерялась.
-        return False, (f"без картинки маркетплейс объявление не примет, "
-                       f"а взять её не вышло: {why}"), []
-
-    new_id, said = await api.create_and_publish(
-        title=title, price=int(price),
-        description=str(ad.get("description") or ""),
-        category_id=cid, ad_type=kind, stock=max(stock, 1),
-        photos=photos, publish=False)
-    return True, str(new_id), left
+    photos = os.path.join(_DATA_DIR, "photos")
+    os.makedirs(photos, exist_ok=True)
+    path = os.path.join(photos, f"copy_{uid}_{ad_id}.jpg")
+    try:
+        with open(path, "wb") as fh:
+            fh.write(data)
+    except OSError as e:
+        return {}, {}, f"картинку некуда сохранить: {str(e)[:100]}"
+    values["photo_path"] = path
+    return values, extra, ""
 
 
 @router.callback_query(F.data.startswith("create_ad:copy:"))
 async def copy_item(callback: CallbackQuery, state: FSMContext,
                     api: YooMarketAPI = None) -> None:
-    """Копия товара: то же объявление, заведённое заново по API.
+    """Копия товара: те же шаги создания, но с готовыми значениями.
 
-    «Создал» — не доказательство: в отчёт идёт номер, который вернул
-    маркетплейс, а отказ печатается его же словами, а не сырым JSON с
-    экранированными кодами — такой отказ продавец прочитать не может.
+    Создаёт ТОТ ЖЕ вызов, что и мастер (`_panel_create_and_report`), и это
+    главное здесь. Путь проверен живьём — им заведены все товары продавца, —
+    а отказ панели по недостающему полю он превращает в вопрос: раздел мог
+    поменяться с прошлого раза, и тупика из этого быть не должно.
     """
     from features import ad_templates_shown
 
@@ -1710,61 +1689,45 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
     if not ad_templates_shown(uid):
         await callback.answer("Этого раздела сейчас нет", show_alert=True)
         return
-    if not api:
-        await callback.answer("Не настроен API-токен — копия идёт через него",
-                              show_alert=True)
-        return
-    # Номер объявления берём из разложенного списка, а не из кнопки: в
-    # `callback_data` 64 байта, и номер раздела с номером строки короче
-    # любого номера объявления — а главное, так кнопка не может указать на
-    # объявление, которого в списке не было.
+
+    # Номер объявления берём из разложенного списка, а не из кнопки: так
+    # кнопка из старого сообщения не может указать на объявление, которого
+    # в списке не было.
     tail = callback.data.split(":")[2:]
-    item_id = ""
+    ad_id = ""
     try:
         idx, j = int(tail[0]), int(tail[1])
         data = await state.get_data()
         order = list(data.get("copy_groups") or [])
         ads = (dict(data.get("copy_ads") or {})).get(order[idx]) or []
-        item_id = str(ads[j].get("id") or "")
+        ad_id = str(ads[j].get("id") or "")
     except (ValueError, IndexError, KeyError, TypeError):
-        item_id = ""
-    if not item_id:
+        ad_id = ""
+    if not ad_id:
         await callback.answer("Список устарел — открой копию заново",
                               show_alert=True)
         return
 
     await callback.answer("Создаю копию…")
-    await callback.message.edit_text("⏳ Завожу такое же объявление…")
-    left: list[str] = []
-    try:
-        ok, said, left = await _copy_ad_via_api(api, item_id)
-    except Exception as e:                                # noqa: BLE001
-        # Разбирать здесь незачем: отказ разбирается один раз, на экране.
-        # Второй разбор того же значения однажды разойдётся с первым.
-        ok, said = False, str(e)
-
-    new_id = said if str(said).isdigit() else ""
-    b = InlineKeyboardBuilder()
-    if ok and new_id:
-        b.button(text="📦 Остатки", callback_data=f"pitem_stock:{new_id}")
-        b.button(text="🚀 На модерацию", callback_data=f"cadpub:{new_id}")
-    b.button(text="📋 Ещё копию", callback_data="create_ad:templates_list")
-    b.button(text="📦 Мои товары", callback_data="menu:ads")
-    ui.lay(b)
-    if ok:
-        body = [f"🆔 {html.escape(new_id)}" if new_id else
-                f"<i>{html.escape(str(said)[:150])}</i>"]
-        if left:
-            body += ["", "<b>Не скопировалось:</b>"]
-            body += [f"• {html.escape(x)}" for x in left]
-        body += ["", "На модерацию отправь сам — сначала проверь остаток."]
-        await callback.message.edit_text(
-            ui.screen("✅ <b>Копия создана</b>", body),
+    await callback.message.edit_text("⏳ Читаю товар в панели…")
+    values, extra, why = await _copy_source_values(uid, ad_id)
+    if why:
+        b = InlineKeyboardBuilder()
+        b.button(text="📋 Ещё копию", callback_data="create_ad:templates_list")
+        b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
+        b.button(text="📦 Мои товары", callback_data="menu:ads")
+        ui.lay(b)
+        await callback.message.edit_text(ui.screen(
+            "❌ <b>Копия не создалась</b>",
+            ["Товар прочитать не вышло:", f"<i>{html.escape(why)}</i>", "",
+             "Заведи товар мастером — он спросит недостающее."]),
             reply_markup=b.as_markup())
         return
-    await callback.message.edit_text(ui.screen(
-        "❌ <b>Копия не создалась</b>",
-        ["Маркетплейс ответил:", f"<i>{html.escape(_readable(said))}</i>", "",
-         "Если он просит заполнить поле — заведи товар мастером: он спросит "
-         "недостающее и дошлёт."]),
-        reply_markup=b.as_markup())
+
+    # Состояние живое: отказ по недостающему полю станет вопросом, а не
+    # тупиком, и после ответа товар уйдёт заново — с той же картинкой.
+    await state.set_state(CreateAdState.panel_select)
+    await state.update_data(pending=values, chosen=dict(extra),
+                            select_queue=[])
+    await _panel_create_and_report(callback.message, uid, values, extra=extra,
+                                   state=state, api=api)
