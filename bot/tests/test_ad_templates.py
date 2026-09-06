@@ -82,6 +82,32 @@ class FSM:
         self.data, self.state = {}, None
 
 
+class Session:
+    """Сессия, отдающая картинку по адресу из карточки объявления."""
+
+    def __init__(self, status=200, body=b"JPEG"):
+        self.status, self.body = status, body
+        self.asked: list[str] = []
+
+    def get(self, url, **kw):
+        self.asked.append(url)
+        outer = self
+
+        class Resp:
+            status = outer.status
+
+            async def read(self):
+                return outer.body
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        return Resp()
+
+
 class Api:
     """Integration API продавца: и список, и создание идут через него."""
 
@@ -98,12 +124,21 @@ class Api:
         self.card = dict(self.CARD)
         self.list_raises = None
         self.create_raises = None
-        self.session = None
+        # Картинку маркетплейс требует полем `files`, и без неё объявление
+        # не примет: подставная сессия отдаёт её так же, как настоящая.
+        self.session = Session()
 
     async def get_ads(self, cursor=None):
         if self.list_raises:
             raise self.list_raises
         return {"data": self.ads}
+
+    async def resolve_category(self, cid):
+        return {512: "Telegram Звёзды", 7: "Гифт-карты"}.get(int(cid), "")
+
+    async def get_categories(self, max_pages=40, parent_id=None):
+        return [{"id": 512, "name": "Telegram Звёзды"},
+                {"id": 7, "name": "Гифт-карты"}]
 
     async def get_ad(self, ad_id):
         return dict(self.card, id=ad_id)
@@ -172,74 +207,121 @@ class TheForkOffersBothWays(Bench):
         self.assertEqual(fsm.state, C.CreateAdState.title)
 
 
-class TheListComesFromTheSameApiThatCreates(Bench):
-    """У панели свои номера товаров. Номер из её списка, отданный в
-    `GET /ads/{id}`, указал бы не туда — копия создала бы не то объявление
-    или не создала бы ничего."""
+class TheListIsGroupedBySection(Bench):
+    """Плоским списком это не читается: объявлений бывает полсотни, а
+    копируют обычно соседнее по разделу. И прежняя версия резала список на
+    двенадцати МОЛЧА — то есть половины товаров для копии просто не было.
 
-    def test_every_ad_gets_a_button(self):
-        cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb, self.api))
-        data = self.kb(cb)
-        self.assertIn("create_ad:copy:11", data)
-        self.assertIn("create_ad:copy:12", data)
+    Разделы считаются тем же кодом, что и на экране «📦 Товары»: второй
+    разбор того же ответа однажды разошёлся бы с первым, и один товар лежал
+    бы на двух экранах в разных разделах."""
 
-    def test_the_names_and_prices_are_on_the_screen(self):
-        cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb, self.api))
+    def sections(self, cb=None):
+        cb = cb or CB("create_ad:templates_list")
+        fsm = FSM()
+        run(C.templates_list(cb, fsm, self.api))
+        return cb, fsm
+
+    def test_each_section_gets_a_button_with_a_count(self):
+        self.api.ads = [
+            dict(self.api.CARD, id=11, category_id=512),
+            dict(self.api.CARD, id=12, category_id=512),
+            dict(self.api.CARD, id=13, category_id=7),
+        ]
+        cb, _fsm = self.sections()
         said = cb.message.texts[-1]
-        self.assertIn("1000 Robux", said)
-        self.assertIn("990", said)
+        self.assertIn("Telegram Звёзды", said)
+        self.assertIn("Гифт-карты", said)
+        self.assertIn("(2)", " ".join(
+            b.text for row in cb.message.kbs[-1].inline_keyboard for b in row))
+
+    def test_a_single_section_is_not_a_choice_of_one(self):
+        """Меню из одного пункта — лишний тап перед единственным
+        действием."""
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        cb, _fsm = self.sections()
+        data = self.kb(cb)
+        self.assertTrue(any(d.startswith("create_ad:copy:") for d in data),
+                        data)
+
+    def test_opening_a_section_lists_its_ads(self):
+        self.api.ads = [
+            dict(self.api.CARD, id=11, title="Звёзды 100", category_id=512),
+            dict(self.api.CARD, id=13, title="Apple 10", category_id=7),
+        ]
+        cb, fsm = self.sections()
+        cb2 = CB("create_ad:sect:0")
+        run(C.open_section(cb2, fsm))
+        said = cb2.message.texts[-1]
+        self.assertIn("Звёзды 100", said)
+        self.assertNotIn("Apple 10", said, "показал чужой раздел")
+
+    def test_a_section_screen_leads_back_to_the_sections(self):
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512),
+                        dict(self.api.CARD, id=13, category_id=7)]
+        cb, fsm = self.sections()
+        cb2 = CB("create_ad:sect:0")
+        run(C.open_section(cb2, fsm))
+        self.assertIn("create_ad:templates_list", self.kb(cb2))
+
+    def test_a_long_section_says_it_was_trimmed(self):
+        """Молчаливое обрезание означает, что половины товаров для копии
+        просто нет, и понять это неоткуда."""
+        self.api.ads = [dict(self.api.CARD, id=i, title=f"Товар {i}",
+                             category_id=512) for i in range(30)]
+        cb, fsm = self.sections()
+        cb2 = CB("create_ad:sect:0")
+        run(C.open_section(cb2, fsm))
+        said = cb2.message.texts[-1]
+        self.assertIn(f"из {len(self.api.ads)}", said)
+        copies = [d for d in self.kb(cb2) if d.startswith("create_ad:copy:")]
+        self.assertEqual(len(copies), C._COPY_LIMIT)
 
     def test_the_price_object_is_read_properly(self):
         """Маркетплейс отдаёт цену объектом. Прочитанная как скаляр, она
-        превращается в ноль — и «990 ₽» на экране стало бы «0 ₽»."""
-        cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb, self.api))
-        self.assertNotIn("1000 Robux</b> — 0 ₽", cb.message.texts[-1])
+        превращается в ноль — и «990 ₽» стало бы «0 ₽»."""
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        cb, fsm = self.sections()
+        self.assertIn("990", cb.message.texts[-1])
 
     def test_an_empty_showcase_says_so_and_offers_the_wizard(self):
         self.api.ads = []
-        cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb, self.api))
+        cb, _fsm = self.sections()
         self.assertIn("нечего", cb.message.texts[-1])
         self.assertIn("create_ad:new", self.kb(cb))
 
     def test_a_refusal_is_readable(self):
         self.api.list_raises = RuntimeError("HTTP 401: token expired")
-        cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb, self.api))
+        cb, _fsm = self.sections()
         self.assertIn("401", cb.message.texts[-1])
         self.assertIn("create_ad:new", self.kb(cb))
 
     def test_without_a_token_it_does_not_pretend(self):
         cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb, None))
+        run(C.templates_list(cb, FSM(), None))
         self.assertTrue(cb.alerts)
         self.assertEqual(cb.message.texts, [])
 
-    def test_the_list_does_not_become_a_wall_of_buttons(self):
-        """Клавиатура из полусотни кнопок — это не выбор, а свалка."""
-        self.api.ads = [{"id": i, "title": f"Товар {i}", "price": i,
-                         "category_id": 1} for i in range(40)]
-        cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb, self.api))
-        copies = [d for d in self.kb(cb) if d.startswith("create_ad:copy:")]
-        self.assertEqual(len(copies), C._COPY_LIMIT)
-
     def test_an_ad_without_an_id_is_skipped(self):
-        self.api.ads = [{"title": "Без номера", "price": 1}]
-        cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb, self.api))
-        self.assertEqual([d for d in self.kb(cb)
-                          if d.startswith("create_ad:copy:")], [])
+        """Кнопка без номера объявления скопировала бы неизвестно что."""
+        self.api.ads = [{"title": "Без номера", "price": 1, "category_id": 512}]
+        cb, _fsm = self.sections()
+        self.assertIn("нечего", cb.message.texts[-1])
 
 
 class TheAdIsCreatedAgainThroughTheApi(Bench):
 
+    def tap(self, where="create_ad:copy:0:0"):
+        """Пройти путь целиком: разделы → объявления → копия."""
+        fsm = FSM()
+        run(C.templates_list(CB("create_ad:templates_list"), fsm, self.api))
+        cb = CB(where)
+        run(C.copy_item(cb, fsm, self.api))
+        return cb
+
     def test_the_same_fields_go_out(self):
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        self.tap()
         self.assertEqual(len(self.api.created), 1, "объявление не создано")
         got = self.api.created[0]
         self.assertEqual(got["title"], "1000 Robux")
@@ -251,50 +333,68 @@ class TheAdIsCreatedAgainThroughTheApi(Bench):
     def test_the_section_is_taken_from_the_ad_itself(self):
         """Ради этого всё и переписано: у панели раздел лежал вложенным
         значением, и её клон его не отправлял — отказ 422 по `category`."""
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
         self.api.card = dict(self.api.CARD, category_id=777)
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
+        self.tap()
         self.assertEqual(self.api.created[0]["category_id"], 777)
 
     def test_the_stock_comes_along(self):
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        self.tap()
         self.assertEqual(self.api.created[0]["stock"], 4)
+
+    def test_the_photo_comes_along(self):
+        """Маркетплейс требует картинку полем `files` и без неё отказывает
+        (живой отказ 02.09)."""
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        self.tap()
+        self.assertTrue(self.api.created[0]["photos"], "ушло без картинки")
+        self.assertTrue(self.api.session.asked, "картинку даже не скачивали")
+
+    def test_without_a_picture_it_does_not_even_try(self):
+        """Отправлять заведомо отвергаемое значит показать продавцу отказ
+        вместо понятной причины."""
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        self.api.card = {"id": 11, "title": "Без фото", "price": 10,
+                         "category_id": 512, "type": "simple"}
+        cb = self.tap()
+        self.assertEqual(self.api.created, [])
+        self.assertIn("картинк", cb.message.texts[-1])
 
     def test_it_is_not_published_by_itself(self):
         """Публикация без остатка отвергается, а остаток у копии свой."""
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        self.tap()
         self.assertFalse(self.api.created[0]["publish"])
 
     def test_codes_are_never_copied_and_it_says_so(self):
         """Остаток товара с авто-выдачей — сами ключи, одноразовые. Взять
         их из образца значит продать один код дважды."""
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
         self.api.card = dict(self.api.CARD, type="auto-delivery")
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
+        cb = self.tap()
         said = cb.message.texts[-1]
         self.assertIn("одноразов", said)
         self.assertIn("Не скопировалось", said)
 
     def test_a_missing_section_refuses_and_names_it(self):
         """«Не вышло» без причины продавцу разбирать нечем."""
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
         self.api.card = {"id": 11, "title": "Есть", "price": 10}
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
+        cb = self.tap()
         self.assertEqual(self.api.created, [])
         self.assertIn("раздел", cb.message.texts[-1])
 
     def test_the_new_number_is_reported(self):
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        cb = self.tap()
         said = cb.message.texts[-1]
         self.assertIn("55", said)
         self.assertIn("Копия создана", said)
 
     def test_the_stock_and_moderation_are_offered_right_there(self):
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        cb = self.tap()
         data = self.kb(cb)
         self.assertIn("pitem_stock:55", data)
         self.assertIn("cadpub:55", data)
@@ -303,50 +403,44 @@ class TheAdIsCreatedAgainThroughTheApi(Bench):
         """Живой отказ уехал на экран как `\\u041f\\u043e\\u043b\\u0435` —
         прочитать это нельзя, то есть отказ есть, а причины нет."""
         import json
-        self.api.create_raises = RuntimeError("422: " + json.dumps(
-            {"message": "Поле Категория обязательно для заполнения.",
-             "errors": {"category": ["Поле Категория обязательно."]}}))
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        self.api.create_raises = RuntimeError("HTTP 422: " + json.dumps(
+            {"error": {"status": 422, "message": "The given data was invalid.",
+                       "errors": {"files": ["Поле files обязательно."]}}}))
+        cb = self.tap()
         said = cb.message.texts[-1]
-        self.assertIn("Категория", said)
+        self.assertIn("files", said)
         self.assertNotIn("u041f", said)
-
-    def test_a_refusal_offers_no_buttons_for_an_ad_that_does_not_exist(self):
-        self.api.create_raises = RuntimeError("422")
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
-        data = " ".join(self.kb(cb))
-        self.assertNotIn("pitem_stock:", data)
-        self.assertNotIn("cadpub:", data)
 
     def test_a_refusal_is_never_called_a_success(self):
         """Бодрый отчёт об успехе там, где ничего не создалось, — самая
         дорогая поломка этого проекта."""
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
         self.api.create_raises = RuntimeError("422: нет раздела")
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
+        cb = self.tap()
         said = cb.message.texts[-1]
         self.assertIn("не создалась", said)
         self.assertNotIn("Копия создана", said)
 
-    def test_the_refusal_on_screen_is_readable_whatever_the_path(self):
-        """Отказ печатается через разбор и на экране тоже, а не только там,
-        где его поймали: путей до экрана два, и разъехаться им нельзя."""
-        import json
-        self.api.create_raises = RuntimeError("422: " + json.dumps(
-            {"errors": {"category": ["Поле Категория обязательно."]}}))
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
-        said = cb.message.texts[-1]
-        self.assertIn("Категория", said)
-        self.assertNotIn("u041a", said)
+    def test_a_refusal_offers_no_buttons_for_an_ad_that_does_not_exist(self):
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        self.api.create_raises = RuntimeError("422")
+        cb = self.tap()
+        data = " ".join(self.kb(cb))
+        self.assertNotIn("pitem_stock:", data)
+        self.assertNotIn("cadpub:", data)
+
+    def test_a_stale_button_does_not_copy_the_wrong_ad(self):
+        """Кнопка осталась в старом сообщении, а список с тех пор другой.
+        Скопировать «что-то похожее по счёту» хуже, чем не скопировать."""
+        self.api.ads = [dict(self.api.CARD, id=11, category_id=512)]
+        cb = self.tap("create_ad:copy:9:9")
+        self.assertEqual(self.api.created, [])
+        self.assertTrue(cb.alerts)
 
     def test_without_a_token_it_says_so_and_does_not_try(self):
-        """Отказ должен назвать причину — «токена нет», а не свалиться на
-        первом же обращении к пустому клиенту."""
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, None))
+        cb = CB("create_ad:copy:0:0")
+        run(C.copy_item(cb, FSM(), None))
         self.assertTrue(any("токен" in a.lower() for a in cb.alerts),
                         cb.alerts)
         self.assertEqual(cb.message.texts, [], "полез создавать без токена")
@@ -380,15 +474,29 @@ class TheCopyIsForAdminsOnly(Bench):
 
     def test_the_list_is_closed_from_an_old_message(self):
         cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb, self.api))
+        run(C.templates_list(cb, FSM(), self.api))
         self.assertTrue(cb.alerts)
         self.assertEqual(cb.message.texts, [], "показал список постороннему")
+
+    def test_the_sections_screen_is_closed_too(self):
+        """Состояние набирается ПРИ ПРАВАХ, и только потом они снимаются:
+        с пустым состоянием экран и так отвечает «список устарел», то есть
+        проверка проходила бы и без всякого заслона."""
+        storage.is_admin = lambda uid: True
+        fsm = FSM()
+        run(C.templates_list(CB("create_ad:templates_list"), fsm, self.api))
+        storage.is_admin = lambda uid: False
+
+        cb = CB("create_ad:sect:1")
+        run(C.open_section(cb, fsm))
+        self.assertTrue(cb.alerts)
+        self.assertEqual(cb.message.texts, [], "показал раздел постороннему")
 
     def test_and_so_is_the_copy_itself(self):
         """Нажатие создаёт настоящее объявление — заслон обязателен и
         здесь, а не только на списке."""
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb, self.api))
+        cb = CB("create_ad:copy:0:0")
+        run(C.copy_item(cb, FSM(), self.api))
         self.assertEqual(self.api.created, [],
                          "посторонний создал объявление копией")
 

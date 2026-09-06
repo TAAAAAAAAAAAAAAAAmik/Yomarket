@@ -57,6 +57,12 @@ def _readable(said) -> str:
         except ValueError:
             body = None
 
+    # Конверт бывает вложенным: у панели `errors` лежит сверху, а
+    # маркетплейс кладёт всё внутрь `error` — и разбор, знающий только
+    # верхний уровень, показал живой отказ про `files` сырыми кодами.
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        body = body["error"]
+
     if isinstance(body, dict):
         # `errors` разбираем ПЕРВЫМ: в `message` лежит сводка вида
         # «x (and 3 more errors)», которая не говорит, каких именно, а по
@@ -1434,22 +1440,63 @@ async def publish_item(callback: CallbackQuery) -> None:
 # Templates
 # ---------------------------------------------------------------------------
 
+async def _ads_by_section(api, uid: int):
+    """Объявления продавца, разложенные по разделам. → (группы, отказ).
+
+    Разделы считаются ТЕМ ЖЕ кодом, что и на экране «📦 Товары»
+    (`_ad_category`, `_category_names`): второй разбор того же ответа
+    однажды разошёлся бы с первым, и один и тот же товар лежал бы в двух
+    экранах в разных разделах.
+    """
+    from handlers.panel_items import (_ad_category, _category_names,
+                                      _wanted_cats)
+
+    try:
+        data = await api.get_ads()
+        ads = data.get("data") or data.get("items") or []
+        names = await _category_names(api, uid, _wanted_cats(ads))
+    except Exception as e:                                # noqa: BLE001
+        return {}, _readable(str(e))
+
+    groups: dict[str, list] = {}
+    for ad in ads:
+        raw = ad.get("id")
+        if raw is None or not str(raw).strip():
+            continue                      # кнопка без номера скопирует не то
+        groups.setdefault(_ad_category(ad, names), []).append(ad)
+    return groups, ""
+
+
+def _section_screen(groups: dict, back: str):
+    """Экран разделов: по кнопке на раздел, с числом объявлений."""
+    b = InlineKeyboardBuilder()
+    rows = []
+    ordered = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    for i, (name, ads) in enumerate(ordered):
+        b.button(text=f"📂 {name[:24]} ({len(ads)})",
+                 callback_data=f"create_ad:sect:{i}")
+        rows.append(f"• <b>{html.escape(name[:40])}</b> — {len(ads)}")
+    b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
+    b.button(text="❌ Отмена", callback_data=back)
+    ui.lay(b)
+    return rows, b, [name for name, _ads in ordered]
+
+
 @router.callback_query(F.data == "create_ad:templates_list")
-async def templates_list(callback: CallbackQuery,
+async def templates_list(callback: CallbackQuery, state: FSMContext,
                          api: YooMarketAPI = None) -> None:
-    """Список объявлений, которые уже стоят на витрине. Копировать — их.
+    """Разделы, в которых у продавца есть объявления.
 
-    Список читается ТЕМ ЖЕ API, которым потом создаётся копия. Через панель
-    он не годится: у панели свои номера товаров, и номер из её списка,
-    отданный в `GET /ads/{id}`, указал бы не туда — а копия создала бы не то
-    объявление или не создала бы ничего.
+    Плоским списком это не читается: объявлений у продавца бывает полсотни,
+    а копируют обычно соседнее по разделу. Прежняя версия к тому же резала
+    список на двенадцати МОЛЧА — то есть половина товаров просто не
+    существовала для копии.
 
-    Выбор в списке и есть подтверждение: отдельного «точно создать?» нет
-    намеренно — лишний экран между решением и действием и был тем, ради чего
-    копию заводили.
+    Список читается ТЕМ ЖЕ API, которым создаётся копия. Через панель он не
+    годится: у панели свои номера товаров, и номер из её списка, отданный в
+    `GET /ads/{id}`, указал бы не туда.
     """
     from features import ad_templates_shown
-    from orderfields import ad_price
 
     uid = callback.from_user.id
     # Заслон и на самом экране, а не только на кнопке: кнопка осталась в
@@ -1464,16 +1511,10 @@ async def templates_list(callback: CallbackQuery,
 
     await callback.answer()
     await callback.message.edit_text("⏳ Читаю объявления…")
-    try:
-        data = await api.get_ads()
-        items = data.get("data") or data.get("items") or []
-        err = ""
-    except Exception as e:                                # noqa: BLE001
-        items, err = [], _readable(str(e))
+    groups, err = await _ads_by_section(api, uid)
 
-    b = InlineKeyboardBuilder()
     if err:
-        # Отказ печатаем его же словами: «не вышло» без причины — отписка.
+        b = InlineKeyboardBuilder()
         b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
         b.button(text="❌ Отмена", callback_data="menu:ads")
         ui.lay(b)
@@ -1483,7 +1524,8 @@ async def templates_list(callback: CallbackQuery,
              f"<i>{html.escape(err)}</i>"]),
             reply_markup=b.as_markup())
         return
-    if not items:
+    if not groups:
+        b = InlineKeyboardBuilder()
         b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
         b.button(text="❌ Отмена", callback_data="menu:ads")
         ui.lay(b)
@@ -1493,27 +1535,75 @@ async def templates_list(callback: CallbackQuery,
             reply_markup=b.as_markup())
         return
 
+    rows, b, order = _section_screen(groups, "menu:ads")
+    # Разложенные объявления кладём в форму, а не в память процесса: она
+    # пересобирается при каждом выкате, и список «устарел» у всех разом.
+    await state.update_data(copy_groups=order,
+                            copy_ads={name: [a for a in ads]
+                                      for name, ads in groups.items()})
+    # Раздел один — показывать выбор из одного не из чего: сразу объявления.
+    if len(order) == 1:
+        await _show_section(callback, state, 0)
+        return
+    await callback.message.edit_text(ui.screen(
+        "📋 <b>Шаблонная копия</b>",
+        ["Заведу такое же объявление: те же название, цена, описание, "
+         "раздел и фото.", "", "<b>Разделы</b>"] + rows),
+        reply_markup=b.as_markup())
+
+
+async def _show_section(callback: CallbackQuery, state: FSMContext,
+                        idx: int) -> None:
+    """Объявления одного раздела."""
+    from orderfields import ad_price
+
+    data = await state.get_data()
+    order = list(data.get("copy_groups") or [])
+    ads_by = dict(data.get("copy_ads") or {})
+    if not (0 <= idx < len(order)):
+        await callback.answer("Список устарел — открой копию заново",
+                              show_alert=True)
+        return
+    name = order[idx]
+    ads = ads_by.get(name) or []
+
+    b = InlineKeyboardBuilder()
     rows = []
-    for it in items[:_COPY_LIMIT]:
-        # `or ""` здесь было бы ошибкой: у объявления с номером 0 ноль ложен,
-        # и оно молча пропало бы из списка.
-        raw = it.get("id")
-        iid = "" if raw is None else str(raw).strip()
-        title = str(it.get("title") or it.get("name") or "без названия")
-        if not iid:
-            continue
+    for j, ad in enumerate(ads[:_COPY_LIMIT]):
+        title = str(ad.get("title") or ad.get("name") or "без названия")
         b.button(text=f"📋 {title[:30]}",
-                 callback_data=f"create_ad:copy:{iid}"[:64])
+                 callback_data=f"create_ad:copy:{idx}:{j}"[:64])
         rows.append(f"• <b>{html.escape(title[:40])}</b> — "
-                    f"{int(ad_price(it) or 0)} ₽")
+                    f"{int(ad_price(ad) or 0)} ₽")
+    # Обрезали — говорим. Молчаливое обрезание означает, что половины
+    # товаров для копии просто нет, и понять это неоткуда.
+    if len(ads) > _COPY_LIMIT:
+        rows += ["", f"<i>Показаны первые {_COPY_LIMIT} из {len(ads)}.</i>"]
+    if len(order) > 1:
+        b.button(text="⬅️ К разделам", callback_data="create_ad:templates_list")
     b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
     b.button(text="❌ Отмена", callback_data="menu:ads")
     ui.lay(b)
     await callback.message.edit_text(ui.screen(
-        "📋 <b>Шаблонная копия</b>",
-        ["Заведу такое же объявление: те же название, цена, описание, "
-         "раздел и фото. Вопросов не будет.", ""] + rows),
-        reply_markup=b.as_markup())
+        f"📂 <b>{html.escape(name[:40])}</b>",
+        ["Выбор здесь и есть подтверждение — объявление уйдёт сразу.", ""]
+        + rows), reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("create_ad:sect:"))
+async def open_section(callback: CallbackQuery, state: FSMContext) -> None:
+    from features import ad_templates_shown
+
+    if not ad_templates_shown(callback.from_user.id):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    await callback.answer()
+    try:
+        idx = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Такого раздела нет", show_alert=True)
+        return
+    await _show_section(callback, state, idx)
 
 
 async def _photo_of(api, ad: dict) -> list:
@@ -1580,7 +1670,11 @@ async def _copy_ad_via_api(api, ad_id: str) -> tuple[bool, str, list[str]]:
 
     photos = await _photo_of(api, ad)
     if not photos:
-        left.append("фото — маркетплейс не отдал картинку, приложи вручную")
+        # Живой отказ 02.09: `errors: {"files": ["Поле files обязательно"]}`.
+        # Отправлять объявление без картинки значит заведомо получить его
+        # ещё раз — лучше сказать сразу и назвать, чего не хватило.
+        return False, ("не удалось взять картинку у объявления, а без неё "
+                       "маркетплейс объявление не принимает"), []
 
     new_id, said = await api.create_and_publish(
         title=title, price=int(price),
@@ -1591,7 +1685,8 @@ async def _copy_ad_via_api(api, ad_id: str) -> tuple[bool, str, list[str]]:
 
 
 @router.callback_query(F.data.startswith("create_ad:copy:"))
-async def copy_item(callback: CallbackQuery, api: YooMarketAPI = None) -> None:
+async def copy_item(callback: CallbackQuery, state: FSMContext,
+                    api: YooMarketAPI = None) -> None:
     """Копия товара: то же объявление, заведённое заново по API.
 
     «Создал» — не доказательство: в отчёт идёт номер, который вернул
@@ -1608,7 +1703,24 @@ async def copy_item(callback: CallbackQuery, api: YooMarketAPI = None) -> None:
         await callback.answer("Не настроен API-токен — копия идёт через него",
                               show_alert=True)
         return
-    item_id = callback.data.split(":")[-1]
+    # Номер объявления берём из разложенного списка, а не из кнопки: в
+    # `callback_data` 64 байта, и номер раздела с номером строки короче
+    # любого номера объявления — а главное, так кнопка не может указать на
+    # объявление, которого в списке не было.
+    tail = callback.data.split(":")[2:]
+    item_id = ""
+    try:
+        idx, j = int(tail[0]), int(tail[1])
+        data = await state.get_data()
+        order = list(data.get("copy_groups") or [])
+        ads = (dict(data.get("copy_ads") or {})).get(order[idx]) or []
+        item_id = str(ads[j].get("id") or "")
+    except (ValueError, IndexError, KeyError, TypeError):
+        item_id = ""
+    if not item_id:
+        await callback.answer("Список устарел — открой копию заново",
+                              show_alert=True)
+        return
 
     await callback.answer("Создаю копию…")
     await callback.message.edit_text("⏳ Завожу такое же объявление…")
