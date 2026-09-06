@@ -1,16 +1,21 @@
-"""Копия товара: тот же товар из панели за одно нажатие.
+"""Копия товара: то же объявление, заведённое заново по API.
 
 Мастер спрашивает название, цену, описание, количество, фото — а потом
 раздел панели и её `filter__N`, и вот их пять-шесть штук, причём про
 половину панель до выбора категории молчит вовсе. Второй такой же товар
 проходил весь этот круг заново.
 
-Главное здесь — **откуда берётся список**. Первая версия помнила товары,
-созданные самим ботом: у продавца их было семь, все заведены раньше, и
-развилка не появлялась вовсе. Снаружи это «кнопка не работает».
+Здесь два живых отказа подряд, и оба про то, ОТКУДА берутся данные.
 
-Поэтому список читается ИЗ ПАНЕЛИ, и копирует тоже она: у неё есть
-`filter__N` этого товара, которых у бота нет и взяться им неоткуда.
+Первая версия помнила товары, созданные самим ботом: у продавца их семь,
+все заведены раньше, и развилка не появлялась вовсе — снаружи «кнопка не
+работает». Вторая копировала формой панели, и панель отказала 422 на
+четырёх полях сразу: её клон не умеет пересылать вложенные значения, а
+раздел у товара как раз такое.
+
+Теперь объявление заводится заново через Integration API: раздел лежит в
+самом объявлении, полем `category_id`. И список читается ТЕМ ЖЕ API — у
+панели свои номера товаров, и номер из её списка указал бы не туда.
 """
 from __future__ import annotations
 
@@ -24,7 +29,6 @@ os.environ.setdefault("BOT_TOKEN", "x")
 
 import features                                            # noqa: E402
 import storage                                             # noqa: E402
-from automation import panel as P                          # noqa: E402
 from handlers import create_ad as C                        # noqa: E402
 
 
@@ -78,30 +82,52 @@ class FSM:
         self.data, self.state = {}, None
 
 
+class Api:
+    """Integration API продавца: и список, и создание идут через него."""
+
+    CARD = {"id": 11, "title": "1000 Robux", "description": "код сразу",
+            "price": {"amount": 990, "currency": "RUB"},
+            "category_id": 512, "type": "simple", "stock": 4,
+            "images": [{"original_url": "https://ya/photo.jpg"}]}
+
+    def __init__(self):
+        self.ads = [dict(self.CARD),
+                    {"id": 12, "title": "Apple 10 TRY", "price": 350,
+                     "category_id": 7, "type": "simple", "stock": 1}]
+        self.created: list[dict] = []
+        self.card = dict(self.CARD)
+        self.list_raises = None
+        self.create_raises = None
+        self.session = None
+
+    async def get_ads(self, cursor=None):
+        if self.list_raises:
+            raise self.list_raises
+        return {"data": self.ads}
+
+    async def get_ad(self, ad_id):
+        return dict(self.card, id=ad_id)
+
+    async def create_and_publish(self, **kw):
+        if self.create_raises:
+            raise self.create_raises
+        self.created.append(kw)
+        return "55", "✅ создан"
+
+
 class Bench(unittest.TestCase):
     UID = 7
 
     def setUp(self):
-        self._creds = storage.get_panel_creds
+        self._token = storage.get_token
         self._shown = features.ad_templates_shown
-        self._list = P.panel_list_items_sync
-        self._clone = P.panel_clone_item_sync
-        storage.get_panel_creds = lambda uid: {"cookies": "c=1"}
+        storage.get_token = lambda uid: "tok"
         features.ad_templates_shown = lambda uid: True
-        self.items = [{"id": 11, "title": "1000 Robux", "price": 990},
-                      {"id": 12, "title": "Apple 10 TRY", "price": 350}]
-        self.listed = (True, self.items)
-        self.cloned = (True, "55")
-        self.clone_calls: list = []
-        P.panel_list_items_sync = lambda cookies: self.listed
-        P.panel_clone_item_sync = lambda cookies, item_id, uid=None: (
-            self.clone_calls.append(item_id), self.cloned)[1]
+        self.api = Api()
 
     def tearDown(self):
-        storage.get_panel_creds = self._creds
+        storage.get_token = self._token
         features.ad_templates_shown = self._shown
-        P.panel_list_items_sync = self._list
-        P.panel_clone_item_sync = self._clone
 
     def kb(self, cb):
         return [b.callback_data for row in cb.message.kbs[-1].inline_keyboard
@@ -130,10 +156,10 @@ class TheForkOffersBothWays(Bench):
         run(C.create_ad_start(cb, fsm))
         self.assertIsNone(fsm.state)
 
-    def test_without_the_panel_there_is_no_fork(self):
-        """Копируется товар ИЗ ПАНЕЛИ. Кнопка, за которой «войди в
-        панель», обещает то, чего за ней нет."""
-        storage.get_panel_creds = lambda uid: {}
+    def test_without_a_token_there_is_no_fork(self):
+        """И список, и создание идут по API. Кнопка, за которой «подключи
+        магазин», обещает то, чего за ней нет."""
+        storage.get_token = lambda uid: ""
         cb, fsm = CB("create_ad:start"), FSM()
         run(C.create_ad_start(cb, fsm))
         self.assertNotIn("create_ad:templates_list", self.kb(cb))
@@ -146,112 +172,185 @@ class TheForkOffersBothWays(Bench):
         self.assertEqual(fsm.state, C.CreateAdState.title)
 
 
-class TheListComesFromThePanel(Bench):
+class TheListComesFromTheSameApiThatCreates(Bench):
+    """У панели свои номера товаров. Номер из её списка, отданный в
+    `GET /ads/{id}`, указал бы не туда — копия создала бы не то объявление
+    или не создала бы ничего."""
 
-    def test_every_product_gets_a_button(self):
+    def test_every_ad_gets_a_button(self):
         cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb))
+        run(C.templates_list(cb, self.api))
         data = self.kb(cb)
         self.assertIn("create_ad:copy:11", data)
         self.assertIn("create_ad:copy:12", data)
 
-    def test_the_names_are_on_the_screen(self):
+    def test_the_names_and_prices_are_on_the_screen(self):
         cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb))
+        run(C.templates_list(cb, self.api))
         said = cb.message.texts[-1]
         self.assertIn("1000 Robux", said)
         self.assertIn("990", said)
 
-    def test_an_empty_panel_says_so_and_offers_the_wizard(self):
-        """Экран, с которого нечего нажать, — тупик."""
-        self.listed = (True, [])
+    def test_the_price_object_is_read_properly(self):
+        """Маркетплейс отдаёт цену объектом. Прочитанная как скаляр, она
+        превращается в ноль — и «990 ₽» на экране стало бы «0 ₽»."""
         cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb))
+        run(C.templates_list(cb, self.api))
+        self.assertNotIn("1000 Robux</b> — 0 ₽", cb.message.texts[-1])
+
+    def test_an_empty_showcase_says_so_and_offers_the_wizard(self):
+        self.api.ads = []
+        cb = CB("create_ad:templates_list")
+        run(C.templates_list(cb, self.api))
         self.assertIn("нечего", cb.message.texts[-1])
         self.assertIn("create_ad:new", self.kb(cb))
 
-    def test_a_refusal_is_shown_in_the_panels_own_words(self):
-        """«Не вышло» без причины — отписка: разбирать её продавцу нечем."""
-        self.listed = (False, "HTTP 419: сессия истекла")
+    def test_a_refusal_is_readable(self):
+        self.api.list_raises = RuntimeError("HTTP 401: token expired")
         cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb))
-        self.assertIn("419", cb.message.texts[-1])
+        run(C.templates_list(cb, self.api))
+        self.assertIn("401", cb.message.texts[-1])
         self.assertIn("create_ad:new", self.kb(cb))
 
-    def test_the_list_does_not_become_a_wall_of_buttons(self):
-        """Панель отдаёт до полусотни: клавиатура из полусотни кнопок —
-        это не выбор, а свалка."""
-        self.listed = (True, [{"id": i, "title": f"Товар {i}", "price": i}
-                              for i in range(40)])
+    def test_without_a_token_it_does_not_pretend(self):
         cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb))
+        run(C.templates_list(cb, None))
+        self.assertTrue(cb.alerts)
+        self.assertEqual(cb.message.texts, [])
+
+    def test_the_list_does_not_become_a_wall_of_buttons(self):
+        """Клавиатура из полусотни кнопок — это не выбор, а свалка."""
+        self.api.ads = [{"id": i, "title": f"Товар {i}", "price": i,
+                         "category_id": 1} for i in range(40)]
+        cb = CB("create_ad:templates_list")
+        run(C.templates_list(cb, self.api))
         copies = [d for d in self.kb(cb) if d.startswith("create_ad:copy:")]
         self.assertEqual(len(copies), C._COPY_LIMIT)
 
-    def test_a_product_without_an_id_is_skipped(self):
-        """Кнопка без номера товара скопировала бы неизвестно что."""
-        self.listed = (True, [{"title": "Без номера", "price": 1}])
+    def test_an_ad_without_an_id_is_skipped(self):
+        self.api.ads = [{"title": "Без номера", "price": 1}]
         cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb))
+        run(C.templates_list(cb, self.api))
         self.assertEqual([d for d in self.kb(cb)
                           if d.startswith("create_ad:copy:")], [])
 
 
-class ThePanelDoesTheCopying(Bench):
+class TheAdIsCreatedAgainThroughTheApi(Bench):
 
-    def test_the_chosen_product_is_the_one_copied(self):
-        cb = CB("create_ad:copy:12")
-        run(C.copy_item(cb))
-        self.assertEqual(self.clone_calls, ["12"])
+    def test_the_same_fields_go_out(self):
+        cb = CB("create_ad:copy:11")
+        run(C.copy_item(cb, self.api))
+        self.assertEqual(len(self.api.created), 1, "объявление не создано")
+        got = self.api.created[0]
+        self.assertEqual(got["title"], "1000 Robux")
+        self.assertEqual(got["price"], 990)
+        self.assertEqual(got["description"], "код сразу")
+        self.assertEqual(got["category_id"], 512)
+        self.assertEqual(got["ad_type"], "simple")
+
+    def test_the_section_is_taken_from_the_ad_itself(self):
+        """Ради этого всё и переписано: у панели раздел лежал вложенным
+        значением, и её клон его не отправлял — отказ 422 по `category`."""
+        self.api.card = dict(self.api.CARD, category_id=777)
+        cb = CB("create_ad:copy:11")
+        run(C.copy_item(cb, self.api))
+        self.assertEqual(self.api.created[0]["category_id"], 777)
+
+    def test_the_stock_comes_along(self):
+        cb = CB("create_ad:copy:11")
+        run(C.copy_item(cb, self.api))
+        self.assertEqual(self.api.created[0]["stock"], 4)
+
+    def test_it_is_not_published_by_itself(self):
+        """Публикация без остатка отвергается, а остаток у копии свой."""
+        cb = CB("create_ad:copy:11")
+        run(C.copy_item(cb, self.api))
+        self.assertFalse(self.api.created[0]["publish"])
+
+    def test_codes_are_never_copied_and_it_says_so(self):
+        """Остаток товара с авто-выдачей — сами ключи, одноразовые. Взять
+        их из образца значит продать один код дважды."""
+        self.api.card = dict(self.api.CARD, type="auto-delivery")
+        cb = CB("create_ad:copy:11")
+        run(C.copy_item(cb, self.api))
+        said = cb.message.texts[-1]
+        self.assertIn("одноразов", said)
+        self.assertIn("Не скопировалось", said)
+
+    def test_a_missing_section_refuses_and_names_it(self):
+        """«Не вышло» без причины продавцу разбирать нечем."""
+        self.api.card = {"id": 11, "title": "Есть", "price": 10}
+        cb = CB("create_ad:copy:11")
+        run(C.copy_item(cb, self.api))
+        self.assertEqual(self.api.created, [])
+        self.assertIn("раздел", cb.message.texts[-1])
 
     def test_the_new_number_is_reported(self):
         cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb))
+        run(C.copy_item(cb, self.api))
         said = cb.message.texts[-1]
         self.assertIn("55", said)
         self.assertIn("Копия создана", said)
 
-    def test_the_stock_is_offered_right_there(self):
-        """Без остатка панель товар не публикует, и оставить продавца
-        искать, где его добавить, значит оборвать дело на середине."""
+    def test_the_stock_and_moderation_are_offered_right_there(self):
         cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb))
+        run(C.copy_item(cb, self.api))
         data = self.kb(cb)
         self.assertIn("pitem_stock:55", data)
         self.assertIn("cadpub:55", data)
 
-    def test_it_says_the_codes_are_not_copied(self):
-        """Остаток товара с кодами — сами ключи, они одноразовые. Молчание
-        здесь читается как «копия готова к продаже»."""
+    def test_a_refusal_is_shown_in_words_not_in_escape_codes(self):
+        """Живой отказ уехал на экран как `\\u041f\\u043e\\u043b\\u0435` —
+        прочитать это нельзя, то есть отказ есть, а причины нет."""
+        import json
+        self.api.create_raises = RuntimeError("422: " + json.dumps(
+            {"message": "Поле Категория обязательно для заполнения.",
+             "errors": {"category": ["Поле Категория обязательно."]}}))
         cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb))
-        self.assertIn("одноразов", cb.message.texts[-1])
-
-    def test_a_refusal_is_shown_in_the_panels_own_words(self):
-        self.cloned = (False, "422: filter__8 — поле Регион обязательно")
-        cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb))
+        run(C.copy_item(cb, self.api))
         said = cb.message.texts[-1]
-        self.assertIn("Регион", said)
+        self.assertIn("Категория", said)
+        self.assertNotIn("u041f", said)
+
+    def test_a_refusal_offers_no_buttons_for_an_ad_that_does_not_exist(self):
+        self.api.create_raises = RuntimeError("422")
+        cb = CB("create_ad:copy:11")
+        run(C.copy_item(cb, self.api))
+        data = " ".join(self.kb(cb))
+        self.assertNotIn("pitem_stock:", data)
+        self.assertNotIn("cadpub:", data)
+
+    def test_a_refusal_is_never_called_a_success(self):
+        """Бодрый отчёт об успехе там, где ничего не создалось, — самая
+        дорогая поломка этого проекта."""
+        self.api.create_raises = RuntimeError("422: нет раздела")
+        cb = CB("create_ad:copy:11")
+        run(C.copy_item(cb, self.api))
+        said = cb.message.texts[-1]
         self.assertIn("не создалась", said)
+        self.assertNotIn("Копия создана", said)
 
-    def test_a_refusal_offers_no_buttons_for_a_product_that_does_not_exist(self):
-        self.cloned = (False, "422")
+    def test_the_refusal_on_screen_is_readable_whatever_the_path(self):
+        """Отказ печатается через разбор и на экране тоже, а не только там,
+        где его поймали: путей до экрана два, и разъехаться им нельзя."""
+        import json
+        self.api.create_raises = RuntimeError("422: " + json.dumps(
+            {"errors": {"category": ["Поле Категория обязательно."]}}))
         cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb))
-        data = self.kb(cb)
-        self.assertNotIn("pitem_stock:", " ".join(data))
-        self.assertNotIn("cadpub:", " ".join(data))
+        run(C.copy_item(cb, self.api))
+        said = cb.message.texts[-1]
+        self.assertIn("Категория", said)
+        self.assertNotIn("u041a", said)
 
-    def test_a_dead_panel_is_not_reported_as_success(self):
-        """«Создал» — не доказательство: панель отвечает 200 и на отказ."""
-        def boom(cookies, item_id, uid=None):
-            raise RuntimeError("таймаут")
-
-        P.panel_clone_item_sync = boom
+    def test_without_a_token_it_says_so_and_does_not_try(self):
+        """Отказ должен назвать причину — «токена нет», а не свалиться на
+        первом же обращении к пустому клиенту."""
         cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb))
-        self.assertIn("не создалась", cb.message.texts[-1])
+        run(C.copy_item(cb, None))
+        self.assertTrue(any("токен" in a.lower() for a in cb.alerts),
+                        cb.alerts)
+        self.assertEqual(cb.message.texts, [], "полез создавать без токена")
+        self.assertEqual(self.api.created, [])
 
 
 class TheCopyIsForAdminsOnly(Bench):
@@ -281,17 +380,43 @@ class TheCopyIsForAdminsOnly(Bench):
 
     def test_the_list_is_closed_from_an_old_message(self):
         cb = CB("create_ad:templates_list")
-        run(C.templates_list(cb))
+        run(C.templates_list(cb, self.api))
         self.assertTrue(cb.alerts)
         self.assertEqual(cb.message.texts, [], "показал список постороннему")
 
     def test_and_so_is_the_copy_itself(self):
-        """Нажатие создаёт настоящий товар на витрине — заслон обязателен
-        и здесь, а не только на списке."""
+        """Нажатие создаёт настоящее объявление — заслон обязателен и
+        здесь, а не только на списке."""
         cb = CB("create_ad:copy:11")
-        run(C.copy_item(cb))
-        self.assertEqual(self.clone_calls, [],
-                         "посторонний создал товар копией")
+        run(C.copy_item(cb, self.api))
+        self.assertEqual(self.api.created, [],
+                         "посторонний создал объявление копией")
+
+
+class ARefusalIsReadable(unittest.TestCase):
+    """Отказ маркетплейса приходит JSON-ом, и русский текст в нём —
+    экранированными кодами. На экране это нечитаемо: отказ есть, а причины
+    нет."""
+
+    def test_escaped_russian_becomes_russian(self):
+        import json
+        raw = "422: " + json.dumps({"message": "Поле Категория обязательно."})
+        self.assertIn("u041f", raw, "тест проверяет не то — текст не экранирован")
+        self.assertIn("Категория", C._readable(raw))
+
+    def test_the_field_errors_win_over_the_summary(self):
+        """«(and 3 more errors)» не говорит, каких именно."""
+        import json
+        raw = "422: " + json.dumps({"message": "x (and 3 more errors)",
+                                    "errors": {"category": ["Нужен раздел"]}})
+        self.assertIn("Нужен раздел", C._readable(raw))
+
+    def test_plain_text_survives(self):
+        """Сырой текст хуже перевода, но лучше молчания."""
+        self.assertIn("таймаут", C._readable("таймаут сети"))
+
+    def test_it_never_returns_a_wall(self):
+        self.assertLessEqual(len(C._readable("э" * 5000)), 400)
 
 
 class TheStockIsFilledInWithoutAsking(Bench):

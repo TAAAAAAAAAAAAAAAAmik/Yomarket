@@ -6,6 +6,8 @@ import html
 import logging
 import re
 
+import aiohttp
+
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -26,6 +28,56 @@ logger = logging.getLogger(__name__)
 # пятидесяти, а клавиатура из пятидесяти кнопок — это не выбор, а
 # свалка: копируют обычно последнее, а не то, что заведено год назад.
 _COPY_LIMIT = 12
+
+
+def _readable(said) -> str:
+    """Отказ маркетплейса по-человечески.
+
+    Он приходит JSON-ом, и русский текст в нём — экранированными кодами:
+    на экран продавца уезжало «\\u041f\\u043e\\u043b\\u0435
+    \\u041a\\u0430\\u0442...» вместо «Поле Категория обязательно».
+    Прочитать это нельзя, то есть отказ есть, а причины нет.
+
+    Сначала пробуем разобрать по полям (`explain_validation` знает их
+    русские имена), потом — просто раскодировать. Что не разобралось,
+    отдаём как есть: сырой текст хуже перевода, но лучше молчания.
+    """
+    import json
+
+    from automation.panel import explain_validation
+
+    text = str(said or "")
+    # `json.loads` сам превращает \uXXXX в буквы — отдельного декодера не
+    # нужно, нужен лишь найденный в строке объект.
+    start = text.find("{")
+    body = None
+    if start >= 0:
+        try:
+            body = json.loads(text[start:])
+        except ValueError:
+            body = None
+
+    if isinstance(body, dict):
+        # `errors` разбираем ПЕРВЫМ: в `message` лежит сводка вида
+        # «x (and 3 more errors)», которая не говорит, каких именно, а по
+        # полям видно, что чинить. `explain_validation` ждёт ровно такой
+        # формы — {поле: [жалобы]} — и знает их русские имена.
+        errs = body.get("errors")
+        if isinstance(errs, dict) and errs:
+            said_ru = explain_validation(json.dumps(errs, ensure_ascii=False))
+            if said_ru:
+                return said_ru[:400]
+            rows = [str(v[0] if isinstance(v, list) and v else v)
+                    for v in errs.values()]
+            joined = " ".join(r for r in rows if r)
+            if joined:
+                return joined[:400]
+        msg = str(body.get("message") or "").strip()
+        if msg:
+            return msg[:400]
+
+    said_ru = explain_validation(text)
+    return (said_ru or text)[:400]
 
 
 class CreateAdState(StatesGroup):
@@ -166,18 +218,17 @@ async def create_ad_start(callback: CallbackQuery, state: FSMContext) -> None:
     единственным настоящим действием.
     """
     from features import ad_templates_shown
-    from storage import get_panel_creds
+    from storage import get_token
 
     await state.clear()
     uid = callback.from_user.id
     # Копия — только админам (решение владельца). Развилки у продавца нет
     # вовсе: кнопка, отвечающая отказом, хуже, чем её отсутствие.
     #
-    # Второе условие — куки панели: копируется ТОВАР ИЗ ПАНЕЛИ, и без входа
-    # в неё список брать неоткуда. Показать кнопку и ответить «войди в
-    # панель» значит обещать то, чего за ней нет.
-    can_copy = (ad_templates_shown(uid)
-                and bool((get_panel_creds(uid) or {}).get("cookies")))
+    # Второе условие — токен: и список объявлений, и само создание идут
+    # через Integration API. Кнопка, за которой «подключи магазин», обещает
+    # то, чего за ней нет.
+    can_copy = ad_templates_shown(uid) and bool(get_token(uid))
     if not can_copy:
         await _ask_title(callback, state)
         return
@@ -1384,56 +1435,52 @@ async def publish_item(callback: CallbackQuery) -> None:
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "create_ad:templates_list")
-async def templates_list(callback: CallbackQuery) -> None:
-    """Список товаров, которые уже стоят в панели. Копировать — их.
+async def templates_list(callback: CallbackQuery,
+                         api: YooMarketAPI = None) -> None:
+    """Список объявлений, которые уже стоят на витрине. Копировать — их.
 
-    Список берётся из ПАНЕЛИ, а не из наших записей. Записывать созданное
-    самими собой означало бы, что скопировать можно только товар, заведённый
-    после обновления бота, — а у продавца их семь, и все прежние. Снаружи
-    это выглядит как «кнопка не работает».
+    Список читается ТЕМ ЖЕ API, которым потом создаётся копия. Через панель
+    он не годится: у панели свои номера товаров, и номер из её списка,
+    отданный в `GET /ads/{id}`, указал бы не туда — а копия создала бы не то
+    объявление или не создала бы ничего.
 
     Выбор в списке и есть подтверждение: отдельного «точно создать?» нет
     намеренно — лишний экран между решением и действием и был тем, ради чего
     копию заводили.
     """
     from features import ad_templates_shown
-    from storage import get_panel_creds
-    from automation.panel import panel_list_items_sync
+    from orderfields import ad_price
 
     uid = callback.from_user.id
     # Заслон и на самом экране, а не только на кнопке: кнопка осталась в
-    # прежних сообщениях, а нажатие создаёт настоящий товар на витрине.
+    # прежних сообщениях, а нажатие создаёт настоящее объявление.
     if not ad_templates_shown(uid):
         await callback.answer("Этого раздела сейчас нет", show_alert=True)
         return
-    creds = get_panel_creds(uid)
-    if not creds or not creds.get("cookies"):
-        await callback.answer("Копия читает товар из панели — войди в неё",
+    if not api:
+        await callback.answer("Не настроен API-токен — копия идёт через него",
                               show_alert=True)
         return
 
     await callback.answer()
-    await callback.message.edit_text("⏳ Читаю товары из панели…")
-    loop = asyncio.get_event_loop()
+    await callback.message.edit_text("⏳ Читаю объявления…")
     try:
-        ok, items = await asyncio.wait_for(
-            loop.run_in_executor(None, panel_list_items_sync,
-                                 creds["cookies"]),
-            timeout=30)
+        data = await api.get_ads()
+        items = data.get("data") or data.get("items") or []
+        err = ""
     except Exception as e:                                # noqa: BLE001
-        ok, items = False, f"панель не ответила: {str(e)[:120]}"
+        items, err = [], _readable(str(e))
 
     b = InlineKeyboardBuilder()
-    if not ok or not isinstance(items, list):
-        # Отказ панели печатаем её же словами: «не вышло» без причины —
-        # отписка, а разбирать её продавцу нечем.
+    if err:
+        # Отказ печатаем его же словами: «не вышло» без причины — отписка.
         b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
         b.button(text="❌ Отмена", callback_data="menu:ads")
         ui.lay(b)
         await callback.message.edit_text(ui.screen(
             "📋 <b>Шаблонная копия</b>",
-            ["Список товаров прочитать не вышло.", "",
-             f"<i>{html.escape(str(items)[:200])}</i>"]),
+            ["Список объявлений прочитать не вышло.", "",
+             f"<i>{html.escape(err)}</i>"]),
             reply_markup=b.as_markup())
         return
     if not items:
@@ -1442,71 +1489,136 @@ async def templates_list(callback: CallbackQuery) -> None:
         ui.lay(b)
         await callback.message.edit_text(ui.screen(
             "📋 <b>Шаблонная копия</b>",
-            ["В панели нет ни одного товара — копировать пока нечего."]),
+            ["На витрине нет ни одного объявления — копировать пока нечего."]),
             reply_markup=b.as_markup())
         return
 
     rows = []
     for it in items[:_COPY_LIMIT]:
-        # `or ""` здесь было бы ошибкой: у товара с номером 0 ноль ложен,
-        # и товар молча пропал бы из списка.
+        # `or ""` здесь было бы ошибкой: у объявления с номером 0 ноль ложен,
+        # и оно молча пропало бы из списка.
         raw = it.get("id")
         iid = "" if raw is None else str(raw).strip()
-        title = str(it.get("title") or "без названия")
+        title = str(it.get("title") or it.get("name") or "без названия")
         if not iid:
             continue
         b.button(text=f"📋 {title[:30]}",
                  callback_data=f"create_ad:copy:{iid}"[:64])
         rows.append(f"• <b>{html.escape(title[:40])}</b> — "
-                    f"{it.get('price', 0)} ₽")
+                    f"{int(ad_price(it) or 0)} ₽")
     b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
     b.button(text="❌ Отмена", callback_data="menu:ads")
     ui.lay(b)
     await callback.message.edit_text(ui.screen(
         "📋 <b>Шаблонная копия</b>",
-        ["Панель создаст такой же товар: те же поля, тот же раздел, то же "
-         "фото. Вопросов не будет.", ""] + rows),
+        ["Заведу такое же объявление: те же название, цена, описание, "
+         "раздел и фото. Вопросов не будет.", ""] + rows),
         reply_markup=b.as_markup())
 
 
+async def _photo_of(api, ad: dict) -> list:
+    """Картинка объявления, скачанная по адресу из его же карточки.
+
+    Адрес ищется по всей карточке (`_find_image_url`), а не по угаданному
+    имени поля: как маркетплейс называет картинку, живьём не проверялось, и
+    ошибиться именем значит молча создать товар без фото — а без него
+    публикация отвергается с `empty_images`.
+    """
+    from automation.panel import _find_image_url
+
+    url = _find_image_url(ad)
+    if not url or not getattr(api, "session", None):
+        return []
+    try:
+        async with api.session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as r:
+            if r.status != 200:
+                return []
+            data = await r.read()
+    except Exception as e:                                # noqa: BLE001
+        logger.warning("картинка объявления не скачалась: %s", e)
+        return []
+    name = url.rsplit("/", 1)[-1].split("?")[0] or "photo.jpg"
+    return [(data, name)]
+
+
+async def _copy_ad_via_api(api, ad_id: str) -> tuple[bool, str, list[str]]:
+    """Завести объявление заново по API. → (получилось, отчёт, что не влезло).
+
+    По API, а не через форму панели: панель отказала 422 на четырёх полях
+    сразу (`category` и ещё три) — её клон не умеет пересылать вложенные
+    значения, а раздел у товара как раз такое. У Integration API раздел
+    лежит прямо в объявлении, полем `category_id`.
+
+    Третьим значением — то, что скопировать НЕЛЬЗЯ. Молчание здесь читалось
+    бы как «копия готова к продаже», а она не готова: у товара с кодами
+    остаток — сами ключи, они одноразовые.
+    """
+    from orderfields import ad_price
+
+    raw = await api.get_ad(ad_id)
+    ad = raw.get("data") or raw
+    title = str(ad.get("title") or ad.get("name") or "").strip()
+    cid = ad.get("category_id") or ad.get("categoryId")
+    if not title or not cid:
+        # Чего не хватило — называем. «Не вышло» без причины продавцу
+        # разбирать нечем.
+        missing = ", ".join(w for w, ok in (("название", title),
+                                            ("раздел", cid)) if not ok)
+        return False, f"в карточке товара нет: {missing}", []
+
+    price = ad_price(ad) or 0
+    kind = str(ad.get("type") or "simple")
+    left: list[str] = []
+    stock = 0
+    if kind == "auto-delivery":
+        left.append("коды — они одноразовые, панель их не копирует")
+    else:
+        try:
+            stock = int(float(ad.get("stock") or 0))
+        except (TypeError, ValueError):
+            stock = 0
+
+    photos = await _photo_of(api, ad)
+    if not photos:
+        left.append("фото — маркетплейс не отдал картинку, приложи вручную")
+
+    new_id, said = await api.create_and_publish(
+        title=title, price=int(price),
+        description=str(ad.get("description") or ""),
+        category_id=cid, ad_type=kind, stock=max(stock, 1),
+        photos=photos, publish=False)
+    return True, str(new_id), left
+
+
 @router.callback_query(F.data.startswith("create_ad:copy:"))
-async def copy_item(callback: CallbackQuery) -> None:
-    """Копия товара — одним запросом к панели.
+async def copy_item(callback: CallbackQuery, api: YooMarketAPI = None) -> None:
+    """Копия товара: то же объявление, заведённое заново по API.
 
-    Копирует ПАНЕЛЬ, а не бот: она читает у товара его собственные поля,
-    вместе с `filter__N`, которых у нас нет и взяться им неоткуда. Свой
-    повтор мастера означал бы, что скопировать можно только то, что бот
-    сам когда-то создал.
-
-    «Создал» — не доказательство: панель отвечает 200 и на отказ, поэтому
-    в отчёт идёт номер, который она вернула, а отказ печатается её же
-    словами.
+    «Создал» — не доказательство: в отчёт идёт номер, который вернул
+    маркетплейс, а отказ печатается его же словами, а не сырым JSON с
+    экранированными кодами — такой отказ продавец прочитать не может.
     """
     from features import ad_templates_shown
-    from storage import get_panel_creds
-    from automation.panel import panel_clone_item_sync
 
     uid = callback.from_user.id
     if not ad_templates_shown(uid):
         await callback.answer("Этого раздела сейчас нет", show_alert=True)
         return
-    item_id = callback.data.split(":")[-1]
-    creds = get_panel_creds(uid)
-    if not creds or not creds.get("cookies"):
-        await callback.answer("Куки панели не найдены — войди снова",
+    if not api:
+        await callback.answer("Не настроен API-токен — копия идёт через него",
                               show_alert=True)
         return
+    item_id = callback.data.split(":")[-1]
 
     await callback.answer("Создаю копию…")
-    await callback.message.edit_text("⏳ Панель делает копию товара…")
-    loop = asyncio.get_event_loop()
+    await callback.message.edit_text("⏳ Завожу такое же объявление…")
+    left: list[str] = []
     try:
-        ok, said = await asyncio.wait_for(
-            loop.run_in_executor(None, panel_clone_item_sync,
-                                 creds["cookies"], item_id, uid),
-            timeout=60)
+        ok, said, left = await _copy_ad_via_api(api, item_id)
     except Exception as e:                                # noqa: BLE001
-        ok, said = False, f"панель не ответила: {str(e)[:150]}"
+        # Разбирать здесь незачем: отказ разбирается один раз, на экране.
+        # Второй разбор того же значения однажды разойдётся с первым.
+        ok, said = False, str(e)
 
     new_id = said if str(said).isdigit() else ""
     b = InlineKeyboardBuilder()
@@ -1517,18 +1629,19 @@ async def copy_item(callback: CallbackQuery) -> None:
     b.button(text="📦 Мои товары", callback_data="menu:ads")
     ui.lay(b)
     if ok:
-        await callback.message.edit_text(ui.screen(
-            "✅ <b>Копия создана</b>",
-            [f"🆔 {html.escape(new_id)}" if new_id else
-             f"<i>{html.escape(str(said)[:150])}</i>",
-             "",
-             "Остаток у копии свой: у товара с кодами они одноразовые, и "
-             "панель их не копирует. Добавь и отправь на модерацию."]),
+        body = [f"🆔 {html.escape(new_id)}" if new_id else
+                f"<i>{html.escape(str(said)[:150])}</i>"]
+        if left:
+            body += ["", "<b>Не скопировалось:</b>"]
+            body += [f"• {html.escape(x)}" for x in left]
+        body += ["", "На модерацию отправь сам — сначала проверь остаток."]
+        await callback.message.edit_text(
+            ui.screen("✅ <b>Копия создана</b>", body),
             reply_markup=b.as_markup())
         return
     await callback.message.edit_text(ui.screen(
         "❌ <b>Копия не создалась</b>",
-        ["Панель ответила:", f"<i>{html.escape(str(said)[:400])}</i>", "",
-         "Если она просит заполнить поле — заведи товар мастером: он "
-         "спросит недостающее и дошлёт."]),
+        ["Маркетплейс ответил:", f"<i>{html.escape(_readable(said))}</i>", "",
+         "Если он просит заполнить поле — заведи товар мастером: он спросит "
+         "недостающее и дошлёт."]),
         reply_markup=b.as_markup())
