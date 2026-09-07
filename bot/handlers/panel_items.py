@@ -458,7 +458,15 @@ async def _toggle(callback: CallbackQuery, public: bool,
             return
 
     await callback.answer("⏳ Выполняю...")
-    result, err = await _run(uid, panel_publish_item_sync, item_id, uid, public)
+    if public:
+        from storage import get_panel_creds
+        creds = get_panel_creds(uid) or {}
+        got, note = await publish_item_sync_first(
+            api, creds.get("cookies", ""), item_id, uid)
+        result, err = (got, note), ""
+    else:
+        result, err = await _run(uid, panel_publish_item_sync, item_id, uid,
+                                 public)
     if result and result[0]:
         if public:
             # Публикация не выставляет товар на продажу: она ставит его в очередь
@@ -472,6 +480,70 @@ async def _toggle(callback: CallbackQuery, public: bool,
         detail = result[1] if result else err
         text = f"❌ Товар #{item_id}: не удалось.\n\n{detail}"
     await callback.message.edit_text(text, reply_markup=_item_kb(item_id))
+
+
+# Статусы, означающие «товар уже не черновик»: он либо в очереди на
+# проверку, либо уже в продаже. По ним и решается, получилась ли публикация.
+_LIVE_STATES = ("moderate", "moderation", "pending", "review",
+                "active", "published")
+
+
+async def publish_item_sync_first(api, cookies: str, item_id: str,
+                                  uid: int) -> tuple[bool, str]:
+    """Отправить товар на модерацию. → (получилось ли, чем и что ответили).
+
+    Дорог две, и порядок не случаен: сперва МАРКЕТПЛЕЙС, потом панель.
+    `POST /ads/{id}/publish` — документированный путь, им же возвращаются
+    истёкшие объявления. Панель на публикацию отвечает «Извините! У вас нет
+    прав для выполнения этого действия» (живой отказ 08.09) — путь, который
+    отказывает, не должен быть первым.
+
+    **Ответ не принимается на веру.** HTTP 200 у этого маркетплейса
+    приходит и на отказ, поэтому статус перечитывается: в отчёт идёт то, что
+    он показывает, а не то, что мы отправили.
+    """
+    from automation.panel import panel_publish_item_sync
+
+    said: list[str] = []
+
+    if api:
+        try:
+            await api.publish_ad(item_id)
+        except Exception as e:                            # noqa: BLE001
+            said.append(f"маркетплейс: {str(e)[:150]}")
+        else:
+            state = await _state_now(api, item_id)
+            if state in _LIVE_STATES:
+                return True, f"через маркетплейс, статус: {state}"
+            said.append(f"маркетплейс принял, а статус остался «{state or '—'}»")
+
+    if cookies:
+        try:
+            loop = asyncio.get_event_loop()
+            ok, note = await asyncio.wait_for(
+                loop.run_in_executor(None, panel_publish_item_sync,
+                                     cookies, item_id, uid),
+                timeout=30)
+        except Exception as e:                            # noqa: BLE001
+            ok, note = False, str(e)[:150]
+        if ok:
+            return True, f"через панель ({note})"
+        said.append(f"панель: {note}")
+
+    # Обе дороги названы: одна причина из двух — это половина правды, а по
+    # ней продавец пойдёт чинить не то.
+    return False, "; ".join(said) or "публиковать нечем"
+
+
+async def _state_now(api, item_id: str) -> str:
+    """Статус объявления сейчас — перечитанный, а не предположенный."""
+    try:
+        ad = await api.get_ad(item_id)
+    except Exception as e:                                # noqa: BLE001
+        logger.info("статус %s не перечитался: %s", item_id, e)
+        return ""
+    inner = (ad.get("data") or ad) if isinstance(ad, dict) else {}
+    return str(inner.get("status") or inner.get("state") or "").lower()
 
 
 @router.callback_query(F.data.startswith("pitem_show:"))

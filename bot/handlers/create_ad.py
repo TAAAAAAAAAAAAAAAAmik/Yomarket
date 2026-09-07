@@ -1718,16 +1718,15 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
                 await status_msg.edit_text("⏳ Товар создан, делаю публичным...")
             except Exception:
                 pass
-            from automation.panel import panel_publish_item_sync
+            # Публикация идёт двумя дорогами, и первой — маркетплейсом:
+            # панель отвечает «У вас нет прав для выполнения этого
+            # действия» (живой отказ 08.09), а `POST /ads/{id}/publish`
+            # документирован и им же возвращаются истёкшие объявления.
+            from handlers.panel_items import publish_item_sync_first
             try:
-                pub_ok, pub_msg = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None, panel_publish_item_sync,
-                        creds["cookies"], item_id, uid,
-                    ),
-                    timeout=30,
-                )
-            except Exception as e:
+                pub_ok, pub_msg = await publish_item_sync_first(
+                    api, creds.get("cookies", ""), item_id, uid)
+            except Exception as e:                        # noqa: BLE001
                 pub_ok, pub_msg = False, f"ошибка: {str(e)[:80]}"
             if pub_ok:
                 pub_note = ("\n🕓 Отправлен на модерацию "
