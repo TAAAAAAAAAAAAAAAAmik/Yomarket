@@ -571,6 +571,11 @@ def panel_get_item_form_sync(cookie_string: str) -> tuple[bool, object]:
                 "dependsOn": f.get("dependsOn"),
                 "component": f.get("component", ""),
                 "relationship": f.get("relationshipType") or f.get("belongsToRelationship") or "",
+                # Что форма предлагает сама. Без этого поле, которого у
+                # товара нет вовсе (`has_chat` — живой ответ 07.09),
+                # спрашивалось у продавца, хотя при обычном создании ушло
+                # бы значение формы и никто бы его не заметил.
+                "value": _field_submit_value(f),
             })
         return True, {"resource": res, "fields": form_fields}
     return False, last_err
@@ -965,6 +970,44 @@ def _get_detail_fields(session, hdrs, rec_id: str,
     except Exception:
         return []
     return _parse_nova_fields_payload(cf) if isinstance(cf, dict) else []
+
+
+def _get_index_fields(session, hdrs, rec_id: str,
+                      resource: str = "items") -> list[dict]:
+    """Поля СТРОКИ товара в списке панели — третий её ответ.
+
+    Нужен на случай, когда карточка закрыта: Nova разрешает просмотр списка
+    и просмотр записи независимо, и «403 на карточку» ещё не значит
+    «раздела не узнать». Строка списка показывает те же связи.
+    """
+    try:
+        r = session.get(
+            f"{PANEL_URL}/nova-api/{resource}",
+            params={"search": str(rec_id), "perPage": "25", "page": "1"},
+            headers=hdrs, timeout=(6, 12), allow_redirects=False)
+    except Exception:
+        return []
+    if r.status_code != 200:
+        return []
+    try:
+        body = r.json()
+    except Exception:
+        return []
+    rows = body.get("resources") if isinstance(body, dict) else None
+    if not isinstance(rows, list):
+        return []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rid = row.get("id")
+        if isinstance(rid, dict):
+            rid = rid.get("value")
+        if str(rid) != str(rec_id):
+            continue
+        fields = row.get("fields")
+        return ([f for f in fields if isinstance(f, dict)]
+                if isinstance(fields, list) else [])
+    return []
 
 
 def _probe_one(session, hdrs, resource: str, rec_id: str) -> tuple[int, list[dict]]:
@@ -2926,11 +2969,20 @@ def panel_item_values_sync(
     # она показывает уже оформленными («129 ₽»), а число из такой строки не
     # достаётся. Что редактируется — берём из формы правки, что нет — отсюда.
     seen = {str(f.get("attribute") or "") for f in fields}
-    for f in _get_detail_fields(session, hdrs, str(item_id)):
-        attr = str(f.get("attribute") or "")
-        if attr and attr not in seen and _is_section_attr(attr):
-            fields.append(f)
-            seen.add(attr)
+
+    def _take(extra_fields) -> int:
+        got = 0
+        for f in extra_fields:
+            attr = str(f.get("attribute") or "")
+            if attr and attr not in seen and _is_section_attr(attr):
+                fields.append(f)
+                seen.add(attr)
+                got += 1
+        return got
+
+    if not _take(_get_detail_fields(session, hdrs, str(item_id))):
+        # Карточка закрыта или раздела в ней нет — остаётся строка списка.
+        _take(_get_index_fields(session, hdrs, str(item_id)))
 
     # `None` — «поля не было», а не «пусто». Разница здесь существенная:
     # у товара в панели ЦЕНЫ НЕТ ВОВСЕ (давняя запись в CLAUDE.md), и
@@ -3045,6 +3097,17 @@ def panel_copy_probe_sync(cookie_string: str, item_id: str,
                 out.append(f"  {attr}: номер={_field_submit_value(f)!r} "
                            f"надпись={_field_label_value(f)!r}")
 
+    # 2б. Строка списка — третий ответ, на случай закрытой карточки
+    idx = _get_index_fields(session, hdrs, str(item_id))
+    out.append(f"строка списка: полей {len(idx)}")
+    if idx:
+        out.append("  " + ", ".join(str(f.get("attribute")) for f in idx))
+        for f in idx:
+            attr = str(f.get("attribute") or "")
+            if _is_section_attr(attr):
+                out.append(f"  {attr}: номер={_field_submit_value(f)!r} "
+                           f"надпись={_field_label_value(f)!r}")
+
     # 3. Что из этого вышло — ровно то, что уедет в создание
     ok, values, extra, labels, image_url, err = panel_item_values_sync(
         cookie_string, item_id, uid)
@@ -3058,30 +3121,18 @@ def panel_copy_probe_sync(cookie_string: str, item_id: str,
         out.append(f"  labels: {labels}")
         out.append(f"  картинка: {'есть' if image_url else 'НЕТ'}")
 
-    # 4. Форма создания и списки — то, с чем сверяется готовый номер
+    # 4. Форма создания — то, с чем сверяется готовый номер. Сам разбор
+    #    «спросит или нет» делает не панель, а копия: он и печатается
+    #    вызывающим, тем же кодом, которым выбирает сама копия.
     form_ok, form = panel_get_item_form_sync(cookie_string)
     out.append("")
     if not form_ok or not isinstance(form, dict):
         out.append(f"форма создания: не прочиталась ({form})")
         return out
-    res = form.get("resource", "items")
     attrs = [f["attribute"] for f in form["fields"]]
-    out.append(f"форма создания: раздел {res}, полей {len(attrs)}")
+    out.append(f"форма создания: раздел {form.get('resource')}, "
+               f"полей {len(attrs)}")
     out.append("  " + ", ".join(map(str, attrs)))
-
-    for attr in [a for a in ("category", "subcategory", "type") if a in attrs]:
-        plain, _t = panel_sync_field_options_sync(
-            cookie_string, res, attr, {})
-        line = f"{attr}: без поиска {len(plain)} вариантов"
-        want = labels.get(attr) if ok else ""
-        if want:
-            found, _t2 = panel_sync_field_options_sync(
-                cookie_string, res, attr, {}, want)
-            line += f"; поиск «{want}» → {len(found)}"
-            if found:
-                line += " (" + ", ".join(
-                    f"{o.get('label')}={o.get('value')}" for o in found[:5]) + ")"
-        out.append(line)
     return out
 
 

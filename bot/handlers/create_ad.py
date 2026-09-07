@@ -677,7 +677,7 @@ async def submit_ad(callback: CallbackQuery, state: FSMContext, api: YooMarketAP
     if form_ok and isinstance(form, dict):
         by_attr = {f["attribute"]: f for f in form["fields"]}
         # Селекты, которые панель требует: спрашиваем в порядке зависимости
-        queue = [a for a in ("category", "subcategory", "type") if a in by_attr]
+        queue = [a for a in _SECTION_TRIPLE if a in by_attr]
         queue += [
             f["attribute"] for f in form["fields"]
             if f.get("required") and f.get("options") and f["attribute"] not in queue
@@ -736,33 +736,53 @@ def _autopick_match(options: list, words) -> dict | None:
     return None
 
 
-def _source_match(options: list, value, label: str) -> dict | None:
-    """Вариант списка, соответствующий тому, что стояло у образца.
+def _pick_option(options: list, value, label: str,
+                 words: list) -> tuple[dict | None, str]:
+    """Какой вариант списка подходит — и почему. → (вариант или None, как).
 
-    Сначала по номеру: форма создания и карточка товара — одна панель, и
-    номера в них обычно те же. Не нашёлся номер — по надписи: раздел
-    «Аккаунты» называется одинаково, каким бы номером он ни был. Не нашлось
-    ни то ни другое — None, и тогда решает подбор по словам.
+    Порядок не декоративный, он от сильного к слабому:
 
-    Молча отправить непроверенный номер нельзя: товар ляжет в чужой раздел,
-    и узнается это по отсутствию продаж, а не по отказу.
+    1. **номер образца** — форма создания и карточка товара это одна панель,
+       один раздел `items` и одно поле, значит и нумерация одна;
+    2. **надпись образца** — если номера в списке нет, но «Аккаунты» в нём
+       есть, это он и есть, каким бы номером ни звался;
+    3. **слово** — название раздела с маркетплейса и слова названия товара;
+       годится только единственное совпадение.
+
+    Ни одного — None, и решает вызывающий: у него есть ещё поиск по панели
+    и номер образца, который списком не опровергнут.
     """
     if value not in (None, ""):
         for o in options:
             if str(o.get("value")) == str(value):
-                return o
+                return o, "номер образца"
     want = str(label or "").strip().lower()
     if want:
         same = [o for o in options
                 if str(o.get("label", "")).strip().lower() == want]
         if len(same) == 1:
-            return same[0]
-    return None
+            return same[0], "надпись образца"
+    by_word = _autopick_match(options, words)
+    if by_word is not None:
+        return by_word, "подобран по названию"
+    return None, ""
 
 
-# Сколько вариантов показываем на одном списке. Это же число говорит,
-# оборван ли ответ панели: ровно столько — значит дальше не показали.
-_OPTIONS_SHOWN = 500
+# Раздел, подраздел и тип выдачи. Их значение по умолчанию не берётся
+# никогда: раздел решает, где покупатель увидит товар, а тип — как заказ
+# будет выдаваться. Молча ошибиться здесь дороже, чем спросить.
+_SECTION_TRIPLE = ("category", "subcategory", "type")
+
+
+# Сколько вариантов держим в состоянии и показываем листалкой. Это же
+# число говорит, оборван ли ответ панели: ровно столько — значит дальше не
+# показали.
+#
+# Было 500, и панель отдавала 825 (живой /copy_debug 07.09). Триста
+# двадцать пять разделов обрезались, «Standoff 2» — буква S — в остаток не
+# попадал, и сверка не находила номер, КОТОРЫЙ ПАНЕЛЬ ПРИСЛАЛА. Продавцу
+# это выглядело как список чужих игр вместо его раздела.
+_OPTIONS_SHOWN = 1000
 
 
 async def _search_options(uid: int, data: dict, attr: str,
@@ -879,59 +899,49 @@ async def _ask_next_select(msg, state: FSMContext, uid: int,
         await _ask_next_select(msg, state, uid, api)
         return
 
-    # Список панель отдаёт ОБРЕЗАННЫМ: без слова для поиска этот адрес
-    # присылает первые несколько сотен по алфавиту. «Нет в списке» поэтому
-    # не значит «нет вовсе» — значит «дальше не показали».
-    capped = len(options) >= _OPTIONS_SHOWN
-    options = options[:_OPTIONS_SHOWN]
     label = f.get("label") or attr
     hint = (data.get("source_labels") or {}).get(attr)
     words = list(data.get("autopick") or [])
+    src = chosen.get(attr)
 
-    # Раздел, известный заранее, выбирается сам — но только когда подходит
-    # ровно один вариант. Выбранное записывается и показывается продавцу:
-    # молча решить за него, где будет лежать товар, значит поставить его
-    # перед фактом на витрине.
-    guess = _source_match(options, chosen.get(attr), hint)
-    took = "как у образца"
+    # Сверяться надо со ВСЕМ, что панель прислала, а обрезать — только
+    # показ. Обрезка до сверки и есть та ошибка, из-за которой копия не
+    # находила номер, ПРИСЛАННЫЙ САМОЙ ПАНЕЛЬЮ: живой ответ — 825
+    # вариантов, сверка шла по первым пятистам, «Standoff 2» на букву S.
+    guess, took = _pick_option(options, src, hint, words)
+
     if guess is None:
-        # Своего ответа нет — пробуем подобрать по словам: названию раздела
-        # с маркетплейса и словам названия товара.
-        guess = _autopick_match(options, words)
-        took = "подобран"
-    if guess is None:
-        # Ни там ни там — спрашиваем панель по имени, а не листаем обрезок.
-        # Ровно то же самое делает продавец, когда пишет название словом.
+        # В списке нужного нет — спрашиваем панель по имени, а не листаем
+        # обрезок. Ровно то же делает продавец, когда пишет название словом.
         found, term = await _search_options(uid, data, attr,
                                             ([hint] if hint else []) + words)
         if found:
-            guess = _source_match(found, chosen.get(attr), hint)
-            took = "как у образца"
+            guess, took = _pick_option(found, src, hint, [term] + words)
             if guess is None:
-                guess = _autopick_match(found, [term] + words)
-                took = "найден по названию"
-            if guess is None:
-                # Выбрать не вышло, но найденное показать лучше, чем
-                # первые пятьсот по алфавиту: там нужного и не было.
-                #
-                # Обрезанность считается ЗАНОВО по самому ответу, а не
-                # объявляется. Панель, не понявшая слова, присылает тот же
-                # обрезок — и записанное «список полон» выбросило бы номер,
-                # взятый с её же карточки, то есть поиск ломал бы то, что
-                # без него работало.
+                # Выбрать не вышло, но найденное показать лучше, чем сотни
+                # чужих строк по алфавиту: нужного среди них и не было.
                 options = found
-                capped = len(found) >= _OPTIONS_SHOWN
-    if guess is None and capped and chosen.get(attr) not in (None, ""):
-        # Номер взят с карточки ЭТОЙ ЖЕ панели, и списком он не опровергнут
-        # — список просто оборван. Выбросить его значит попросить продавца
-        # искать руками то, что у товара уже стоит.
-        guess = {"value": chosen[attr], "label": hint or str(chosen[attr])}
-        took = "как у образца"
-    if guess is None and attr in chosen:
-        # Список полон, а номера в нём нет — такой не отправляем: товар лёг
-        # бы в чужой раздел молча.
-        chosen.pop(attr, None)
-        await state.update_data(chosen=chosen)
+
+    if guess is None and attr not in _SECTION_TRIPLE:
+        # Поле, которого у образца нет вовсе: в форме создания есть
+        # `has_chat`, `created_order` и подобные, а у товара их не бывает —
+        # спросить о них значит спросить о том, чего копировать неоткуда.
+        # Что предлагает сама форма, то и уходит при обычном создании.
+        default = f.get("value")
+        if default not in (None, "", [], {}):
+            guess, took = ({"value": default, "label": str(default)},
+                           "по умолчанию формы")
+
+    if guess is None and src not in (None, ""):
+        # Номер взят с карточки ЭТОЙ ЖЕ панели, у ЭТОГО ЖЕ товара, и поле у
+        # формы создания то же самое — значит и нумерация та же. Не сошлось
+        # ни со списком, ни с поиском — отправляем как есть и говорим об
+        # этом: панель, если номер не тот, ответит отказом по полю, и отказ
+        # станет вопросом. Выбросить номер — это тупик вместо вопроса, и
+        # ровно в него копия и упиралась.
+        guess = {"value": src, "label": hint or str(src)}
+        took = "как у образца, со списком не сверился"
+
     if guess is not None:
         chosen[attr] = guess.get("value")
         notes = list(data.get("autopicked") or [])
@@ -941,9 +951,11 @@ async def _ask_next_select(msg, state: FSMContext, uid: int,
         await _ask_next_select(msg, state, uid, api)
         return
 
+    # В состояние — сколько влезает; сверка уже прошла по всему списку.
+    shown = options[:_OPTIONS_SHOWN]
     await state.update_data(
         current_attr=attr, current_label=label,
-        current_options=options, current_view=options, current_page=0,
+        current_options=shown, current_view=shown, current_page=0,
         select_queue=queue[1:],
     )
     await _render_select(msg, state, edit=True)
@@ -2072,7 +2084,7 @@ def _select_queue(fields: list) -> list:
     прочие обязательные. Тот же порядок, что у мастера, — и он важен:
     варианты подраздела панель отдаёт только после выбранного раздела."""
     by_attr = {f["attribute"]: f for f in fields}
-    queue = [a for a in ("category", "subcategory", "type") if a in by_attr]
+    queue = [a for a in _SECTION_TRIPLE if a in by_attr]
     queue += [
         f["attribute"] for f in fields
         if f.get("required") and f.get("options") and f["attribute"] not in queue
@@ -2083,7 +2095,7 @@ def _select_queue(fields: list) -> list:
 
 
 @router.message(Command("copy_debug"))
-async def copy_debug(message: Message) -> None:
+async def copy_debug(message: Message, api: YooMarketAPI = None) -> None:
     """/copy_debug <номер объявления> — что копия видит у товара.
 
     Копия читает панель тремя ответами: форма правки, карточка, форма
@@ -2101,7 +2113,10 @@ async def copy_debug(message: Message) -> None:
     uid = message.from_user.id
     parts = (message.text or "").split()
     if len(parts) < 2 or not parts[1].strip().isdigit():
-        await message.answer("Нужен номер объявления: <code>/copy_debug 219206</code>")
+        # Без номера — список своих товаров с номерами. Пример в подсказке
+        # один раз уже увели в тупик: номер из него был выдуманный, панель
+        # ответила 403/404, и следующий час ушёл на разбор чужой ошибки.
+        await message.answer(await _my_ad_numbers(api))
         return
     ad_id = parts[1].strip()
 
@@ -2122,7 +2137,117 @@ async def copy_debug(message: Message) -> None:
         await status.edit_text(f"❌ {html.escape(str(e)[:300])}")
         return
 
+    # 403 и 404 значат «панель не показывает этот товар», а не «копия
+    # сломалась»: чаще всего номер просто не свой. Молчать об этом нельзя —
+    # ровно на этом и потерялся час.
+    # Но «не свой» — это когда молчат ОБА ответа. Карточка закрывается
+    # отдельно от формы правки, и одна её 403 у своего же товара — повод
+    # читать раздел из списка, а не объявлять товар чужим.
+    if _not_ours(rows):
+        rows = list(rows) + [
+            "",
+            "403/404 на обоих ответах — панель не показывает этот товар.",
+            "Скорее всего номер не твой. Свои: /copy_debug без номера.",
+        ]
+    else:
+        rows = list(rows) + [""] + await _select_verdicts(uid, ad_id, api)
+
     text = "🔍 <b>Что копия видит у товара " + html.escape(ad_id) + "</b>\n\n"
     body = "\n".join(html.escape(r) for r in rows)
     # 4096 знаков — потолок Telegram; обрезаем хвост, а не роняем отправку
     await status.edit_text((text + f"<code>{body}</code>")[:4000])
+
+
+def _not_ours(rows: list) -> bool:
+    """Панель не показала товар НИ ОДНИМ ответом — значит номер не свой.
+
+    Одной закрытой карточки для такого вывода мало: Nova разрешает форму
+    правки, карточку и список независимо друг от друга.
+    """
+    def line(head: str) -> str:
+        return next((r for r in rows if r.startswith(head)), "")
+
+    return ("HTTP 40" in line("форма правки:")
+            and "HTTP 40" in line("карточка:"))
+
+
+async def _select_verdicts(uid: int, ad_id: str, api) -> list[str]:
+    """Спросит копия раздел или нет — и почему. Тем же кодом, что и она.
+
+    Главный вопрос диагностики именно этот, и отвечать на него пересказом
+    нельзя: «должно сработать» уже дважды оказывалось неправдой. Здесь
+    вызываются ровно те функции, которыми выбирает `_ask_next_select`, — и
+    тест сверяет, что вывод совпадает с тем, что копия делает на самом деле.
+    """
+    from automation.panel import (panel_item_values_sync,
+                                  panel_sync_field_options_sync)
+    from storage import get_panel_creds
+
+    creds = get_panel_creds(uid) or {}
+    loop = asyncio.get_event_loop()
+    ok, values, extra, labels, _url, err = await loop.run_in_executor(
+        None, panel_item_values_sync, creds["cookies"], str(ad_id), uid)
+    if not ok:
+        return [f"разбор списков: товар не прочитался ({err})"]
+
+    form = await _creation_form(uid)
+    if not form:
+        return ["разбор списков: форма создания не прочиталась"]
+
+    words = [w for w in [await _section_word(api, ad_id)] if w]
+    words += [w for w in _title_words(values) if w not in words]
+
+    chosen = dict(extra)
+    data = {"form_resource": form.get("resource", "items"), "chosen": chosen}
+    out = [f"слова-подсказки: {words}"]
+    for attr in _select_queue(form["fields"]):
+        fld = next((f for f in form["fields"] if f["attribute"] == attr), {})
+        options = fld.get("options") or []
+        if not options:
+            options, _t = await loop.run_in_executor(
+                None, panel_sync_field_options_sync, creds["cookies"],
+                data["form_resource"], attr, dict(chosen))
+        hint = labels.get(attr)
+        src = chosen.get(attr)
+        pick, how = _pick_option(options, src, hint, words)
+        where = f"список {len(options)}"
+        if pick is None:
+            found, term = await _search_options(
+                uid, data, attr, ([hint] if hint else []) + words)
+            if found:
+                pick, how = _pick_option(found, src, hint, [term] + words)
+                where += f", поиск «{term}» → {len(found)}"
+        if pick is None and src not in (None, ""):
+            pick, how = {"value": src, "label": hint or str(src)}, \
+                "как у образца, со списком не сверился"
+        if pick is None:
+            out.append(f"{attr}: СПРОСИТ ({where}; у образца "
+                       f"номер={src!r} надпись={hint!r})")
+            continue
+        chosen[attr] = pick.get("value")
+        out.append(f"{attr}: {pick.get('value')} «{pick.get('label')}» "
+                   f"— {how} ({where})")
+    return out
+
+
+async def _my_ad_numbers(api) -> str:
+    """Номера своих объявлений — то, что просит `/copy_debug`.
+
+    Спрашивается у маркетплейса: номер объявления там и номер товара в
+    панели — одно и то же число, по нему копия и ходит. Пример с
+    выдуманным номером однажды увёл разбор на час: панель ответила 403/404,
+    и это прочиталось как поломка копии.
+    """
+    if not api:
+        return "Не настроен API-токен — номера объявлений спросить негде."
+    try:
+        raw = await api.get_ads()
+    except Exception as e:                                # noqa: BLE001
+        return f"Объявления не прочитались: {html.escape(str(e)[:200])}"
+    ads = (raw.get("data") if isinstance(raw, dict) else raw) or []
+    if not ads:
+        return "Объявлений нет — копировать нечего."
+    rows = [f"<code>{a.get('id')}</code> — {html.escape(str(a.get('title'))[:40])}"
+            for a in ads[:20]]
+    return ("Номер объявления, а потом: <code>/copy_debug НОМЕР</code>\n\n"
+            + "\n".join(rows))[:4000]

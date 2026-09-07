@@ -245,6 +245,55 @@ class ThePluginTellsTheWizardWhichSectionToUse(unittest.TestCase):
                         "широкое слово перебило бы узкое")
 
 
+class WhatDecidesWhichOptionIsTheRightOne(unittest.TestCase):
+    """Порядок доводов в `_pick_option` — не вкусовщина.
+
+    Форма создания и карточка товара — одна панель, один раздел `items` и
+    одно поле, значит и нумерация одна: номер образца сильнее всего
+    остального. Надпись — второй довод, на случай если номера в списке нет.
+    Слово — третий и самый слабый: им товар кладут не на ту полку.
+    """
+
+    def pick(self, options, value=None, label="", words=None):
+        got, how = C._pick_option(options, value, label, words or [])
+        return (None if got is None else got["value"]), how
+
+    def test_the_number_wins_over_a_label_pointing_elsewhere(self):
+        """Надпись на карточке бывает старой или иначе оформленной. Номер —
+        это то, чем товар связан с разделом на самом деле."""
+        options = [{"label": "Игры", "value": 12},
+                   {"label": "Аккаунты", "value": 30}]
+        self.assertEqual(self.pick(options, 12, "Аккаунты"),
+                         (12, "номер образца"))
+
+    def test_the_label_decides_when_the_number_is_absent(self):
+        options = [{"label": "Аккаунты", "value": 30}]
+        self.assertEqual(self.pick(options, 12, "Аккаунты"),
+                         (30, "надпись образца"))
+
+    def test_a_word_is_the_last_resort(self):
+        options = [{"label": "Standoff 2", "value": 44},
+                   {"label": "Roblox", "value": 45}]
+        self.assertEqual(self.pick(options, None, "", ["standoff"]),
+                         (44, "подобран по названию"))
+
+    def test_two_word_matches_decide_nothing(self):
+        """Раздел решает, где покупатель увидит товар."""
+        options = [{"label": "Standoff 2 GL", "value": 44},
+                   {"label": "Standoff 2 RU", "value": 45}]
+        self.assertEqual(self.pick(options, None, "", ["standoff"]),
+                         (None, ""))
+
+    def test_two_options_with_the_same_label_decide_nothing_either(self):
+        options = [{"label": "Аккаунты", "value": 30},
+                   {"label": "аккаунты", "value": 31}]
+        self.assertEqual(self.pick(options, None, "Аккаунты"), (None, ""))
+
+
+# Сколько вариантов панель отдаёт на самом деле — живой ответ 07.09.# Сколько вариантов панель отдаёт на самом деле — живой ответ 07.09.
+_PANEL_GIVES = 825
+
+
 def many(n: int) -> list[dict]:
     """Список, обрезанный панелью: ровно столько, сколько она показывает."""
     return [{"label": f"Игра {i:03d}", "value": 1000 + i} for i in range(n)]
@@ -307,12 +356,22 @@ class ACutOffListDoesNotDenyTheSectionTheItemAlreadyHas(unittest.TestCase):
         self.assertEqual(self.asked, [], "спросил то, что у товара уже стоит")
         self.assertEqual(self.created[0]["extra"], {"category": 12})
 
-    def test_a_full_list_that_denies_the_number_is_believed(self):
-        """Тот же номер, но список полон — значит номера правда нет."""
-        self.wizard(many(C._OPTIONS_SHOWN - 1), {"category": 12},
-                    {"category": "Standoff 2"})
-        self.assertEqual(self.asked, ["category"])
-        self.assertEqual(self.created, [])
+    def test_a_number_no_list_confirms_goes_out_and_says_so(self):
+        """Тупик хуже отказа. Номер взят с карточки ТОЙ ЖЕ панели, у ТОГО
+        ЖЕ товара, в том же поле того же раздела `items` — значит нумерация
+        та же. Если он не сошёлся ни со списком, ни с поиском, отправляем
+        его и говорим об этом: панель, если номер не тот, ответит отказом
+        по полю, а отказ мастер превращает в вопрос.
+
+        Выброшенный номер вопросом не становится — он становится списком из
+        сотен чужих строк, в котором нужного нет. Ровно в это копия и
+        упиралась."""
+        self.wizard(many(20), {"category": 12}, {"category": "Standoff 2"})
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.created[0]["extra"], {"category": 12})
+        self.assertTrue(
+            any("не сверился" in p for p in self.created[0]["picked"]),
+            self.created[0]["picked"])
 
     def test_it_asks_the_panel_by_name_before_giving_up(self):
         """Листать за продавца обрезок бессмысленно — нужного в нём не было.
@@ -324,6 +383,65 @@ class ACutOffListDoesNotDenyTheSectionTheItemAlreadyHas(unittest.TestCase):
         self.assertEqual(self.created[0]["extra"], {"category": 44})
         self.assertEqual(self.searched[0][0], "Standoff 2",
                          "искать надо сперва по надписи образца")
+
+    def test_a_field_the_item_never_has_takes_the_forms_own_default(self):
+        """В форме создания есть поля, которых у товара не бывает вовсе —
+        живой ответ 07.09: `has_chat`, `created_order`, `wait_order`,
+        `confirmed_order`. Спросить о них значит спросить о том, чего
+        копировать неоткуда: при обычном создании уходит то, что предлагает
+        сама форма."""
+        fields = [{"attribute": "has_chat", "label": "Чат",
+                   "options": opts("Да", "Нет"), "value": 1}]
+        state = FSM({"select_queue": ["has_chat"], "form_fields": fields,
+                     "chosen": {}, "pending": {}, "autopick": [],
+                     "source_labels": {}})
+        asyncio.run(C._ask_next_select(Msg(), state, 1))
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.created[0]["extra"], {"has_chat": 1})
+
+    def test_but_the_section_never_takes_a_default(self):
+        """Раздел решает, где покупатель увидит товар, а тип — как заказ
+        будет выдан. Тихо подставить сюда «что предлагает форма» значит
+        поставить продавца перед фактом на витрине."""
+        for attr in C._SECTION_TRIPLE:
+            with self.subTest(attr):
+                self.created.clear()
+                self.asked.clear()
+                fields = [{"attribute": attr, "label": attr,
+                           "options": opts("Первый", "Второй"), "value": 1}]
+                state = FSM({"select_queue": [attr], "form_fields": fields,
+                             "chosen": {}, "pending": {}, "autopick": [],
+                             "source_labels": {}})
+                asyncio.run(C._ask_next_select(Msg(), state, 1))
+                self.assertEqual(self.asked, [attr])
+                self.assertEqual(self.created, [])
+
+    def test_a_section_past_the_shown_part_is_still_matched(self):
+        """Живой /copy_debug 07.09: панель отдала 825 вариантов, а сверка
+        шла по первым пятистам. Триста двадцать пять разделов обрезались, и
+        «Standoff 2» — буква S — в остаток не попадал: копия не находила
+        номер, КОТОРЫЙ ПАНЕЛЬ ЖЕ И ПРИСЛАЛА.
+
+        Сверяться надо со всем, что пришло; обрезать — только показ."""
+        options = many(_PANEL_GIVES) + [{"label": "Standoff 2", "value": 44}]
+        self.wizard(options, {"category": 44}, {"category": "Standoff 2"})
+        self.assertEqual(self.asked, [], "не нашёл присланного панелью")
+        self.assertEqual(self.created[0]["extra"], {"category": 44})
+        # Именно НАШЁЛ, а не отправил не глядя: «не сверился» здесь значит,
+        # что сверка снова идёт по обрезку, просто беду прикрывает запасной
+        # ход. Отличать эти два случая и есть смысл проверки.
+        self.assertTrue(
+            any("номер образца" in p for p in self.created[0]["picked"]),
+            self.created[0]["picked"])
+
+    def test_the_shown_part_stays_bounded(self):
+        """Показ обрезается по-прежнему: восемьсот кнопок в состоянии — это
+        не выбор, а склад."""
+        options = many(_PANEL_GIVES) + [{"label": "Standoff 2", "value": 44}]
+        state = self.wizard(options, {}, {}, ["ничего не подойдёт"])
+        self.assertEqual(self.asked, ["category"])
+        self.assertLessEqual(len(state.data["current_options"]),
+                             C._OPTIONS_SHOWN)
 
     def test_a_search_that_returns_the_same_stub_does_not_break_the_number(self):
         """Панель, не понявшая слова, присылает тот же обрезок. Записанное

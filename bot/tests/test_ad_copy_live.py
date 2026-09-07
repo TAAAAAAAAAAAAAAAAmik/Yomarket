@@ -118,6 +118,11 @@ CREATION_FIELDS = [
 # /update-fields, иначе разбор увёл бы туда и форму правки.
 _DETAIL = re.compile(r"^/nova-api/[\w-]+/\d+$")
 
+# Номер товара-образца. Живая панель на чужой номер отвечает отказом, и
+# подставная обязана вести себя так же: выдуманный номер в подсказке
+# однажды увёл разбор на час.
+ITEM_ID = "219206"
+
 
 class Nova(BaseHTTPRequestHandler):
     """Панель, отвечающая как настоящая. Что приняла — складывает в `posted`."""
@@ -127,6 +132,9 @@ class Nova(BaseHTTPRequestHandler):
     refuse_always: dict | None = None
     # Обрезает ли панель список вариантов, как живая
     capped: bool = False
+    # Закрыта ли карточка записи: Nova разрешает список и карточку
+    # независимо, и «403 на карточку» ещё не значит «раздела не узнать»
+    card_closed: bool = False
 
     def log_message(self, *a):
         pass
@@ -146,6 +154,11 @@ class Nova(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if "/update-fields" in self.path:
+            # Чужой или несуществующий номер живая панель отдаёт отказом на
+            # правку и «нет такого» на карточку — не пустыми полями.
+            if not self._is_ours():
+                self._json(403, {"message": "нет доступа"})
+                return
             self._json(200, {"fields": ITEM_FIELDS})
             return
         if "/associatable/" in self.path:
@@ -157,7 +170,16 @@ class Nova(BaseHTTPRequestHandler):
             self._json(200, {"resources": self._options(attr, search)})
             return
         if _DETAIL.match(self.path.split("?")[0]):
+            if not self._is_ours() or Nova.card_closed:
+                self._json(403 if Nova.card_closed else 404,
+                           {"message": "нет доступа"})
+                return
             self._json(200, {"resource": {"fields": DETAIL_FIELDS}})
+            return
+        if self.path.split("?")[0] == "/nova-api/items":
+            # Список товаров: строка того же товара с теми же связями
+            self._json(200, {"resources": [
+                {"id": {"value": int(ITEM_ID)}, "fields": DETAIL_FIELDS}]})
             return
         if "/creation-fields" in self.path:
             # Только `items`: настоящая панель на прочие разделы отвечает
@@ -178,6 +200,12 @@ class Nova(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         self._json(404, {"message": "нет такого"})
+
+    def _is_ours(self) -> bool:
+        """Наш ли это товар — по номеру в пути."""
+        import re as _re
+        got = _re.search(r"/nova-api/[\w-]+/(\d+)", self.path)
+        return bool(got) and got.group(1) == ITEM_ID
 
     def _options(self, attr: str, search: str) -> list:
         """Варианты списка — так же обрезанно, как их отдаёт живая панель.
@@ -234,6 +262,7 @@ class Bench(unittest.TestCase):
         Nova.refuse_first = None
         Nova.refuse_always = None
         Nova.capped = False
+        Nova.card_closed = False
 
     def read(self):
         return P.panel_item_values_sync("session=1", "219206", uid=None)
@@ -465,6 +494,7 @@ class TheWholeCopyRunsEndToEnd(Bench):
         Nova.refuse_first = None
         Nova.refuse_always = None
         Nova.capped = False
+        Nova.card_closed = False
 
     def tearDown(self):
         self.storage.get_panel_creds = self._creds
@@ -927,6 +957,101 @@ class TheWholeCopyRunsEndToEnd(Bench):
             P.PANEL_URL = old
         said = cb.message.texts[-1]
         self.assertNotIn("✅ <b>Товар создан", said)
+
+
+class AClosedCardIsNotTheEndOfTheRoad(Bench):
+    """Nova разрешает просмотр списка и просмотр записи независимо. Карточка
+    может ответить 403 у товара, чей раздел прекрасно виден в списке, — и
+    копия, знающая только карточку, вставала бы на ровном месте."""
+
+    def setUp(self):
+        Nova.card_closed = True
+
+    def tearDown(self):
+        Nova.card_closed = False
+
+    def test_the_section_comes_from_the_list_instead(self):
+        ok, _v, extra, labels, _u, err = P.panel_item_values_sync(
+            "session=1", ITEM_ID, uid=None)
+        self.assertTrue(ok, err)
+        self.assertEqual(extra.get("category"), 12)
+        self.assertEqual(labels.get("subcategory"), "Standoff 2")
+
+
+class TheProbeSaysWhenTheNumberIsNotYours(Bench):
+    """Выдуманный номер в примере увёл разбор на час: панель ответила
+    403/404, и это прочиталось как поломка копии."""
+
+    def setUp(self):
+        import storage
+        self.storage = storage
+        self._creds = storage.get_panel_creds
+        storage.get_panel_creds = lambda uid: {"cookies": "session=1"}
+
+    def tearDown(self):
+        self.storage.get_panel_creds = self._creds
+
+    def probe(self, ad_id="999999"):
+        import asyncio
+        from handlers import create_ad as C
+
+        class Msg:
+            def __init__(s):
+                s.texts = []
+
+            async def edit_text(s, text, **kw):
+                s.texts.append(text)
+                return s
+
+            async def answer(s, text, **kw):
+                s.texts.append(text)
+                return s
+
+        class M:
+            text = f"/copy_debug {ad_id}"
+            from_user = type("U", (), {"id": 7})()
+
+            def __init__(s):
+                s.sent = Msg()
+
+            async def answer(s, text, **kw):
+                s.sent.texts.append(text)
+                return s.sent
+
+        m = M()
+        asyncio.run(C.copy_debug(m, None))
+        return m.sent.texts[-1]
+
+    def test_a_number_the_panel_will_not_show_is_named_as_such(self):
+        said = self.probe("999999")
+        self.assertIn("не показывает этот товар", said)
+        self.assertIn("не твой", said)
+
+    def test_a_real_number_is_not_called_someone_elses(self):
+        said = self.probe(ITEM_ID)
+        self.assertNotIn("не твой", said)
+        self.assertIn("форма создания", said)
+
+    def test_the_verdict_matches_what_the_copy_actually_does(self):
+        """Диагностика, расходящаяся с делом, хуже её отсутствия: по ней
+        принимают решения. Здесь сверяется буквально — что она написала про
+        раздел и что уехало в панель при настоящем нажатии."""
+        said = self.probe(ITEM_ID)
+        self.assertNotIn("СПРОСИТ", said, said)
+        for attr, number in (("category", "12"), ("subcategory", "44"),
+                             ("type", "2")):
+            self.assertIn(f"{attr}: {number} ", said, said)
+
+    def test_it_says_plainly_when_the_copy_will_ask(self):
+        """Молчаливое «наверное, сработает» дважды оказалось неправдой."""
+        was, DETAIL_FIELDS[:] = DETAIL_FIELDS[:], []
+        closed, Nova.card_closed = Nova.card_closed, True
+        try:
+            said = self.probe(ITEM_ID)
+            self.assertIn("СПРОСИТ", said, said)
+        finally:
+            DETAIL_FIELDS[:] = was
+            Nova.card_closed = closed
 
 
 if __name__ == "__main__":
