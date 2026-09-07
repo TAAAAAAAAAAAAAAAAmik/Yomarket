@@ -114,6 +114,7 @@ class LiveNova(BaseHTTPRequestHandler):
     # карточке (11), ни в строке списка (6). Раздел задаётся один раз при
     # создании, и больше его в панели не видно.
     section_visible: bool = True
+    refuse: bool = False
 
     def log_message(self, *a):
         pass
@@ -208,6 +209,9 @@ class LiveNova(BaseHTTPRequestHandler):
         LiveNova.posted.append({"path": self.path,
                                 "ctype": self.headers.get("Content-Type") or "",
                                 "raw": self.rfile.read(n) if n else b""})
+        if LiveNova.refuse:
+            self._json(422, {"errors": {"content": ["Ссылки запрещены."]}})
+            return
         self._json(201, {"resource": {"id": 900002}})
 
 
@@ -347,6 +351,19 @@ class Bench(unittest.TestCase):
         self._creds, self._dir = storage.get_panel_creds, storage._DATA_DIR
         self._shown = features.ad_templates_shown
         self.tmp = tempfile.TemporaryDirectory()
+        # Настройки продавца — свои на каждый тест: запомненный раздел
+        # иначе утёк бы в соседний и проверял бы не то.
+        self.marks: dict = {}
+        self._get_marks = storage.get_copy_marks
+        self._set_marks = storage.remember_copy_marks
+        self._del_marks = storage.forget_copy_marks
+        storage.get_copy_marks = lambda uid, ad: dict(
+            self.marks.get(str(ad)) or {})
+        storage.remember_copy_marks = lambda uid, ad, values, labels=None: (
+            self.marks.__setitem__(str(ad), {"values": dict(values),
+                                             "labels": dict(labels or {})}))
+        storage.forget_copy_marks = lambda uid, ad: (
+            self.marks.pop(str(ad), None) is not None)
         storage.get_panel_creds = lambda uid: {"cookies": "session=1"}
         storage._DATA_DIR = self.tmp.name
         features.ad_templates_shown = lambda uid: True
@@ -354,11 +371,15 @@ class Bench(unittest.TestCase):
         LiveNova.card_open = True
         LiveNova.list_open = True
         LiveNova.section_visible = True
+        LiveNova.refuse = False
         Api.section = "Аккаунты"
         Api.stock, Api.refills = 0, []
         Api.path = ["Игры", "Standoff 2", "Аккаунты"]
 
     def tearDown(self):
+        self.storage.get_copy_marks = self._get_marks
+        self.storage.remember_copy_marks = self._set_marks
+        self.storage.forget_copy_marks = self._del_marks
         self.storage.get_panel_creds = self._creds
         self.storage._DATA_DIR = self._dir
         self.features.ad_templates_shown = self._shown
@@ -436,7 +457,8 @@ class TheCopyAsksNothingWhenTheSampleHasTheAnswers(Bench):
         cb = self.press()
         said = cb.message.texts[-1]
         self.assertIn("Заполнено ботом", said)
-        self.assertIn("раздел: 613", said)
+        self.assertIn("раздел: Standoff 2 (613)", said,
+                      "и надпись, и номер: спор закрывают числа")
 
 
 class TheSectionIsFoundEvenWithoutTheCard(Bench):
@@ -490,6 +512,114 @@ class ThePanelShowsNoSectionAtAllAndItStillWorks(Bench):
         cb = self.press()
         asked = [t for t in cb.message.texts if "Выбери" in t]
         self.assertTrue(any("category" in t for t in asked), asked)
+
+
+class AnAnswerGivenOnceIsNotAskedAgain(Bench):
+    """Раздела у товара в панели нет нигде, и второй раз узнать его
+    неоткуда. Значит спрошенное однажды надо помнить за образцом — иначе
+    один и тот же вопрос повторяется при каждой копии одного товара.
+
+    Запоминается только после того, как панель товар ПРИНЯЛА: отказ
+    означал бы, что значения не подошли, а запомненная неправда хуже
+    вопроса — раздел после создания не меняется.
+    """
+
+    def setUp(self):
+        super().setUp()
+        LiveNova.section_visible = False
+        Api.path = []                      # раздел взять неоткуда вовсе
+
+    def answer_the_questions(self, cb):
+        """Ответить на все вопросы так, как ответил бы продавец.
+
+        Их бывает несколько подряд: ответ на раздел открывает подраздел.
+        Остановиться на первом значит не дойти до создания — а запоминается
+        выбранное только после того, как панель товар приняла.
+        """
+        fsm = self.fsm
+        for _ in range(6):
+            options = fsm.data.get("current_view") or []
+            if not fsm.data.get("current_attr") or not options:
+                break
+            want = next((i for i, o in enumerate(options)
+                         if o["label"] in ("Standoff 2", "Аккаунты",
+                                           "Мгновенная выдача")), 0)
+            pick = CB(f"cadopt:{want}")
+            pick.message = cb.message
+            asyncio.run(C.choose_select_option(pick, fsm, Api()))
+        return fsm
+
+    def test_the_first_copy_asks_and_the_answer_is_remembered(self):
+        cb = self.press()
+        self.assertIn("category", [t for t in cb.message.texts
+                                   if "Выбери" in t][0])
+        self.answer_the_questions(cb)
+        self.assertEqual(self.marks.get(ITEM, {}).get("values", {}).get(
+            "category"), 613, self.marks)
+
+    def test_and_the_name_is_remembered_with_the_number(self):
+        """Номер 613 продавцу не говорит ничего, «Standoff 2» — всё."""
+        cb = self.press()
+        self.answer_the_questions(cb)
+        self.assertEqual(self.marks[ITEM]["labels"].get("category"),
+                         "Standoff 2")
+
+    def test_a_refusal_shows_the_names_it_tried(self):
+        """Продавец решает по отказу, туда ли шёл товар. Форма к этому
+        моменту уже закрыта, и надписи надо снять раньше — иначе на экране
+        голые номера."""
+        LiveNova.refuse = True
+        cb = self.press()
+        self.answer_the_questions(cb)
+        self.assertIn("Standoff 2", cb.message.texts[-1])
+
+    def test_a_refusal_remembers_nothing(self):
+        """Значения не подошли — запомненная неправда хуже вопроса."""
+        was, LiveNova.refuse = getattr(LiveNova, "refuse", False), True
+        try:
+            cb = self.press()
+            self.answer_the_questions(cb)
+            self.assertEqual(self.marks, {}, self.marks)
+        finally:
+            LiveNova.refuse = was
+
+    def test_the_second_copy_does_not_ask_the_same_thing(self):
+        """Ради этого всё и делалось."""
+        self.marks[ITEM] = {"values": {"category": 613, "subcategory": 3,
+                                       "type": 1},
+                            "labels": {"category": "Standoff 2"}}
+        cb = self.press()
+        self.assertEqual([t for t in cb.message.texts if "Выбери" in t], [])
+        self.assertEqual(str(self.created().get("category")), "613")
+
+    def test_the_report_names_the_section_not_its_number(self):
+        self.marks[ITEM] = {"values": {"category": 613, "subcategory": 3,
+                                       "type": 1},
+                            "labels": {"category": "Standoff 2"}}
+        cb = self.press()
+        self.assertIn("раздел: Standoff 2", cb.message.texts[-1])
+
+    def test_the_seller_can_take_the_answer_back(self):
+        """Ошибиться разделом можно один раз: панель менять его не даёт."""
+        self.marks[ITEM] = {"values": {"category": 613}, "labels": {}}
+        cb = CB(f"create_ad:forget:{ITEM}")
+        asyncio.run(C.forget_marks(cb))
+        self.assertEqual(self.marks, {})
+        self.assertTrue(cb.alerts)
+
+    def test_what_the_panel_shows_beats_what_we_remember(self):
+        """Прочитанное у панели свежее запомненного.
+
+        Запомненный номер взят НАСТОЯЩИЙ, из того же списка: иначе сверка
+        отвергла бы его сама, и проверка проходила бы при любом порядке —
+        то есть не проверяла бы ничего."""
+        LiveNova.section_visible = True
+        other = CATEGORY_OPTIONS[0]
+        self.assertNotEqual(other["value"], 613)
+        self.marks[ITEM] = {"values": {"category": other["value"]},
+                            "labels": {"category": other["display"]}}
+        self.press()
+        self.assertEqual(str(self.created().get("category")), "613")
 
 
 class WithNoSourceAtAllItAsksOnlyWhatItCannotKnow(Bench):

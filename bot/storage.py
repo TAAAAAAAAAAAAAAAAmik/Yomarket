@@ -590,6 +590,70 @@ def save_settings(user_id: int, settings: dict) -> None:
     _save_all_settings(all_settings)
 
 
+# Сколько образцов помнить. Раздел у каждого свой, и список растёт с
+# каждым новым товаром: без потолка настройки продавца пухнут молча.
+_COPY_MARKS_KEEP = 60
+
+
+def get_copy_marks(user_id: int, ad_id) -> dict:
+    """Раздел, подраздел и тип выдачи, выбранные для ЭТОГО образца раньше.
+
+    Раздела у товара в панели нет нигде — она задаёт его при создании и
+    больше не показывает. Значит второй раз узнать его неоткуда, и
+    спрашивать пришлось бы при каждой копии одного и того же товара.
+    Спрошенное один раз запоминается за ним навсегда.
+
+    → {"values": {атрибут: номер}, "labels": {атрибут: надпись}}; пусто —
+    не спрашивали ещё.
+    """
+    marks = (get_settings(user_id).get("copy_marks") or {}).get(str(ad_id))
+    if not isinstance(marks, dict):
+        return {}
+    return {"values": dict(marks.get("values") or {}),
+            "labels": dict(marks.get("labels") or {})}
+
+
+def remember_copy_marks(user_id: int, ad_id, values: dict,
+                        labels: dict | None = None) -> None:
+    """Запомнить выбранное за образцом. Пустое не запоминается.
+
+    Зовётся ТОЛЬКО после того, как панель товар приняла: отказ означает,
+    что значения не подошли, а запомненная неправда хуже вопроса — раздел
+    после создания не меняется, и товар остался бы лежать не там.
+    """
+    values = {k: v for k, v in (values or {}).items() if v not in (None, "")}
+    if not values or not ad_id:
+        return
+    settings = get_settings(user_id)
+    marks = dict(settings.get("copy_marks") or {})
+    marks[str(ad_id)] = {"values": values,
+                         "labels": {k: str(v) for k, v in (labels or {}).items()
+                                    if k in values and v}}
+    # Свежие важнее: помним последние, остальное вытесняется.
+    if len(marks) > _COPY_MARKS_KEEP:
+        for extra_key in list(marks)[:len(marks) - _COPY_MARKS_KEEP]:
+            marks.pop(extra_key, None)
+    settings["copy_marks"] = marks
+    save_settings(user_id, settings)
+
+
+def forget_copy_marks(user_id: int, ad_id) -> bool:
+    """Забыть выбранное за образцом. → было ли что забывать.
+
+    Ошибиться разделом можно только один раз — панель менять его не даёт,
+    и товар придётся заводить заново. Значит забыть ответ продавец обязан
+    иметь возможность сам, а не через поддержку.
+    """
+    settings = get_settings(user_id)
+    marks = dict(settings.get("copy_marks") or {})
+    if str(ad_id) not in marks:
+        return False
+    marks.pop(str(ad_id), None)
+    settings["copy_marks"] = marks
+    save_settings(user_id, settings)
+    return True
+
+
 def get_all_users() -> list[int]:
     return [int(uid) for uid in _load().keys()]
 

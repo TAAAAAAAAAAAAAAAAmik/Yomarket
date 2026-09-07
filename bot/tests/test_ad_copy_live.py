@@ -489,6 +489,12 @@ class TheWholeCopyRunsEndToEnd(Bench):
         self.tmp = tempfile.TemporaryDirectory()
         storage.get_panel_creds = lambda uid: {"cookies": "session=1"}
         storage._DATA_DIR = self.tmp.name
+        # Настройки — тоже во временный каталог. Копия запоминает раздел за
+        # образцом, и без этого запомненное доживало бы до соседнего теста и
+        # меняло его исход — молча и в зависимости от порядка.
+        self._blob = storage._BLOBS["settings"]
+        storage._BLOBS["settings"] = os.path.join(self.tmp.name,
+                                                  "settings.json")
         features.ad_templates_shown = lambda uid: True
         Nova.posted = []
         Nova.refuse_first = None
@@ -499,6 +505,7 @@ class TheWholeCopyRunsEndToEnd(Bench):
     def tearDown(self):
         self.storage.get_panel_creds = self._creds
         self.storage._DATA_DIR = self._dir
+        self.storage._BLOBS["settings"] = self._blob
         self.features.ad_templates_shown = self._shown
         self.tmp.cleanup()
 
@@ -794,9 +801,10 @@ class TheWholeCopyRunsEndToEnd(Bench):
         cb = self.press()
         said = cb.message.texts[-1]
         self.assertIn("Заполнено ботом", said)
-        self.assertIn("раздел: 12", said)
-        self.assertIn("подраздел: 44", said)
-        self.assertIn("тип выдачи: 2", said)
+        # И надпись, и номер: продавцу нужна первая, спор закрывает второй.
+        self.assertIn("раздел: Аккаунты (12)", said)
+        self.assertIn("подраздел: Standoff 2 (44)", said)
+        self.assertIn("тип выдачи: Мгновенная выдача (2)", said)
         self.assertIn("полей раздела: 2", said)
 
     def test_the_refusal_shows_it_too(self):
@@ -808,7 +816,7 @@ class TheWholeCopyRunsEndToEnd(Bench):
             Nova.refuse_always = None
         said = cb.message.texts[-1]
         self.assertIn("Заполнено ботом", said)
-        self.assertIn("раздел: 12", said)
+        self.assertIn("раздел: Аккаунты (12)", said)
 
     def test_the_section_travels_though_the_edit_form_hides_it(self):
         """Живая поломка 03.09: раздела нет в форме ПРАВКИ — панель его

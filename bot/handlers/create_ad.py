@@ -946,8 +946,13 @@ async def _ask_next_select(msg, state: FSMContext, uid: int,
         chosen[attr] = guess.get("value")
         notes = list(data.get("autopicked") or [])
         notes.append(f"{label}: {guess.get('label')} ({took})")
+        # Надпись — рядом с номером: по ней продавец узнаёт раздел в
+        # отчёте, и её же запоминаем за образцом. Номер ему ничего не
+        # говорит, а «Standoff 2» говорит всё.
+        names = dict(data.get("chosen_labels") or {})
+        names[attr] = str(guess.get("label") or "")
         await state.update_data(chosen=chosen, autopicked=notes,
-                                select_queue=queue[1:])
+                                chosen_labels=names, select_queue=queue[1:])
         await _ask_next_select(msg, state, uid, api)
         return
 
@@ -1119,9 +1124,11 @@ async def choose_select_option(callback: CallbackQuery, state: FSMContext,
         return
     chosen = data.get("chosen") or {}
     chosen[attr] = options[idx].get("value")
+    names = dict(data.get("chosen_labels") or {})
+    names[attr] = str(options[idx].get("label") or "")
     await state.update_data(
-        chosen=chosen, current_attr=None, current_options=[],
-        current_view=[], current_page=0,
+        chosen=chosen, chosen_labels=names, current_attr=None,
+        current_options=[], current_view=[], current_page=0,
     )
     await callback.answer(f"✅ {str(options[idx].get('label',''))[:30]}")
     await _ask_next_select(callback.message, state, callback.from_user.id,
@@ -1144,7 +1151,37 @@ def _title_words(values: dict) -> list[str]:
     return sorted(dict.fromkeys(words), key=len, reverse=True)[:8]
 
 
-def _carried_note(extra: dict | None) -> str:
+async def _remember_selects(uid: int, state, extra: dict | None) -> dict:
+    """Запомнить раздел, подраздел и тип за образцом. → что запомнили.
+
+    Зовётся только после того, как панель товар ПРИНЯЛА. Запоминается
+    ровно тройка: остальное у товара читается заново каждый раз, а эти три
+    поля панель после создания не показывает вовсе.
+    """
+    out: dict = {"labels": {}, "source": ""}
+    if state is None:
+        return out
+    try:
+        data = await state.get_data()
+    except Exception:                                     # noqa: BLE001
+        return out
+    out["labels"] = dict(data.get("chosen_labels") or {})
+    source = str(data.get("copy_source_id") or "")
+    if not source:
+        return out                     # обычное создание мастером — не копия
+    out["source"] = source
+    picked = {k: v for k, v in (extra or {}).items() if k in _SECTION_TRIPLE}
+    if not picked:
+        return out
+    try:
+        from storage import remember_copy_marks
+        remember_copy_marks(uid, source, picked, out["labels"])
+    except Exception as e:                                # noqa: BLE001
+        logger.info("раздел образца %s не запомнился: %s", source, e)
+    return out
+
+
+def _carried_note(extra: dict | None, labels: dict | None = None) -> str:
     """Строка «что бот заполнил сам» — числами, а не обещанием.
 
     Продавец трижды прочитал перечень полей ФОРМЫ панели как список того,
@@ -1156,8 +1193,14 @@ def _carried_note(extra: dict | None) -> str:
         return ""
     names = {"category": "раздел", "subcategory": "подраздел",
              "type": "тип выдачи"}
-    rows = [f"{names[k]}: {extra[k]}" for k in ("category", "subcategory",
-                                                "type") if extra.get(k)]
+    # Надпись И номер. Номер здесь не украшение: продавец трижды прочитал
+    # перечень полей формы как список того, что он должен заполнить сам, и
+    # спор закрывают именно числа. А «Standoff 2» рядом с числом отвечает
+    # на второй вопрос — туда ли ляжет товар.
+    labels = labels or {}
+    rows = [f"{names[k]}: {labels[k]} ({extra[k]})" if labels.get(k)
+            else f"{names[k]}: {extra[k]}"
+            for k in ("category", "subcategory", "type") if extra.get(k)]
     filters = sum(1 for k in extra if k.lower().startswith("filter__"))
     if filters:
         rows.append(f"полей раздела: {filters}")
@@ -1435,6 +1478,14 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
         )
 
     if ok:
+        # Запоминаем выбранное — ТОЛЬКО теперь, когда панель товар приняла.
+        # Отказ означал бы, что значения не подошли, а запомненная неправда
+        # хуже вопроса: раздел после создания не меняется, и товар остался
+        # бы лежать не там.
+        #
+        # И ДО закрытия формы: закрытая — это пустое состояние, а раздел,
+        # надписи и номер образца лежат именно в нём.
+        names = await _remember_selects(uid, state, extra)
         # Форма отработала — закрываем её. Брошенный экран ловит любое
         # следующее сообщение, включая команду: так молча не работали
         # `/chat_debug` и `/withdraw_debug`.
@@ -1496,6 +1547,11 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
             b.button(text="🚀 На модерацию",
                      callback_data=f"cadpub:{item_id}")
         b.button(text="➕ Добавить ещё", callback_data="create_ad:start")
+        if names.get("source"):
+            # Ошибиться разделом можно один раз: панель менять его не даёт.
+            # Значит забыть ответ продавец должен уметь сам.
+            b.button(text="✏️ Раздел не тот",
+                     callback_data=f"create_ad:forget:{names['source']}")
         b.button(text="📦 Мои товары", callback_data="menu:ads")
         ui.lay(b)
         await _edit_safely(
@@ -1504,7 +1560,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
             f"📝 {html.escape(str(values['title']))}\n"            f"💰 {values['price']} ₽"
             f"{chr(10) + '🆔 ' + item_id if item_id else ''}"
             f"{_picked_note(picked)}"
-            + _carried_note(extra)
+            + _carried_note(extra, names.get("labels"))
             + (("\n✂️ Из описания убрано: "
                 + ", ".join(f"«{html.escape(w)}»" for w in cleaned)
                 + " — панель это слово не принимает.") if cleaned else "")
@@ -1550,6 +1606,10 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
     # в форме заранее не объявлена (`Обязательные: []`), поэтому узнать про
     # такое поле можно только отсюда. Один раз: если и со спрошенным полем
     # отказ повторится, продавец получит отчёт, а не круг вопросов.
+    # Надписи разделов — ДО закрытия формы: закрытая это пустое состояние,
+    # и отказ показывал бы голые номера там, где продавец как раз и решает,
+    # туда ли шёл товар. Запоминать при этом нечего: панель товар не приняла.
+    seen_names = (await state.get_data()).get("chosen_labels") if state else {}
     if state is not None:
         asked = await _ask_for_refused_fields(msg, uid, values, extra, picked,
                                               state, result_msg, api)
@@ -1594,7 +1654,8 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
     header = ("⚠️ <b>Панель не приняла товар</b>" if why or is_found
               else "❌ <b>Не удалось создать товар</b>")
 
-    parts = [f"{header}{_picked_note(picked)}{_carried_note(extra)}"]
+    parts = [f"{header}{_picked_note(picked)}"
+             f"{_carried_note(extra, seen_names)}"]
     if why:
         parts.append("")
         parts.append(html.escape(why))
@@ -2056,12 +2117,24 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
             reply_markup=b.as_markup())
         return
 
+    # Раздел, подраздел и тип, выбранные для этого образца раньше. Раздела
+    # у товара в панели нет нигде — узнать его второй раз неоткуда, и без
+    # памяти продавца спрашивали бы при каждой копии одного и того же
+    # товара. Прочитанное у панели важнее запомненного: оно свежее.
+    from storage import get_copy_marks
+
+    marks = get_copy_marks(uid, ad_id)
+    chosen = {**marks.get("values", {}), **extra}
+    hints = {**marks.get("labels", {}), **labels}
+
     # Состояние живое: отказ по недостающему полю станет вопросом, а не
     # тупиком, и после ответа товар уйдёт заново — с той же картинкой.
     await state.set_state(CreateAdState.panel_select)
-    await state.update_data(pending=values, chosen=dict(extra),
+    await state.update_data(pending=values, chosen=chosen,
                             select_queue=[], autopick=words,
-                            source_labels=dict(labels))
+                            source_labels=hints,
+                            chosen_labels=dict(marks.get("labels") or {}),
+                            copy_source_id=str(ad_id))
 
     # Сверка идёт по живой форме панели, а это ещё пара запросов: без
     # строки о ней экран стоял бы «Читаю товар» и выглядел бы зависшим.
@@ -2079,7 +2152,7 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
         return
 
     # Формы нет — создаём напрямую, панель сама скажет, чего не хватает.
-    await _panel_create_and_report(callback.message, uid, values, extra=extra,
+    await _panel_create_and_report(callback.message, uid, values, extra=chosen,
                                    state=state, api=api)
 
 
@@ -2121,6 +2194,32 @@ def _select_queue(fields: list) -> list:
     ]
     return queue
 
+
+
+@router.callback_query(F.data.startswith("create_ad:forget:"))
+async def forget_marks(callback: CallbackQuery) -> None:
+    """Забыть раздел, запомненный за образцом.
+
+    Ошибиться разделом можно ровно один раз: панель менять его после
+    создания не даёт, и товар придётся заводить заново. Значит отменить
+    свой же ответ продавец должен уметь сам — иначе одна ошибка
+    закрепляется за товаром навсегда.
+    """
+    from features import ad_templates_shown
+    from storage import forget_copy_marks
+
+    uid = callback.from_user.id
+    if not ad_templates_shown(uid):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    ad_id = callback.data.split(":", 2)[2]
+    if forget_copy_marks(uid, ad_id):
+        await callback.answer(
+            "Забыл. При следующей копии этого товара спрошу раздел заново.",
+            show_alert=True)
+    else:
+        await callback.answer("За этим товаром ничего и не помнилось",
+                              show_alert=True)
 
 
 @router.message(Command("copy_debug"))
