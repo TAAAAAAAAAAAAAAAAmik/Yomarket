@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import sys
 import threading
@@ -30,10 +31,12 @@ os.environ.setdefault("BOT_TOKEN", "x")
 
 from automation import panel as P                          # noqa: E402
 
-# Товар-образец: ровно та форма, в которой Nova отдаёт update-fields.
-# Раздел и подраздел — BelongsTo: выбранное в `belongsToId`, а в `value`
-# лежит НАДПИСЬ. Отправленная надпись и есть та поломка, из-за которой
-# копия падала с 422.
+# Товар-образец в форме ПРАВКИ — ровно так, как её отдаёт живая панель.
+# Раздела, подраздела, типа и `filter__N` здесь НЕТ: панель их показывает,
+# но менять после создания не даёт. Копия, читавшая только эту форму,
+# уходила без раздела — и получала «Поле Категория обязательно» на товаре,
+# у которого раздел есть. Подставная панель отдавала их и здесь, поэтому
+# проверки проходили, а живая копия ломалась.
 ITEM_FIELDS = [
     {"attribute": "id", "value": 219206},
     # Поля, которых при СОЗДАНИИ нет вовсе: у товара они есть, а форма
@@ -47,6 +50,22 @@ ITEM_FIELDS = [
     # Живой отказ 02.09: копия читала ноль и вставала.
     {"attribute": "content", "value": "Аккаунт с внутриигровой валютой."},
     {"attribute": "quantity", "value": 3},
+    {"attribute": "images", "component": "advanced-media-library-field",
+     "value": [{"original_url": "http://ЗАМЕНА/media/photo.jpg"}]},
+    {"attribute": "created_at", "value": "2026-08-01 10:00:00"},
+    {"attribute": "slug", "value": "akkaunt-standoff-2"},
+]
+
+# Карточка товара — второй ответ панели, и единственное место, где раздел
+# виден. Он BelongsTo: выбранное в `belongsToId`, а в `value` НАДПИСЬ.
+# Отправленная надпись и есть та поломка, из-за которой копия падала с 422.
+DETAIL_FIELDS = [
+    {"attribute": "id", "value": 219206},
+    {"attribute": "title", "value": "Аккаунт Standoff 2 с виртами"},
+    # Цена на карточке уже оформлена — числа из такой строки не достать.
+    # Поэтому карточка отдаёт только поля раздела, а цену берут у
+    # маркетплейса: прочитанная отсюда, она сорвала бы копию.
+    {"attribute": "price", "value": "1 490 ₽"},
     {"attribute": "category", "value": {"display": "Аккаунты"},
      "belongsToId": 12, "relationshipType": "belongsTo",
      "component": "belongs-to-field"},
@@ -58,11 +77,23 @@ ITEM_FIELDS = [
      "component": "belongs-to-field"},
     {"attribute": "filter__8", "value": "Россия"},
     {"attribute": "filter__3", "value": 7},
-    {"attribute": "images", "component": "advanced-media-library-field",
-     "value": [{"original_url": "http://ЗАМЕНА/media/photo.jpg"}]},
-    {"attribute": "created_at", "value": "2026-08-01 10:00:00"},
-    {"attribute": "slug", "value": "akkaunt-standoff-2"},
 ]
+
+# Варианты списков — то, чем панель отвечает мастеру на «покажи разделы».
+# Копия сверяет с ними готовые номера: отправленный непроверенным, чужой
+# номер положил бы товар в чужой раздел молча.
+ASSOCIATABLE = {
+    "category": [{"value": 12, "display": "Аккаунты"},
+                 {"value": 13, "display": "Ключи"}],
+    "subcategory": [{"value": 44, "display": "Standoff 2"},
+                    {"value": 45, "display": "Roblox"},
+                    # Название, которого нет ни в заголовке товара, ни в
+                    # разделе с маркетплейса: найти его можно ТОЛЬКО по
+                    # надписи, снятой у образца.
+                    {"value": 46, "display": "Игровые ценности"}],
+    "type": [{"value": 2, "display": "Мгновенная выдача"},
+             {"value": 3, "display": "Ручная выдача"}],
+}
 
 # Форма СОЗДАНИЯ. Фильтры в ней есть — на этом построен весь разбор
 # отказов: «filter__8: Поле Регион обязательно» мастер ищет именно здесь и
@@ -80,6 +111,11 @@ CREATION_FIELDS = [
     {"attribute": "filter__3", "rules": []},
     {"attribute": "images", "rules": []},
 ]
+
+
+# Карточка записи: /nova-api/items/219206 — без хвостов вроде
+# /update-fields, иначе разбор увёл бы туда и форму правки.
+_DETAIL = re.compile(r"^/nova-api/[\w-]+/\d+$")
 
 
 class Nova(BaseHTTPRequestHandler):
@@ -108,6 +144,14 @@ class Nova(BaseHTTPRequestHandler):
             return
         if "/update-fields" in self.path:
             self._json(200, {"fields": ITEM_FIELDS})
+            return
+        if "/associatable/" in self.path:
+            attr = self.path.split("/associatable/")[1].split("?")[0]
+            rows = ASSOCIATABLE.get(attr)
+            self._json(200, {"resources": rows} if rows else {"resources": []})
+            return
+        if _DETAIL.match(self.path.split("?")[0]):
+            self._json(200, {"resource": {"fields": DETAIL_FIELDS}})
             return
         if "/creation-fields" in self.path:
             # Только `items`: настоящая панель на прочие разделы отвечает
@@ -205,7 +249,7 @@ def _parse_body(row: dict) -> dict:
 class TheSourceItemIsReadAsCreationExpectsIt(Bench):
 
     def test_the_plain_fields_come_back(self):
-        ok, values, _extra, _url, err = self.read()
+        ok, values, _extra, _labels, _url, err = self.read()
         self.assertTrue(ok, err)
         self.assertEqual(values["title"], "Аккаунт Standoff 2 с виртами")
         self.assertEqual(values["description"],
@@ -216,13 +260,13 @@ class TheSourceItemIsReadAsCreationExpectsIt(Bench):
         """У товара в панели поля цены НЕТ. Ноль по умолчанию уехал бы на
         витрину ценой; `None` означает «поля не было», и вызывающий берёт
         цену из второго источника."""
-        _ok, values, _extra, _url, _err = self.read()
+        _ok, values, _extra, _labels, _url, _err = self.read()
         self.assertIsNone(values["price"])
 
     def test_the_section_is_a_number_not_a_label(self):
         """`str(value)` отправил бы «Аккаунты» — и панель ответила бы 422
         по полю `category`. Живой отказ, из-за которого всё и переделано."""
-        _ok, values, extra, _url, _err = self.read()
+        _ok, values, extra, _labels, _url, _err = self.read()
         self.assertEqual(extra["category"], 12)
         self.assertEqual(extra["subcategory"], 44)
         self.assertEqual(values["category"], 12)
@@ -230,20 +274,20 @@ class TheSourceItemIsReadAsCreationExpectsIt(Bench):
     def test_every_filter_comes_along(self):
         """Какие из них обязательны, зависит от раздела, и форма создания
         об этом молчит — перечислить поимённо нельзя."""
-        _ok, _values, extra, _url, _err = self.read()
+        _ok, _values, extra, _labels, _url, _err = self.read()
         self.assertEqual(extra["filter__8"], "Россия")
         self.assertEqual(extra["filter__3"], 7)
 
     def test_the_items_own_fields_stay_behind(self):
         """`id` исходного товара в теле создания — это попытка создать
         товар с чужим номером."""
-        _ok, _values, extra, _url, _err = self.read()
+        _ok, _values, extra, _labels, _url, _err = self.read()
         for own in ("id", "created_at", "slug"):
             with self.subTest(own):
                 self.assertNotIn(own, extra)
 
     def test_the_picture_address_is_found(self):
-        _ok, _values, _extra, url, _err = self.read()
+        _ok, _values, _extra, _labels, url, _err = self.read()
         self.assertTrue(url.endswith("/media/photo.jpg"), url)
 
     def test_a_relative_picture_address_still_works(self):
@@ -255,7 +299,7 @@ class TheSourceItemIsReadAsCreationExpectsIt(Bench):
                 was = f["value"]
                 f["value"] = [{"original_url": "/media/photo.jpg"}]
                 try:
-                    _ok, _v, _e, url, _err = self.read()
+                    _ok, _v, _e, _l, url, _err = self.read()
                     self.assertTrue(url.startswith(self.base), url)
                     data = P.panel_fetch_image_sync("session=1", url)
                     self.assertTrue(data.startswith(b"\xff\xd8"))
@@ -265,7 +309,7 @@ class TheSourceItemIsReadAsCreationExpectsIt(Bench):
         self.fail("в образце нет картинки")
 
     def test_the_picture_downloads(self):
-        _ok, _v, _e, url, _err = self.read()
+        _ok, _v, _e, _l, url, _err = self.read()
         data = P.panel_fetch_image_sync("session=1", url)
         self.assertTrue(data.startswith(b"\xff\xd8"), "это не картинка")
 
@@ -274,7 +318,7 @@ class TheSourceItemIsReadAsCreationExpectsIt(Bench):
         old = ITEM_FIELDS[:]
         try:
             ITEM_FIELDS.clear()
-            ok, _v, _e, _u, err = self.read()
+            ok, _v, _e, _l, _u, err = self.read()
             self.assertFalse(ok)
             self.assertTrue(err)
         finally:
@@ -286,7 +330,7 @@ class TheCopyGoesOutAsARealCreation(Bench):
     отказ по полю он умеет превращать в вопрос."""
 
     def make(self, photo=True):
-        _ok, values, extra, url, _err = self.read()
+        _ok, values, extra, _labels, url, _err = self.read()
         path = ""
         if photo:
             import tempfile
@@ -554,7 +598,7 @@ class TheWholeCopyRunsEndToEnd(Bench):
         """Бесплатный товар на витрине хуже несозданной копии."""
         import asyncio
         from handlers import create_ad as C
-        values, _extra, why = asyncio.run(
+        values, _extra, _labels, _words, why = asyncio.run(
             C._copy_source_values(7, "219206", None))
         self.assertEqual(values, {})
         self.assertIn("бесплатной", why)
@@ -712,24 +756,80 @@ class TheWholeCopyRunsEndToEnd(Bench):
         self.assertIn("Заполнено ботом", said)
         self.assertIn("раздел: 12", said)
 
-    def test_an_unreadable_section_stops_before_sending(self):
-        """Молча пропущенный раздел превращается в отказ «Поле Категория
-        обязательно» — и выглядит так, будто бот просит его заполнить."""
-        for f in ITEM_FIELDS:
-            if f["attribute"] == "category":
+    def test_the_section_travels_though_the_edit_form_hides_it(self):
+        """Живая поломка 03.09: раздела нет в форме ПРАВКИ — панель его
+        показывает, но менять не даёт. Копия, читавшая только эту форму,
+        уходила без раздела, и панель отвечала «Поле Категория обязательно»
+        на товаре, у которого раздел есть."""
+        self.assertFalse(
+            [f for f in ITEM_FIELDS if f["attribute"] == "category"],
+            "форма правки не должна знать раздела — иначе проверка мнимая")
+        self.press()
+        self.assertEqual(str(self.created_body().get("category")), "12")
+
+    def test_a_section_known_only_by_name_is_found_in_the_form(self):
+        """Номера у панели и у маркетплейса совпадать не обязаны, а надпись
+        совпадёт. Взята она нарочно такая, какой нет ни в названии товара,
+        ни в разделе с маркетплейса: подбор по словам её не найдёт, и
+        проверяется именно сверка по надписи образца."""
+        for f in DETAIL_FIELDS:
+            if f["attribute"] == "subcategory":
                 was = dict(f)
                 f.pop("belongsToId", None)
-                f["value"] = {"display": "Аккаунты"}
+                f["value"] = {"display": "Игровые ценности"}
                 try:
-                    ok, _v, _e, _u, err = self.read()
-                    self.assertFalse(ok, "ушёл бы товар без раздела")
-                    self.assertIn("раздел", err.lower())
-                    self.assertIn("Аккаунты", err, "не сказал, что пришло")
+                    self.press()
+                    self.assertEqual(
+                        str(self.created_body().get("subcategory")), "46")
                 finally:
                     f.clear()
                     f.update(was)
                 return
-        self.fail("в образце нет раздела")
+        self.fail("в карточке образца нет подраздела")
+
+    def test_a_number_the_form_does_not_know_never_goes_out(self):
+        """Отправленный на веру чужой номер положит товар в чужой раздел —
+        и узнается это по отсутствию продаж, а не по отказу панели."""
+        for f in DETAIL_FIELDS:
+            if f["attribute"] == "subcategory":
+                was = dict(f)
+                f["belongsToId"] = 999
+                f["value"] = {"display": "Раздела с таким именем нет"}
+                try:
+                    self.press()
+                    self.assertNotEqual(
+                        str(self.created_body().get("subcategory")), "999")
+                finally:
+                    f.clear()
+                    f.update(was)
+                return
+        self.fail("в карточке образца нет подраздела")
+
+    def test_nothing_is_asked_when_the_sample_has_the_answers(self):
+        """Ради этого копию и делали. Продавец трижды спрашивал, почему он
+        должен заполнять раздел, подраздел и тип у товара, с которого
+        копируют: ответы на все три у образца есть."""
+        cb = self.press()
+        asked = [t for t in cb.message.texts if "Выбери" in t]
+        self.assertEqual(asked, [], "спросил то, что стояло у образца")
+        self.assertIn("создан", cb.message.texts[-1].lower())
+
+    def test_a_card_the_panel_will_not_show_is_not_a_dead_end(self):
+        """Версия 03.09 отказывалась копировать, не найдя раздела: «у
+        товара в панели нет раздела — заведи мастером». Раздел у товара
+        был, читали не там, и заслон превратил починимую беду в тупик.
+
+        Без карточки бот берёт, что может — название раздела с
+        маркетплейса, слова названия, — и спрашивает лишь остальное."""
+        was, DETAIL_FIELDS[:] = DETAIL_FIELDS[:], []
+        try:
+            cb = self.press()
+        finally:
+            DETAIL_FIELDS[:] = was
+        said = cb.message.texts[-1]
+        self.assertNotIn("не создалась", said)
+        self.assertNotIn("прочитать не вышло", said)
+        self.assertIn("Выбери", said, "должен спросить, а не отказать")
 
     def test_a_dead_panel_does_not_report_success(self):
         old = P.PANEL_URL

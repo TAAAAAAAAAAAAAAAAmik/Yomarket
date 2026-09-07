@@ -735,6 +735,30 @@ def _autopick_match(options: list, words) -> dict | None:
     return None
 
 
+def _source_match(options: list, value, label: str) -> dict | None:
+    """Вариант списка, соответствующий тому, что стояло у образца.
+
+    Сначала по номеру: форма создания и карточка товара — одна панель, и
+    номера в них обычно те же. Не нашёлся номер — по надписи: раздел
+    «Аккаунты» называется одинаково, каким бы номером он ни был. Не нашлось
+    ни то ни другое — None, и тогда решает подбор по словам.
+
+    Молча отправить непроверенный номер нельзя: товар ляжет в чужой раздел,
+    и узнается это по отсутствию продаж, а не по отказу.
+    """
+    if value not in (None, ""):
+        for o in options:
+            if str(o.get("value")) == str(value):
+                return o
+    want = str(label or "").strip().lower()
+    if want:
+        same = [o for o in options
+                if str(o.get("label", "")).strip().lower() == want]
+        if len(same) == 1:
+            return same[0]
+    return None
+
+
 async def _ask_next_select(msg, state: FSMContext, uid: int,
                            api=None) -> None:
     """Спросить следующее обязательное поле-список — или уже создать товар.
@@ -779,6 +803,13 @@ async def _ask_next_select(msg, state: FSMContext, uid: int,
             options, trace = [], f"ошибка: {str(e)[:60]}"
 
     if not options:
+        # У копии ответ уже есть — взятый у образца, из этой же панели.
+        # Сверить его не с чем, но отправить лучше, чем упереться в тупик:
+        # без раздела панель товар не примет вовсе.
+        if chosen.get(attr) not in (None, ""):
+            await state.update_data(select_queue=queue[1:])
+            await _ask_next_select(msg, state, uid, api)
+            return
         # Обязательное поле без вариантов — это тупик, показываем диагностику
         if f.get("required") or attr in ("category", "subcategory", "type"):
             await state.clear()
@@ -808,11 +839,25 @@ async def _ask_next_select(msg, state: FSMContext, uid: int,
     # ровно один вариант. Выбранное записывается и показывается продавцу:
     # молча решить за него, где будет лежать товар, значит поставить его
     # перед фактом на витрине.
-    guess = _autopick_match(options, data.get("autopick") or [])
+    # Взятое у образца проверяется по списку формы, а не отправляется на
+    # веру: номера у панели и у маркетплейса совпадать не обязаны, а
+    # отправленный чужой номер положит товар в чужой раздел молча.
+    guess = _source_match(options, chosen.get(attr),
+                          (data.get("source_labels") or {}).get(attr))
+    took = "как у образца"
+    if guess is None:
+        # Своего ответа нет — пробуем подобрать по словам: названию раздела
+        # с маркетплейса и словам названия товара.
+        guess = _autopick_match(options, data.get("autopick") or [])
+        took = "подобран"
+        if guess is None and attr in chosen:
+            # Не сверилось и не подобралось — чужой номер не отправляем.
+            chosen.pop(attr, None)
+            await state.update_data(chosen=chosen)
     if guess is not None:
         chosen[attr] = guess.get("value")
         notes = list(data.get("autopicked") or [])
-        notes.append(f"{label}: {guess.get('label')}")
+        notes.append(f"{label}: {guess.get('label')} ({took})")
         await state.update_data(chosen=chosen, autopicked=notes,
                                 select_queue=queue[1:])
         await _ask_next_select(msg, state, uid, api)
@@ -1738,14 +1783,39 @@ async def _stock_from_api(api, ad_id: str):
         return None
 
 
+async def _section_word(api, ad_id: str) -> str:
+    """Название раздела товара по данным маркетплейса.
+
+    Третий источник раздела, и самый устойчивый: у объявления в Integration
+    API есть `category_id`, и по нему маркетплейс называет раздел словом.
+    Номера у панели и у маркетплейса могут не совпасть, а слово совпадёт —
+    по нему бот и находит нужную строку в форме создания.
+    """
+    card = await _ad_card(api, ad_id)
+    cid = card.get("category_id")
+    if cid in (None, "", 0) or not api:
+        return ""
+    try:
+        return str(await api.resolve_category(cid) or "")
+    except Exception as e:                                # noqa: BLE001
+        logger.info("раздел %s не назвался: %s", cid, e)
+        return ""
+
+
 async def _copy_source_values(uid: int, ad_id: str,
-                              api=None) -> tuple[dict, dict, str]:
-    """Значения исходного товара для нового. → (values, extra, причина).
+                              api=None) -> tuple[dict, dict, dict, list, str]:
+    """Значения исходного товара для нового.
+
+    → (values, extra, labels, слова-подсказки, причина отказа)
 
     Копия — это пробег по тем же шагам создания, но с готовыми значениями:
     читаем товар в панели ровно в том виде, в каком форма создания их ждёт,
     и картинку кладём файлом — панель принимает её только настоящей
     загрузкой.
+
+    `labels` — надписи выбранного (раздел, подраздел, тип): по ним бот
+    находит ту же строку в форме создания, когда номера в ней другие.
+    Слова-подсказки — то же самое для полей, которых у образца нет вовсе.
 
     Картинка НЕ удаляется по дороге: отказ панели по недостающему полю
     превращается в вопрос, после ответа товар уходит заново — и файл нужен
@@ -1761,13 +1831,13 @@ async def _copy_source_values(uid: int, ad_id: str,
     creds = get_panel_creds(uid) or {}
     cookies = creds.get("cookies")
     if not cookies:
-        return {}, {}, "куки панели не найдены — войди в панель заново"
+        return {}, {}, {}, [], "куки панели не найдены — войди в панель заново"
 
     loop = asyncio.get_event_loop()
-    ok, values, extra, url, err = await loop.run_in_executor(
+    ok, values, extra, labels, url, err = await loop.run_in_executor(
         None, panel_item_values_sync, cookies, str(ad_id), uid)
     if not ok:
-        return {}, {}, err or "панель не отдала поля товара"
+        return {}, {}, {}, [], err or "панель не отдала поля товара"
 
     # Каждое поле берётся оттуда, где оно есть. У товара в панели ЦЕНЫ НЕТ
     # ВОВСЕ — давняя запись в CLAUDE.md, из-за неё же снята и правка цены
@@ -1781,18 +1851,24 @@ async def _copy_source_values(uid: int, ad_id: str,
         if float(values["price"]) <= 0:
             raise ValueError
     except (TypeError, ValueError):
-        return {}, {}, ("цену товара не отдали ни панель, ни маркетплейс — "
-                        "копия ушла бы бесплатной")
+        return {}, {}, {}, [], ("цену товара не отдали ни панель, ни "
+                                "маркетплейс — копия ушла бы бесплатной")
     values["price"] = int(float(values["price"]))
     values["quantity"] = int(values.get("quantity") or 1)
 
+    # Слова-подсказки: сначала название раздела с маркетплейса, потом слова
+    # названия товара. Порядок тот, которого ждёт `_autopick_match`, — от
+    # узкого к широкому: раздел назван точно, название лишь намекает.
+    words = [w for w in [await _section_word(api, ad_id)] if w]
+    words += [w for w in _title_words(values) if w not in words]
+
     if not url:
-        return {}, {}, ("у товара в панели не нашлось картинки, а без неё "
-                        "объявление не создать")
+        return {}, {}, {}, [], ("у товара в панели не нашлось картинки, а без "
+                                "неё объявление не создать")
     data = await loop.run_in_executor(None, panel_fetch_image_sync,
                                       cookies, url)
     if not data:
-        return {}, {}, "картинку товара скачать не вышло"
+        return {}, {}, {}, [], "картинку товара скачать не вышло"
 
     photos = os.path.join(_DATA_DIR, "photos")
     os.makedirs(photos, exist_ok=True)
@@ -1801,9 +1877,9 @@ async def _copy_source_values(uid: int, ad_id: str,
         with open(path, "wb") as fh:
             fh.write(data)
     except OSError as e:
-        return {}, {}, f"картинку некуда сохранить: {str(e)[:100]}"
+        return {}, {}, {}, [], f"картинку некуда сохранить: {str(e)[:100]}"
     values["photo_path"] = path
-    return values, extra, ""
+    return values, extra, labels, words, ""
 
 
 @router.callback_query(F.data.startswith("create_ad:copy:"))
@@ -1811,10 +1887,14 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
                     api: YooMarketAPI = None) -> None:
     """Копия товара: те же шаги создания, но с готовыми значениями.
 
-    Создаёт ТОТ ЖЕ вызов, что и мастер (`_panel_create_and_report`), и это
-    главное здесь. Путь проверен живьём — им заведены все товары продавца, —
-    а отказ панели по недостающему полю он превращает в вопрос: раздел мог
-    поменяться с прошлого раза, и тупика из этого быть не должно.
+    Идёт тем же путём, что и мастер, — та же форма панели, та же очередь
+    списков, тот же вызов создания. Разница одна: на каждый вопрос ответ уже
+    есть, взятый у образца, и потому вопрос не задаётся.
+
+    Форму панели копия читает ОБЯЗАТЕЛЬНО. Отправлять готовые номера, не
+    сверив их со списком формы, значит однажды положить товар в чужой
+    раздел: номера панели и маркетплейса совпадать не обязаны, а ошибка
+    видна только по отсутствию продаж.
     """
     from features import ad_templates_shown
 
@@ -1843,7 +1923,7 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
 
     await callback.answer("Создаю копию…")
     await callback.message.edit_text("⏳ Читаю товар в панели…")
-    values, extra, why = await _copy_source_values(uid, ad_id, api)
+    values, extra, labels, words, why = await _copy_source_values(uid, ad_id, api)
     if why:
         b = InlineKeyboardBuilder()
         b.button(text="📋 Ещё копию", callback_data="create_ad:templates_list")
@@ -1859,14 +1939,66 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
 
     # Состояние живое: отказ по недостающему полю станет вопросом, а не
     # тупиком, и после ответа товар уйдёт заново — с той же картинкой.
-    #
-    # `autopick` — слова названия товара. Если панель потребует поле,
-    # которого у образца нет вовсе (скопировать его неоткуда), мастер
-    # сначала попробует выбрать сам: ровно один подходящий вариант он
-    # возьмёт молча, а спросит только там, где вариантов несколько — там
-    # выбор и правда за продавцом, иначе товар ляжет не туда.
     await state.set_state(CreateAdState.panel_select)
     await state.update_data(pending=values, chosen=dict(extra),
-                            select_queue=[], autopick=_title_words(values))
+                            select_queue=[], autopick=words,
+                            source_labels=dict(labels))
+
+    # Сверка идёт по живой форме панели, а это ещё пара запросов: без
+    # строки о ней экран стоял бы «Читаю товар» и выглядел бы зависшим.
+    await _edit_safely(callback.message, "⏳ Сверяю разделы с формой панели…")
+    form = await _creation_form(uid)
+    if form:
+        queue = _select_queue(form["fields"])
+        await state.update_data(form_resource=form["resource"],
+                                form_fields=form["fields"],
+                                select_queue=queue)
+        # Дальше — та же дорога, что у мастера: на каждом списке бот сперва
+        # смотрит, что стояло у образца, и спрашивает только там, где взять
+        # ответ неоткуда.
+        await _ask_next_select(callback.message, state, uid, api)
+        return
+
+    # Формы нет — создаём напрямую, панель сама скажет, чего не хватает.
     await _panel_create_and_report(callback.message, uid, values, extra=extra,
                                    state=state, api=api)
+
+
+async def _creation_form(uid: int) -> dict | None:
+    """Форма создания товара из панели, или None.
+
+    Живёт отдельно от мастера потому, что нужна двоим: мастер спрашивает по
+    ней продавца, копия — сверяет по ней готовые значения.
+    """
+    from automation.panel import panel_get_item_form_sync
+    from storage import get_panel_creds
+
+    creds = get_panel_creds(uid) or {}
+    if not creds.get("cookies"):
+        return None
+    loop = asyncio.get_event_loop()
+    try:
+        ok, form = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_get_item_form_sync,
+                                 creds["cookies"]),
+            timeout=30,
+        )
+    except Exception as e:                                # noqa: BLE001
+        logger.info("форма создания не прочиталась: %s", e)
+        return None
+    return form if (ok and isinstance(form, dict) and form.get("fields")) else None
+
+
+def _select_queue(fields: list) -> list:
+    """Списки формы в порядке зависимости: раздел → подраздел → тип, потом
+    прочие обязательные. Тот же порядок, что у мастера, — и он важен:
+    варианты подраздела панель отдаёт только после выбранного раздела."""
+    by_attr = {f["attribute"]: f for f in fields}
+    queue = [a for a in ("category", "subcategory", "type") if a in by_attr]
+    queue += [
+        f["attribute"] for f in fields
+        if f.get("required") and f.get("options") and f["attribute"] not in queue
+        and f["attribute"] not in ("title", "price", "content")
+    ]
+    return queue
+

@@ -341,6 +341,7 @@ class TheCopyIsARunThroughTheSameCreation(Bench):
                       "category": 12},
                      {"category": 12, "subcategory": 44,
                       "filter__8": "Россия"},
+                     {"category": "Аккаунты", "subcategory": "Standoff 2"},
                      "https://panel/media/x.jpg", "")
         self.image = b"\xff\xd8JPEG"
         self.sent: list[dict] = []
@@ -427,7 +428,7 @@ class TheCopyIsARunThroughTheSameCreation(Bench):
         self.assertIn("виртами", hint)
 
     def test_a_panel_that_cannot_read_the_item_says_why(self):
-        self.read = (False, {}, {}, "", "update-fields: 419")
+        self.read = (False, {}, {}, {}, "", "update-fields: 419")
         cb, _fsm = self.tap()
         self.assertEqual(self.sent, [])
         self.assertIn("419", cb.message.texts[-1])
@@ -435,7 +436,7 @@ class TheCopyIsARunThroughTheSameCreation(Bench):
     def test_without_a_picture_it_does_not_even_try(self):
         """Без картинки объявление не создастся — отправлять заведомо
         отвергаемое значит показать продавцу отказ вместо причины."""
-        self.read = (True, self.read[1], self.read[2], "", "")
+        self.read = (True, self.read[1], self.read[2], self.read[3], "", "")
         cb, _fsm = self.tap()
         self.assertEqual(self.sent, [])
         self.assertIn("картинк", cb.message.texts[-1])
@@ -523,7 +524,7 @@ class TheCopyIsForAdminsOnly(Bench):
         touched = []
         was = PANEL.panel_item_values_sync
         PANEL.panel_item_values_sync = lambda *a, **kw: (
-            touched.append(a), (False, {}, {}, "", "x"))[1]
+            touched.append(a), (False, {}, {}, {}, "", "x"))[1]
         try:
             cb = CB("create_ad:copy:0:0")
             run(C.copy_item(cb, FSM(), self.api))

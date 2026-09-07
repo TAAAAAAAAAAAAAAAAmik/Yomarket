@@ -152,11 +152,18 @@ class TheWizardStopsAskingWhatItAlreadyKnows(unittest.TestCase):
                          {"category": 2, "subcategory": 1})
 
     def test_the_seller_is_told_what_was_chosen_for_him(self):
-        """Иначе он узнает, где лежит товар, только с витрины."""
+        """Иначе он узнает, где лежит товар, только с витрины.
+
+        Рядом с названием сказано и КАК оно выбрано: подобранное по словам
+        может оказаться не тем, а взятое у образца — то же самое, что у
+        товара, с которого копировали. Разница эта продавцу и нужна."""
         self.run_wizard(["robux", "roblox"])
         picked = self.created[0]["picked"]
-        self.assertIn("Категория: Roblox", picked)
-        self.assertIn("Подкатегория: Robux", picked)
+        self.assertTrue(any(p.startswith("Категория: Roblox") for p in picked),
+                        picked)
+        self.assertTrue(any(p.startswith("Подкатегория: Robux") for p in picked),
+                        picked)
+        self.assertTrue(all("подобран" in p for p in picked), picked)
 
     def test_without_a_hint_the_wizard_asks_as_before(self):
         """Обычное создание товара этой правкой не меняется."""

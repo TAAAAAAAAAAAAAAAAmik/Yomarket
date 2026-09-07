@@ -499,6 +499,11 @@ def _parse_nova_fields_payload(cf: dict) -> list[dict]:
                 raw_fields.extend(pf.values())
             elif isinstance(pf, list):
                 raw_fields.extend(pf)
+    # Карточка записи заворачивает поля ещё на уровень: {"resource": {...}}.
+    # Раздел, подраздел и тип панель ПОКАЗЫВАЕТ, но менять не даёт — в форме
+    # правки их нет вовсе, и читать их надо отсюда.
+    if not raw_fields and isinstance(cf.get("resource"), dict):
+        raw_fields = _parse_nova_fields_payload(cf["resource"])
     return [f for f in raw_fields if isinstance(f, dict)]
 
 
@@ -593,8 +598,12 @@ def panel_sync_field_options_sync(
         "search": search, "first": "false", "withTrashed": "false",
         "editing": "true", "editMode": "create",
     }
+    # Своё имя запроса заполненным полем не перебивается: у копии в
+    # `form_values` едет весь товар целиком, и поле с именем `first` или
+    # `search` молча изменило бы смысл вопроса, а не ответ на него.
     for k, v in form_values.items():
-        assoc_params[k] = str(v)
+        if k not in assoc_params:
+            assoc_params[k] = str(v)
     try:
         r = session.get(
             f"{PANEL_URL}/nova-api/{resource}/associatable/{field_attr}",
@@ -620,7 +629,8 @@ def panel_sync_field_options_sync(
     # 2. Разбор зависимого поля через creation-fields
     params = {"editing": "true", "editMode": "create", "field": field_attr}
     for k, v in form_values.items():
-        params[k] = str(v)
+        if k not in params:
+            params[k] = str(v)
     try:
         r = session.get(
             f"{PANEL_URL}/nova-api/{resource}/creation-fields",
@@ -931,6 +941,30 @@ def _looks_like_link(f: dict) -> str:
         if rid is not None and not isinstance(rid, (dict, list)):
             return str(rid)
     return ""
+
+
+def _get_detail_fields(session, hdrs, rec_id: str,
+                       resource: str = "items") -> list[dict]:
+    """Поля КАРТОЧКИ записи — те, которых в форме правки нет вовсе.
+
+    Раздел, подраздел, тип выдачи и `filter__N` панель показывает, но менять
+    после создания не даёт: `update-fields` их не отдаёт. Копия читала только
+    форму правки — и раздела у товара «не оказывалось», хотя на карточке он
+    есть; отсюда и отказ панели «Поле Категория обязательно» на товаре,
+    заведённом с разделом.
+    """
+    try:
+        r = session.get(f"{PANEL_URL}/nova-api/{resource}/{rec_id}",
+                        headers=hdrs, timeout=(6, 10), allow_redirects=False)
+    except Exception:
+        return []
+    if r.status_code != 200:
+        return []
+    try:
+        cf = r.json()
+    except Exception:
+        return []
+    return _parse_nova_fields_payload(cf) if isinstance(cf, dict) else []
 
 
 def _probe_one(session, hdrs, resource: str, rec_id: str) -> tuple[int, list[dict]]:
@@ -2817,33 +2851,86 @@ def _media_url_of(value) -> str:
     return (PANEL_URL.rstrip("/") + found) if found else ""
 
 
+def _is_section_attr(attr: str) -> bool:
+    """Поле раздела: то, что панель показывает, но править не даёт.
+
+    Ими форма создания и отличается от формы правки: раздел, подраздел, тип
+    выдачи и атрибуты раздела `filter__1`…`filter__11` задаются один раз.
+    Перечислять их поимённо нельзя — какие есть, зависит от раздела.
+    """
+    al = attr.lower()
+    if al.startswith("filter__"):
+        return True
+    if any(k in al for k in ("categ", "kategor", "razdel", "podrazd")):
+        return True
+    return al in ("type", "vid", "kind", "delivery", "delivery_type",
+                  "tip", "tip_vydachi")
+
+
+def _field_label_value(f: dict) -> str:
+    """Надпись выбранного варианта — то, чем поле подписано у человека.
+
+    Номера разделов у формы создания и у карточки могут не совпасть, а
+    отправленный чужой номер положит товар не туда молча. Надпись — второй
+    ключ: по ней выбранное сверяется со списком формы. Чисто числовая
+    строка надписью не считается: это номер, и совпадение с ним было бы
+    случайным.
+    """
+    val = f.get("value")
+    if isinstance(val, dict):
+        for k in ("display", "title", "name", "label", "text", "value"):
+            got = val.get(k)
+            if isinstance(got, str) and got.strip() and not got.strip().isdigit():
+                return got.strip()
+    if isinstance(val, str) and val.strip() and not val.strip().isdigit():
+        return val.strip()
+    for o in _normalize_options(f):
+        if str(o.get("value")) == str(val):
+            return str(o.get("label") or "")
+    return ""
+
+
 def panel_item_values_sync(
     cookie_string: str, item_id: str, uid: int | None = None,
-) -> tuple[bool, dict, dict, str, str]:
+) -> tuple[bool, dict, dict, dict, str, str]:
     """Значения товара в том виде, в каком их ждёт СОЗДАНИЕ нового.
 
-    → (получилось, values, extra, адрес картинки, причина отказа)
+    → (получилось, values, extra, labels, адрес картинки, причина отказа)
 
     Копия — это пробег по тем же шагам создания, но с готовыми значениями.
     Поэтому здесь не свой формат, а ровно тот, который принимает
     `panel_create_product_sync`: `values` с названием, ценой, описанием и
     количеством, и `extra` — наложение «атрибут → значение» поверх формы.
 
-    В `extra` уходит ВСЁ остальное, что у товара есть: раздел, подраздел,
-    тип, `filter__1`…`filter__11`. Перечислять их поимённо нельзя — какие
-    из них обязательны, зависит от раздела, и форма создания об этом
-    молчит (у гифт-карт это `filter__8` «Регион», живой отказ 20.08).
+    **Читаются ДВА ответа панели, а не один.** Форма правки отдаёт название,
+    остаток и картинку, но раздела, подраздела, типа и `filter__N` в ней нет
+    вовсе: панель их показывает, а менять не даёт. Копия, читавшая только
+    форму правки, уходила без раздела — и панель отвечала «Поле Категория
+    обязательно» на товаре, у которого раздел есть. Остальное берётся с
+    карточки записи.
 
     Номера разделов берутся через `_field_submit_value`: у полей BelongsTo
     выбранное лежит в `belongsToId`, а `str(value)` отправил бы НАДПИСЬ —
-    именно из-за этого копия теряла раздел и получала 422.
+    именно из-за этого копия теряла раздел и получала 422. Рядом с номером
+    едет `labels` — надпись, по которой выбранное можно опознать в форме
+    создания, если номера в ней окажутся другими.
     """
     session = _make_panel_requests_session(cookie_string)
     hdrs = _panel_xsrf_headers(session, cookie_string)
     fields, err = _get_update_fields(session, hdrs, str(item_id))
     _save_refreshed_cookies(uid, cookie_string, session)
     if not fields:
-        return False, {}, {}, "", (err or "панель не отдала поля товара")
+        return False, {}, {}, {}, "", (err or "панель не отдала поля товара")
+
+    # Карточка — второй источник, и только для полей раздела: цену и остаток
+    # она показывает уже оформленными («129 ₽»), а число из такой строки не
+    # достаётся. Что редактируется — берём из формы правки, что нет — отсюда.
+    seen = {str(f.get("attribute") or "") for f in fields}
+    for f in _get_detail_fields(session, hdrs, str(item_id)):
+        attr = str(f.get("attribute") or "")
+        if attr and attr not in seen and _is_section_attr(attr):
+            fields.append(f)
+            seen.add(attr)
 
     # `None` — «поля не было», а не «пусто». Разница здесь существенная:
     # у товара в панели ЦЕНЫ НЕТ ВОВСЕ (давняя запись в CLAUDE.md), и
@@ -2852,12 +2939,8 @@ def panel_item_values_sync(
     values = {"title": "", "price": None, "description": "", "quantity": None,
               "category": ""}
     extra: dict = {}
+    labels: dict = {}
     image_url = ""
-    # Поля, которые прочитать НЕ вышло: панель отдала их так, что скаляра из
-    # них не достать. Молча пропущенные, они превращаются в отказ «Поле
-    # Категория обязательно» — и продавец видит, будто бот просит заполнить
-    # раздел, хотя раздел у товара есть.
-    unread: dict = {}
     for f in fields:
         attr = str(f.get("attribute") or "")
         if not attr or attr in _ITEM_OWN_FIELDS:
@@ -2868,47 +2951,42 @@ def panel_item_values_sync(
             image_url = image_url or _media_url_of(f.get("value"))
             continue
         sub = _field_submit_value(f)
-        if sub is None or sub == "" or isinstance(sub, (dict, list)):
-            # Пустое поле — это законно пустое поле. А вот непустое, из
-            # которого не достаётся значение, надо назвать: чинится это
-            # одной строкой, если знать, что панель прислала.
-            raw = f.get("value")
-            if raw not in (None, "", [], {}):
-                unread[attr] = str(raw)[:120]
-            continue
+        if sub == "" or isinstance(sub, (dict, list)):
+            sub = None
         # Те же слова, по которым форма создания раскладывает значения, —
         # иначе прочитанное и отправленное разошлись бы уже на названии.
         if any(k in al for k in ("title", "name", "header", "naimenov")):
-            values["title"] = str(sub)
+            if sub is not None:
+                values["title"] = str(sub)
         elif any(k in al for k in ("price", "cost", "cena")):
-            values["price"] = sub
+            if sub is not None:
+                values["price"] = sub
         elif any(k in al for k in ("desc", "opis", "text", "content")):
-            values["description"] = str(sub)
+            if sub is not None:
+                values["description"] = str(sub)
         elif any(k in al for k in ("count", "quantity", "qty", "stock")):
             try:
                 values["quantity"] = int(float(sub))
             except (TypeError, ValueError):
                 pass
         else:
-            # ТОЧНОЕ имя, а не вхождение: «subcategory» тоже содержит
-            # «categ», идёт следом и затирала раздел — вместо 12 уезжало 44,
-            # то есть товар лёг бы в чужой раздел. В `extra` попадают оба,
-            # каждый под своим именем, и там путаницы нет.
-            if al in ("category", "category_id", "kategoriya"):
-                values["category"] = sub
-            extra[attr] = sub
+            if sub is not None:
+                # ТОЧНОЕ имя, а не вхождение: «subcategory» тоже содержит
+                # «categ», идёт следом и затирала раздел — вместо 12 уезжало
+                # 44, то есть товар лёг бы в чужой раздел. В `extra` попадают
+                # оба, каждый под своим именем, и там путаницы нет.
+                if al in ("category", "category_id", "kategoriya"):
+                    values["category"] = sub
+                extra[attr] = sub
+            # Надпись записывается и БЕЗ номера: панель отдаёт раздел то
+            # номером, то одной надписью, и во втором случае надпись — всё,
+            # что у нас есть. Записанная только рядом с номером, она
+            # молчала бы ровно там, где нужна.
+            if (label := _field_label_value(f)):
+                labels[attr] = label
     if not values["title"]:
-        return False, {}, {}, "", "в полях товара нет названия"
-    # Раздел — то, без чего панель товар не примет, и то, что продавец
-    # заполнять не должен. Не прочитали — говорим ЧТО именно панель отдала,
-    # а не отправляем заведомо неполный товар и не спрашиваем его потом.
-    if not any(k in extra for k in ("category", "category_id")):
-        shape = unread.get("category") or unread.get("category_id")
-        return False, {}, {}, "", (
-            f"раздел товара прочитать не вышло — панель отдала его так: "
-            f"{shape}" if shape else
-            "у товара в панели нет раздела — заведи его мастером")
-    return True, values, extra, image_url, ""
+        return False, {}, {}, {}, "", "в полях товара нет названия"
+    return True, values, extra, labels, image_url, ""
 
 
 def panel_fetch_image_sync(cookie_string: str, url: str) -> bytes:
