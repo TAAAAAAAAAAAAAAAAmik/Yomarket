@@ -676,6 +676,61 @@ class TheWholeCopyRunsEndToEnd(Bench):
         self.assertIn("не приняла", said, "молча вырезал кусок и создал товар")
         self.assertNotIn("Из описания убрано", said)
 
+    def test_a_field_the_source_lacks_is_guessed_from_its_name(self):
+        """Панель может потребовать поле, которого у образца нет вовсе —
+        скопировать его неоткуда. Тогда мастер выбирает сам, если подходит
+        ровно один вариант: спрашивать там, где выбора нет, — работа на
+        ровном месте."""
+        import asyncio
+        from handlers import create_ad as C
+        words = C._title_words({"title": "Аккаунт Standoff 2 с виртами"})
+        self.assertIn("Standoff", words)
+        self.assertNotIn("2", words, "короткие слова подойдут к чему угодно")
+        self.assertGreater(len(words[0]), len(words[-1]) - 1,
+                           "слова должны идти от узкого к широкому")
+
+    def test_the_report_shows_what_the_bot_filled_in(self):
+        """Продавец трижды прочитал перечень полей формы панели как список
+        того, что он должен заполнить сам. Спорить экранами бессмысленно —
+        отправленное надо ПОКАЗАТЬ числами."""
+        cb = self.press()
+        said = cb.message.texts[-1]
+        self.assertIn("Заполнено ботом", said)
+        self.assertIn("раздел: 12", said)
+        self.assertIn("подраздел: 44", said)
+        self.assertIn("тип выдачи: 2", said)
+        self.assertIn("полей раздела: 2", said)
+
+    def test_the_refusal_shows_it_too(self):
+        """Именно на отказе продавец и решил, что у него просят раздел."""
+        Nova.refuse_always = {"filter__9": ["Поле Платформа обязательно."]}
+        try:
+            cb = self.press()
+        finally:
+            Nova.refuse_always = None
+        said = cb.message.texts[-1]
+        self.assertIn("Заполнено ботом", said)
+        self.assertIn("раздел: 12", said)
+
+    def test_an_unreadable_section_stops_before_sending(self):
+        """Молча пропущенный раздел превращается в отказ «Поле Категория
+        обязательно» — и выглядит так, будто бот просит его заполнить."""
+        for f in ITEM_FIELDS:
+            if f["attribute"] == "category":
+                was = dict(f)
+                f.pop("belongsToId", None)
+                f["value"] = {"display": "Аккаунты"}
+                try:
+                    ok, _v, _e, _u, err = self.read()
+                    self.assertFalse(ok, "ушёл бы товар без раздела")
+                    self.assertIn("раздел", err.lower())
+                    self.assertIn("Аккаунты", err, "не сказал, что пришло")
+                finally:
+                    f.clear()
+                    f.update(was)
+                return
+        self.fail("в образце нет раздела")
+
     def test_a_dead_panel_does_not_report_success(self):
         old = P.PANEL_URL
         try:

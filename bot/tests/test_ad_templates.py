@@ -417,6 +417,15 @@ class TheCopyIsARunThroughTheSameCreation(Bench):
         self.assertEqual(fsm.state, C.CreateAdState.panel_select)
         self.assertEqual(fsm.data.get("chosen", {}).get("filter__8"), "Россия")
 
+    def test_the_title_is_left_as_a_hint_for_fields_the_source_lacks(self):
+        """Панель может потребовать поле, которого у образца нет вовсе.
+        Без подсказки мастер спросит его у продавца — хотя ровно один
+        подходящий вариант он мог бы взять сам."""
+        _cb, fsm = self.tap()
+        hint = fsm.data.get("autopick") or []
+        self.assertTrue(hint, "подсказки из названия нет")
+        self.assertIn("виртами", hint)
+
     def test_a_panel_that_cannot_read_the_item_says_why(self):
         self.read = (False, {}, {}, "", "update-fields: 419")
         cb, _fsm = self.tap()

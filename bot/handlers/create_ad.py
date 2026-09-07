@@ -993,6 +993,42 @@ async def choose_select_option(callback: CallbackQuery, state: FSMContext,
                            api)
 
 
+def _title_words(values: dict) -> list[str]:
+    """Слова названия товара — подсказка для полей, которых у образца нет.
+
+    От узкого к широкому, как того ждёт `_autopick_match`: длинные слова
+    различают лучше («Standoff» точнее «аккаунта»). Короткие и служебные
+    выброшены — по «на» подойдёт что угодно, а подошедшее «что угодно»
+    положит товар не в тот раздел.
+    """
+    import re as _re
+
+    raw = f"{values.get('title') or ''}"
+    words = [w for w in _re.split(r"[^\w]+", raw, flags=_re.UNICODE)
+             if len(w) >= 4]
+    return sorted(dict.fromkeys(words), key=len, reverse=True)[:8]
+
+
+def _carried_note(extra: dict | None) -> str:
+    """Строка «что бот заполнил сам» — числами, а не обещанием.
+
+    Продавец трижды прочитал перечень полей ФОРМЫ панели как список того,
+    что он должен заполнить: «и так же просит категории». Спорить об этом
+    экранами бессмысленно — надо ПОКАЗАТЬ отправленное. Если раздела в
+    строке нет, значит его правда нет, и видно это сразу обоим.
+    """
+    if not extra:
+        return ""
+    names = {"category": "раздел", "subcategory": "подраздел",
+             "type": "тип выдачи"}
+    rows = [f"{names[k]}: {extra[k]}" for k in ("category", "subcategory",
+                                                "type") if extra.get(k)]
+    filters = sum(1 for k in extra if k.lower().startswith("filter__"))
+    if filters:
+        rows.append(f"полей раздела: {filters}")
+    return ("\n🧩 Заполнено ботом — " + " · ".join(rows)) if rows else ""
+
+
 def _picked_note(picked: list | None) -> str:
     """Строка о разделах, выбранных ботом. Пусто — если выбирал продавец."""
     if not picked:
@@ -1333,6 +1369,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
             f"📝 {html.escape(str(values['title']))}\n"            f"💰 {values['price']} ₽"
             f"{chr(10) + '🆔 ' + item_id if item_id else ''}"
             f"{_picked_note(picked)}"
+            + _carried_note(extra)
             + (("\n✂️ Из описания убрано: "
                 + ", ".join(f"«{html.escape(w)}»" for w in cleaned)
                 + " — панель это слово не принимает.") if cleaned else "")
@@ -1422,7 +1459,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
     header = ("⚠️ <b>Панель не приняла товар</b>" if why or is_found
               else "❌ <b>Не удалось создать товар</b>")
 
-    parts = [f"{header}{_picked_note(picked)}"]
+    parts = [f"{header}{_picked_note(picked)}{_carried_note(extra)}"]
     if why:
         parts.append("")
         parts.append(html.escape(why))
@@ -1822,8 +1859,14 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
 
     # Состояние живое: отказ по недостающему полю станет вопросом, а не
     # тупиком, и после ответа товар уйдёт заново — с той же картинкой.
+    #
+    # `autopick` — слова названия товара. Если панель потребует поле,
+    # которого у образца нет вовсе (скопировать его неоткуда), мастер
+    # сначала попробует выбрать сам: ровно один подходящий вариант он
+    # возьмёт молча, а спросит только там, где вариантов несколько — там
+    # выбор и правда за продавцом, иначе товар ляжет не туда.
     await state.set_state(CreateAdState.panel_select)
     await state.update_data(pending=values, chosen=dict(extra),
-                            select_queue=[])
+                            select_queue=[], autopick=_title_words(values))
     await _panel_create_and_report(callback.message, uid, values, extra=extra,
                                    state=state, api=api)

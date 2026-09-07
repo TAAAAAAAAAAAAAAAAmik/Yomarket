@@ -2853,6 +2853,11 @@ def panel_item_values_sync(
               "category": ""}
     extra: dict = {}
     image_url = ""
+    # Поля, которые прочитать НЕ вышло: панель отдала их так, что скаляра из
+    # них не достать. Молча пропущенные, они превращаются в отказ «Поле
+    # Категория обязательно» — и продавец видит, будто бот просит заполнить
+    # раздел, хотя раздел у товара есть.
+    unread: dict = {}
     for f in fields:
         attr = str(f.get("attribute") or "")
         if not attr or attr in _ITEM_OWN_FIELDS:
@@ -2864,6 +2869,12 @@ def panel_item_values_sync(
             continue
         sub = _field_submit_value(f)
         if sub is None or sub == "" or isinstance(sub, (dict, list)):
+            # Пустое поле — это законно пустое поле. А вот непустое, из
+            # которого не достаётся значение, надо назвать: чинится это
+            # одной строкой, если знать, что панель прислала.
+            raw = f.get("value")
+            if raw not in (None, "", [], {}):
+                unread[attr] = str(raw)[:120]
             continue
         # Те же слова, по которым форма создания раскладывает значения, —
         # иначе прочитанное и отправленное разошлись бы уже на названии.
@@ -2888,6 +2899,15 @@ def panel_item_values_sync(
             extra[attr] = sub
     if not values["title"]:
         return False, {}, {}, "", "в полях товара нет названия"
+    # Раздел — то, без чего панель товар не примет, и то, что продавец
+    # заполнять не должен. Не прочитали — говорим ЧТО именно панель отдала,
+    # а не отправляем заведомо неполный товар и не спрашиваем его потом.
+    if not any(k in extra for k in ("category", "category_id")):
+        shape = unread.get("category") or unread.get("category_id")
+        return False, {}, {}, "", (
+            f"раздел товара прочитать не вышло — панель отдала его так: "
+            f"{shape}" if shape else
+            "у товара в панели нет раздела — заведи его мастером")
     return True, values, extra, image_url, ""
 
 
