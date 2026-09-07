@@ -769,6 +769,64 @@ class TheMarketplaceNameNeedNotMatchThePanels(Bench):
         self.assertEqual(str(self.created().get("category")), "613")
 
 
+class TheAdviceMatchesWhatIsActuallyMissing(Bench):
+    """«Добавь остатки, потом жми На модерацию» при полном остатке — это
+    совет сделать ровно то, что только что не сработало.
+
+    Живой случай 08.09: остатки в товаре есть, публикация не проходит, а
+    отчёт советовал добавить остатки.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from handlers import panel_items as PI
+        self.PI = PI
+        self._pub = PI.publish_item_sync_first
+        self.answer = (False, "маркетплейс через API его не публикует")
+
+        async def refused(api, cookies, item_id, uid):
+            return self.answer
+
+        PI.publish_item_sync_first = refused
+
+    def tearDown(self):
+        self.PI.publish_item_sync_first = self._pub
+        super().tearDown()
+
+    def test_with_stock_in_place_it_does_not_ask_for_stock(self):
+        Api.kind = "auto-value"
+        Api.value_block = {"stock": 5}
+        cb = self.press()
+        said = cb.message.texts[-1]
+        self.assertIn("остаток на месте", said.lower(), said)
+        self.assertNotIn("Добавь остатки", said)
+
+    def test_without_stock_the_two_steps_stay(self):
+        """А когда остатка правда нет — совет прежний и верный."""
+        Api.kind = "auto-delivery"
+        cb = self.press()
+        self.assertIn("Добавь остатки", cb.message.texts[-1])
+
+    def test_the_marketplace_answer_reaches_the_seller(self):
+        """Причина отказа — то единственное, ради чего этот экран читают."""
+        cb = self.press()
+        self.assertIn("через API его не публикует", cb.message.texts[-1])
+
+    def test_the_button_follows_the_outcome_not_the_wording(self):
+        """Кнопка «На модерацию» показывалась по слову «модерац» в своём же
+        отчёте. Разбор собственной прозы — тихая поломка, которая ждёт
+        правки текста."""
+        cb = self.press()
+        kb = next((k for k in reversed(cb.message.kbs) if k), None)
+        texts = [b.text for row in (kb.inline_keyboard if kb else []) for b in row]
+        self.assertIn("🚀 На модерацию", texts, texts)
+        self.answer = (True, "через маркетплейс, статус: moderate")
+        cb2 = self.press()
+        kb2 = next((k for k in reversed(cb2.message.kbs) if k), None)
+        texts2 = [b.text for row in (kb2.inline_keyboard if kb2 else []) for b in row]
+        self.assertNotIn("🚀 На модерацию", texts2, texts2)
+
+
 class WithNoSourceAtAllItAsksOnlyWhatItCannotKnow(Bench):
     """Панель закрыла и карточку, и список, а маркетплейс не назвал раздел.
 

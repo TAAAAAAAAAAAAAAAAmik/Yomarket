@@ -28,18 +28,21 @@ def run(coro):
 
 
 class Api:
-    def __init__(self, state_after="moderate", fail=None):
-        self.state_after, self.fail = state_after, fail
+    def __init__(self, state_after="moderate", fail=None, before="draft",
+                 answer=None):
+        self.state_after, self.fail, self.before = state_after, fail, before
+        self.answer = answer
         self.published: list = []
 
     async def publish_ad(self, ad_id):
         if self.fail:
             raise RuntimeError(self.fail)
         self.published.append(str(ad_id))
-        return {"data": {"status": self.state_after}}
+        return self.answer if self.answer is not None else {
+            "data": {"status": self.state_after}}
 
     async def get_ad(self, ad_id):
-        state = self.state_after if self.published else "draft"
+        state = self.state_after if self.published else self.before
         return {"data": {"id": ad_id, "status": state}}
 
 
@@ -108,6 +111,33 @@ class TheMarketplaceGoesFirst(Bench):
         ok, note = self.publish(None, cookies="")
         self.assertFalse(ok)
         self.assertTrue(note)
+
+    def test_a_status_the_marketplace_never_publishes_is_named(self):
+        """«Статус остался unpublish» — это факт, а не причина, и делать с
+        ним продавцу нечего. Про этот статус известно ровно то, что через
+        API маркетплейс его не публикует, а на сайте кнопка работает."""
+        api = Api(state_after="unpublish", before="unpublish")
+        ok, note = self.publish(api)
+        self.assertFalse(ok)
+        self.assertIn("на сайте", note)
+        self.assertIn("unpublish", note)
+
+    def test_the_marketplace_answer_is_shown_not_swallowed(self):
+        """Тело ответа выбрасывалось, и разбор упирался в «принял, а статус
+        не изменился» — без единого слова о том, что он сказал."""
+        api = Api(state_after="unpublish", before="unpublish",
+                  answer={"message": "incorrect_status"})
+        _ok, note = self.publish(api)
+        self.assertIn("incorrect_status", note)
+
+    def test_an_already_published_item_is_not_published_twice(self):
+        """Повторная публикация живого товара — лишний запрос и лишний
+        отказ: маркетплейс отвечает на такое `incorrect_status`."""
+        api = Api(before="active")
+        ok, note = self.publish(api)
+        self.assertTrue(ok, note)
+        self.assertEqual(api.published, [])
+        self.assertEqual(self.panel_calls, [])
 
     def test_a_dead_panel_does_not_eat_the_answer(self):
         """Товар уже создан. Исключение отсюда съело бы отчёт о нём."""

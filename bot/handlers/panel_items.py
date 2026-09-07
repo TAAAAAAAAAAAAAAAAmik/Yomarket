@@ -485,7 +485,7 @@ async def _toggle(callback: CallbackQuery, public: bool,
 # Статусы, означающие «товар уже не черновик»: он либо в очереди на
 # проверку, либо уже в продаже. По ним и решается, получилась ли публикация.
 _LIVE_STATES = ("moderate", "moderation", "pending", "review",
-                "active", "published")
+                "active", "published", "publish")
 
 
 async def publish_item_sync_first(api, cookies: str, item_id: str,
@@ -498,24 +498,35 @@ async def publish_item_sync_first(api, cookies: str, item_id: str,
     прав для выполнения этого действия» (живой отказ 08.09) — путь, который
     отказывает, не должен быть первым.
 
-    **Ответ не принимается на веру.** HTTP 200 у этого маркетплейса
-    приходит и на отказ, поэтому статус перечитывается: в отчёт идёт то, что
-    он показывает, а не то, что мы отправили.
+    **Ответ не принимается на веру.** HTTP 200 приходит и на отказ, поэтому
+    статус перечитывается: в отчёт идёт то, что он показывает, а не то, что
+    мы отправили.
+
+    **И если не вышло — называется причина, а не только факт.** Статус
+    `unpublish` маркетплейс через API не публикует; это его известное
+    поведение (`_MANUAL_ONLY` в клиенте API, проверено на живых
+    объявлениях), и продавцу надо сказать про сайт, а не оставить его перед
+    «не удалось».
     """
     from automation.panel import panel_publish_item_sync
 
     said: list[str] = []
+    answer = ""
 
     if api:
+        was = await _state_now(api, item_id)
+        if was in _LIVE_STATES:
+            return True, f"уже {was}"
         try:
-            await api.publish_ad(item_id)
+            got = await api.publish_ad(item_id)
         except Exception as e:                            # noqa: BLE001
             said.append(f"маркетплейс: {str(e)[:150]}")
         else:
+            answer = _short_answer(got)
             state = await _state_now(api, item_id)
             if state in _LIVE_STATES:
                 return True, f"через маркетплейс, статус: {state}"
-            said.append(f"маркетплейс принял, а статус остался «{state or '—'}»")
+            said.append(_why_not(state, answer))
 
     if cookies:
         try:
@@ -533,6 +544,36 @@ async def publish_item_sync_first(api, cookies: str, item_id: str,
     # Обе дороги названы: одна причина из двух — это половина правды, а по
     # ней продавец пойдёт чинить не то.
     return False, "; ".join(said) or "публиковать нечем"
+
+
+def _why_not(state: str, answer: str) -> str:
+    """Почему товар не опубликовался — словами, а не одним статусом.
+
+    «Статус остался unpublish» — это факт, а не причина, и продавцу с ним
+    делать нечего. Про этот статус известно ровно то, что маркетплейс через
+    API его не публикует, а на сайте кнопка работает.
+    """
+    from api.yoomarket import YooMarketAPI
+
+    tail = f" Ответ маркетплейса: {answer}." if answer else ""
+    if state in YooMarketAPI._MANUAL_ONLY:
+        return ("маркетплейс запрос принял, но товары в статусе "
+                f"«{state}» он через API не публикует — это проверено на "
+                "живых объявлениях. Опубликуй его на сайте Юмаркета: там "
+                "кнопка работает." + tail)
+    return (f"маркетплейс принял, а статус остался «{state or '—'}»." + tail)
+
+
+def _short_answer(got) -> str:
+    """Что ответил маркетплейс — коротко и без вранья про пустоту."""
+    if not isinstance(got, dict) or not got:
+        return ""
+    inner = got.get("data") if isinstance(got.get("data"), dict) else got
+    for key in ("message", "error", "status", "detail"):
+        val = inner.get(key) if isinstance(inner, dict) else None
+        if val not in (None, ""):
+            return str(val)[:120]
+    return str(sorted(inner))[:120] if isinstance(inner, dict) else ""
 
 
 async def _state_now(api, item_id: str) -> str:
