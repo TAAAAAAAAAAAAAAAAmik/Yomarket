@@ -737,8 +737,52 @@ def _autopick_match(options: list, words) -> dict | None:
     return None
 
 
-def _pick_option(options: list, value, label: str,
-                 words: list) -> tuple[dict | None, str]:
+def _match_by_text(options: list, title: str, description: str = "",
+                   ) -> dict | None:
+    """Вариант, чьё НАЗВАНИЕ встречается в тексте товара.
+
+    Поиск идёт в обратную сторону, и в этом всё дело. Раньше бот брал свои
+    слова («Аккаунт», «Баланс») и искал их среди названий разделов — так
+    находится «Аккаунты с виртами» и НИКОГДА не находится «Black Russia»:
+    это два слова, и ни одно из них в названии товара не стоит. А панель
+    прислала все 825 названий сама — значит надо искать ИХ в тексте товара,
+    а не наоборот. «Black Russia» лежит в описании открытым текстом.
+
+    Правила:
+
+    * **по целым словам.** «Ace» иначе нашёлся бы внутри «Аccess» и положил
+      товар в чужой раздел;
+    * **длинное побеждает.** «Black Russia Mobile» содержит «Black Russia»,
+      и при обоих совпадениях верное — длинное;
+    * **название важнее описания.** В описании бывает «переход со Steam», и
+      раздел Steam там ни при чём;
+    * **два равных — не выбор.** Раздел решает, где покупатель увидит товар.
+    """
+    import re as _re
+
+    def hunt(text: str) -> dict | None:
+        low = _re.sub(r"\s+", " ", str(text or "")).strip().lower()
+        if not low:
+            return None
+        hits = []
+        for o in options:
+            name = str(o.get("label") or "").strip().lower()
+            if len(name) < 4:
+                continue          # «AI», «ARK» найдутся внутри чужих слов
+            if _re.search(r"(?<!\w)" + _re.escape(name) + r"(?!\w)", low):
+                hits.append((len(name), o))
+        if not hits:
+            return None
+        best = max(h[0] for h in hits)
+        top = [o for size, o in hits if size == best]
+        return top[0] if len(top) == 1 else None
+
+    return hunt(title) or hunt(f"{title} {description}")
+
+
+def _pick_option(options: list, value, label: str, words: list,
+                 title: str = "", description: str = "",
+                 ) -> tuple[dict | None, str]:
     """Какой вариант списка подходит — и почему. → (вариант или None, как).
 
     Порядок не декоративный, он от сильного к слабому:
@@ -747,7 +791,10 @@ def _pick_option(options: list, value, label: str,
        один раздел `items` и одно поле, значит и нумерация одна;
     2. **надпись образца** — если номера в списке нет, но «Аккаунты» в нём
        есть, это он и есть, каким бы номером ни звался;
-    3. **слово** — название раздела с маркетплейса и слова названия товара;
+    3. **название варианта, найденное в тексте товара** — «Black Russia»
+       стоит в описании открытым текстом, и панель это название прислала
+       сама;
+    4. **слово** — название раздела с маркетплейса и слова названия товара;
        годится только единственное совпадение.
 
     Ни одного — None, и решает вызывающий: у него есть ещё поиск по панели
@@ -763,6 +810,11 @@ def _pick_option(options: list, value, label: str,
                 if str(o.get("label", "")).strip().lower() == want]
         if len(same) == 1:
             return same[0], "надпись образца"
+    # Название варианта, найденное в тексте товара. Сильнее россыпи слов:
+    # там совпадает кусок, здесь — всё название целиком.
+    in_text = _match_by_text(options, title, description)
+    if in_text is not None:
+        return in_text, "найден в тексте товара"
     by_word = _autopick_match(options, words)
     if by_word is not None:
         return by_word, "подобран по названию"
@@ -909,7 +961,13 @@ async def _ask_next_select(msg, state: FSMContext, uid: int,
     # показ. Обрезка до сверки и есть та ошибка, из-за которой копия не
     # находила номер, ПРИСЛАННЫЙ САМОЙ ПАНЕЛЬЮ: живой ответ — 825
     # вариантов, сверка шла по первым пятистам, «Standoff 2» на букву S.
-    guess, took = _pick_option(options, src, hint, words)
+    # Текст товара — второй ключ к разделу: «Black Russia» стоит в
+    # описании, а в названии его нет вовсе.
+    pending = data.get("pending") or {}
+    title = str(pending.get("title") or "")
+    description = str(pending.get("description") or "")
+
+    guess, took = _pick_option(options, src, hint, words, title, description)
 
     if guess is None:
         # В списке нужного нет — спрашиваем панель по имени, а не листаем
@@ -917,7 +975,8 @@ async def _ask_next_select(msg, state: FSMContext, uid: int,
         found, term = await _search_options(uid, data, attr,
                                             ([hint] if hint else []) + words)
         if found:
-            guess, took = _pick_option(found, src, hint, [term] + words)
+            guess, took = _pick_option(found, src, hint, [term] + words,
+                                       title, description)
             if guess is None:
                 # Выбрать не вышло, но найденное показать лучше, чем сотни
                 # чужих строк по алфавиту: нужного среди них и не было.
@@ -1177,6 +1236,12 @@ async def _remember_selects(uid: int, state, extra: dict | None) -> dict:
     try:
         from storage import remember_copy_marks
         remember_copy_marks(uid, source, picked, out["labels"])
+        # И за разделом маркетплейса — чтобы новый товар той же игры не
+        # спрашивал заново. Ключ отдельный: товар и раздел это разное, и
+        # смешивать их в одном перечне значит однажды взять чужой ответ.
+        cat = str(data.get("copy_source_cat") or "")
+        if cat:
+            remember_copy_marks(uid, f"cat:{cat}", picked, out["labels"])
     except Exception as e:                                # noqa: BLE001
         logger.info("раздел образца %s не запомнился: %s", source, e)
     return out
@@ -1692,6 +1757,16 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
             # когда остатка нет: без него публиковать нечего.
             b.button(text="📦 Прислать остатки",
                      callback_data=f"pitem_stock:{item_id}")
+            # И вторая — чтобы не присылать их руками каждый раз. Настройка
+            # лежит на экране копии, и найти её оттуда никому не пришло бы
+            # в голову: спрашивают-то здесь.
+            #
+            # Но только тому, кому этот экран открыт: кнопка, отвечающая
+            # «этого раздела сейчас нет», — это дохлая кнопка, а не забота.
+            from features import ad_templates_shown
+            if ad_templates_shown(uid):
+                b.button(text="⚙️ Класть их всегда",
+                         callback_data="create_ad:stock")
         if item_id and "модерац" not in pub_note:
             b.button(text="🚀 На модерацию",
                      callback_data=f"cadpub:{item_id}")
@@ -2273,7 +2348,14 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
     # товара. Прочитанное у панели важнее запомненного: оно свежее.
     from storage import get_copy_marks
 
+    # Память двухслойная. Сперва за этим товаром, потом — за РАЗДЕЛОМ
+    # маркетплейса: у продавца полтора десятка аккаунтов одной игры, они
+    # лежат в одном `category_id`, и раздел панели у них тот же. Спросить
+    # один раз про Black Russia и переспрашивать на каждом новом аккаунте
+    # той же игры — это тот самый круг, которого мы избавляемся.
     marks = get_copy_marks(uid, ad_id)
+    if not marks.get("values") and cid not in (None, "", 0):
+        marks = get_copy_marks(uid, f"cat:{cid}")
     chosen = {**marks.get("values", {}), **extra}
     hints = {**marks.get("labels", {}), **labels}
 
@@ -2284,7 +2366,8 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
                             select_queue=[], autopick=words,
                             source_labels=hints,
                             chosen_labels=dict(marks.get("labels") or {}),
-                            copy_source_id=str(ad_id))
+                            copy_source_id=str(ad_id),
+                            copy_source_cat=str(cid or ""))
 
     # Сверка идёт по живой форме панели, а это ещё пара запросов: без
     # строки о ней экран стоял бы «Читаю товар» и выглядел бы зависшим.
@@ -2517,13 +2600,17 @@ async def _select_verdicts(uid: int, ad_id: str, api) -> list[str]:
                 data["form_resource"], attr, dict(chosen))
         hint = labels.get(attr)
         src = chosen.get(attr)
-        pick, how = _pick_option(options, src, hint, words)
+        pick, how = _pick_option(options, src, hint, words,
+                                 str(values.get("title") or ""),
+                                 str(values.get("description") or ""))
         where = f"список {len(options)}"
         if pick is None:
             found, term = await _search_options(
                 uid, data, attr, ([hint] if hint else []) + words)
             if found:
-                pick, how = _pick_option(found, src, hint, [term] + words)
+                pick, how = _pick_option(found, src, hint, [term] + words,
+                                         str(values.get("title") or ""),
+                                         str(values.get("description") or ""))
                 where += f", поиск «{term}» → {len(found)}"
         if pick is None and src not in (None, ""):
             pick, how = {"value": src, "label": hint or str(src)}, \

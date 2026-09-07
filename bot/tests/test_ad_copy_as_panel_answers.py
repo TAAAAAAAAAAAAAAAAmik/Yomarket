@@ -41,13 +41,18 @@ ITEM = "250614"
 # цепочка разделов маркетплейса.
 TITLE = "💖Аккаунт 💖Баланс: 3.000.000 ₽⚡4 LVL 💖"
 
+# Описание. Игра названа ЗДЕСЬ — в заголовке её нет вовсе, и никакая
+# пословная догадка её оттуда не достанет: «Black Russia» это два слова.
+DESCRIPTION = ("Аккаунт Black Russia, 4 уровень, баланс 3.000.000 ₽ в банке. "
+               "Вход по почте, данные меняются.")
+
 # Девять полей формы правки — ровно те, что назвала живая панель.
 EDIT_FIELDS = [
     {"attribute": "id", "value": int(ITEM)},
     {"attribute": "public", "value": 1},
     {"attribute": "moderation_status", "value": "approved"},
     {"attribute": "title", "value": TITLE},
-    {"attribute": "content", "value": "Аккаунт с внутриигровой валютой."},
+    {"attribute": "content", "value": DESCRIPTION},
     {"attribute": "quantity", "value": 3},
     {"attribute": "images", "component": "advanced-media-library-field",
      "value": [{"original_url": "http://ЗАМЕНА/media/photo.jpg"}]},
@@ -60,7 +65,7 @@ EDIT_FIELDS = [
 CARD_FIELDS = [
     {"attribute": "id", "value": int(ITEM)},
     {"attribute": "price", "value": "1 490 ₽"},
-    {"attribute": "category", "value": {"display": "Standoff 2"},
+    {"attribute": "category", "value": {"display": "Black Russia"},
      "belongsToId": 613, "component": "belongs-to-field"},
     {"attribute": "subcategory", "value": {"display": "Аккаунты"},
      "belongsToId": 3, "component": "belongs-to-field"},
@@ -91,10 +96,10 @@ CREATION_FIELDS = (
 # начинался с «Dying Light, 7 Days to Die, 8 Ball Pool…», и нужного там не
 # было. Обрезать список ДО сверки — это и есть та ошибка.
 _GAMES = [f"Игра {i:04d}" for i in range(824)]
-_GAMES.insert(700, "Standoff 2")
-CATEGORY_OPTIONS = [{"value": 613 if g == "Standoff 2" else 1000 + i,
+_GAMES.insert(700, "Black Russia")
+CATEGORY_OPTIONS = [{"value": 613 if g == "Black Russia" else 1000 + i,
                      "display": g} for i, g in enumerate(_GAMES)]
-SUBCATEGORY_OPTIONS = [{"value": 3, "display": "Аккаунты"},
+SUBCATEGORY_OPTIONS = [{"value": 3, "display": "Аккаунты с виртами"},
                        {"value": 4, "display": "Ключи"},
                        {"value": 5, "display": "Валюта"}]
 TYPE_OPTIONS = [{"value": 1, "display": "Мгновенная выдача"},
@@ -321,7 +326,7 @@ class Api:
     # Дерево разделов маркетплейса. Товар лежит в ЛИСТЕ («Аккаунты»), а
     # панель раскладывает по играм («Standoff 2»): нужное слово стоит на
     # среднем уровне, и одним именем листа его не достать.
-    path: list = ["Игры", "Standoff 2", "Аккаунты"]
+    path: list = ["Игры", "Black Russia", "Аккаунты"]
 
     async def resolve_category(self, cid):
         return Api.section
@@ -396,10 +401,15 @@ class Bench(unittest.TestCase):
         LiveNova.refuse = False
         Api.section = "Аккаунты"
         Api.stock, Api.refills = 0, []
-        Api.path = ["Игры", "Standoff 2", "Аккаунты"]
+        Api.path = ["Игры", "Black Russia", "Аккаунты"]
         Api.kind, Api.value_block, Api.items_left, Api.updated = "", {}, [], []
 
     def tearDown(self):
+        if hasattr(self, "_was_content"):
+            for f in EDIT_FIELDS:
+                if f["attribute"] == "content":
+                    f["value"] = self._was_content
+            del self._was_content
         self.storage.get_copy_marks = self._get_marks
         self.storage.remember_copy_marks = self._set_marks
         self.storage.forget_copy_marks = self._del_marks
@@ -407,6 +417,20 @@ class Bench(unittest.TestCase):
         self.storage._DATA_DIR = self._dir
         self.features.ad_templates_shown = self._shown
         self.tmp.cleanup()
+
+    def set_description(self, text: str) -> None:
+        """Подменить описание образца — с откатом в `tearDown`.
+
+        `EDIT_FIELDS[:]` копирует СПИСОК, а словари в нём общие: правка
+        `f["value"]` доживала до соседнего теста и меняла его исход в
+        зависимости от порядка. Ровно так и упали две проверки.
+        """
+        for f in EDIT_FIELDS:
+            if f["attribute"] == "content":
+                if not hasattr(self, "_was_content"):
+                    self._was_content = f["value"]
+                f["value"] = text
+                return
 
     def press(self):
         fsm, api = FSM(), Api()
@@ -480,7 +504,7 @@ class TheCopyAsksNothingWhenTheSampleHasTheAnswers(Bench):
         cb = self.press()
         said = cb.message.texts[-1]
         self.assertIn("Заполнено ботом", said)
-        self.assertIn("раздел: Standoff 2 (613)", said,
+        self.assertIn("раздел: Black Russia (613)", said,
                       "и надпись, и номер: спор закрывают числа")
 
 
@@ -527,122 +551,36 @@ class ThePanelShowsNoSectionAtAllAndItStillWorks(Bench):
         self.assertEqual(self.chosen.get("category"), 613, self.chosen)
         self.assertEqual(self.chosen.get("subcategory"), 3, self.chosen)
 
-    def test_the_leaf_name_alone_would_not_have_been_enough(self):
-        """Раздел в панели — игра, а лист дерева — «Аккаунты». Версия,
-        читавшая только лист, искала «Аккаунты» среди 825 игр — и, конечно,
-        не находила: в названии товара игры тоже нет."""
-        Api.path = ["Аккаунты"]
+    def test_the_game_is_taken_from_the_description(self):
+        """Ради этого правка и делалась. Раздел панели — игра, а в НАЗВАНИИ
+        товара её нет: «💖Аккаунт 💖Баланс: 3.000.000 ₽». Зато она есть в
+        описании, и панель прислала все 825 названий сама — значит искать
+        надо их в тексте товара, а не свои слова в их списке."""
+        Api.path = []                  # дерево маркетплейса молчит
+        cb = self.press()
+        asked = [t for t in cb.message.texts if "Выбери" in t]
+        self.assertEqual(len(asked), 1, asked)
+        self.assertIn("type", asked[0])
+        self.assertEqual(self.fsm.data["chosen"].get("category"), 613)
+
+    def test_and_it_says_where_it_found_it(self):
+        Api.path = []
+        cb = self.press()
+        # Проверяем данные, а не прозу: строка отчёта собирается из них,
+        # а до самого отчёта копия ещё не дошла — стоит на вопросе о типе.
+        self.assertTrue(
+            any("найден в тексте товара" in n
+                for n in (self.fsm.data.get("autopicked") or [])),
+            self.fsm.data.get("autopicked"))
+
+    def test_without_the_game_anywhere_it_asks(self):
+        """Ни в описании, ни в дереве — тогда вопрос честный. Выдумывать
+        раздел бот не должен: ошибка видна только по отсутствию продаж."""
+        Api.path = []
+        self.set_description("Аккаунт с виртами, вход по почте.")
         cb = self.press()
         asked = [t for t in cb.message.texts if "Выбери" in t]
         self.assertTrue(any("category" in t for t in asked), asked)
-
-
-class AnAnswerGivenOnceIsNotAskedAgain(Bench):
-    """Раздела у товара в панели нет нигде, и второй раз узнать его
-    неоткуда. Значит спрошенное однажды надо помнить за образцом — иначе
-    один и тот же вопрос повторяется при каждой копии одного товара.
-
-    Запоминается только после того, как панель товар ПРИНЯЛА: отказ
-    означал бы, что значения не подошли, а запомненная неправда хуже
-    вопроса — раздел после создания не меняется.
-    """
-
-    def setUp(self):
-        super().setUp()
-        LiveNova.section_visible = False
-        Api.path = []                      # раздел взять неоткуда вовсе
-
-    def answer_the_questions(self, cb):
-        """Ответить на все вопросы так, как ответил бы продавец.
-
-        Их бывает несколько подряд: ответ на раздел открывает подраздел.
-        Остановиться на первом значит не дойти до создания — а запоминается
-        выбранное только после того, как панель товар приняла.
-        """
-        fsm = self.fsm
-        for _ in range(6):
-            options = fsm.data.get("current_view") or []
-            if not fsm.data.get("current_attr") or not options:
-                break
-            want = next((i for i, o in enumerate(options)
-                         if o["label"] in ("Standoff 2", "Аккаунты",
-                                           "Мгновенная выдача")), 0)
-            pick = CB(f"cadopt:{want}")
-            pick.message = cb.message
-            asyncio.run(C.choose_select_option(pick, fsm, Api()))
-        return fsm
-
-    def test_the_first_copy_asks_and_the_answer_is_remembered(self):
-        cb = self.press()
-        self.assertIn("category", [t for t in cb.message.texts
-                                   if "Выбери" in t][0])
-        self.answer_the_questions(cb)
-        self.assertEqual(self.marks.get(ITEM, {}).get("values", {}).get(
-            "category"), 613, self.marks)
-
-    def test_and_the_name_is_remembered_with_the_number(self):
-        """Номер 613 продавцу не говорит ничего, «Standoff 2» — всё."""
-        cb = self.press()
-        self.answer_the_questions(cb)
-        self.assertEqual(self.marks[ITEM]["labels"].get("category"),
-                         "Standoff 2")
-
-    def test_a_refusal_shows_the_names_it_tried(self):
-        """Продавец решает по отказу, туда ли шёл товар. Форма к этому
-        моменту уже закрыта, и надписи надо снять раньше — иначе на экране
-        голые номера."""
-        LiveNova.refuse = True
-        cb = self.press()
-        self.answer_the_questions(cb)
-        self.assertIn("Standoff 2", cb.message.texts[-1])
-
-    def test_a_refusal_remembers_nothing(self):
-        """Значения не подошли — запомненная неправда хуже вопроса."""
-        was, LiveNova.refuse = getattr(LiveNova, "refuse", False), True
-        try:
-            cb = self.press()
-            self.answer_the_questions(cb)
-            self.assertEqual(self.marks, {}, self.marks)
-        finally:
-            LiveNova.refuse = was
-
-    def test_the_second_copy_does_not_ask_the_same_thing(self):
-        """Ради этого всё и делалось."""
-        self.marks[ITEM] = {"values": {"category": 613, "subcategory": 3,
-                                       "type": 1},
-                            "labels": {"category": "Standoff 2"}}
-        cb = self.press()
-        self.assertEqual([t for t in cb.message.texts if "Выбери" in t], [])
-        self.assertEqual(str(self.created().get("category")), "613")
-
-    def test_the_report_names_the_section_not_its_number(self):
-        self.marks[ITEM] = {"values": {"category": 613, "subcategory": 3,
-                                       "type": 1},
-                            "labels": {"category": "Standoff 2"}}
-        cb = self.press()
-        self.assertIn("раздел: Standoff 2", cb.message.texts[-1])
-
-    def test_the_seller_can_take_the_answer_back(self):
-        """Ошибиться разделом можно один раз: панель менять его не даёт."""
-        self.marks[ITEM] = {"values": {"category": 613}, "labels": {}}
-        cb = CB(f"create_ad:forget:{ITEM}")
-        asyncio.run(C.forget_marks(cb))
-        self.assertEqual(self.marks, {})
-        self.assertTrue(cb.alerts)
-
-    def test_what_the_panel_shows_beats_what_we_remember(self):
-        """Прочитанное у панели свежее запомненного.
-
-        Запомненный номер взят НАСТОЯЩИЙ, из того же списка: иначе сверка
-        отвергла бы его сама, и проверка проходила бы при любом порядке —
-        то есть не проверяла бы ничего."""
-        LiveNova.section_visible = True
-        other = CATEGORY_OPTIONS[0]
-        self.assertNotEqual(other["value"], 613)
-        self.marks[ITEM] = {"values": {"category": other["value"]},
-                            "labels": {"category": other["display"]}}
-        self.press()
-        self.assertEqual(str(self.created().get("category")), "613")
 
 
 class TheStockIsPutInByTheBotAsFarAsItHonestlyCan(Bench):
@@ -679,6 +617,27 @@ class TheStockIsPutInByTheBotAsFarAsItHonestlyCan(Bench):
         self.assertIn("2 шт.", said, "сколько нужно — числом")
         self.assertEqual(Api.refills, [], "коды нельзя копировать")
         self.assertIn("📦 Прислать остатки", self.keyboard_texts(cb))
+        # И дорога к настройке — оттуда, где о ней спрашивают. Экран копии
+        # ищут не здесь, а кнопка нужна именно в этот момент.
+        self.assertIn("⚙️ Класть их всегда", self.keyboard_texts(cb))
+
+    def test_but_not_to_a_seller_the_screen_is_closed_for(self):
+        """Отчёт один на копию и на мастер, а копия открыта не всем.
+        Кнопка, отвечающая «этого раздела сейчас нет», — дохлая кнопка.
+
+        Проверяется настоящий путь мастера: копия при закрытом разделе
+        отказывает раньше кнопок, и проверка через неё была бы пустой."""
+        Api.kind = "auto-delivery"
+        self.features.ad_templates_shown = lambda uid: False
+        msg = Msg()
+        asyncio.run(C._panel_create_and_report(
+            msg, 7, {"title": "Товар", "price": 100, "description": "текст",
+                     "quantity": 1},
+            extra={"category": 613}, state=FSM(), api=Api()))
+        kb = next((k for k in reversed(msg.kbs) if k), None)
+        texts = [b.text for row in (kb.inline_keyboard if kb else []) for b in row]
+        self.assertIn("📦 Прислать остатки", texts, texts)
+        self.assertNotIn("⚙️ Класть их всегда", texts, texts)
 
     def test_an_unlimited_copy_is_not_nagged_about_stock(self):
         Api.kind = "unlimited"
@@ -686,6 +645,128 @@ class TheStockIsPutInByTheBotAsFarAsItHonestlyCan(Bench):
         said = cb.message.texts[-1]
         self.assertIn("безлимит", said.lower())
         self.assertNotIn("📦 Прислать остатки", self.keyboard_texts(cb))
+
+
+class AnAnswerGivenOnceIsNotAskedAgain(Bench):
+    """Раздела у товара в панели нет нигде, и узнать его второй раз
+    неоткуда. Спрошенное однажды помнится за образцом — и за РАЗДЕЛОМ
+    маркетплейса: аккаунтов одной игры у продавца десяток, и переспрашивать
+    про Black Russia на каждом — тот самый круг, ради которого всё это.
+
+    Запоминается только после того, как панель товар ПРИНЯЛА: отказ значит,
+    что значения не подошли, а запомненная неправда хуже вопроса.
+    """
+
+    def setUp(self):
+        super().setUp()
+        LiveNova.section_visible = False
+        Api.path = []
+        # Игру убираем и из описания: иначе раздел находится сам, и
+        # проверка проверяла бы не память, а поиск по тексту.
+        self.set_description("Аккаунт с виртами, вход по почте.")
+
+    def answer_the_questions(self, cb):
+        """Ответить на все вопросы так, как ответил бы продавец."""
+        fsm = self.fsm
+        for _ in range(6):
+            options = fsm.data.get("current_view") or []
+            if not fsm.data.get("current_attr") or not options:
+                break
+            want = next((i for i, o in enumerate(options)
+                         if o["label"] in ("Black Russia", "Аккаунты с виртами",
+                                           "Мгновенная выдача")), 0)
+            pick = CB(f"cadopt:{want}")
+            pick.message = cb.message
+            asyncio.run(C.choose_select_option(pick, fsm, Api()))
+        return fsm
+
+    def test_the_answers_are_remembered_after_success(self):
+        cb = self.press()
+        self.assertTrue([t for t in cb.message.texts if "Выбери" in t])
+        self.answer_the_questions(cb)
+        self.assertEqual(self.marks.get(ITEM, {}).get("values", {}).get(
+            "category"), 613, self.marks)
+
+    def test_and_the_name_is_remembered_with_the_number(self):
+        """Номер 613 продавцу не говорит ничего, «Black Russia» — всё."""
+        cb = self.press()
+        self.answer_the_questions(cb)
+        self.assertEqual(self.marks[ITEM]["labels"].get("category"),
+                         "Black Russia")
+
+    def test_another_item_of_the_same_game_reuses_the_answer(self):
+        """Аккаунтов Black Russia у продавца десяток, и все они лежат в
+        одном разделе маркетплейса. Спросить про игру один раз и
+        переспрашивать на каждом новом аккаунте — тот самый круг."""
+        cb = self.press()
+        self.answer_the_questions(cb)
+        self.assertIn("cat:5221", self.marks, self.marks)
+        # Другой товар, тот же раздел маркетплейса, своей памяти нет.
+        self.marks.pop(ITEM, None)
+        cb2 = self.press()
+        self.assertEqual([t for t in cb2.message.texts if "Выбери" in t], [])
+        self.assertEqual(str(self.created().get("category")), "613")
+
+    def test_a_refusal_remembers_nothing(self):
+        """Значения не подошли — запомненная неправда хуже вопроса."""
+        LiveNova.refuse = True
+        cb = self.press()
+        self.answer_the_questions(cb)
+        self.assertEqual(self.marks, {}, self.marks)
+
+    def test_a_refusal_shows_the_names_it_tried(self):
+        """Продавец решает по отказу, туда ли шёл товар. Форма к этому
+        моменту уже закрыта, и надписи надо снять раньше."""
+        LiveNova.refuse = True
+        cb = self.press()
+        self.answer_the_questions(cb)
+        self.assertIn("Black Russia", cb.message.texts[-1])
+
+    def test_the_second_copy_does_not_ask_the_same_thing(self):
+        self.marks[ITEM] = {"values": {"category": 613, "subcategory": 3,
+                                       "type": 1},
+                            "labels": {"category": "Black Russia"}}
+        cb = self.press()
+        self.assertEqual([t for t in cb.message.texts if "Выбери" in t], [])
+        self.assertEqual(str(self.created().get("category")), "613")
+
+    def test_the_report_names_the_section_not_its_number(self):
+        self.marks[ITEM] = {"values": {"category": 613, "subcategory": 3,
+                                       "type": 1},
+                            "labels": {"category": "Black Russia"}}
+        cb = self.press()
+        self.assertIn("раздел: Black Russia", cb.message.texts[-1])
+
+    def test_the_seller_can_take_the_answer_back(self):
+        """Ошибиться разделом можно один раз: панель менять его не даёт."""
+        self.marks[ITEM] = {"values": {"category": 613}, "labels": {}}
+        cb = CB(f"create_ad:forget:{ITEM}")
+        asyncio.run(C.forget_marks(cb))
+        self.assertEqual(self.marks, {})
+        self.assertTrue(cb.alerts)
+
+    def test_what_the_panel_shows_beats_what_we_remember(self):
+        """Прочитанное у панели свежее запомненного. Номер взят настоящий,
+        из того же списка: иначе сверка отвергла бы его сама, и проверка
+        проходила бы при любом порядке."""
+        LiveNova.section_visible = True
+        other = CATEGORY_OPTIONS[0]
+        self.assertNotEqual(other["value"], 613)
+        self.marks[ITEM] = {"values": {"category": other["value"]},
+                            "labels": {"category": other["display"]}}
+        self.press()
+        self.assertEqual(str(self.created().get("category")), "613")
+
+
+class TheMarketplaceNameNeedNotMatchThePanels(Bench):
+    """Раздел у маркетплейса называется по-своему. Это подсказка, а не
+    источник номера: номер берётся у панели."""
+
+    def test_a_name_that_matches_nothing_changes_nothing(self):
+        Api.section = "Игровые ценности и аккаунты"
+        cb = self.press()
+        self.assertEqual([t for t in cb.message.texts if "Выбери" in t], [])
+        self.assertEqual(str(self.created().get("category")), "613")
 
 
 class WithNoSourceAtAllItAsksOnlyWhatItCannotKnow(Bench):

@@ -163,7 +163,10 @@ class TheWizardStopsAskingWhatItAlreadyKnows(unittest.TestCase):
                         picked)
         self.assertTrue(any(p.startswith("Подкатегория: Robux") for p in picked),
                         picked)
-        self.assertTrue(all("подобран" in p for p in picked), picked)
+        # И КАК выбрано — у каждой строки своя причина в скобках. Слово
+        # проверять нельзя: причин несколько, и «найден в тексте товара»
+        # такая же законная, как «подобран по названию».
+        self.assertTrue(all(p.rstrip().endswith(")") for p in picked), picked)
 
     def test_without_a_hint_the_wizard_asks_as_before(self):
         """Обычное создание товара этой правкой не меняется."""
@@ -243,6 +246,86 @@ class ThePluginTellsTheWizardWhichSectionToUse(unittest.TestCase):
         self.assertIn("roblox", words)
         self.assertLess(words.index("robux"), words.index("roblox"),
                         "широкое слово перебило бы узкое")
+
+
+class TheSectionIsLookedForInTheItemsOwnText(unittest.TestCase):
+    """Поиск идёт В ОБРАТНУЮ СТОРОНУ, и в этом всё дело.
+
+    Раньше бот брал свои слова («Аккаунт», «Баланс») и искал их среди
+    названий разделов. Так находится «Аккаунты с виртами» и НИКОГДА не
+    находится «Black Russia»: это два слова, и ни одного из них в названии
+    товара нет. А панель прислала все 825 названий сама — значит искать
+    надо ИХ в тексте товара.
+
+    Живой случай 07.09: продавец получил подраздел «Аккаунты с виртами»
+    автоматически, а раздел «Black Russia» бот взять не мог, хотя игра
+    названа в описании открытым текстом.
+    """
+
+    GAMES = [{"label": n, "value": i} for i, n in enumerate(
+        ["Black Desert", "Black Russia", "Black Russia Mobile", "Steam",
+         "ARK: Survival Evolved", "AI LIMIT", "Ace Racer", "Роблокс"],
+        start=1)]
+
+    def find(self, title, description=""):
+        got = C._match_by_text(self.GAMES, title, description)
+        return None if got is None else got["label"]
+
+    def test_the_game_is_found_in_the_description(self):
+        self.assertEqual(
+            self.find("💖Аккаунт 💖Баланс: 3.000.000 ₽",
+                      "Аккаунт Black Russia, 4 уровень, вирты в банке."),
+            "Black Russia")
+
+    def test_the_title_beats_the_description(self):
+        """Название товара говорит о нём самом, описание — о чём угодно:
+        «переход с Black Russia не нужен» стоит в описании аккаунта Steam.
+
+        Проверка нарочно такая, где длинное имя лежит в ОПИСАНИИ, а верное
+        короткое — в названии: иначе побеждало бы длинное, и порядок ничего
+        бы не решал."""
+        self.assertEqual(
+            self.find("Аккаунт Steam", "Переход с Black Russia не нужен."),
+            "Steam")
+
+    def test_the_longest_name_wins(self):
+        """«Black Russia Mobile» содержит «Black Russia» — при обоих
+        совпадениях верное длинное."""
+        self.assertEqual(self.find("", "аккаунт Black Russia Mobile"),
+                         "Black Russia Mobile")
+
+    def test_two_names_of_equal_length_decide_nothing(self):
+        """Раздел решает, где покупатель увидит товар. Ошибиться можно один
+        раз: панель менять раздел после создания не даёт."""
+        games = [{"label": "Раст", "value": 1}, {"label": "Тарк", "value": 2}]
+        self.assertIsNone(
+            C._match_by_text(games, "", "продаю Раст и Тарк одним лотом"))
+
+    def test_only_whole_words_count(self):
+        """Название внутри чужого слова положило бы товар в чужой раздел.
+        Границы нужны ОБЕ: справа — «Роблоксовый», слева — «МикроРоблокс»."""
+        self.assertIsNone(self.find("", "это Роблоксовый аккаунт"))
+        self.assertIsNone(self.find("", "продаю МикроРоблокс задёшево"))
+        self.assertIsNone(self.find("", "оплата через SuperSteam"))
+
+    def test_it_works_for_cyrillic_names_too(self):
+        """`\b` перед кириллицей ведёт себя не так, как ждут, — граница
+        считается по самому слову."""
+        self.assertEqual(self.find("", "продаю аккаунт Роблокс дёшево"),
+                         "Роблокс")
+        self.assertIsNone(self.find("", "это Роблоксовый аккаунт"))
+
+    def test_short_names_are_not_hunted(self):
+        """Двухбуквенное название найдётся в любом тексте."""
+        games = [{"label": "AI", "value": 1}, {"label": "ARK", "value": 2}]
+        self.assertIsNone(C._match_by_text(games, "", "аккаунт AI и ARK"))
+
+    def test_empty_text_finds_nothing(self):
+        self.assertIsNone(self.find("", ""))
+        self.assertIsNone(self.find(None, None))
+
+    def test_a_name_that_is_not_there_is_not_invented(self):
+        self.assertIsNone(self.find("Аккаунт с виртами", "Вход по почте."))
 
 
 class WhatDecidesWhichOptionIsTheRightOne(unittest.TestCase):
