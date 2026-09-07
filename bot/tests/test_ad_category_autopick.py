@@ -325,6 +325,16 @@ class ACutOffListDoesNotDenyTheSectionTheItemAlreadyHas(unittest.TestCase):
         self.assertEqual(self.searched[0][0], "Standoff 2",
                          "искать надо сперва по надписи образца")
 
+    def test_a_search_that_returns_the_same_stub_does_not_break_the_number(self):
+        """Панель, не понявшая слова, присылает тот же обрезок. Записанное
+        по такому ответу «список полон» выбрасывало номер, взятый с её же
+        карточки, — то есть поиск ломал то, что без него работало."""
+        self.found = many(C._OPTIONS_SHOWN)
+        self.wizard(many(C._OPTIONS_SHOWN), {"category": 12},
+                    {"category": "Standoff 2"})
+        self.assertEqual(self.asked, [], "спросил то, что у товара уже стоит")
+        self.assertEqual(self.created[0]["extra"], {"category": 12})
+
     def test_what_the_search_found_is_shown_instead_of_the_cut_off_list(self):
         """Выбрать не вышло — но показать найденное лучше, чем первые
         пятьсот по алфавиту: нужного среди них и не было."""

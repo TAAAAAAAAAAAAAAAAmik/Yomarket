@@ -8,6 +8,7 @@ import re
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
@@ -912,7 +913,14 @@ async def _ask_next_select(msg, state: FSMContext, uid: int,
             if guess is None:
                 # Выбрать не вышло, но найденное показать лучше, чем
                 # первые пятьсот по алфавиту: там нужного и не было.
-                options, capped = found, False
+                #
+                # Обрезанность считается ЗАНОВО по самому ответу, а не
+                # объявляется. Панель, не понявшая слова, присылает тот же
+                # обрезок — и записанное «список полон» выбросило бы номер,
+                # взятый с её же карточки, то есть поиск ломал бы то, что
+                # без него работало.
+                options = found
+                capped = len(found) >= _OPTIONS_SHOWN
     if guess is None and capped and chosen.get(attr) not in (None, ""):
         # Номер взят с карточки ЭТОЙ ЖЕ панели, и списком он не опровергнут
         # — список просто оборван. Выбросить его значит попросить продавца
@@ -2072,3 +2080,49 @@ def _select_queue(fields: list) -> list:
     ]
     return queue
 
+
+
+@router.message(Command("copy_debug"))
+async def copy_debug(message: Message) -> None:
+    """/copy_debug <номер объявления> — что копия видит у товара.
+
+    Копия читает панель тремя ответами: форма правки, карточка, форма
+    создания со списками. Когда она спрашивает раздел у товара, где раздел
+    есть, догадаться, который из трёх молчит, нельзя — а каждая догадка
+    стоила дня. Здесь печатается каждый.
+
+    Только чтение: те же GET, что делает сама копия, ничего не создаётся.
+    Команда скрытая — печатает разбор ответов панели, а это устройство
+    бота, не продавца.
+    """
+    from automation.panel import panel_copy_probe_sync
+    from storage import get_panel_creds
+
+    uid = message.from_user.id
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.answer("Нужен номер объявления: <code>/copy_debug 219206</code>")
+        return
+    ad_id = parts[1].strip()
+
+    creds = get_panel_creds(uid) or {}
+    if not creds.get("cookies"):
+        await message.answer("Куки панели не найдены — войди в панель заново.")
+        return
+
+    status = await message.answer(f"⏳ Смотрю товар {ad_id} глазами копии…")
+    loop = asyncio.get_event_loop()
+    try:
+        rows = await asyncio.wait_for(
+            loop.run_in_executor(None, panel_copy_probe_sync,
+                                 creds["cookies"], ad_id, uid),
+            timeout=120,
+        )
+    except Exception as e:                                # noqa: BLE001
+        await status.edit_text(f"❌ {html.escape(str(e)[:300])}")
+        return
+
+    text = "🔍 <b>Что копия видит у товара " + html.escape(ad_id) + "</b>\n\n"
+    body = "\n".join(html.escape(r) for r in rows)
+    # 4096 знаков — потолок Telegram; обрезаем хвост, а не роняем отправку
+    await status.edit_text((text + f"<code>{body}</code>")[:4000])

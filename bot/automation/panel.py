@@ -2989,6 +2989,102 @@ def panel_item_values_sync(
     return True, values, extra, labels, image_url, ""
 
 
+def panel_copy_probe_sync(cookie_string: str, item_id: str,
+                          uid: int | None = None) -> list[str]:
+    """Что копия ВИДИТ у товара — фактами, а не догадками. Только чтение.
+
+    Копия читает панель тремя разными ответами, и когда она спрашивает
+    раздел у товара, где раздел есть, догадаться, который из трёх молчит,
+    нельзя. Здесь печатается каждый: коды ответов, имена полей, что вышло в
+    `values`, `extra` и `labels`, и сколько вариантов панель отдаёт на
+    список — с поиском по надписи образца и без него.
+
+    Ничего не меняет и не создаёт: те же GET, что делает копия.
+    """
+    out: list[str] = []
+    session = _make_panel_requests_session(cookie_string)
+    hdrs = _panel_xsrf_headers(session, cookie_string)
+
+    def _get(path: str):
+        try:
+            return session.get(PANEL_URL + path, headers=hdrs,
+                               timeout=(6, 12), allow_redirects=False)
+        except Exception as e:                            # noqa: BLE001
+            out.append(f"{path}: не дозвонились ({str(e)[:60]})")
+            return None
+
+    # 1. Форма правки — откуда берутся название, остаток и картинка
+    r = _get(f"/nova-api/items/{item_id}/update-fields"
+             f"?editing=true&editMode=update")
+    if r is not None:
+        fields = []
+        if r.status_code == 200:
+            try:
+                fields = _parse_nova_fields_payload(r.json())
+            except Exception:
+                fields = []
+        out.append(f"форма правки: HTTP {r.status_code}, полей {len(fields)}")
+        out.append("  " + (", ".join(str(f.get("attribute")) for f in fields)
+                           or "—"))
+
+    # 2. Карточка — единственное место, где виден раздел
+    r = _get(f"/nova-api/items/{item_id}")
+    if r is not None:
+        card = []
+        if r.status_code == 200:
+            try:
+                card = _parse_nova_fields_payload(r.json())
+            except Exception:
+                card = []
+        out.append(f"карточка: HTTP {r.status_code}, полей {len(card)}")
+        out.append("  " + (", ".join(str(f.get("attribute")) for f in card)
+                           or "—"))
+        for f in card:
+            attr = str(f.get("attribute") or "")
+            if _is_section_attr(attr):
+                out.append(f"  {attr}: номер={_field_submit_value(f)!r} "
+                           f"надпись={_field_label_value(f)!r}")
+
+    # 3. Что из этого вышло — ровно то, что уедет в создание
+    ok, values, extra, labels, image_url, err = panel_item_values_sync(
+        cookie_string, item_id, uid)
+    out.append("")
+    out.append(f"прочиталось: {'да' if ok else 'нет — ' + err}")
+    if ok:
+        out.append(f"  название: {values.get('title')!r}")
+        out.append(f"  цена в панели: {values.get('price')!r} "
+                   f"(её там обычно нет — берётся у маркетплейса)")
+        out.append(f"  extra: {extra}")
+        out.append(f"  labels: {labels}")
+        out.append(f"  картинка: {'есть' if image_url else 'НЕТ'}")
+
+    # 4. Форма создания и списки — то, с чем сверяется готовый номер
+    form_ok, form = panel_get_item_form_sync(cookie_string)
+    out.append("")
+    if not form_ok or not isinstance(form, dict):
+        out.append(f"форма создания: не прочиталась ({form})")
+        return out
+    res = form.get("resource", "items")
+    attrs = [f["attribute"] for f in form["fields"]]
+    out.append(f"форма создания: раздел {res}, полей {len(attrs)}")
+    out.append("  " + ", ".join(map(str, attrs)))
+
+    for attr in [a for a in ("category", "subcategory", "type") if a in attrs]:
+        plain, _t = panel_sync_field_options_sync(
+            cookie_string, res, attr, {})
+        line = f"{attr}: без поиска {len(plain)} вариантов"
+        want = labels.get(attr) if ok else ""
+        if want:
+            found, _t2 = panel_sync_field_options_sync(
+                cookie_string, res, attr, {}, want)
+            line += f"; поиск «{want}» → {len(found)}"
+            if found:
+                line += " (" + ", ".join(
+                    f"{o.get('label')}={o.get('value')}" for o in found[:5]) + ")"
+        out.append(line)
+    return out
+
+
 def panel_fetch_image_sync(cookie_string: str, url: str) -> bytes:
     """Скачать картинку товара сессией ПАНЕЛИ.
 
