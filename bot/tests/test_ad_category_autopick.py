@@ -245,5 +245,97 @@ class ThePluginTellsTheWizardWhichSectionToUse(unittest.TestCase):
                         "широкое слово перебило бы узкое")
 
 
+def many(n: int) -> list[dict]:
+    """Список, обрезанный панелью: ровно столько, сколько она показывает."""
+    return [{"label": f"Игра {i:03d}", "value": 1000 + i} for i in range(n)]
+
+
+class ACutOffListDoesNotDenyTheSectionTheItemAlreadyHas(unittest.TestCase):
+    """Живой экран 07.09: «Выбери Категория (всего: 500)» и пятьсот чужих
+    игр по алфавиту.
+
+    Панель отдаёт список ОБРЕЗАННЫМ: без слова для поиска приходят первые
+    несколько сотен. «Нет в списке» поэтому не значит «нет вовсе» — значит
+    «дальше не показали», и выбрасывать из-за этого номер, взятый с карточки
+    ТОЙ ЖЕ панели, нельзя: продавец получает список чужих игр вместо
+    раздела, который у товара уже стоит.
+
+    Обратное тоже обязано работать: полный список номер именно опровергает,
+    и такой не отправляется — товар лёг бы в чужой раздел молча.
+    """
+
+    def setUp(self):
+        self.created: list = []
+        self.asked: list = []
+        self.searched: list = []
+        self._create, self._render = C._panel_create_and_report, C._render_select
+        self._search = C._search_options
+
+        async def create(msg, uid, values, extra=None, picked=None,
+                         state=None, api=None):
+            self.created.append({"extra": dict(extra or {}), "picked": picked})
+
+        async def render(msg, state, edit=True):
+            data = await state.get_data()
+            self.asked.append(data.get("current_attr"))
+
+        async def search(uid, data, attr, terms):
+            self.searched.append(list(terms))
+            return self.found, (self.found and terms[0] or "")
+
+        self.found: list = []
+        C._panel_create_and_report, C._render_select = create, render
+        C._search_options = search
+
+    def tearDown(self):
+        C._panel_create_and_report, C._render_select = self._create, self._render
+        C._search_options = self._search
+
+    def wizard(self, options, chosen, labels=None, words=None):
+        fields = [{"attribute": "category", "label": "Категория",
+                   "options": options}]
+        state = FSM({"select_queue": ["category"], "form_fields": fields,
+                     "chosen": dict(chosen), "pending": {"title": "товар"},
+                     "source_labels": dict(labels or {}),
+                     "autopick": list(words or [])})
+        asyncio.run(C._ask_next_select(Msg(), state, 1))
+        return state
+
+    def test_the_number_from_the_card_survives_a_cut_off_list(self):
+        self.wizard(many(C._OPTIONS_SHOWN), {"category": 12},
+                    {"category": "Standoff 2"})
+        self.assertEqual(self.asked, [], "спросил то, что у товара уже стоит")
+        self.assertEqual(self.created[0]["extra"], {"category": 12})
+
+    def test_a_full_list_that_denies_the_number_is_believed(self):
+        """Тот же номер, но список полон — значит номера правда нет."""
+        self.wizard(many(C._OPTIONS_SHOWN - 1), {"category": 12},
+                    {"category": "Standoff 2"})
+        self.assertEqual(self.asked, ["category"])
+        self.assertEqual(self.created, [])
+
+    def test_it_asks_the_panel_by_name_before_giving_up(self):
+        """Листать за продавца обрезок бессмысленно — нужного в нём не было.
+        Тем же адресом, которым ищет он словом, бот спрашивает сам."""
+        self.found = [{"label": "Standoff 2", "value": 44}]
+        self.wizard(many(C._OPTIONS_SHOWN), {}, {"category": "Standoff 2"},
+                    ["аккаунт"])
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.created[0]["extra"], {"category": 44})
+        self.assertEqual(self.searched[0][0], "Standoff 2",
+                         "искать надо сперва по надписи образца")
+
+    def test_what_the_search_found_is_shown_instead_of_the_cut_off_list(self):
+        """Выбрать не вышло — но показать найденное лучше, чем первые
+        пятьсот по алфавиту: нужного среди них и не было."""
+        self.found = [{"label": "Standoff 2 GL", "value": 44},
+                      {"label": "Standoff 2 RU", "value": 45}]
+        state = self.wizard(many(C._OPTIONS_SHOWN), {},
+                            {"category": "Standoff 2"})
+        self.assertEqual(self.asked, ["category"])
+        self.assertEqual(state.data["current_options"], self.found)
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+from urllib.parse import unquote_plus
 import os
 import sys
 import threading
@@ -124,6 +125,8 @@ class Nova(BaseHTTPRequestHandler):
     posted: list = []
     refuse_first: dict | None = None
     refuse_always: dict | None = None
+    # Обрезает ли панель список вариантов, как живая
+    capped: bool = False
 
     def log_message(self, *a):
         pass
@@ -147,8 +150,11 @@ class Nova(BaseHTTPRequestHandler):
             return
         if "/associatable/" in self.path:
             attr = self.path.split("/associatable/")[1].split("?")[0]
-            rows = ASSOCIATABLE.get(attr)
-            self._json(200, {"resources": rows} if rows else {"resources": []})
+            search = ""
+            for part in self.path.split("?")[-1].split("&"):
+                if part.startswith("search="):
+                    search = unquote_plus(part[len("search="):])
+            self._json(200, {"resources": self._options(attr, search)})
             return
         if _DETAIL.match(self.path.split("?")[0]):
             self._json(200, {"resource": {"fields": DETAIL_FIELDS}})
@@ -172,6 +178,22 @@ class Nova(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         self._json(404, {"message": "нет такого"})
+
+    def _options(self, attr: str, search: str) -> list:
+        """Варианты списка — так же обрезанно, как их отдаёт живая панель.
+
+        Без слова для поиска этот адрес присылает первые пятьсот по
+        алфавиту: раздела «Standoff 2» среди них нет, и продавцу выпадал
+        список чужих игр вместо раздела, который у товара уже стоит.
+        """
+        rows = ASSOCIATABLE.get(attr) or []
+        if search:
+            s = search.lower()
+            return [r for r in rows if s in str(r["display"]).lower()]
+        if Nova.capped:
+            return [{"value": 1000 + i, "display": f"Игра {i:03d}"}
+                    for i in range(500)]
+        return rows
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -211,6 +233,7 @@ class Bench(unittest.TestCase):
         Nova.posted = []
         Nova.refuse_first = None
         Nova.refuse_always = None
+        Nova.capped = False
 
     def read(self):
         return P.panel_item_values_sync("session=1", "219206", uid=None)
@@ -441,6 +464,7 @@ class TheWholeCopyRunsEndToEnd(Bench):
         Nova.posted = []
         Nova.refuse_first = None
         Nova.refuse_always = None
+        Nova.capped = False
 
     def tearDown(self):
         self.storage.get_panel_creds = self._creds
@@ -830,6 +854,69 @@ class TheWholeCopyRunsEndToEnd(Bench):
         self.assertNotIn("не создалась", said)
         self.assertNotIn("прочитать не вышло", said)
         self.assertIn("Выбери", said, "должен спросить, а не отказать")
+
+    def test_a_section_past_the_first_page_still_goes_out(self):
+        """Живой экран 07.09: «Выбери Категория (всего: 500)» и пятьсот
+        чужих игр по алфавиту. Панель отдаёт список ОБРЕЗАННЫМ, раздела
+        товара в нём нет — а прошлая правка из-за этого выбрасывала верный
+        номер, взятый с карточки той же панели.
+
+        Название взято такое, какого нет ни в списке, ни в поиске: тогда
+        опровергнуть номер нечем, и отправляется он."""
+        Nova.capped = True
+        for f in DETAIL_FIELDS:
+            if f["attribute"] == "category":
+                was = dict(f)
+                f["value"] = {"display": "Раздел, которого панель не покажет"}
+                try:
+                    cb = self.press()
+                    self.assertNotIn("Выбери", cb.message.texts[-1])
+                    self.assertEqual(
+                        str(self.created_body().get("category")), "12")
+                finally:
+                    f.clear()
+                    f.update(was)
+                return
+        self.fail("в карточке образца нет раздела")
+
+    def test_it_asks_the_panel_by_name_instead_of_leafing_through(self):
+        """Номера у образца нет — есть надпись. Листать обрезанный список
+        за продавца бессмысленно: нужного в нём и не было. Тем же адресом,
+        которым ищет продавец словом, бот спрашивает панель сам."""
+        Nova.capped = True
+        for f in DETAIL_FIELDS:
+            if f["attribute"] == "subcategory":
+                was = dict(f)
+                f.pop("belongsToId", None)
+                f["value"] = {"display": "Standoff 2"}
+                try:
+                    cb = self.press()
+                    self.assertNotIn("Выбери", cb.message.texts[-1])
+                    self.assertEqual(
+                        str(self.created_body().get("subcategory")), "44")
+                finally:
+                    f.clear()
+                    f.update(was)
+                return
+        self.fail("в карточке образца нет подраздела")
+
+    def test_a_number_the_full_list_denies_is_still_not_sent(self):
+        """Обрезанный список не опровергает номер, а полный — опровергает.
+        Смешать эти два случая значит отправлять чужие номера всегда."""
+        for f in DETAIL_FIELDS:
+            if f["attribute"] == "subcategory":
+                was = dict(f)
+                f["belongsToId"] = 999
+                f["value"] = {"display": "Такого раздела нет"}
+                try:
+                    self.press()
+                    self.assertNotEqual(
+                        str(self.created_body().get("subcategory")), "999")
+                finally:
+                    f.clear()
+                    f.update(was)
+                return
+        self.fail("в карточке образца нет подраздела")
 
     def test_a_dead_panel_does_not_report_success(self):
         old = P.PANEL_URL

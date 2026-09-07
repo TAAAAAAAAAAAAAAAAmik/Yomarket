@@ -759,6 +759,52 @@ def _source_match(options: list, value, label: str) -> dict | None:
     return None
 
 
+# Сколько вариантов показываем на одном списке. Это же число говорит,
+# оборван ли ответ панели: ровно столько — значит дальше не показали.
+_OPTIONS_SHOWN = 500
+
+
+async def _search_options(uid: int, data: dict, attr: str,
+                          terms: list) -> tuple[list, str]:
+    """Спросить у панели варианты ПО ИМЕНИ. → (варианты, по какому слову).
+
+    Без слова для поиска панель отдаёт первые несколько сотен вариантов по
+    алфавиту, и «Standoff 2» в них не попадает: продавцу показывался список
+    из пятисот чужих игр вместо раздела, который у товара уже стоит.
+    Ровно этим адресом пользуется и поиск словом — только слово бот берёт у
+    образца, а не у продавца.
+    """
+    from storage import get_panel_creds
+    from automation.panel import panel_sync_field_options_sync
+
+    creds = get_panel_creds(uid) or {}
+    if not creds.get("cookies"):
+        return [], ""
+    loop = asyncio.get_event_loop()
+    seen: set = set()
+    for term in terms[:4]:
+        t = str(term or "").strip()
+        # Короткое слово подойдёт к чему угодно, и поиск по нему вернёт
+        # такой же обрезок, как без него.
+        if len(t) < 3 or t.lower() in seen:
+            continue
+        seen.add(t.lower())
+        try:
+            rows, _trace = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, panel_sync_field_options_sync, creds["cookies"],
+                    data.get("form_resource", "items"), attr,
+                    data.get("chosen") or {}, t),
+                timeout=20,
+            )
+        except Exception as e:                            # noqa: BLE001
+            logger.info("поиск вариантов «%s» не удался: %s", t, e)
+            rows = []
+        if rows:
+            return rows, t
+    return [], ""
+
+
 async def _ask_next_select(msg, state: FSMContext, uid: int,
                            api=None) -> None:
     """Спросить следующее обязательное поле-список — или уже создать товар.
@@ -832,28 +878,52 @@ async def _ask_next_select(msg, state: FSMContext, uid: int,
         await _ask_next_select(msg, state, uid, api)
         return
 
-    options = options[:500]
+    # Список панель отдаёт ОБРЕЗАННЫМ: без слова для поиска этот адрес
+    # присылает первые несколько сотен по алфавиту. «Нет в списке» поэтому
+    # не значит «нет вовсе» — значит «дальше не показали».
+    capped = len(options) >= _OPTIONS_SHOWN
+    options = options[:_OPTIONS_SHOWN]
     label = f.get("label") or attr
+    hint = (data.get("source_labels") or {}).get(attr)
+    words = list(data.get("autopick") or [])
 
     # Раздел, известный заранее, выбирается сам — но только когда подходит
     # ровно один вариант. Выбранное записывается и показывается продавцу:
     # молча решить за него, где будет лежать товар, значит поставить его
     # перед фактом на витрине.
-    # Взятое у образца проверяется по списку формы, а не отправляется на
-    # веру: номера у панели и у маркетплейса совпадать не обязаны, а
-    # отправленный чужой номер положит товар в чужой раздел молча.
-    guess = _source_match(options, chosen.get(attr),
-                          (data.get("source_labels") or {}).get(attr))
+    guess = _source_match(options, chosen.get(attr), hint)
     took = "как у образца"
     if guess is None:
         # Своего ответа нет — пробуем подобрать по словам: названию раздела
         # с маркетплейса и словам названия товара.
-        guess = _autopick_match(options, data.get("autopick") or [])
+        guess = _autopick_match(options, words)
         took = "подобран"
-        if guess is None and attr in chosen:
-            # Не сверилось и не подобралось — чужой номер не отправляем.
-            chosen.pop(attr, None)
-            await state.update_data(chosen=chosen)
+    if guess is None:
+        # Ни там ни там — спрашиваем панель по имени, а не листаем обрезок.
+        # Ровно то же самое делает продавец, когда пишет название словом.
+        found, term = await _search_options(uid, data, attr,
+                                            ([hint] if hint else []) + words)
+        if found:
+            guess = _source_match(found, chosen.get(attr), hint)
+            took = "как у образца"
+            if guess is None:
+                guess = _autopick_match(found, [term] + words)
+                took = "найден по названию"
+            if guess is None:
+                # Выбрать не вышло, но найденное показать лучше, чем
+                # первые пятьсот по алфавиту: там нужного и не было.
+                options, capped = found, False
+    if guess is None and capped and chosen.get(attr) not in (None, ""):
+        # Номер взят с карточки ЭТОЙ ЖЕ панели, и списком он не опровергнут
+        # — список просто оборван. Выбросить его значит попросить продавца
+        # искать руками то, что у товара уже стоит.
+        guess = {"value": chosen[attr], "label": hint or str(chosen[attr])}
+        took = "как у образца"
+    if guess is None and attr in chosen:
+        # Список полон, а номера в нём нет — такой не отправляем: товар лёг
+        # бы в чужой раздел молча.
+        chosen.pop(attr, None)
+        await state.update_data(chosen=chosen)
     if guess is not None:
         chosen[attr] = guess.get("value")
         notes = list(data.get("autopicked") or [])
