@@ -938,11 +938,19 @@ async def ads_debug(message: Message, api: YooMarketAPI) -> None:
     try:
         data = await api.get_ads()
         rows = await api.get_all_ads()
+        # Форма страницы ОБЪЯВЛЕНИЙ — своя строка. Ниже печатается ещё и
+        # форма справочника разделов, и прошлый разбор спутал одно с
+        # другим: курсор искали не там, где он лежит у товаров.
+        page_shape = (
+            f"страница /ads: строк {len(data.get('data') or [])}, "
+            f"meta {_json.dumps(data.get('meta'), ensure_ascii=False)[:120]}, "
+            f"links {_json.dumps(data.get('links'), ensure_ascii=False)[:120]}")
         if not rows:
             report = f"API вернул пусто: {_json.dumps(data, ensure_ascii=False)[:400]}"
         else:
             ad = rows[0]
             lines = [f"всего объявлений (все страницы): {len(rows)}",
+                     page_shape,
                      f"ключи: {list(ad.keys())}", ""]
             for k, v in ad.items():
                 if isinstance(v, (dict, list)):

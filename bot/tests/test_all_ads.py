@@ -104,6 +104,96 @@ class EveryPageIsRead(unittest.TestCase):
         self.assertEqual(run(api.get_all_ads()), [{"id": 1}])
 
 
+class TheCursorIsWhereThisMarketplacePutsIt(unittest.TestCase):
+    """Живой ответ 08.09, дословно:
+
+        "meta":  {"per_page": 100, "has_more": true}
+        "links": {"next_cursor": "eyJpZCI6MTA5…", "prev_cursor": null}
+
+    Курсор лежит в `links.next_cursor`. Мы искали `meta.next_cursor`,
+    `meta.next` и `links.next` — ни одного из них тут нет, и листание не
+    начиналось ВООБЩЕ. Продавец видел 15 объявлений из полусотни.
+    """
+
+    def real_shape(self, pages):
+        api = YooMarketAPI("token")
+        api.asked = []
+
+        async def get_ads(cursor=None):
+            api.asked.append(cursor)
+            rows, nxt = pages[cursor]
+            return {"data": rows,
+                    "meta": {"per_page": 100, "has_more": bool(nxt)},
+                    "links": {"next_cursor": nxt, "prev_cursor": None}}
+
+        api.get_ads = get_ads
+        return api
+
+    def test_the_next_pages_are_read(self):
+        api = self.real_shape({
+            None: ([{"id": 250730}], "eyJpZCI6MTA5"),
+            "eyJpZCI6MTA5": ([{"id": 250731}], None),
+        })
+        got = run(api.get_all_ads())
+        self.assertEqual([a["id"] for a in got], [250730, 250731])
+
+    def test_has_more_false_stops_it(self):
+        """У последней страницы курсор остаётся от предыдущей: без этого
+        стопа цикл сходил бы за ней ещё раз."""
+        api = YooMarketAPI("token")
+        api.asked = []
+
+        async def get_ads(cursor=None):
+            api.asked.append(cursor)
+            return {"data": [{"id": 1}],
+                    "meta": {"has_more": False},
+                    "links": {"next_cursor": "старый"}}
+
+        api.get_ads = get_ads
+        run(api.get_all_ads())
+        self.assertEqual(api.asked, [None])
+
+    def test_a_full_url_is_not_a_cursor(self):
+        """`links.next` у Laravel бывает адресом страницы. Отправленный как
+        курсор, он вернул бы ту же страницу — и цикл бы закрутился."""
+        api = YooMarketAPI("token")
+        api.asked = []
+
+        async def get_ads(cursor=None):
+            api.asked.append(cursor)
+            return {"data": [{"id": 1}],
+                    "links": {"next": "https://api.yoo.market/ads?page=2"}}
+
+        api.get_ads = get_ads
+        run(api.get_all_ads())
+        self.assertEqual(api.asked, [None])
+
+
+class TheCategoryReferenceIsReadWholeToo(unittest.TestCase):
+    """Тот же курсор — и у справочника разделов. «Категорий в справочнике:
+    100» было ровно одной страницей: верхний уровень этого маркетплейса —
+    сотни игр, и по имени находилась только первая сотня."""
+
+    def test_all_pages_of_categories(self):
+        api = YooMarketAPI("token")
+        pages = {
+            None: ([{"id": 1, "title": "Brawl Stars"}], "c2"),
+            "c2": ([{"id": 77, "title": "Black Russia"}], None),
+        }
+
+        async def get(path, params=None):
+            cursor = (params or {}).get("cursor")
+            rows, nxt = pages[cursor]
+            return {"data": rows,
+                    "meta": {"per_page": 100, "has_more": bool(nxt)},
+                    "links": {"next_cursor": nxt}}
+
+        api._get = get
+        got = run(api.get_categories())
+        self.assertEqual([c["title"] for c in got],
+                         ["Brawl Stars", "Black Russia"])
+
+
 class TheExpiredRestoreSeesEveryPageToo(unittest.TestCase):
     """Истёкшее объявление со второй страницы не возвращалось никогда:
     проход просто его не видел."""
