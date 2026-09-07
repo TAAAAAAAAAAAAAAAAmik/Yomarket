@@ -171,6 +171,9 @@ class AddingAWatch(FlowCase):
             async def get_ads(self, *a, **kw):
                 return {"data": [{"id": 220075}, {"id": 999}]}
 
+            async def get_all_ads(self, *a, **kw):
+                return [{"id": 220075}, {"id": 999}]
+
         import api.yoomarket as Y
         self.patch(Y, "YooMarketAPI", FakeApi)
 
@@ -242,6 +245,9 @@ class AddingFromOwnListings(FlowCase):
 
             async def get_ads(self, *a, **kw):
                 return ads
+
+            async def get_all_ads(self, *a, **kw):
+                return list(ads.get("data") or [])
 
         import api.yoomarket as Y
         self.patch(Y, "YooMarketAPI", FakeApi)

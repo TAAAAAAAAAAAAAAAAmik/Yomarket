@@ -119,10 +119,14 @@ async def show_stats(callback: CallbackQuery, api: YooMarketAPI) -> None:
         try:
             ads_data = await api.get_ads()
             meta = ads_data.get("meta", {})
-            ads_list = ads_data.get("data") or ads_data.get("items") or []
-            ads_total = str(
-                meta.get("total") or meta.get("count") or meta.get("total_count") or len(ads_list)
-            )
+            total = (meta.get("total") or meta.get("count")
+                     or meta.get("total_count"))
+            # Своё число маркетплейс называет не всегда, а `len` первой
+            # страницы — это не «сколько у меня товаров», а «сколько влезло
+            # в один ответ». Считаем по всем страницам, а не по одной.
+            if not total:
+                total = len(await api.get_all_ads())
+            ads_total = str(total)
         except Exception as e:
             logger.warning("Stats ads error: %s", e)
 

@@ -138,6 +138,45 @@ class YooMarketAPI:
             params["cursor"] = cursor
         return await self._get("/ads", params=params)
 
+    async def get_all_ads(self, max_pages: int = 25) -> list[dict]:
+        """ВСЕ объявления продавца — с проходом по страницам.
+
+        `/ads` отдаёт список курсором, и одна страница — это два-три десятка
+        товаров. Все, кто спрашивал «мои товары», читали только первую: у
+        продавца с полусотней объявлений половина просто не существовала —
+        ни в списке, ни в копии, ни в статистике, ни в автовозврате
+        истёкших. Снаружи это «бот загружает не все товары».
+
+        Потолок страниц не для красоты: курсор, который сервер повторяет,
+        крутил бы этот цикл вечно. Повтор ловится отдельно — по тому же
+        курсору дважды не ходим.
+        """
+        out: list[dict] = []
+        seen_ids: set = set()
+        cursor: str | None = None
+        used: set = set()
+        for _ in range(max_pages):
+            data = await self.get_ads(cursor)
+            rows = data.get("data") or data.get("items") or []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                rid = str(row.get("id") or "")
+                # Один и тот же товар с двух страниц — это не два товара.
+                if rid and rid in seen_ids:
+                    continue
+                if rid:
+                    seen_ids.add(rid)
+                out.append(row)
+            meta = data.get("meta") or {}
+            cursor = (meta.get("next_cursor") or meta.get("next")
+                      or (data.get("links") or {}).get("next"))
+            if not cursor or not rows or cursor in used:
+                break
+            used.add(cursor)
+        logger.info("объявлений загружено: %d", len(out))
+        return out
+
     async def get_ad(self, ad_id: int | str) -> dict:
         return await self._get(f"/ads/{ad_id}")
 
@@ -245,9 +284,9 @@ class YooMarketAPI:
         три разных исхода, которые прежде схлопывались в одно число и последнее
         сообщение об ошибке.
         """
-        data = await self.get_ads()
-        ads = [a for a in (data.get("data") or data.get("items") or [])
-               if isinstance(a, dict)]
+        # ВСЕ страницы: истёкшее объявление со второй страницы не
+        # возвращалось никогда — проход просто его не видел.
+        ads = [a for a in await self.get_all_ads() if isinstance(a, dict)]
         skip = {str(i) for i in (skip_ids or ())}
         # Статусы, публиковать которые маркетплейс уже отказывался. Список собран
         # из его собственных ответов `incorrect_status`, а не придуман мной:

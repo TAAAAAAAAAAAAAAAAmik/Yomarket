@@ -303,6 +303,9 @@ class Api:
                           "title": TITLE,
                           "price": {"amount": 1490}}]}
 
+    async def get_all_ads(self, max_pages=25):
+        return (await self.get_ads()).get("data")
+
     # Вид товара: от него зависит, что бот может с остатком сделать сам.
     kind: str = ""
     value_block: dict = {}

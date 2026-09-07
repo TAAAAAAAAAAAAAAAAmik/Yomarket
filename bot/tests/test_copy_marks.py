@@ -23,11 +23,17 @@ class Bench(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self._dir = storage._DATA_DIR
         storage._DATA_DIR = self.tmp.name
-        storage._SETTINGS_FILE = os.path.join(self.tmp.name, "settings.json")
+        # Путь читается из `_BLOBS`, а не из `_SETTINGS_FILE`: подменённая
+        # переменная ничего не меняла, тест писал в НАСТОЯЩИЕ настройки, и
+        # запомненный раздел приезжал из соседнего теста — падение зависело
+        # от порядка запуска.
+        self._blob = storage._BLOBS["settings"]
+        storage._BLOBS["settings"] = os.path.join(self.tmp.name,
+                                                  "settings.json")
 
     def tearDown(self):
         storage._DATA_DIR = self._dir
-        storage._SETTINGS_FILE = os.path.join(self._dir, "settings.json")
+        storage._BLOBS["settings"] = self._blob
         self.tmp.cleanup()
 
 

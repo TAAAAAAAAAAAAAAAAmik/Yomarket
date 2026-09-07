@@ -1973,8 +1973,7 @@ async def _ads_by_section(api, uid: int):
                                       _wanted_cats)
 
     try:
-        data = await api.get_ads()
-        ads = data.get("data") or data.get("items") or []
+        ads = await api.get_all_ads()
         names = await _category_names(api, uid, _wanted_cats(ads))
     except Exception as e:                                # noqa: BLE001
         return {}, _readable(str(e))
@@ -2087,8 +2086,14 @@ async def templates_list(callback: CallbackQuery, state: FSMContext,
 
 
 async def _show_section(callback: CallbackQuery, state: FSMContext,
-                        idx: int) -> None:
-    """Объявления одного раздела."""
+                        idx: int, page: int = 0) -> None:
+    """Объявления одного раздела — страницами.
+
+    Двенадцать кнопок на экране это предел читаемости, а товаров в разделе
+    бывает полсотни. Раньше остальные просто не показывались: экран честно
+    писал «первые 12 из 30», но добраться до тринадцатого было нечем — то
+    есть скопировать его было нельзя.
+    """
     from orderfields import ad_price
 
     data = await state.get_data()
@@ -2100,28 +2105,51 @@ async def _show_section(callback: CallbackQuery, state: FSMContext,
         return
     name = order[idx]
     ads = ads_by.get(name) or []
+    pages = max(1, (len(ads) + _COPY_LIMIT - 1) // _COPY_LIMIT)
+    page = max(0, min(page, pages - 1))
+    start = page * _COPY_LIMIT
 
     b = InlineKeyboardBuilder()
     rows = []
-    for j, ad in enumerate(ads[:_COPY_LIMIT]):
+    for j, ad in enumerate(ads[start:start + _COPY_LIMIT], start=start):
         title = str(ad.get("title") or ad.get("name") or "без названия")
         b.button(text=f"📋 {title[:30]}",
                  callback_data=f"create_ad:copy:{idx}:{j}"[:64])
         rows.append(f"• <b>{html.escape(title[:40])}</b> — "
                     f"{int(ad_price(ad) or 0)} ₽")
-    # Обрезали — говорим. Молчаливое обрезание означает, что половины
-    # товаров для копии просто нет, и понять это неоткуда.
-    if len(ads) > _COPY_LIMIT:
-        rows += ["", f"<i>Показаны первые {_COPY_LIMIT} из {len(ads)}.</i>"]
-    if len(order) > 1:
-        b.button(text="⬅️ К разделам", callback_data="create_ad:templates_list")
-    b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
-    b.button(text="❌ Отмена", callback_data="menu:ads")
     ui.lay(b)
+    if pages > 1:
+        from aiogram.types import InlineKeyboardButton
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                text="◀️", callback_data=f"create_ad:sect:{idx}:{page - 1}"))
+        nav.append(InlineKeyboardButton(
+            text=f"{page + 1}/{pages}", callback_data="create_ad:noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(
+                text="▶️", callback_data=f"create_ad:sect:{idx}:{page + 1}"))
+        b.row(*nav)
+        rows += ["", f"<i>Всего в разделе: {len(ads)}.</i>"]
+    tail = InlineKeyboardBuilder()
+    if len(order) > 1:
+        tail.button(text="⬅️ К разделам",
+                    callback_data="create_ad:templates_list")
+    tail.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
+    tail.button(text="❌ Отмена", callback_data="menu:ads")
+    ui.lay(tail)
+    for row in tail.export():
+        b.row(*row)
     await callback.message.edit_text(ui.screen(
         f"📂 <b>{html.escape(name[:40])}</b>",
         ["Выбор здесь и есть подтверждение — объявление уйдёт сразу.", ""]
         + rows), reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "create_ad:noop")
+async def section_noop(callback: CallbackQuery) -> None:
+    """Кнопка-счётчик страниц: нажимается, но делать ей нечего."""
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("create_ad:sect:"))
@@ -2132,12 +2160,16 @@ async def open_section(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Этого раздела сейчас нет", show_alert=True)
         return
     await callback.answer()
+    # `create_ad:sect:{раздел}` и `create_ad:sect:{раздел}:{страница}` —
+    # читать последнее число нельзя: у второй формы это страница.
+    tail = callback.data.split(":")[2:]
     try:
-        idx = int(callback.data.split(":")[-1])
-    except ValueError:
+        idx = int(tail[0])
+        page = int(tail[1]) if len(tail) > 1 else 0
+    except (ValueError, IndexError):
         await callback.answer("Такого раздела нет", show_alert=True)
         return
-    await _show_section(callback, state, idx)
+    await _show_section(callback, state, idx, page)
 
 
 async def _ad_card(api, ad_id: str) -> dict:
@@ -2640,10 +2672,9 @@ async def _my_ad_numbers(api) -> str:
     if not api:
         return "Не настроен API-токен — номера объявлений спросить негде."
     try:
-        raw = await api.get_ads()
+        ads = await api.get_all_ads()
     except Exception as e:                                # noqa: BLE001
         return f"Объявления не прочитались: {html.escape(str(e)[:200])}"
-    ads = (raw.get("data") if isinstance(raw, dict) else raw) or []
     if not ads:
         return "Объявлений нет — копировать нечего."
     rows = [f"<code>{a.get('id')}</code> — {html.escape(str(a.get('title'))[:40])}"

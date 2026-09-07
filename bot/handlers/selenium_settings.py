@@ -865,7 +865,8 @@ async def _my_ads(uid: int, reload: bool = False) -> list:
     names: dict = {}
     try:
         await api.start()
-        data = await api.get_ads()
+        ads_all = await api.get_all_ads()
+        data = {"data": ads_all}
         # Название раздела API рядом с объявлением не кладёт — только номер,
         # и номер этот из своего пространства: 5221 в каталоге витрины нет.
         # Зато у API есть справочник разделов, и название в нём общее с
@@ -1470,7 +1471,7 @@ async def _match_by_own_ads(uid: int, offers: list[dict]) -> tuple[dict | None,
     api = YooMarketAPI(token)
     try:
         await api.start()
-        data = await api.get_ads()
+        data = {"data": await api.get_all_ads()}
     except Exception as e:
         logger.warning("own ads for position match (%s): %s", uid, e)
         return None, set()
@@ -3216,9 +3217,7 @@ async def restore_debug(message: Message, api: YooMarketAPI) -> None:
 
     status = await message.answer("⏳ Читаю объявления...")
     try:
-        data = await api.get_ads()
-        rows = [a for a in (data.get("data") or data.get("items") or [])
-                if isinstance(a, dict)]
+        rows = [a for a in await api.get_all_ads() if isinstance(a, dict)]
         by_state: dict[str, int] = {}
         for a in rows:
             by_state[api._ad_state(a)] = by_state.get(api._ad_state(a), 0) + 1

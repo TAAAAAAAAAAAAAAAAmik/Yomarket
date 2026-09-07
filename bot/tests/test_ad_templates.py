@@ -139,6 +139,11 @@ class Api:
             raise self.list_raises
         return {"data": self.ads}
 
+    async def get_all_ads(self, max_pages=25):
+        if self.list_raises:
+            raise self.list_raises
+        return list(self.ads)
+
     async def resolve_category(self, cid):
         return {512: "Telegram Звёзды", 7: "Гифт-карты"}.get(int(cid), "")
 
@@ -270,18 +275,60 @@ class TheListIsGroupedBySection(Bench):
         run(C.open_section(cb2, fsm))
         self.assertIn("create_ad:templates_list", self.kb(cb2))
 
-    def test_a_long_section_says_it_was_trimmed(self):
-        """Молчаливое обрезание означает, что половины товаров для копии
-        просто нет, и понять это неоткуда."""
+    def _long_section(self, n=30):
         self.api.ads = [dict(self.api.CARD, id=i, title=f"Товар {i}",
-                             category_id=512) for i in range(30)]
-        cb, fsm = self.sections()
+                             category_id=512) for i in range(n)]
+        _cb, fsm = self.sections()
         cb2 = CB("create_ad:sect:0")
         run(C.open_section(cb2, fsm))
+        return cb2, fsm
+
+    def test_a_long_section_is_paged_not_cut(self):
+        """Двенадцать кнопок — предел читаемости, а товаров в разделе
+        бывает полсотни. Раньше остальные просто не показывались: экран
+        честно писал «первые 12 из 30», но добраться до тринадцатого было
+        нечем — то есть скопировать его было НЕЛЬЗЯ."""
+        cb2, _fsm = self._long_section(30)
         said = cb2.message.texts[-1]
-        self.assertIn(f"из {len(self.api.ads)}", said)
+        self.assertIn("Всего в разделе: 30", said)
         copies = [d for d in self.kb(cb2) if d.startswith("create_ad:copy:")]
         self.assertEqual(len(copies), C._COPY_LIMIT)
+        self.assertIn("create_ad:sect:0:1", self.kb(cb2), "листалки нет")
+
+    def test_the_next_page_shows_the_rest(self):
+        cb2, fsm = self._long_section(30)
+        cb3 = CB("create_ad:sect:0:1")
+        run(C.open_section(cb3, fsm))
+        copies = [d for d in self.kb(cb3) if d.startswith("create_ad:copy:")]
+        self.assertEqual(len(copies), C._COPY_LIMIT)
+        # Номера СКВОЗНЫЕ: копия берёт объявление по этому номеру из
+        # списка, и нумерация с нуля на каждой странице скопировала бы
+        # чужой товар.
+        self.assertIn("create_ad:copy:0:12", copies)
+        self.assertIn("create_ad:sect:0:0", self.kb(cb3), "назад некуда")
+
+    def test_the_last_page_is_not_a_dead_end(self):
+        cb2, fsm = self._long_section(30)
+        cb4 = CB("create_ad:sect:0:2")
+        run(C.open_section(cb4, fsm))
+        copies = [d for d in self.kb(cb4) if d.startswith("create_ad:copy:")]
+        self.assertEqual(len(copies), 6, copies)
+        self.assertNotIn("create_ad:sect:0:3", self.kb(cb4))
+
+    def test_a_page_beyond_the_end_shows_the_last_one(self):
+        """Кнопка из старого сообщения указывает на страницу, которой уже
+        нет: пустой экран здесь читался бы как «товары пропали»."""
+        cb2, fsm = self._long_section(30)
+        cb5 = CB("create_ad:sect:0:99")
+        run(C.open_section(cb5, fsm))
+        self.assertTrue([d for d in self.kb(cb5)
+                         if d.startswith("create_ad:copy:")])
+
+    def test_a_short_section_has_no_pager(self):
+        """Листалка на одной странице — кнопка, которой некуда вести."""
+        cb2, _fsm = self._long_section(3)
+        self.assertNotIn("create_ad:noop", self.kb(cb2))
+        self.assertNotIn("Всего в разделе", cb2.message.texts[-1])
 
     def test_the_price_object_is_read_properly(self):
         """Маркетплейс отдаёт цену объектом. Прочитанная как скаляр, она

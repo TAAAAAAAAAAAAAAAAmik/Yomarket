@@ -571,6 +571,9 @@ class TheWholeCopyRunsEndToEnd(Bench):
                                   "price": {"amount": 1490},
                                   "category_id": 12}]}
 
+            async def get_all_ads(s, max_pages=25):
+                return (await s.get_ads()).get("data")
+
             async def resolve_category(s, cid):
                 return "Аккаунты"
 

@@ -34,6 +34,9 @@ class FakeAPI:
     async def get_ads(self, cursor=None):
         return {"data": list(self.ads), "meta": {}}
 
+    async def get_all_ads(self, max_pages=25):
+        return list(self.ads)
+
 
 class Screen:
     def __init__(self):

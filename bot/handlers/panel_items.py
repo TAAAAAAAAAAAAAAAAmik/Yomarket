@@ -106,8 +106,10 @@ async def list_categories(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.answer()
     await _safe_edit(callback.message, "⏳ Загружаю категории...")
     try:
-        data = await api.get_ads()
-        ads = data.get("data") or data.get("items") or []
+        # ВСЕ страницы: `/ads` отдаёт список курсором, и одна страница —
+        # это два-три десятка товаров. Читая только первую, бот показывал
+        # продавцу половину его же магазина.
+        ads = await api.get_all_ads()
         names = await _category_names(
             api, callback.from_user.id, _wanted_cats(ads))
     except Exception as e:
@@ -187,8 +189,10 @@ async def _render_ads(callback: CallbackQuery, api: YooMarketAPI,
     await callback.answer()
     await _safe_edit(callback.message, "⏳ Загружаю товары...")
     try:
-        data = await api.get_ads()
-        ads = data.get("data") or data.get("items") or []
+        # ВСЕ страницы: `/ads` отдаёт список курсором, и одна страница —
+        # это два-три десятка товаров. Читая только первую, бот показывал
+        # продавцу половину его же магазина.
+        ads = await api.get_all_ads()
         names = await _category_names(
             api, callback.from_user.id, _wanted_cats(ads))
     except Exception as e:
@@ -933,12 +937,12 @@ async def ads_debug(message: Message, api: YooMarketAPI) -> None:
     status = await message.answer("⏳ Читаю объявление из API...")
     try:
         data = await api.get_ads()
-        rows = data.get("data") or data.get("items") or []
+        rows = await api.get_all_ads()
         if not rows:
             report = f"API вернул пусто: {_json.dumps(data, ensure_ascii=False)[:400]}"
         else:
             ad = rows[0]
-            lines = [f"всего объявлений: {len(rows)}",
+            lines = [f"всего объявлений (все страницы): {len(rows)}",
                      f"ключи: {list(ad.keys())}", ""]
             for k, v in ad.items():
                 if isinstance(v, (dict, list)):

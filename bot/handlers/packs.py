@@ -233,8 +233,7 @@ async def pack_add_list(callback: CallbackQuery, api: YooMarketAPI) -> None:
         return
     await callback.answer("⏳ Загружаю товары…")
     try:
-        data = await api.get_ads()
-        ads = data.get("data") or data.get("items") or []
+        ads = await api.get_all_ads()
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка загрузки: {e}")
         return
