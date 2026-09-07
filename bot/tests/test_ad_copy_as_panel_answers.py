@@ -241,15 +241,21 @@ def _body(row: dict) -> dict:
 class Msg:
     def __init__(self):
         self.texts: list[str] = []
+        self.kbs: list = []
         self.chat = type("C", (), {"id": 1})()
         self.message_id = 1
 
+    def __init_subclass__(cls, **kw):
+        super().__init_subclass__(**kw)
+
     async def edit_text(self, text, reply_markup=None, **kw):
         self.texts.append(text)
+        self.kbs.append(reply_markup)
         return self
 
     async def answer(self, text, reply_markup=None, **kw):
         self.texts.append(text)
+        self.kbs.append(reply_markup)
         return self
 
 
@@ -292,9 +298,25 @@ class Api:
                           "title": TITLE,
                           "price": {"amount": 1490}}]}
 
+    # Вид товара: от него зависит, что бот может с остатком сделать сам.
+    kind: str = ""
+    value_block: dict = {}
+    items_left: list = []
+    updated: list = []
+
     async def get_ad(self, ad_id):
         return {"data": {"id": ad_id, "stock": 3, "category_id": 5221,
+                         "type": Api.kind,
                          "price": {"amount": 1490, "currency": "RUB"}}}
+
+    async def get_ad_value(self, ad_id):
+        return {"data": dict(Api.value_block)}
+
+    async def update_ad_value(self, ad_id, **fields):
+        Api.updated.append(fields)
+
+    async def get_ad_items(self, ad_id, cursor=None):
+        return {"data": list(Api.items_left)}
 
     # Дерево разделов маркетплейса. Товар лежит в ЛИСТЕ («Аккаунты»), а
     # панель раскладывает по играм («Standoff 2»): нужное слово стоит на
@@ -375,6 +397,7 @@ class Bench(unittest.TestCase):
         Api.section = "Аккаунты"
         Api.stock, Api.refills = 0, []
         Api.path = ["Игры", "Standoff 2", "Аккаунты"]
+        Api.kind, Api.value_block, Api.items_left, Api.updated = "", {}, [], []
 
     def tearDown(self):
         self.storage.get_copy_marks = self._get_marks
@@ -620,6 +643,49 @@ class AnAnswerGivenOnceIsNotAskedAgain(Bench):
                             "labels": {"category": other["display"]}}
         self.press()
         self.assertEqual(str(self.created().get("category")), "613")
+
+
+class TheStockIsPutInByTheBotAsFarAsItHonestlyCan(Bench):
+    """Что бот может сделать с остатком сам, зависит от вида товара.
+
+    У авто-выбора остаток — число, и настройки выдачи: их бот переносит
+    целиком. У авто-выдачи остаток — сами коды или аккаунты: скопировать их
+    с образца значит продать одно и то же дважды, а выдумать — положить на
+    витрину пустышку. Там бот честно говорит, сколько нужно, и принимает их
+    одним сообщением.
+    """
+
+    def keyboard_texts(self, cb) -> list:
+        kb = next((k for k in reversed(cb.message.kbs) if k), None)
+        return [b.text for row in (kb.inline_keyboard if kb else [])
+                for b in row]
+
+    def test_an_auto_value_copy_gets_its_settings_and_its_stock(self):
+        Api.kind = "auto-value"
+        Api.value_block = {"min": 10, "max": 900, "step": 5, "label_id": 3,
+                           "stock": 7}
+        cb = self.press()
+        self.assertEqual(Api.updated,
+                         [{"min": 10, "max": 900, "step": 5, "label_id": 3}])
+        self.assertIn("Настройки выдачи перенесены", cb.message.texts[-1])
+        self.assertIn("Остаток проставлен", cb.message.texts[-1])
+
+    def test_codes_are_not_copied_and_the_button_appears(self):
+        Api.kind = "auto-delivery"
+        Api.items_left = [{"status": "available"}, {"status": "available"}]
+        cb = self.press()
+        said = cb.message.texts[-1]
+        self.assertIn("одноразовые", said)
+        self.assertIn("2 шт.", said, "сколько нужно — числом")
+        self.assertEqual(Api.refills, [], "коды нельзя копировать")
+        self.assertIn("📦 Прислать остатки", self.keyboard_texts(cb))
+
+    def test_an_unlimited_copy_is_not_nagged_about_stock(self):
+        Api.kind = "unlimited"
+        cb = self.press()
+        said = cb.message.texts[-1]
+        self.assertIn("безлимит", said.lower())
+        self.assertNotIn("📦 Прислать остатки", self.keyboard_texts(cb))
 
 
 class WithNoSourceAtAllItAsksOnlyWhatItCannotKnow(Bench):

@@ -563,13 +563,23 @@ class ARefusalIsReadable(unittest.TestCase):
 class TheStockIsFilledInWithoutAsking(Bench):
     """Мастер спросил «сколько штук», а отчёт всё равно требовал нажать
     «📦 Добавить остатки» и ввести то же число. Без остатка панель товар не
-    публикует, то есть круг был обязательным."""
+    публикует, то есть круг был обязательным.
+
+    Что бот может сделать сам, зависит от вида товара, и видов четыре.
+    Один общий путь здесь был бы враньём: у авто-выбора остаток — число, и
+    бот проставит его целиком сам; у авто-выдачи это сами коды, и придумать
+    их нельзя.
+    """
 
     class Api:
-        def __init__(self, kind="auto-value", stock=0, after=None):
+        def __init__(self, kind="auto-value", stock=0, after=None,
+                     src_value=None, src_items=None):
             self.kind, self.stock = kind, stock
             self.after = stock if after is None else after
             self.refilled: list = []
+            self.updated: list = []
+            self.src_value = src_value or {}
+            self.src_items = src_items or []
             self.reads = 0
 
         async def get_ad(self, ad_id):
@@ -583,41 +593,91 @@ class TheStockIsFilledInWithoutAsking(Bench):
         async def refill_ad_value(self, ad_id, amount):
             self.refilled.append(amount)
 
+        async def get_ad_value(self, ad_id):
+            return {"data": dict(self.src_value)}
+
+        async def update_ad_value(self, ad_id, **fields):
+            self.updated.append(fields)
+
+        async def get_ad_items(self, ad_id, cursor=None):
+            return {"data": list(self.src_items)}
+
+    def fill(self, api, want=5, source=""):
+        return run(C._fill_stock(api, "55", want, source))
+
     def test_it_tops_up_to_the_asked_number(self):
         api = self.Api(stock=0, after=5)
-        said = run(C._fill_stock(api, "55", 5))
+        said, ok = self.fill(api)
         self.assertEqual(api.refilled, [5])
         self.assertIn("5", said)
+        self.assertTrue(ok)
 
     def test_it_does_not_double_what_the_panel_already_put_there(self):
         """Панель кладёт количество в свою форму при создании. Прибавить
         сверху столько же значит удвоить остаток."""
         api = self.Api(stock=5, after=5)
-        said = run(C._fill_stock(api, "55", 5))
+        said, ok = self.fill(api)
         self.assertEqual(api.refilled, [], "остаток удвоился")
-        self.assertIn("на месте", said)
+        self.assertTrue(ok)
 
     def test_it_tops_up_only_the_difference(self):
         api = self.Api(stock=2, after=5)
-        run(C._fill_stock(api, "55", 5))
+        self.fill(api)
         self.assertEqual(api.refilled, [3])
+
+    def test_the_delivery_settings_travel_with_the_stock(self):
+        """Копия с тем же остатком, но чужим минимумом и шагом — другой
+        товар: покупатель увидит другую сумму покупки."""
+        api = self.Api(stock=0, after=5,
+                       src_value={"min": 10, "max": 900, "step": 5,
+                                  "label_id": 3, "stock": 5})
+        said, _ok = self.fill(api, want=0, source="42")
+        self.assertEqual(api.updated,
+                         [{"min": 10, "max": 900, "step": 5, "label_id": 3}])
+        self.assertIn("Настройки выдачи перенесены", said)
+
+    def test_the_stock_of_the_sample_is_used_when_none_was_asked(self):
+        api = self.Api(stock=0, after=7, src_value={"stock": 7})
+        said, ok = self.fill(api, want=0, source="42")
+        self.assertEqual(api.refilled, [7])
+        self.assertTrue(ok)
+        self.assertIn("столько же, сколько у образца", said)
 
     def test_codes_are_never_copied(self):
         """Остаток товара с авто-выдачей — это сами ключи, одноразовые.
         Взять их из образца значит продать один код дважды."""
         api = self.Api(kind="auto-delivery")
-        said = run(C._fill_stock(api, "55", 5))
+        said, ok = self.fill(api)
         self.assertEqual(api.refilled, [])
         self.assertIn("код", said.lower())
+        self.assertFalse(ok, "кнопка «прислать остатки» обязана появиться")
+
+    def test_and_it_says_how_many_the_sample_has(self):
+        """«Пришли список» без числа заставляет идти считать в панель."""
+        api = self.Api(kind="auto-delivery",
+                       src_items=[{"status": "available"},
+                                  {"status": "available"},
+                                  {"status": "sold"}])
+        said, _ok = self.fill(api, source="42")
+        self.assertIn("2 шт.", said)
+
+    def test_an_unlimited_item_needs_no_stock_and_says_so(self):
+        """«Остаток проставить не вышло» у безлимитного товара — это отчёт
+        о беде, которой нет."""
+        said, ok = self.fill(self.Api(kind="unlimited"))
+        self.assertTrue(ok)
+        self.assertIn("безлимит", said.lower())
+        self.assertNotIn("не вышло", said)
 
     def test_the_report_names_the_number_the_server_returned(self):
         """HTTP 200 не доказательство: перечитываем и печатаем то, что
         ответил маркетплейс, а не то, что отправили."""
         api = self.Api(stock=0, after=2)
-        said = run(C._fill_stock(api, "55", 5))
+        said, ok = self.fill(api)
         self.assertIn("2", said)
         self.assertIn("5", said)
         self.assertIn("вручную", said)
+        self.assertFalse(ok)
 
     def test_a_broken_call_does_not_eat_the_report(self):
         """Товар уже создан. Исключение отсюда съело бы отчёт о нём."""
@@ -625,13 +685,12 @@ class TheStockIsFilledInWithoutAsking(Bench):
             async def get_ad(self, ad_id):
                 raise RuntimeError("сеть")
 
-        said = run(C._fill_stock(Dead(), "55", 5))
+        said, ok = self.fill(Dead())
         self.assertIn("вручную", said)
+        self.assertFalse(ok)
 
     def test_nothing_to_fill_says_nothing(self):
-        api = self.Api()
-        self.assertEqual(run(C._fill_stock(api, "55", 0)), "")
-        self.assertEqual(run(C._fill_stock(None, "55", 5)), "")
+        self.assertEqual(self.fill(None), ("", False))
 
 
 if __name__ == "__main__":
