@@ -94,6 +94,7 @@ class CreateAdState(StatesGroup):
     photo = State()
     confirm = State()
     panel_select = State()  # choosing category/subcategory/type from panel options
+    copy_stock = State()    # список остатков, который бот кладёт новым товарам
 
 
 def _cancel_kb() -> InlineKeyboardMarkup:
@@ -1351,7 +1352,7 @@ async def _ask_for_refused_fields(msg, uid: int, values: dict,
 
 
 async def _fill_stock(api, item_id: str, want, source_id: str = "",
-                      ) -> tuple[str, bool]:
+                      uid: int = 0) -> tuple[str, bool]:
     """Проставить остаток новому товару. → (строка отчёта, проставлен ли).
 
     Без остатка панель товар не публикует, и продавцу приходилось жать
@@ -1392,6 +1393,12 @@ async def _fill_stock(api, item_id: str, want, source_id: str = "",
         return "\n📦 Остаток не нужен — товар безлимитный.", True
 
     if kind == "auto-delivery":
+        # Заготовка продавца, если он её задал. Копировать позиции с
+        # образца по-прежнему нельзя — они одноразовые, — а свой список он
+        # вправе положить один раз и не вводить его каждый раз заново.
+        ready = await _default_stock(uid)
+        if ready:
+            return await _put_items(api, item_id, ready)
         need = await _source_items_left(api, source_id)
         return ("\n📦 <b>Остаток — это сам товар</b>: коды или аккаунты, и они"
                 " одноразовые. Скопировать их с образца нельзя — это значит"
@@ -1415,6 +1422,45 @@ async def _fill_stock(api, item_id: str, want, source_id: str = "",
     except Exception as e:                                # noqa: BLE001
         logger.warning("остаток товару %s не проставлен: %s", item_id, e)
         return "\n📦 Остаток проставить не вышло — добавь вручную.", False
+
+
+async def _default_stock(uid: int) -> list:
+    """Остатки, которые продавец велел класть новым товарам сам."""
+    if not uid:
+        return []
+    try:
+        from storage import get_copy_stock
+        return get_copy_stock(uid)
+    except Exception as e:                                # noqa: BLE001
+        logger.info("остатки по умолчанию не прочитались: %s", e)
+        return []
+
+
+async def _put_items(api, item_id: str, rows: list) -> tuple[str, bool]:
+    """Положить позиции авто-выдачи и ПЕРЕЧИТАТЬ. → (отчёт, получилось ли).
+
+    Перечитывание здесь не формальность: «отправили 3» и «в наличии 3» —
+    разные утверждения, а публиковать товар маркетплейс даст только по
+    второму.
+
+    И говорится вслух, что покупатель получит именно эти строки: заготовка,
+    забытая на витрине, — это оплаченный заказ с мусором внутри.
+    """
+    try:
+        await api.add_ad_items(item_id, list(rows))
+        left = await api.get_ad_items(item_id)
+        free = [r for r in (left.get("data") or [])
+                if str((r or {}).get("status", "available")) == "available"]
+    except Exception as e:                                # noqa: BLE001
+        logger.warning("позиции товару %s не добавились: %s", item_id, e)
+        return ("\n📦 Остатки по умолчанию положить не вышло: "
+                f"{html.escape(str(e)[:120])}"), False
+    if not free:
+        return ("\n📦 Остатки отправлены, но в наличии их нет — "
+                "проверь список у товара."), False
+    return (f"\n📦 Остаток проставлен: {len(free)} поз. — твоя заготовка."
+            "\n<i>Покупатель получит именно эти строки. Заменишь на "
+            "настоящие — кнопка «📦 Прислать остатки».</i>"), True
 
 
 async def _source_items_left(api, source_id: str) -> str:
@@ -1601,7 +1647,8 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
             except Exception:
                 pass
             stock_note, stock_ok = await _fill_stock(
-                api, item_id, values.get("quantity", 0), names.get("source", ""))
+                api, item_id, values.get("quantity", 0),
+                names.get("source", ""), uid)
             try:
                 await status_msg.edit_text("⏳ Товар создан, делаю публичным...")
             except Exception:
@@ -1872,6 +1919,7 @@ def _section_screen(groups: dict, back: str):
                  callback_data=f"create_ad:sect:{i}")
         rows.append(f"• <b>{html.escape(name[:40])}</b> — {len(ads)}")
     b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
+    b.button(text="📦 Остатки по умолчанию", callback_data="create_ad:stock")
     b.button(text="❌ Отмена", callback_data=back)
     ui.lay(b)
     return rows, b, [name for name, _ads in ordered]
@@ -2420,6 +2468,16 @@ async def _select_verdicts(uid: int, ad_id: str, api) -> list[str]:
     if not ok:
         return [f"разбор списков: товар не прочитался ({err})"]
 
+    # Что запомнено за этим образцом. Без этого «бот запомнил раздел»
+    # проверить нечем: раздела в панели нет, и снаружи память неотличима
+    # от удачной догадки.
+    from storage import get_copy_marks, get_copy_stock
+
+    marks = get_copy_marks(uid, ad_id)
+    head = [f"запомнено за образцом: {marks.get('values') or '—'}",
+            f"  надписи: {marks.get('labels') or '—'}",
+            f"остатки по умолчанию: {len(get_copy_stock(uid))} поз."]
+
     form = await _creation_form(uid)
     if not form:
         return ["разбор списков: форма создания не прочиталась"]
@@ -2432,9 +2490,10 @@ async def _select_verdicts(uid: int, ad_id: str, api) -> list[str]:
     # Значит единственный источник — маркетплейс, и если молчит он, копия
     # спросит. Что именно он сказал, и печатаем.
     card = await _ad_card(api, ad_id)
-    out = [f"маркетплейс: поля {sorted(card)[:14]}" if card
-           else "маркетплейс: карточку объявления не отдал",
-           f"  category_id: {card.get('category_id')!r}"]
+    out = head + [
+        f"маркетплейс: поля {sorted(card)[:14]}" if card
+        else "маркетплейс: карточку объявления не отдал",
+        f"  category_id: {card.get('category_id')!r}"]
     cid = card.get("category_id")
     try:
         out.append(f"  путь раздела: {await api.category_path(cid)}"
@@ -2500,3 +2559,108 @@ async def _my_ad_numbers(api) -> str:
             for a in ads[:20]]
     return ("Номер объявления, а потом: <code>/copy_debug НОМЕР</code>\n\n"
             + "\n".join(rows))[:4000]
+
+
+@router.callback_query(F.data == "create_ad:stock")
+async def copy_stock_screen(callback: CallbackQuery, state: FSMContext) -> None:
+    """Остатки, которые бот кладёт новому товару сам.
+
+    У товара с авто-выдачей остаток — это сами коды или аккаунты, и
+    придумать их бот не может. А положить СВОЙ список продавец вправе один
+    раз, а не вводить его после каждой копии.
+    """
+    from features import ad_templates_shown
+    from storage import get_copy_stock
+
+    uid = callback.from_user.id
+    if not ad_templates_shown(uid):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+
+    rows = get_copy_stock(uid)
+    b = InlineKeyboardBuilder()
+    b.button(text="✏️ Задать список", callback_data="create_ad:stock_edit")
+    if rows:
+        b.button(text="🗑 Убрать", callback_data="create_ad:stock_off")
+    b.button(text="⬅️ К копии", callback_data="create_ad:templates_list")
+    ui.lay(b)
+
+    body = ["Что бот положит в остаток каждому новому товару с авто-выдачей.",
+            ""]
+    if rows:
+        shown = "\n".join(html.escape(r) for r in rows[:10])
+        body += [f"Сейчас — <b>{len(rows)}</b> поз.:",
+                 f"<code>{shown}</code>",
+                 ("…и ещё %d" % (len(rows) - 10)) if len(rows) > 10 else "",
+                 "",
+                 "⚠️ <b>Это то, что получит покупатель.</b> Заготовка, "
+                 "забытая на витрине, — оплаченный заказ с мусором внутри."]
+    else:
+        body += ["Сейчас список пуст — бот остатки не трогает и просит "
+                 "прислать их после каждой копии.",
+                 "",
+                 "Годится, когда позиции у всех товаров одинаковые. "
+                 "Разные ключи каждому товару так не раздать: список один."]
+    await callback.message.edit_text(
+        ui.screen("📦 <b>Остатки по умолчанию</b>",
+                  [line for line in body if line != ""] or body),
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "create_ad:stock_off")
+async def copy_stock_off(callback: CallbackQuery, state: FSMContext) -> None:
+    from features import ad_templates_shown
+    from storage import set_copy_stock
+
+    if not ad_templates_shown(callback.from_user.id):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    set_copy_stock(callback.from_user.id, [])
+    await callback.answer("Убрал. Остатки буду просить, как раньше.",
+                          show_alert=True)
+    await copy_stock_screen(callback, state)
+
+
+@router.callback_query(F.data == "create_ad:stock_edit")
+async def copy_stock_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    from features import ad_templates_shown
+
+    if not ad_templates_shown(callback.from_user.id):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    await state.set_state(CreateAdState.copy_stock)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="create_ad:stock")
+    await callback.message.edit_text(
+        ui.screen("📦 <b>Список остатков</b>",
+                  ["Пришли позиции сообщением, <b>по одной в строке</b>:",
+                   "<code>KEY-1111\nKEY-2222\nKEY-3333</code>",
+                   "",
+                   "Их получит покупатель — как есть, слово в слово."]),
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.message(CreateAdState.copy_stock)
+async def copy_stock_save(message: Message, state: FSMContext) -> None:
+    from storage import set_copy_stock
+
+    rows = [ln.strip() for ln in (message.text or "").splitlines()
+            if ln.strip()]
+    if not rows:
+        await message.answer("Пусто — пришли позиции, по одной в строке.")
+        return
+    await state.clear()
+    kept = set_copy_stock(message.from_user.id, rows)
+    b = InlineKeyboardBuilder()
+    b.button(text="📋 К копии", callback_data="create_ad:templates_list")
+    b.button(text="📦 Список", callback_data="create_ad:stock")
+    ui.lay(b)
+    await message.answer(
+        ui.screen("✅ <b>Запомнил</b>",
+                  [f"Позиций: <b>{kept}</b>. Буду класть их каждому новому "
+                   "товару с авто-выдачей.",
+                   "",
+                   "⚠️ Покупатель получит именно эти строки."]),
+        reply_markup=b.as_markup())

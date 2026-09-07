@@ -654,6 +654,32 @@ def forget_copy_marks(user_id: int, ad_id) -> bool:
     return True
 
 
+# Сколько строк остатка держим по умолчанию. Список уходит покупателям
+# как есть, и тысяча строк в настройках — это не удобство, а склад.
+_COPY_STOCK_MAX = 200
+
+
+def get_copy_stock(user_id: int) -> list[str]:
+    """Остатки, которые бот кладёт новому товару сам. Пусто — не кладёт.
+
+    Это ТО, ЧТО ПОЛУЧИТ ПОКУПАТЕЛЬ: у товара с авто-выдачей остаток — сами
+    коды или аккаунты. Поэтому по умолчанию список пуст: подставленная за
+    продавца заготовка ушла бы живому покупателю вместо товара.
+    """
+    rows = get_settings(user_id).get("copy_stock") or []
+    return [str(r) for r in rows if str(r).strip()][:_COPY_STOCK_MAX]
+
+
+def set_copy_stock(user_id: int, rows: list[str]) -> int:
+    """Задать остатки по умолчанию. → сколько строк сохранено."""
+    clean = [str(r).strip() for r in (rows or []) if str(r).strip()]
+    clean = clean[:_COPY_STOCK_MAX]
+    settings = get_settings(user_id)
+    settings["copy_stock"] = clean
+    save_settings(user_id, settings)
+    return len(clean)
+
+
 def get_all_users() -> list[int]:
     return [int(uid) for uid in _load().keys()]
 

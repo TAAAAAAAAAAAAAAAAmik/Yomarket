@@ -643,6 +643,61 @@ class TheStockIsFilledInWithoutAsking(Bench):
         self.assertTrue(ok)
         self.assertIn("столько же, сколько у образца", said)
 
+    def test_the_sellers_own_list_is_put_in_for_him(self):
+        """Позиции с образца копировать нельзя — они одноразовые. А свой
+        список продавец вправе положить один раз, а не вводить его после
+        каждой копии."""
+        api = self.Api(kind="auto-delivery")
+        api.added: list = []
+
+        async def add_ad_items(ad_id, items):
+            api.added.append(list(items))
+
+        async def get_ad_items(ad_id, cursor=None):
+            return {"data": [{"status": "available"} for _ in api.added[0]]}
+
+        api.add_ad_items, api.get_ad_items = add_ad_items, get_ad_items
+        was = C._default_stock
+
+        async def ready(uid):
+            return ["KEY-1111", "KEY-2222", "KEY-3333"]
+
+        C._default_stock = ready
+        try:
+            said, ok = self.fill(api, source="42")
+        finally:
+            C._default_stock = was
+        self.assertEqual(api.added, [["KEY-1111", "KEY-2222", "KEY-3333"]])
+        self.assertTrue(ok)
+        self.assertIn("3 поз.", said)
+        self.assertIn("получит именно эти строки", said,
+                      "заготовка на витрине — оплаченный заказ с мусором")
+
+    def test_the_list_is_re_read_not_taken_on_trust(self):
+        """HTTP 200 не доказательство: публиковать маркетплейс даст по
+        «в наличии», а не по «отправлено»."""
+        api = self.Api(kind="auto-delivery")
+
+        async def add_ad_items(ad_id, items):
+            return {}
+
+        async def get_ad_items(ad_id, cursor=None):
+            return {"data": []}            # приняли, а в наличии пусто
+
+        api.add_ad_items, api.get_ad_items = add_ad_items, get_ad_items
+        was = C._default_stock
+
+        async def ready(uid):
+            return ["KEY-1111"]
+
+        C._default_stock = ready
+        try:
+            said, ok = self.fill(api, source="42")
+        finally:
+            C._default_stock = was
+        self.assertFalse(ok)
+        self.assertIn("в наличии их нет", said)
+
     def test_codes_are_never_copied(self):
         """Остаток товара с авто-выдачей — это сами ключи, одноразовые.
         Взять их из образца значит продать один код дважды."""

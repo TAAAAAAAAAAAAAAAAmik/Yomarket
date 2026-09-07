@@ -94,5 +94,49 @@ class WhatWasAnsweredOnceIsKept(Bench):
                          613)
 
 
+class TheDefaultStockIsTheSellersOwnDecision(unittest.TestCase):
+    """У товара с авто-выдачей остаток — это сами коды или аккаунты, и их
+    получает покупатель. Заготовка, подставленная за продавца, ушла бы
+    живому человеку вместо товара, поэтому по умолчанию список пуст."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._blob = storage._BLOBS["settings"]
+        storage._BLOBS["settings"] = os.path.join(self.tmp.name, "s.json")
+
+    def tearDown(self):
+        storage._BLOBS["settings"] = self._blob
+        self.tmp.cleanup()
+
+    def test_empty_until_the_seller_says_otherwise(self):
+        self.assertEqual(storage.get_copy_stock(1), [])
+
+    def test_what_was_given_comes_back_in_order(self):
+        """Порядок — это порядок выдачи покупателям."""
+        storage.set_copy_stock(1, ["KEY-1111", "KEY-2222", "KEY-3333"])
+        self.assertEqual(storage.get_copy_stock(1),
+                         ["KEY-1111", "KEY-2222", "KEY-3333"])
+
+    def test_blank_lines_are_not_goods(self):
+        """Пустая строка, уехавшая покупателю, — это оплаченная пустота."""
+        n = storage.set_copy_stock(1, ["KEY-1", "", "   ", "KEY-2"])
+        self.assertEqual(n, 2)
+        self.assertEqual(storage.get_copy_stock(1), ["KEY-1", "KEY-2"])
+
+    def test_it_can_be_taken_back(self):
+        storage.set_copy_stock(1, ["KEY-1"])
+        self.assertEqual(storage.set_copy_stock(1, []), 0)
+        self.assertEqual(storage.get_copy_stock(1), [])
+
+    def test_it_is_the_sellers_own(self):
+        storage.set_copy_stock(1, ["KEY-1"])
+        self.assertEqual(storage.get_copy_stock(2), [])
+
+    def test_it_does_not_become_a_warehouse(self):
+        storage.set_copy_stock(1, [f"K{i}" for i in range(500)])
+        self.assertLessEqual(len(storage.get_copy_stock(1)),
+                             storage._COPY_STOCK_MAX)
+
+
 if __name__ == "__main__":
     unittest.main()
