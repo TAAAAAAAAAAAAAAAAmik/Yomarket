@@ -1778,6 +1778,11 @@ async def templates_list(callback: CallbackQuery, state: FSMContext,
         copy_groups=order,
         copy_ads={name: [{"id": a.get("id"),
                           "title": a.get("title") or a.get("name"),
+                          # Номер раздела маркетплейса: раздела у товара в
+                          # панели нет НИГДЕ, и это единственный источник.
+                          # Он уже прочитан ради группировки — спрашивать
+                          # его второй раз незачем.
+                          "category_id": a.get("category_id"),
                           "price": a.get("price")} for a in ads]
                   for name, ads in groups.items()})
     # Раздел один — показывать выбор из одного не из чего: сразу объявления.
@@ -1873,27 +1878,49 @@ async def _stock_from_api(api, ad_id: str):
         return None
 
 
-async def _section_word(api, ad_id: str) -> str:
-    """Название раздела товара по данным маркетплейса.
+async def _section_words(api, ad_id: str, cid=None) -> list:
+    """Названия разделов маркетплейса для этого товара — цепочкой.
 
-    Третий источник раздела, и самый устойчивый: у объявления в Integration
-    API есть `category_id`, и по нему маркетплейс называет раздел словом.
-    Номера у панели и у маркетплейса могут не совпасть, а слово совпадёт —
-    по нему бот и находит нужную строку в форме создания.
+    Третий источник раздела и самый устойчивый: номера у панели и у
+    маркетплейса свои, а слова совпадают.
+
+    Берётся именно ЦЕПОЧКА, а не имя листа. Товар лежит в листе
+    («Аккаунты»), а панель раскладывает товары по играм («Standoff 2»):
+    нужное слово стоит на среднем уровне дерева. Версия, читавшая только
+    лист, искала в списке из 825 игр слово «Аккаунты» — и, разумеется, не
+    находила ничего.
+
+    Порядок — от узкого к широкому, как того ждёт `_autopick_match`: лист
+    отличает подраздел, ветвь выше — раздел.
     """
-    card = await _ad_card(api, ad_id)
-    cid = card.get("category_id")
-    if cid in (None, "", 0) or not api:
-        return ""
+    if not api:
+        return []
+    if cid in (None, "", 0):
+        cid = (await _ad_card(api, ad_id)).get("category_id")
+    if cid in (None, "", 0):
+        return []
+    out: list = []
     try:
-        return str(await api.resolve_category(cid) or "")
+        # Со сроком: обход дерева бывает долгим, а продавец ждёт экрана.
+        path = await asyncio.wait_for(api.category_path(cid), timeout=40)
     except Exception as e:                                # noqa: BLE001
-        logger.info("раздел %s не назвался: %s", cid, e)
-        return ""
+        logger.info("путь раздела %s не прочитался: %s", cid, e)
+        path = []
+    # Цепочка идёт от верхушки к листу; нам нужен обратный порядок.
+    out += [w for w in reversed(path) if w]
+    if not out:
+        try:
+            one = str(await api.resolve_category(cid) or "")
+        except Exception as e:                            # noqa: BLE001
+            logger.info("раздел %s не назвался: %s", cid, e)
+            one = ""
+        if one:
+            out.append(one)
+    return out
 
 
-async def _copy_source_values(uid: int, ad_id: str,
-                              api=None) -> tuple[dict, dict, dict, list, str]:
+async def _copy_source_values(uid: int, ad_id: str, api=None,
+                              cid=None) -> tuple[dict, dict, dict, list, str]:
     """Значения исходного товара для нового.
 
     → (values, extra, labels, слова-подсказки, причина отказа)
@@ -1949,7 +1976,7 @@ async def _copy_source_values(uid: int, ad_id: str,
     # Слова-подсказки: сначала название раздела с маркетплейса, потом слова
     # названия товара. Порядок тот, которого ждёт `_autopick_match`, — от
     # узкого к широкому: раздел назван точно, название лишь намекает.
-    words = [w for w in [await _section_word(api, ad_id)] if w]
+    words = [w for w in await _section_words(api, ad_id, cid) if w]
     words += [w for w in _title_words(values) if w not in words]
 
     if not url:
@@ -2004,8 +2031,9 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
         order = list(data.get("copy_groups") or [])
         ads = (dict(data.get("copy_ads") or {})).get(order[idx]) or []
         ad_id = str(ads[j].get("id") or "")
+        cid = ads[j].get("category_id")
     except (ValueError, IndexError, KeyError, TypeError):
-        ad_id = ""
+        ad_id, cid = "", None
     if not ad_id:
         await callback.answer("Список устарел — открой копию заново",
                               show_alert=True)
@@ -2013,7 +2041,8 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
 
     await callback.answer("Создаю копию…")
     await callback.message.edit_text("⏳ Читаю товар в панели…")
-    values, extra, labels, words, why = await _copy_source_values(uid, ad_id, api)
+    values, extra, labels, words, why = await _copy_source_values(
+        uid, ad_id, api, cid)
     if why:
         b = InlineKeyboardBuilder()
         b.button(text="📋 Ещё копию", callback_data="create_ad:templates_list")
@@ -2194,12 +2223,31 @@ async def _select_verdicts(uid: int, ad_id: str, api) -> list[str]:
     if not form:
         return ["разбор списков: форма создания не прочиталась"]
 
-    words = [w for w in [await _section_word(api, ad_id)] if w]
+    words = [w for w in await _section_words(api, ad_id) if w]
     words += [w for w in _title_words(values) if w not in words]
+
+    # Раздела у товара в панели нет НИГДЕ — ни в форме правки, ни на
+    # карточке, ни в строке списка (живой ответ 07.09 по товару 250614).
+    # Значит единственный источник — маркетплейс, и если молчит он, копия
+    # спросит. Что именно он сказал, и печатаем.
+    card = await _ad_card(api, ad_id)
+    out = [f"маркетплейс: поля {sorted(card)[:14]}" if card
+           else "маркетплейс: карточку объявления не отдал",
+           f"  category_id: {card.get('category_id')!r}"]
+    cid = card.get("category_id")
+    try:
+        out.append(f"  путь раздела: {await api.category_path(cid)}"
+                   if cid else "  путь раздела: —")
+        if cid:
+            out.append(f"  раздел словом: {await api.resolve_category(cid)!r}")
+            for path, got in (await api.category_probe(cid)).items():
+                out.append(f"  {path}: {got}")
+    except Exception as e:                                # noqa: BLE001
+        out.append(f"  путь раздела: не прочитался ({str(e)[:120]})")
+    out.append(f"слова-подсказки: {words}")
 
     chosen = dict(extra)
     data = {"form_resource": form.get("resource", "items"), "chosen": chosen}
-    out = [f"слова-подсказки: {words}"]
     for attr in _select_queue(form["fields"]):
         fld = next((f for f in form["fields"] if f["attribute"] == attr), {})
         options = fld.get("options") or []

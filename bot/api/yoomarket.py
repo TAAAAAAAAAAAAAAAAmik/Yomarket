@@ -669,6 +669,123 @@ class YooMarketAPI:
                     len(found), len(wanted), requests_made)
         return found
 
+    async def _path_upwards(self, target: int, limit: int = 8) -> list[str]:
+        """Цепочка разделов подъёмом по `parent_id`, если он есть в ответе.
+
+        Обход дерева сверху упирается в уровень, где сотни строк (у этого
+        маркетплейса — игры), и бюджет запросов кончается раньше, чем
+        находится лист. Подъём стоит по запросу на уровень.
+        """
+        chain: list[str] = []
+        cur: int | None = target
+        seen: set[int] = set()
+        while cur is not None and cur not in seen and len(chain) < limit:
+            seen.add(cur)
+            try:
+                body = await self._get(f"/categories/{cur}")
+            except Exception as e:                        # noqa: BLE001
+                logger.info("раздел %s не прочитался: %s", cur, e)
+                return []
+            inner = body.get("data") if isinstance(body, dict) and isinstance(
+                body.get("data"), dict) else body
+            if not isinstance(inner, dict):
+                return []
+            label = inner.get("name") or inner.get("title")
+            if not label:
+                return []
+            chain.append(str(label))
+            parent = inner.get("parent_id")
+            if parent in (None, "", 0):
+                parent = inner.get("parent")
+                if isinstance(parent, dict):
+                    parent = parent.get("id")
+            try:
+                cur = int(parent) if parent not in (None, "", 0) else None
+            except (TypeError, ValueError):
+                cur = None
+        # Собрано снизу вверх, а отдаём сверху вниз — как обход дерева.
+        return list(reversed(chain)) if chain else []
+
+    async def category_probe(self, category_id: int | str) -> dict:
+        """Что маркетплейс отвечает про ОДИН раздел — только чтение.
+
+        Нужна ровно затем, чтобы не гадать, есть ли в ответе родитель:
+        раздела у товара в панели нет нигде, и цепочка разделов
+        маркетплейса — единственный источник. Печатает `/copy_debug`.
+        """
+        out: dict = {}
+        for path in (f"/categories/{category_id}",
+                     f"/categories/{category_id}/filters"):
+            try:
+                body = await self._get(path)
+            except Exception as e:                        # noqa: BLE001
+                out[path] = f"отказ: {str(e)[:80]}"
+                continue
+            if not isinstance(body, dict):
+                out[path] = f"не словарь: {type(body).__name__}"
+                continue
+            inner = body.get("data") if isinstance(body.get("data"), dict) else body
+            out[path] = {
+                "ключи": sorted(body)[:12],
+                "внутри": sorted(inner)[:14],
+                "name": inner.get("name") or inner.get("title"),
+                "parent_id": inner.get("parent_id") or inner.get("parent"),
+            }
+        return out
+
+    async def category_path(self, category_id: int | str,
+                            max_requests: int = 25) -> list[str]:
+        """Названия разделов от верхушки дерева до этого — цепочкой.
+
+        Товар лежит в ЛИСТЕ («Аккаунты»), а панель раскладывает товары по
+        играм («Standoff 2»): нужное слово стоит на среднем уровне, и одним
+        именем листа его не достать. Отсюда цепочка целиком — по ней бот и
+        ищет раздел в форме панели.
+
+        Обход тот же, что у `find_categories`: по уровням и ровно настолько,
+        насколько нужно. Пустой список — не нашли.
+        """
+        try:
+            target = int(category_id)
+        except (TypeError, ValueError):
+            return []
+
+        # Короткая дорога: если раздел называет своего родителя, цепочка
+        # собирается подъёмом — это единицы запросов вместо обхода дерева,
+        # в котором один уровень бывает в сотни строк.
+        chain = await self._path_upwards(target)
+        if chain:
+            return chain
+
+        frontier: list[tuple] = [(None, [])]
+        visited: set = set()
+        made = 0
+        while frontier and made < max_requests:
+            parent, path = frontier.pop(0)
+            if parent in visited:
+                continue
+            visited.add(parent)
+            try:
+                rows = await self.get_categories(max_pages=2, parent_id=parent)
+            except RuntimeError as e:
+                logger.info("categories(parent=%s): %s", parent, e)
+                continue
+            made += 1
+            for row in rows:
+                try:
+                    cid = int(row.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                label = str(row.get("name") or row.get("title") or "")
+                here = path + [label] if label else list(path)
+                if cid == target:
+                    logger.info("путь раздела %s: %s за %d запросов",
+                                target, here, made)
+                    return here
+                if not row.get("is_leaf") and cid not in visited:
+                    frontier.append((cid, here))
+        return []
+
     async def resolve_category(self, category_id: int | str) -> str:
         """Название одного раздела без обхода всего дерева.
 

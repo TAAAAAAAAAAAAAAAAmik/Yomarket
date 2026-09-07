@@ -34,14 +34,19 @@ os.environ.setdefault("BOT_TOKEN", "x")
 from automation import panel as P                          # noqa: E402
 from handlers import create_ad as C                        # noqa: E402
 
-ITEM = "1198"
+ITEM = "250614"
+
+# Название живого товара дословно. Игры в нём нет: слова-подсказки из него —
+# «Аккаунт» и «Баланс», и по ним раздел-игру не найти. Отсюда и берётся
+# цепочка разделов маркетплейса.
+TITLE = "💖Аккаунт 💖Баланс: 3.000.000 ₽⚡4 LVL 💖"
 
 # Девять полей формы правки — ровно те, что назвала живая панель.
 EDIT_FIELDS = [
     {"attribute": "id", "value": int(ITEM)},
     {"attribute": "public", "value": 1},
     {"attribute": "moderation_status", "value": "approved"},
-    {"attribute": "title", "value": "Аккаунт Standoff 2 с виртами"},
+    {"attribute": "title", "value": TITLE},
     {"attribute": "content", "value": "Аккаунт с внутриигровой валютой."},
     {"attribute": "quantity", "value": 3},
     {"attribute": "images", "component": "advanced-media-library-field",
@@ -104,6 +109,11 @@ class LiveNova(BaseHTTPRequestHandler):
     posted: list = []
     card_open: bool = True
     list_open: bool = True
+    # Показывает ли панель раздел хоть где-нибудь. Живой ответ 07.09 по
+    # товару 250614: НЕ показывает — ни в форме правки (7 полей), ни на
+    # карточке (11), ни в строке списка (6). Раздел задаётся один раз при
+    # создании, и больше его в панели не видно.
+    section_visible: bool = True
 
     def log_message(self, *a):
         pass
@@ -146,14 +156,14 @@ class LiveNova(BaseHTTPRequestHandler):
             if not LiveNova.card_open:
                 self._json(403, {"message": "нет доступа"})
                 return
-            self._json(200, {"resource": {"fields": CARD_FIELDS}})
+            self._json(200, {"resource": {"fields": self._card()}})
             return
         if path == "/nova-api/items":
             if not LiveNova.list_open:
                 self._json(403, {"message": "нет доступа"})
                 return
             self._json(200, {"resources": [
-                {"id": {"value": int(ITEM)}, "fields": CARD_FIELDS}]})
+                {"id": {"value": int(ITEM)}, "fields": self._card()}]})
             return
         if path.startswith("/media/"):
             body = b"\xff\xd8\xff\xe0JPEG"
@@ -164,6 +174,18 @@ class LiveNova(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         self._json(404, {"message": "нет такого"})
+
+    def _card(self) -> list:
+        if LiveNova.section_visible:
+            return CARD_FIELDS
+        # Карточка живого товара: ни раздела, ни подраздела, ни типа —
+        # только показные поля с русскими именами и связь на единицы.
+        return [{"attribute": "id", "value": int(ITEM)},
+                {"attribute": "изображение", "value": None},
+                {"attribute": "заголовок", "value": "Аккаунт"},
+                {"attribute": "ComputedField", "value": "—"},
+                {"attribute": "статус", "value": "Опубликован"},
+                {"attribute": "items", "value": None}]
 
     def _options(self, attr: str) -> list:
         search = self._param("search").lower()
@@ -263,15 +285,23 @@ class Api:
 
     async def get_ads(self, cursor=None):
         return {"data": [{"id": int(ITEM), "category_id": 5221,
-                          "title": "Аккаунт Standoff 2 с виртами",
+                          "title": TITLE,
                           "price": {"amount": 1490}}]}
 
     async def get_ad(self, ad_id):
-        return {"data": {"id": ad_id, "stock": 3,
+        return {"data": {"id": ad_id, "stock": 3, "category_id": 5221,
                          "price": {"amount": 1490, "currency": "RUB"}}}
+
+    # Дерево разделов маркетплейса. Товар лежит в ЛИСТЕ («Аккаунты»), а
+    # панель раскладывает по играм («Standoff 2»): нужное слово стоит на
+    # среднем уровне, и одним именем листа его не достать.
+    path: list = ["Игры", "Standoff 2", "Аккаунты"]
 
     async def resolve_category(self, cid):
         return Api.section
+
+    async def category_path(self, cid, max_requests=80):
+        return list(Api.path)
 
     async def get_categories(self, **kw):
         return [{"id": 5221, "name": Api.section}]
@@ -323,8 +353,10 @@ class Bench(unittest.TestCase):
         LiveNova.posted = []
         LiveNova.card_open = True
         LiveNova.list_open = True
+        LiveNova.section_visible = True
         Api.section = "Аккаунты"
         Api.stock, Api.refills = 0, []
+        Api.path = ["Игры", "Standoff 2", "Аккаунты"]
 
     def tearDown(self):
         self.storage.get_panel_creds = self._creds
@@ -337,6 +369,10 @@ class Bench(unittest.TestCase):
         asyncio.run(C.templates_list(CB("create_ad:templates_list"), fsm, api))
         cb = CB("create_ad:copy:0:0")
         asyncio.run(C.copy_item(cb, fsm, api))
+        # Копия могла остановиться на вопросе — тогда создания нет вовсе, и
+        # проверять надо ВЫБРАННОЕ, а не отправленное.
+        self.fsm = fsm
+        self.chosen = dict(fsm.data.get("chosen") or {})
         return cb
 
     def created(self) -> dict:
@@ -369,7 +405,7 @@ class TheCopyAsksNothingWhenTheSampleHasTheAnswers(Bench):
     def test_the_rest_of_the_item_travels_too(self):
         self.press()
         body = self.created()
-        self.assertEqual(body.get("title"), "Аккаунт Standoff 2 с виртами")
+        self.assertEqual(body.get("title"), TITLE)
         self.assertEqual(str(body.get("price")), "1490")
         self.assertEqual(body.get("filter__8"), "Россия")
         self.assertIn("файл", str(body.get("__media__[images][0]")))
@@ -421,44 +457,65 @@ class TheSectionIsFoundEvenWithoutTheCard(Bench):
         self.assertEqual(str(self.created().get("category")), "613")
 
 
-class WithNoSourceAtAllItAsksOnlyWhatItCannotKnow(Bench):
-    """Худший случай: панель закрыла и карточку, и список. Раздел взять
-    неоткуда — остаются слова: название раздела с маркетплейса и слова
-    названия товара, по которым бот спрашивает панель сам.
+class ThePanelShowsNoSectionAtAllAndItStillWorks(Bench):
+    """Живой ответ 07.09 по товару 250614: раздела в панели нет НИГДЕ.
 
-    Так добываются раздел и подраздел. Тип выдачи словами не добывается:
-    «Мгновенная выдача» в названии товара не встречается, и здесь вопрос
-    честный — молча подставить его нельзя, от него зависит, как покупатель
-    получит заказ."""
+    Форма правки — семь полей (title, content, images и тексты сообщений),
+    карточка — одиннадцать показных с русскими именами, строка списка —
+    шесть. Ни `category`, ни `subcategory`, ни `type`, ни `filter__N`:
+    панель задаёт их один раз при создании и больше не показывает.
+
+    Значит источник один — маркетплейс. И берётся из него не имя листа, а
+    ЦЕПОЧКА: товар лежит в «Аккаунтах», а панель раскладывает по играм, и
+    нужное слово стоит на среднем уровне дерева.
+    """
+
+    def setUp(self):
+        super().setUp()
+        LiveNova.section_visible = False
+
+    def test_the_section_comes_from_the_marketplace_tree(self):
+        cb = self.press()
+        asked = [t for t in cb.message.texts if "Выбери" in t]
+        self.assertEqual(len(asked), 1, asked)
+        self.assertIn("type", asked[0], "спрошен должен быть только тип")
+        self.assertEqual(self.chosen.get("category"), 613, self.chosen)
+        self.assertEqual(self.chosen.get("subcategory"), 3, self.chosen)
+
+    def test_the_leaf_name_alone_would_not_have_been_enough(self):
+        """Раздел в панели — игра, а лист дерева — «Аккаунты». Версия,
+        читавшая только лист, искала «Аккаунты» среди 825 игр — и, конечно,
+        не находила: в названии товара игры тоже нет."""
+        Api.path = ["Аккаунты"]
+        cb = self.press()
+        asked = [t for t in cb.message.texts if "Выбери" in t]
+        self.assertTrue(any("category" in t for t in asked), asked)
+
+
+class WithNoSourceAtAllItAsksOnlyWhatItCannotKnow(Bench):
+    """Панель закрыла и карточку, и список, а маркетплейс не назвал раздел.
+
+    Тогда остаются слова названия товара — а в нём игры нет. Копия
+    спрашивает, и это честный вопрос: выдумывать раздел она не должна.
+    Важно другое — она не отказывается копировать, как делала версия 03.09.
+    """
 
     def setUp(self):
         super().setUp()
         LiveNova.card_open = False
         LiveNova.list_open = False
+        Api.path = []
 
-    def test_the_section_and_subsection_are_still_found_by_name(self):
+    def test_it_asks_instead_of_inventing(self):
         cb = self.press()
-        asked = [t for t in cb.message.texts if "Выбери" in t]
-        self.assertEqual(len(asked), 1, asked)
-        self.assertIn("type", asked[0])
+        self.assertTrue([t for t in cb.message.texts if "Выбери" in t])
 
-    def test_and_it_is_not_a_dead_end(self):
+    def test_but_it_is_not_a_dead_end(self):
         """Прежняя версия на этом месте отказывалась копировать вовсе."""
         cb = self.press()
         said = cb.message.texts[-1]
         self.assertNotIn("не создалась", said)
         self.assertNotIn("прочитать не вышло", said)
-
-
-class TheMarketplaceNameNeedNotMatchThePanels(Bench):
-    """Раздел у маркетплейса называется по-своему. Это подсказка, а не
-    источник номера: номер берётся у панели, и совпадать они не обязаны."""
-
-    def test_a_name_that_matches_nothing_changes_nothing(self):
-        Api.section = "Игровые ценности и аккаунты"
-        cb = self.press()
-        self.assertEqual([t for t in cb.message.texts if "Выбери" in t], [])
-        self.assertEqual(str(self.created().get("category")), "613")
 
 
 if __name__ == "__main__":
