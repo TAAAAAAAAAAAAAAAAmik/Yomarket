@@ -12,6 +12,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import ui
 
 from api.yoomarket import YooMarketAPI
+from handlers import pager
 # Под своим именем: в этих обработчиках есть локальная
 # `next_cursor`, а одноимённая переменная делает имя
 # ЛОКАЛЬНЫМ на всю функцию — вызов до присваивания падает
@@ -112,8 +113,14 @@ def _format_orders_text(orders: list[dict], details: dict | None = None) -> str:
             + "\n\n".join(rows))
 
 
-def _build_orders_keyboard(orders: list[dict], next_cursor: str | None,
+def _build_orders_keyboard(orders: list[dict], next_token: str | None,
                            details: dict | None = None) -> InlineKeyboardMarkup:
+    """`next_token` — НОМЕР курсора из `pager`, а не сам курсор.
+
+    Под `callback_data` Telegram даёт 64 байта, а курсор этого маркетплейса
+    — семьдесят с лишним символов base64. Имя параметра поэтому другое:
+    переданный сюда настоящий курсор роняет весь экран.
+    """
     builder = InlineKeyboardBuilder()
     for order in orders:
         d = _merge(order, details)
@@ -133,9 +140,9 @@ def _build_orders_keyboard(orders: list[dict], next_cursor: str | None,
     # Листалка стоит отдельной строкой: рядом с «🔍 Поиск» она читается как
     # ещё один фильтр, хотя делает совсем другое.
     page = 0
-    if next_cursor:
+    if next_token:
         builder.button(text="Следующая →", callback_data=PaginationCallback(
-            entity="orders", cursor=next_cursor).pack())
+            entity="orders", cursor=next_token).pack())
         page = 1
     tail: list[tuple[str, str]] = [("🔍 Поиск", "orders:search"),
              ("✅ Выполненные", "orders:filter:done"),
@@ -155,10 +162,11 @@ async def show_orders(callback: CallbackQuery, api: YooMarketAPI) -> None:
     try:
         data = await api.get_orders()
         orders: list[dict] = data.get("data") or data.get("items") or []
-        next_cursor: str | None = _next_cursor(data)
+        token = pager.remember(callback.from_user.id, "orders",
+                               _next_cursor(data))
         details = get_settings(callback.from_user.id).get("known_order_details") or {}
         text = _format_orders_text(orders, details)
-        keyboard = _build_orders_keyboard(orders, next_cursor, details)
+        keyboard = _build_orders_keyboard(orders, token, details)
     except Exception as e:
         text = f"❌ Ошибка: {e}"
         keyboard = back_keyboard()
@@ -172,14 +180,23 @@ async def paginate_orders(
     callback_data: PaginationCallback,
     api: YooMarketAPI,
 ) -> None:
+    cursor = pager.recall(callback.from_user.id, "orders", callback_data.cursor)
+    if not cursor:
+        # Номера нет — бот перезапускался, и кнопка из переписки ведёт в
+        # никуда. Открыть первую страницу под видом следующей значит
+        # соврать; говорим как есть.
+        await callback.answer("Список устарел — открой заказы заново",
+                              show_alert=True)
+        return
     await callback.message.edit_text("⏳ Загружаю...")
     try:
-        data = await api.get_orders(cursor=callback_data.cursor)
+        data = await api.get_orders(cursor=cursor)
         orders: list[dict] = data.get("data") or data.get("items") or []
-        next_cursor: str | None = _next_cursor(data)
+        token = pager.remember(callback.from_user.id, "orders",
+                               _next_cursor(data))
         details = get_settings(callback.from_user.id).get("known_order_details") or {}
         text = _format_orders_text(orders, details)
-        keyboard = _build_orders_keyboard(orders, next_cursor, details)
+        keyboard = _build_orders_keyboard(orders, token, details)
     except Exception as e:
         text = f"❌ Ошибка: {e}"
         keyboard = back_keyboard()

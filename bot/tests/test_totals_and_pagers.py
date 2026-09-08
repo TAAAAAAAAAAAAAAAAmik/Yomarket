@@ -24,14 +24,19 @@ def run(coro):
     return asyncio.run(coro)
 
 
+# Курсор ДОСЛОВНО из живого отказа 08.09. Короткий выдуманный пропустил
+# беду: `page:chat_orders:` + семьдесят символов не влезают в 64 байта
+# callback_data, и экран падал целиком.
+REAL_CURSOR = "eyJpZCI6MTIyMzUzNSwiX3BvaW50c1RvTmV4dEl0ZW1zIjp0cnVlfQ"
+
 LIVE = {"data": [{"id": 1}],
         "meta": {"per_page": 15, "has_more": True},
-        "links": {"next_cursor": "eyJpZCI6MjUwNjM5", "prev_cursor": None}}
+        "links": {"next_cursor": REAL_CURSOR, "prev_cursor": None}}
 
 
 class TheCursorIsFoundInTheLiveShape(unittest.TestCase):
     def test_the_live_answer_yields_its_cursor(self):
-        self.assertEqual(next_cursor(LIVE), "eyJpZCI6MjUwNjM5")
+        self.assertEqual(next_cursor(LIVE), REAL_CURSOR)
 
     def test_the_old_place_alone_is_not_enough(self):
         """Именно из-за этого листалки и не было: в `meta` курсора нет."""
@@ -146,7 +151,7 @@ class OrdersApi:
                           "price": {"amount": 100}}],
                 "meta": {"per_page": 15, "has_more": self.with_next}}
         if self.with_next:
-            body["links"] = {"next_cursor": "eyJpZCI6MQ", "prev_cursor": None}
+            body["links"] = {"next_cursor": REAL_CURSOR, "prev_cursor": None}
         return body
 
 
@@ -199,6 +204,145 @@ class TheChatsScreenOpensAndPages(unittest.TestCase):
         cb = self.open(OrdersApi(with_next=True))
         self.assertTrue(any("Следующая" in b for b in buttons(cb.message.kbs[-1])),
                         buttons(cb.message.kbs[-1]))
+
+
+def data_of(kb) -> list:
+    return [b.callback_data for row in (kb.inline_keyboard if kb else [])
+            for b in row if b.callback_data]
+
+
+class NoButtonCarriesMoreThanTelegramAllows(unittest.TestCase):
+    """Живой отказ 08.09: «Resulted callback data is too long! …> 64».
+
+    Курсор этого маркетплейса — семьдесят с лишним символов base64, а под
+    `callback_data` Telegram даёт 64 БАЙТА. И падала не кнопка, а весь
+    экран: она собирается внутри той же попытки, что и список, и
+    исключение доехало до продавца как «Заказы не загрузились».
+
+    Раньше это не всплывало по случайности: курсор читали не из того
+    ключа, он всегда выходил пустым, и кнопки не было вовсе.
+    """
+
+    def setUp(self):
+        from handlers import pager
+        self.pager = pager
+        pager.forget(7)
+
+    def tearDown(self):
+        self.pager.forget(7)
+
+    def test_the_orders_button_fits(self):
+        from handlers import orders as O
+        token = self.pager.remember(7, "orders", REAL_CURSOR)
+        kb = O._build_orders_keyboard([{"id": 1}], token, {})
+        for cb in data_of(kb):
+            self.assertLessEqual(len(cb.encode()), 64, cb)
+
+    def test_the_chats_button_fits(self):
+        from handlers import chats as CH
+        token = self.pager.remember(7, "chat_orders", REAL_CURSOR)
+        kb = CH._build_chat_orders_keyboard([{"id": 1}], token, {}, {})
+        for cb in data_of(kb):
+            self.assertLessEqual(len(cb.encode()), 64, cb)
+
+    def test_the_ads_list_button_passes_the_token_through(self):
+        """Эта клавиатура ниоткуда не зовётся, но ловушка в ней та же.
+
+        Проверяется пропуск НАСКВОЗЬ: что дали, то и уехало в кнопку. Иначе
+        короткий номер превращался бы в длинную строку внутри самой
+        клавиатуры, и потолок в 64 байта снова оказался бы пробит."""
+        from keyboards.main import ads_list_keyboard
+        token = self.pager.remember(7, "ads", REAL_CURSOR)
+        kb = ads_list_keyboard([{"id": 1, "title": "Товар"}], token)
+        pagers = [c for c in data_of(kb) if c.startswith("page:ads:")]
+        self.assertEqual(pagers, [f"page:ads:{token}"], data_of(kb))
+        for cb in data_of(kb):
+            self.assertLessEqual(len(cb.encode()), 64, cb)
+
+    def test_the_whole_screen_survives_a_real_cursor(self):
+        """Проверка не на кнопку, а на ЭКРАН: именно он и падал."""
+        from handlers import orders as O
+        cb = CB("menu:orders")
+        run(O.show_orders(cb, OrdersApi()))
+        said = cb.message.texts[-1]
+        self.assertNotIn("не загрузились", said, said)
+        self.assertNotIn("too long", said, said)
+
+
+class TheNumberLeadsBackToTheRealCursor(unittest.TestCase):
+    """Номер в кнопке бесполезен, если по нему не находится курсор."""
+
+    def setUp(self):
+        from handlers import pager
+        self.pager = pager
+        pager.forget(7)
+
+    def tearDown(self):
+        self.pager.forget(7)
+
+    def test_what_was_remembered_comes_back(self):
+        token = self.pager.remember(7, "orders", REAL_CURSOR)
+        self.assertEqual(self.pager.recall(7, "orders", token), REAL_CURSOR)
+
+    def test_the_same_cursor_keeps_its_number(self):
+        """Продавец жмёт «Обновить», и список переехал бы на новый номер
+        при том же самом курсоре — словарь рос бы на каждое нажатие."""
+        a = self.pager.remember(7, "orders", REAL_CURSOR)
+        b = self.pager.remember(7, "orders", REAL_CURSOR)
+        self.assertEqual(a, b)
+
+    def test_lists_do_not_mix(self):
+        self.pager.remember(7, "orders", "A")
+        self.pager.remember(7, "chat_orders", "B")
+        self.assertEqual(self.pager.recall(7, "orders", "0"), "A")
+        self.assertEqual(self.pager.recall(7, "chat_orders", "0"), "B")
+
+    def test_sellers_do_not_mix(self):
+        self.pager.remember(7, "orders", "A")
+        self.assertEqual(self.pager.recall(8, "orders", "0"), "")
+        self.pager.forget(8)
+
+    def test_an_unknown_number_is_empty_not_the_first_page(self):
+        """Бот перезапускался, кнопка из переписки ведёт в никуда. Открыть
+        первую страницу под видом следующей значит соврать."""
+        self.assertEqual(self.pager.recall(7, "orders", "5"), "")
+        self.assertEqual(self.pager.recall(7, "orders", "мусор"), "")
+
+    def test_old_numbers_do_not_shift_when_the_store_is_trimmed(self):
+        """Сдвиг превратил бы кнопку в переписке в кнопку на ЧУЖУЮ
+        страницу — молча."""
+        first = self.pager.remember(7, "orders", "c0")
+        for i in range(1, self.pager._KEEP + 5):
+            self.pager.remember(7, "orders", f"c{i}")
+        last = self.pager.remember(7, "orders", "хвост")
+        self.assertEqual(self.pager.recall(7, "orders", last), "хвост")
+        self.assertEqual(self.pager.recall(7, "orders", first), "",
+                         "старый номер должен опустеть, а не указать на чужое")
+
+    def test_an_empty_cursor_is_not_remembered(self):
+        self.assertEqual(self.pager.remember(7, "orders", ""), "")
+
+
+class AStaleButtonSaysSoInsteadOfLying(unittest.TestCase):
+    def setUp(self):
+        from handlers import pager
+        self.pager = pager
+        pager.forget(7)
+
+    def test_orders_say_the_list_is_stale(self):
+        from handlers import orders as O
+        from keyboards.main import PaginationCallback
+
+        cb = CB("")
+        alerts: list = []
+
+        async def answer(text="", **kw):
+            alerts.append(text)
+
+        cb.answer = answer
+        run(O.paginate_orders(cb, PaginationCallback(entity="orders",
+                                                     cursor="99"), OrdersApi()))
+        self.assertTrue(any("устарел" in a for a in alerts), alerts)
 
 
 if __name__ == "__main__":

@@ -84,8 +84,14 @@ def ads_menu_keyboard() -> InlineKeyboardMarkup:
 
 def ads_list_keyboard(
     ads: list[dict],
-    next_cursor: str | None,
+    next_token: str | None,
 ) -> InlineKeyboardMarkup:
+    """`next_token` — НОМЕР курсора из `handlers.pager`, а не сам курсор.
+
+    Под `callback_data` Telegram даёт 64 байта, а курсор этого маркетплейса
+    — семьдесят с лишним символов base64: настоящий курсор здесь роняет
+    сборку клавиатуры, а вместе с ней и весь экран.
+    """
     builder = InlineKeyboardBuilder()
     for ad in ads:
         ad_id = str(ad.get("id", ""))
@@ -99,11 +105,11 @@ def ads_list_keyboard(
     # как одно длинное. Подвал раскладывается по ширине надписей.
     import ui
     page = 0
-    if next_cursor:
+    if next_token:
         # Листалка отдельной строкой: рядом с действиями она читается как
         # ещё одно действие.
         builder.button(text="Ещё товары ▶️", callback_data=PaginationCallback(
-            entity="ads", cursor=next_cursor).pack())
+            entity="ads", cursor=next_token).pack())
         page = 1
     tail = [("➕ Добавить товар", "create_ad:start"),
              ("🔄 Обновить", "ads_load"),

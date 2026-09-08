@@ -11,6 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import ui
 
 from api.yoomarket import YooMarketAPI
+from handlers import pager
 # Под своим именем: в этих обработчиках есть локальная
 # `next_cursor`, а одноимённая переменная делает имя
 # ЛОКАЛЬНЫМ на всю функцию — вызов до присваивания падает
@@ -290,9 +291,15 @@ def _mark_answered(uid: int, key: str) -> None:
     save_settings(uid, s)
 
 
-def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None,
+def _build_chat_orders_keyboard(orders: list[dict], next_token: str | None,
                                 watched: dict | None = None,
                                 details: dict | None = None) -> InlineKeyboardMarkup:
+    """`next_token` — НОМЕР курсора из `pager`, а не сам курсор.
+
+    Под `callback_data` Telegram даёт 64 байта, а курсор этого маркетплейса
+    — семьдесят с лишним символов base64. Имя параметра поэтому другое:
+    переданный сюда настоящий курсор роняет весь экран.
+    """
     builder = InlineKeyboardBuilder()
     details = details or {}
     # Проблемные — наверх: в списке на две страницы красный чат внизу второй
@@ -303,8 +310,10 @@ def _build_chat_orders_keyboard(orders: list[dict], next_cursor: str | None,
         oid = str(order.get("id", ""))
         builder.button(text=_order_label(order, details.get(oid) or {}),
                        callback_data=ChatCallback(chat_id=oid).pack())
-    if next_cursor:
-        builder.button(text="Следующая →", callback_data=PaginationCallback(entity="chat_orders", cursor=next_cursor).pack())
+    if next_token:
+        builder.button(text="Следующая →",
+                       callback_data=PaginationCallback(
+                           entity="chat_orders", cursor=next_token).pack())
     # Поддержка и модерация живут вне заказов, поэтому у них свой вход. Он
     # обязан пережить пустой список заказов: иначе отслеживаемые чаты
     # становятся недоступны ровно тогда, когда они единственные.
@@ -445,14 +454,15 @@ async def show_chats(callback: CallbackQuery, api: YooMarketAPI) -> None:
     try:
         data = await api.get_orders()
         orders: list[dict] = data.get("data") or data.get("items") or []
-        next_cursor: str | None = _next_cursor(data)
+        token = pager.remember(callback.from_user.id, "chat_orders",
+                               _next_cursor(data))
         if orders:
             text = "💬 <b>Чаты</b>\n" + _legend(orders, details)
         else:
             text = ("💬 <b>Чаты</b>\n\nПо заказам чатов пока нет."
                     + (f"\nОтслеживаемых чатов вне заказов: <b>{len(watched)}</b>."
                        if watched else ""))
-        keyboard = _build_chat_orders_keyboard(orders, next_cursor, watched, details)
+        keyboard = _build_chat_orders_keyboard(orders, token, watched, details)
     except Exception as e:
         # Упавший список заказов не должен прятать чаты, которые от него не зависят
         text = f"❌ Заказы не загрузились: {e}"
@@ -484,17 +494,26 @@ async def paginate_chat_orders(
     callback_data: PaginationCallback,
     api: YooMarketAPI,
 ) -> None:
+    cursor = pager.recall(callback.from_user.id, "chat_orders",
+                          callback_data.cursor)
+    if not cursor:
+        # Номера нет — бот перезапускался. Открыть первую страницу под
+        # видом следующей значит соврать; говорим как есть.
+        await callback.answer("Список устарел — открой чаты заново",
+                              show_alert=True)
+        return
     await callback.answer()
     await _safe_edit(callback, "⏳ Загружаю...")
     try:
-        data = await api.get_orders(cursor=callback_data.cursor)
+        data = await api.get_orders(cursor=cursor)
         orders: list[dict] = data.get("data") or data.get("items") or []
-        next_cursor: str | None = _next_cursor(data)
+        token = pager.remember(callback.from_user.id, "chat_orders",
+                               _next_cursor(data))
         s = get_settings(callback.from_user.id)
         details = s.get("known_order_details") or {}
         text = "💬 <b>Чаты</b>\n" + _legend(orders, details)
         keyboard = _build_chat_orders_keyboard(
-            orders, next_cursor, s.get("watched_chats") or {}, details)
+            orders, token, s.get("watched_chats") or {}, details)
     except Exception as e:
         text = f"❌ Ошибка: {_esc(str(e)[:200])}"
         keyboard = back_keyboard()
