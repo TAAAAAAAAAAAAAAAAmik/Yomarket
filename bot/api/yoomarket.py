@@ -295,10 +295,8 @@ class YooMarketAPI:
             kind = str(inner.get("type") or "")
 
             if kind == "auto-delivery":
-                data = await self.get_ad_items(ad_id)
-                rows = data.get("data") or data.get("items") or []
-                free = [r for r in rows
-                        if str((r or {}).get("status", "available")) == "available"]
+                from orderfields import ad_items_free
+                free = ad_items_free(await self.get_ad_items(ad_id))
                 return bool(free), f"позиций в наличии: {len(free)}"
 
             if kind == "auto-value":

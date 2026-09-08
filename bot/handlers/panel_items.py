@@ -398,10 +398,8 @@ async def _stock_left(api: YooMarketAPI, item_id: str,
         ad_type = str(inner.get("type") or "")
 
         if ad_type == "auto-delivery":
-            data = await api.get_ad_items(item_id)
-            rows = data.get("data") or data.get("items") or []
-            free = [r for r in rows
-                    if str((r or {}).get("status", "available")) == "available"]
+            from orderfields import ad_items_free
+            free = ad_items_free(await api.get_ad_items(item_id))
             return bool(free), f"позиций в наличии: {len(free)}"
 
         if ad_type == "auto-value":
@@ -742,6 +740,10 @@ async def item_stock_save(message: Message, state: FSMContext,
     status = await message.answer("⏳ Добавляю остатки...")
 
     kept = False
+    # Легли ли позиции НА САМОМ ДЕЛЕ. Заголовок «✅ Готово» и совет «жми на
+    # модерацию» при пустом остатке — это ровно тот бодрый отчёт об
+    # успехе, из-за которого продавец шёл проверять не то.
+    landed = False
     try:
         ad = await api.get_ad(item_id)
         inner = ad.get("data") or ad
@@ -750,18 +752,58 @@ async def item_stock_save(message: Message, state: FSMContext,
         if ad_type == "auto-value" or (text.isdigit() and ad_type != "auto-delivery"):
             await api.refill_ad_value(item_id, float(text))
             done = f"остаток пополнен на {text}"
+            landed = True
         else:
             items = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            await api.add_ad_items(item_id, items)
-            done = f"добавлено позиций: {len(items)}"
+            answer = await api.add_ad_items(item_id, items) or {}
+            # ПЕРЕЧИТЫВАЕМ. «Отправлено 3» и «в наличии 3» — разные
+            # утверждения, а публиковать маркетплейс даёт по второму:
+            # 08.09 три позиции ушли без ошибки, и публикация тут же
+            # отказала `empty_stock`. Отчёт «добавлено позиций: 3» в этом
+            # случае был бодрым враньём.
+            from orderfields import ad_items_free
+            try:
+                free = len(ad_items_free(await api.get_ad_items(item_id)))
+            except Exception as e:                        # noqa: BLE001
+                logger.info("остатки %s не перечитались: %s", item_id, e)
+                free = -1
+            if free < 0:
+                done = (f"отправлено позиций: {len(items)} "
+                        "(перечитать не вышло — проверь список у товара)")
+            elif free >= len(items):
+                done = f"в наличии позиций: {free}"
+                landed = True
+            else:
+                # Причину знает только маркетплейс, и он на отправку
+                # ответил. Выбросить его ответ значит оставить продавцу
+                # загадку вместо отчёта.
+                done = (f"отправлено {len(items)}, а в наличии {free}"
+                        f"\n<i>Маркетплейс ответил:</i> "
+                        f"<code>{_esc(str(answer)[:200])}</code>"
+                        + ui.admin_hint(
+                            message.from_user.id,
+                            f"\n<i>Разбор:</i> <code>/stock_debug "
+                            f"{_esc(str(item_id))}</code>"))
             # Тот же список пригодится следующей копии. Просить продавца
             # найти для этого отдельный экран — значит просить его вводить
             # одно и то же после каждой копии.
-            kept = _remember_stock(message.from_user.id, items)
+            #
+            # Но только если позиции ЛЕГЛИ: запомнить заготовкой то, что
+            # маркетплейс не принял, значит подставлять её каждому новому
+            # товару и каждый раз получать тот же пустой остаток.
+            if landed:
+                kept = _remember_stock(message.from_user.id, items)
 
         b = InlineKeyboardBuilder()
-        b.button(text="🚀 Отправить на модерацию",
-                 callback_data=f"pitem_show:{item_id}")
+        if landed:
+            b.button(text="🚀 Отправить на модерацию",
+                     callback_data=f"pitem_show:{item_id}")
+        else:
+            # Кнопка идёт по исходу, а не по тексту отчёта: советовать
+            # модерацию там, где остатка нет, — значит послать продавца
+            # получить отказ `empty_stock`.
+            b.button(text="📦 Прислать ещё раз",
+                     callback_data=f"pitem_stock:{item_id}")
         b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
         ui.lay(b)
         # Запомненное называется вслух: эти строки уходят покупателям, и
@@ -770,11 +812,13 @@ async def item_stock_save(message: Message, state: FSMContext,
                 " товару с авто-выдачей.\n<i>Покупатель получит именно эти"
                 " строки. Поменять: «📋 Шаблонная копия → 📦 Остатки по"
                 " умолчанию».</i>" if kept else "")
-        await status.edit_text(
-            f"✅ <b>Готово</b> — {done}.\n\n"
-            f"Теперь товар можно отправить на модерацию." + note,
-            reply_markup=b.as_markup(),
-        )
+        head = ("✅ <b>Готово</b>" if landed
+                else "⚠️ <b>Остаток не встал</b>")
+        tail = ("\n\nТеперь товар можно отправить на модерацию." if landed
+                else "\n\nБез остатка публиковать нечего: маркетплейс "
+                     "отказывает — <code>empty_stock</code>.")
+        await status.edit_text(head + f" — {done}." + tail + note,
+                               reply_markup=b.as_markup())
     except Exception as e:
         b = InlineKeyboardBuilder()
         b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
@@ -2048,6 +2092,102 @@ async def chat_send_probe(message: Message) -> None:
     for i in range(0, min(len(text), 10000), 3500):
         await message.answer(f"<code>{text[i:i + 3500]}</code>")
     await status.delete()
+
+
+@router.message(Command("stock_debug"))
+async def stock_debug(message: Message, api: YooMarketAPI) -> None:
+    """Остатки одного товара: что маркетплейс принял и что отдаёт обратно.
+
+    Написана после живого случая 08.09: копия отправила три позиции,
+    маркетплейс ответил без ошибки, а публикация тут же отказала
+    `empty_stock` — то есть остатка у товара нет. Догадываться о форме
+    тела запроса здесь бессмысленно: команда печатает, что мы отправили
+    и что он ответил, слово в слово.
+
+    По умолчанию **только читает**. Со вторым словом — отправляет ровно
+    одну эту строку тем же вызовом, каким её отправляет копия, и
+    показывает сырой ответ. Строка остаётся у товара: это его остаток, а
+    не наш черновик, и убирать её за продавца команда не станет.
+    """
+    import html as _html
+    import json as _json
+
+    from handlers.start import BOT_VERSION
+    from orderfields import ad_items_free, ad_items_rows
+
+    if not api:
+        await message.answer("⚠️ Нет токена — отправь /start")
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer(
+            "Укажи номер: <code>/stock_debug 250845</code>\n"
+            "Проба отправкой (строка останется у товара): "
+            "<code>/stock_debug 250845 KEY-ПРОБА</code>")
+        return
+    ad_id = parts[1].lstrip("#")
+    probe = parts[2].strip() if len(parts) > 2 else ""
+
+    status = await message.answer("⏳ Читаю остатки…")
+    out = [f"🔍 <b>Остатки товара {_html.escape(ad_id)}</b>  "
+           f"<code>{_html.escape(BOT_VERSION)}</code>", ""]
+
+    def raw(value) -> str:
+        try:
+            text = _json.dumps(value, ensure_ascii=False)
+        except Exception:                                 # noqa: BLE001
+            text = str(value)
+        return f"<code>{_html.escape(text[:600])}</code>"
+
+    async def snapshot(title: str) -> None:
+        out.append(f"<b>{title}</b>")
+        try:
+            got = await api.get_ad_items(ad_id)
+        except Exception as e:                            # noqa: BLE001
+            out.append(f"не прочиталось: <code>{_html.escape(str(e)[:200])}</code>")
+            return
+        rows = ad_items_rows(got)
+        free = ad_items_free(got)
+        keys = list(got.keys()) if isinstance(got, dict) else type(got).__name__
+        out.append(f"ключи ответа: <code>{_html.escape(str(keys))}</code>")
+        out.append(f"позиций: <b>{len(rows)}</b> · из них свободных: "
+                   f"<b>{len(free)}</b>")
+        seen = sorted({str(r.get("status", "—")) for r in rows})
+        if seen:
+            out.append(f"статусы: <code>{_html.escape(str(seen))}</code>")
+        if rows:
+            out.append("первая строка: " + raw(rows[0]))
+        else:
+            out.append("сырой ответ: " + raw(got))
+
+    # Вид товара решает, что вообще значит «остаток»: у авто-выдачи это
+    # позиции, у авто-выбора — число, у безлимитного его нет вовсе.
+    try:
+        ad = await api.get_ad(ad_id)
+        inner = (ad.get("data") or ad) if isinstance(ad, dict) else {}
+        out += [f"вид: <code>{_html.escape(str(inner.get('type') or '—'))}</code>"
+                f" · статус: <code>{_html.escape(str(inner.get('status') or '—'))}</code>"
+                f" · stock: <code>{_html.escape(str(inner.get('stock')))}</code>", ""]
+    except Exception as e:                                # noqa: BLE001
+        out += [f"карточка не прочиталась: <code>{_html.escape(str(e)[:200])}</code>",
+                ""]
+
+    await snapshot("📖 Что маркетплейс отдаёт сейчас")
+
+    if probe:
+        out += ["", "<b>📮 Проба отправкой</b>",
+                "отправляю: " + raw({"items": [probe]})]
+        try:
+            answer = await api.add_ad_items(ad_id, [probe])
+            out.append("ответ: " + raw(answer))
+        except Exception as e:                            # noqa: BLE001
+            out.append(f"отказ: <code>{_html.escape(str(e)[:300])}</code>")
+        out.append("")
+        await snapshot("📖 Что он отдаёт после отправки")
+        out.append("<i>Эта строка осталась у товара — убери её, если товар "
+                   "живой.</i>")
+
+    await status.edit_text("\n".join(out)[:4000])
 
 
 @router.message(Command("withdraw_debug"))

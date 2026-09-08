@@ -1481,7 +1481,7 @@ async def _fill_stock(api, item_id: str, want, source_id: str = "",
         # вправе положить один раз и не вводить его каждый раз заново.
         ready = await _default_stock(uid)
         if ready:
-            note, ok = await _put_items(api, item_id, ready)
+            note, ok = await _put_items(api, item_id, ready, uid)
             return note, ok, True
         need = await _source_items_left(api, source_id)
         return ("\n📦 <b>Остаток — это сам товар</b>: коды или аккаунты, и они"
@@ -1521,7 +1521,8 @@ async def _default_stock(uid: int) -> list:
         return []
 
 
-async def _put_items(api, item_id: str, rows: list) -> tuple[str, bool]:
+async def _put_items(api, item_id: str, rows: list,
+                     uid: int = 0) -> tuple[str, bool]:
     """Положить позиции авто-выдачи и ПЕРЕЧИТАТЬ. → (отчёт, получилось ли).
 
     Перечитывание здесь не формальность: «отправили 3» и «в наличии 3» —
@@ -1531,18 +1532,28 @@ async def _put_items(api, item_id: str, rows: list) -> tuple[str, bool]:
     И говорится вслух, что покупатель получит именно эти строки: заготовка,
     забытая на витрине, — это оплаченный заказ с мусором внутри.
     """
+    from orderfields import ad_items_free
+
+    answer: dict = {}
     try:
-        await api.add_ad_items(item_id, list(rows))
+        answer = await api.add_ad_items(item_id, list(rows)) or {}
         left = await api.get_ad_items(item_id)
-        free = [r for r in (left.get("data") or [])
-                if str((r or {}).get("status", "available")) == "available"]
+        free = ad_items_free(left)
     except Exception as e:                                # noqa: BLE001
         logger.warning("позиции товару %s не добавились: %s", item_id, e)
         return ("\n📦 Остатки по умолчанию положить не вышло: "
                 f"{html.escape(str(e)[:120])}"), False
     if not free:
-        return ("\n📦 Остатки отправлены, но в наличии их нет — "
-                "проверь список у товара."), False
+        # «Отправлено, а в наличии нет» — это не отчёт, а загадка: причина
+        # лежит в ответе маркетплейса, и он единственный, кто её знает.
+        # Живой случай 08.09: три позиции ушли, публикация отказала
+        # `empty_stock`, а что ответил маркетплейс на саму отправку — бот
+        # выбрасывал.
+        return ("\n📦 Остатки отправлены, но в наличии их нет."
+                f"\n<i>Маркетплейс на отправку ответил:</i> "
+                f"<code>{html.escape(str(answer)[:200])}</code>"
+                + ui.admin_hint(uid, f"\n<i>Разбор:</i> <code>/stock_debug "
+                                     f"{html.escape(str(item_id))}</code>")), False
     return (f"\n📦 Остаток проставлен: {len(free)} поз. — твоя заготовка."
             "\n<i>Покупатель получит именно эти строки. Заменишь на "
             "настоящие — кнопка «📦 Прислать остатки».</i>"), True
@@ -1552,13 +1563,13 @@ async def _source_items_left(api, source_id: str) -> str:
     """Сколько непроданных позиций у образца — словами. Пусто — не узнали."""
     if not api or not source_id:
         return ""
+    from orderfields import ad_items_free
+
     try:
-        rows = (await api.get_ad_items(source_id)).get("data") or []
+        free = ad_items_free(await api.get_ad_items(source_id))
     except Exception as e:                                # noqa: BLE001
         logger.info("позиции образца %s не прочитались: %s", source_id, e)
         return ""
-    free = [r for r in rows
-            if str((r or {}).get("status", "available")) == "available"]
     return f"{len(free)} шт. в наличии" if free else ""
 
 

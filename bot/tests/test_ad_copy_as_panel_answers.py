@@ -775,6 +775,17 @@ class TheStockIsPutInByTheBotAsFarAsItHonestlyCan(Bench):
         said = self.press().message.texts[-1]
         self.assertIn("в наличии их нет", said, said)
 
+    def test_and_the_report_carries_what_the_marketplace_answered(self):
+        """Живой случай 08.09: позиции ушли, публикация отказала
+        `empty_stock`, а ответ маркетплейса на саму отправку бот
+        выбрасывал — и «отправлены, но их нет» осталось загадкой."""
+        Api.kind = "auto-delivery"
+        self.default_stock = ["KEY-1111"]
+        Api.accepts = 0
+        said = self.press().message.texts[-1]
+        self.assertIn("Маркетплейс на отправку ответил", said)
+        self.assertIn("added", said, said)
+
     def test_a_marketplace_that_refuses_the_list_says_so(self):
         """Исключение отсюда съело бы весь отчёт о созданном товаре."""
         Api.kind = "auto-delivery"

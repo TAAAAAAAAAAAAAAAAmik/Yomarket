@@ -196,6 +196,38 @@ def ad_title(payload) -> str:
                  depth=2)
 
 
+# Чем маркетплейс помечает НЕпроданную позицию. Слова его, не наши: у
+# позиций, которые он отдаёт, статуса может не быть вовсе — тогда позиция
+# считается свободной, иначе новый товар выглядел бы пустым.
+_ITEM_FREE = {"available", "active", "in_stock", "instock", "free", "new",
+              "not_sold", "unsold", ""}
+
+
+def ad_items_rows(payload) -> list:
+    """Позиции автовыдачи из ответа `/ads/{id}/items` — списком.
+
+    Читателей у этого ответа четверо, и разбирали они его каждый по-своему:
+    один смотрел только в `data`, второй ещё и в `items`. Разница вылезла
+    живьём 08.09 — копия отправила три позиции и сказала «в наличии их
+    нет», потому что смотрела в тот ключ, которого в ответе не было.
+    """
+    node = payload
+    for key in ("data", "items", "results"):
+        if isinstance(node, dict) and isinstance(node.get(key), list):
+            return [r for r in node[key] if isinstance(r, dict)]
+    if isinstance(node, dict) and isinstance(node.get("data"), dict):
+        return ad_items_rows(node["data"])
+    if isinstance(node, list):
+        return [r for r in node if isinstance(r, dict)]
+    return []
+
+
+def ad_items_free(payload) -> list:
+    """Только непроданные позиции. → список строк ответа."""
+    return [r for r in ad_items_rows(payload)
+            if str(r.get("status", "")).strip().lower() in _ITEM_FREE]
+
+
 def order_quantity(order: dict) -> str:
     return _deep(order, ("quantity", "count", "qty", "amount_items", "items_count"),
                  skip=_PERSON_KEYS, depth=1)
