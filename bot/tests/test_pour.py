@@ -61,10 +61,15 @@ class Bench(unittest.TestCase):
         self.made: list = []
         self.answers: list = []
 
-        async def fake_pour(uid, ad_id, cid=None, api=None):
+        self.published: list = []
+
+        async def fake_pour(uid, ad_id, cid=None, api=None, publish=True):
             self.made.append(str(ad_id))
+            self.published.append(bool(publish))
             return (self.answers.pop(0) if self.answers
-                    else {"ok": True, "id": f"new{len(self.made)}", "why": ""})
+                    else {"ok": True, "id": f"new{len(self.made)}", "why": "",
+                          "stock_ok": True, "stock": "", "published": True,
+                          "publish": ""})
 
         C.pour_once = fake_pour
 
@@ -232,6 +237,223 @@ class EveryRefusalIsWrittenDown(Bench):
                              storage._POUR_MADE_MAX)
 
 
+class TheWorkingHoursAreTheSellers(Bench):
+    """Ночью поднимать некому: покупатели спят, а объявления и лимиты
+    тратятся так же."""
+
+    def at(self, hour: int, **conf):
+        import localtime as _lt
+        was = _lt.hour
+        _lt.hour = lambda settings: hour
+        M._lt = _lt if hasattr(M, "_lt") else None
+        try:
+            return self.pour(**conf)
+        finally:
+            _lt.hour = was
+
+    def test_outside_the_window_it_does_not_pour(self):
+        self.at(3, from_hour=9, to_hour=23)
+        self.assertEqual(self.made, [])
+
+    def test_inside_the_window_it_does(self):
+        self.at(10, from_hour=9, to_hour=23)
+        self.assertEqual(self.made, ["11"])
+
+    def test_equal_bounds_mean_around_the_clock(self):
+        """0–24 и 9–9 — это «всегда»: пустое окно значило бы «никогда», и
+        залив молчал бы, не сказав почему."""
+        self.at(3, from_hour=0, to_hour=24)
+        self.assertEqual(self.made, ["11"])
+
+    def test_a_window_over_midnight_works_too(self):
+        """22–6 — это вечер и ночь, а не пустой промежуток."""
+        self.at(23, from_hour=22, to_hour=6)
+        self.assertEqual(self.made, ["11"], "23:00 внутри 22–6")
+        self.made.clear()
+        self.at(12, from_hour=22, to_hour=6)
+        self.assertEqual(self.made, [], "полдень вне 22–6")
+
+    def test_the_step_is_not_burned_while_waiting_for_the_window(self):
+        """Отметка «залил» вне окна означала бы, что первый залив в девять
+        утра случится не сразу, а через шаг."""
+        conf = self.at(3, from_hour=9, to_hour=23)
+        self.assertEqual(conf["last_run"], 0.0)
+
+
+class TheDailyCapHolds(Bench):
+    def test_it_stops_at_the_cap(self):
+        conf = self.pour(cap=2)
+        for _ in range(4):
+            conf["last_run"] = 0.0
+            storage.save_pour(self.UID, conf)
+            run(self.mgr._maybe_pour(self.UID, storage.get_settings(self.UID)))
+            conf = storage.get_pour(self.UID)
+        self.assertEqual(len(self.made), 2, self.made)
+
+    def test_and_says_so_once(self):
+        """Минутный залив написал бы эту строку тысячу раз и вытеснил из
+        журнала всё остальное."""
+        conf = self.pour(cap=1)
+        for _ in range(3):
+            conf["last_run"] = 0.0
+            storage.save_pour(self.UID, conf)
+            run(self.mgr._maybe_pour(self.UID, storage.get_settings(self.UID)))
+            conf = storage.get_pour(self.UID)
+        said = [r for r in conf["log"] if "потолок" in r]
+        self.assertEqual(len(said), 1, conf["log"])
+
+    def test_a_new_day_starts_the_count_over(self):
+        conf = self.pour(cap=1)
+        conf["day"] = "2000-01-01"
+        conf["last_run"] = 0.0
+        storage.save_pour(self.UID, conf)
+        self.made.clear()
+        run(self.mgr._maybe_pour(self.UID, storage.get_settings(self.UID)))
+        self.assertEqual(self.made, ["11"], "новый день — новый счёт")
+
+    def test_no_cap_means_no_cap(self):
+        conf = self.pour(cap=0)
+        conf["last_run"] = 0.0
+        storage.save_pour(self.UID, conf)
+        run(self.mgr._maybe_pour(self.UID, storage.get_settings(self.UID)))
+        self.assertEqual(len(self.made), 2)
+
+
+class KeepingOnlyTheLastCopies(Bench):
+    """«Держать N» — про сегодняшние тоже: за сутки минутного залива их
+    накопится больше тысячи, и «убирать вчерашние» тут не спасает."""
+
+    def today_rows(self, n):
+        import localtime as _lt
+        today = _lt.today_str(storage.get_settings(self.UID))
+        return [{"id": f"c{i}", "src": "11", "day": today, "at": float(i)}
+                for i in range(n)]
+
+    def test_the_extra_ones_go(self):
+        conf = self.pour(keep=2, made=self.today_rows(4))
+        # Четыре старых плюс одна новая — держим две последние.
+        self.assertEqual(sorted(self.deleted), ["c0", "c1", "c2"])
+        self.assertEqual(len(conf["made"]), 2)
+
+    def test_the_newest_stay(self):
+        conf = self.pour(keep=2, made=self.today_rows(4))
+        kept = [r["id"] for r in conf["made"]]
+        self.assertIn("new1", kept, "только что созданная — самая свежая")
+        self.assertIn("c3", kept)
+
+    def test_zero_keeps_the_old_behaviour(self):
+        self.pour(keep=0, made=self.today_rows(4))
+        self.assertEqual(self.deleted, [], "без «держать N» трогаем вчерашние")
+
+    def test_each_item_is_counted_on_its_own(self):
+        """Три копии одного товара и три другого — это не шесть подряд."""
+        rows = self.today_rows(2)
+        rows += [{"id": "d0", "src": "12", "day": rows[0]["day"], "at": 0.0},
+                 {"id": "d1", "src": "12", "day": rows[0]["day"], "at": 1.0}]
+        conf = self.pour(keep=2, items=["11", "12"], made=rows)
+        self.assertEqual(sorted(self.deleted), ["c0", "d0"])
+
+
+class ThePauseAndThePublishFlag(Bench):
+    def test_the_gap_is_waited_between_items(self):
+        slept: list = []
+
+        async def fake_sleep(sec):
+            slept.append(sec)
+
+        was = M.asyncio.sleep
+        M.asyncio.sleep = fake_sleep
+        try:
+            self.pour(items=["11", "12"], gap=7)
+        finally:
+            M.asyncio.sleep = was
+        self.assertEqual(slept, [7], "пауза одна — между двумя товарами")
+
+    def test_no_gap_no_waiting(self):
+        slept: list = []
+
+        async def fake_sleep(sec):
+            slept.append(sec)
+
+        was = M.asyncio.sleep
+        M.asyncio.sleep = fake_sleep
+        try:
+            self.pour(items=["11", "12"], gap=0)
+        finally:
+            M.asyncio.sleep = was
+        self.assertEqual(slept, [])
+
+    def test_the_publish_choice_reaches_the_copy(self):
+        self.pour(publish=False)
+        self.assertEqual(self.published, [False])
+
+    def test_and_by_default_it_publishes(self):
+        self.pour()
+        self.assertEqual(self.published, [True])
+
+
+class TheJournalTellsAboutTheStock(Bench):
+    """«Иногда остатки не вписываются» — это про молчание: причина была
+    написана в отчёте копии и выброшена вместе с ним."""
+
+    def test_a_copy_without_stock_is_marked(self):
+        self.answers = [{"ok": True, "id": "77", "why": "", "stock_ok": False,
+                         "stock": "Остаток — это сам товар", "published": False,
+                         "publish": "empty_stock"}]
+        conf = self.pour()
+        line = "\n".join(conf["log"])
+        self.assertIn("без остатка", line, conf["log"])
+        self.assertIn("сам товар", line, "причина — словами маркетплейса")
+
+    def test_and_a_failed_publication_too(self):
+        self.answers = [{"ok": True, "id": "77", "why": "", "stock_ok": False,
+                         "stock": "", "published": False,
+                         "publish": "empty_stock"}]
+        conf = self.pour()
+        self.assertIn("empty_stock", "\n".join(conf["log"]))
+
+    def test_a_good_copy_is_marked_good(self):
+        conf = self.pour()
+        self.assertIn("✅", "\n".join(conf["log"]))
+
+
+class TheStockIsPerItemFirst(unittest.TestCase):
+    """Одна заготовка на все товары кладёт покупателю ключ от чужой игры."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._blob = storage._BLOBS["settings"]
+        storage._BLOBS["settings"] = os.path.join(self.tmp.name, "s.json")
+
+    def tearDown(self):
+        storage._BLOBS["settings"] = self._blob
+        self.tmp.cleanup()
+
+    def ready(self, src=""):
+        import handlers.create_ad as C
+        return run(C._default_stock(7, src))
+
+    def test_its_own_list_wins(self):
+        storage.set_copy_stock(7, ["ОБЩИЙ"])
+        storage.set_pour_stock(7, "11", ["СВОЙ-1", "СВОЙ-2"])
+        self.assertEqual(self.ready("11"), ["СВОЙ-1", "СВОЙ-2"])
+
+    def test_the_common_one_fills_the_gap(self):
+        storage.set_copy_stock(7, ["ОБЩИЙ"])
+        self.assertEqual(self.ready("12"), ["ОБЩИЙ"])
+
+    def test_and_nothing_is_still_nothing(self):
+        """Подставить за продавца нечего — и выдумывать нельзя: эти строки
+        уходят живому покупателю."""
+        self.assertEqual(self.ready("12"), [])
+
+    def test_an_emptied_list_falls_back_to_the_common_one(self):
+        storage.set_copy_stock(7, ["ОБЩИЙ"])
+        storage.set_pour_stock(7, "11", ["СВОЙ"])
+        storage.set_pour_stock(7, "11", [])
+        self.assertEqual(self.ready("11"), ["ОБЩИЙ"])
+
+
 class TheScreenActuallyWiresItUp(Bench):
     """Настройку можно написать правильно и забыть позвать из экрана —
     снаружи это «нажал, а ничего не изменилось»."""
@@ -376,6 +598,114 @@ class TheScreenActuallyWiresItUp(Bench):
                 self.assertEqual(cb.said, [], call.__name__)
                 self.assertTrue(cb.alerts, call.__name__)
 
+    def test_the_cap_is_saved(self):
+        cb = self.CB("pour:cap")
+        run(self.C.pour_cap(cb, self.FSM()))
+        fsm = self.FSM()
+        run(fsm.update_data(pour_key="cap"))
+        msg = self.Msg("50")
+        run(self.C.pour_number_save(msg, fsm))
+        self.assertEqual(storage.get_pour(self.UID)["cap"], 50)
+
+    def test_and_so_are_keep_and_gap(self):
+        for key, value in (("keep", 3), ("gap", 10)):
+            with self.subTest(key=key):
+                fsm = self.FSM()
+                run(fsm.update_data(pour_key=key))
+                run(self.C.pour_number_save(self.Msg(str(value)), fsm))
+                self.assertEqual(storage.get_pour(self.UID)[key], value)
+
+    def test_a_negative_number_is_refused(self):
+        fsm = self.FSM()
+        run(fsm.update_data(pour_key="cap"))
+        msg = self.Msg("-5")
+        run(self.C.pour_number_save(msg, fsm))
+        self.assertTrue(any("нельзя" in t for t in msg.said), msg.said)
+        self.assertEqual(storage.get_pour(self.UID)["cap"], 0)
+
+    def test_the_hours_preset_is_saved(self):
+        cb = self.CB("pour:hours:9-23")
+        run(self.C.pour_hours_preset(cb, self.FSM(), self.Api()))
+        conf = storage.get_pour(self.UID)
+        self.assertEqual((conf["from_hour"], conf["to_hour"]), (9, 23))
+
+    def test_the_hours_can_be_typed(self):
+        run(self.C.pour_hours_save(self.Msg("8-22"), self.FSM()))
+        conf = storage.get_pour(self.UID)
+        self.assertEqual((conf["from_hour"], conf["to_hour"]), (8, 22))
+
+    def test_a_dash_of_any_kind_works(self):
+        """Телефон подставляет длинное тире сам, и продавец об этом не
+        знает — отказ выглядел бы как «не понимает цифры»."""
+        run(self.C.pour_hours_save(self.Msg("9–21"), self.FSM()))
+        self.assertEqual(storage.get_pour(self.UID)["to_hour"], 21)
+
+    def test_nonsense_hours_are_refused(self):
+        msg = self.Msg("с утра до вечера")
+        run(self.C.pour_hours_save(msg, self.FSM()))
+        self.assertTrue(any("дефис" in t for t in msg.said), msg.said)
+
+    def test_hours_out_of_range_are_refused(self):
+        msg = self.Msg("9-30")
+        run(self.C.pour_hours_save(msg, self.FSM()))
+        self.assertTrue(any("от 0 до 24" in t for t in msg.said), msg.said)
+
+    def test_the_publish_switch_flips(self):
+        cb = self.CB("pour:pub")
+        run(self.C.pour_publish_toggle(cb, self.FSM(), self.Api()))
+        self.assertFalse(storage.get_pour(self.UID)["publish"])
+        run(self.C.pour_publish_toggle(cb, self.FSM(), self.Api()))
+        self.assertTrue(storage.get_pour(self.UID)["publish"])
+
+    def test_pour_now_creates_and_remembers(self):
+        """Ручной прогон записывает созданное за ботом так же: иначе
+        завтра эти копии не удалятся — бот не будет знать, что они его."""
+        conf = storage.get_pour(self.UID)
+        conf["items"] = ["11"]
+        storage.save_pour(self.UID, conf)
+        cb = self.CB("pour:now")
+        run(self.C.pour_now(cb, self.FSM(), self.Api()))
+        self.assertEqual(self.made, ["11"])
+        self.assertEqual([r["id"] for r in storage.get_pour(self.UID)["made"]],
+                         ["new1"])
+
+    def test_pour_now_without_items_leads_to_choosing_them(self):
+        cb = self.CB("pour:now")
+        run(self.C.pour_now(cb, self.FSM(), self.Api()))
+        self.assertEqual(self.made, [])
+        self.assertTrue(any("Какие товары" in t for t in cb.said), cb.said)
+
+    def test_the_items_own_stock_is_saved(self):
+        fsm = self.FSM()
+        run(self.C.pour_pick(self.CB("pour:pick"), fsm, self.Api()))
+        run(self.C.pour_toggle_item(self.CB("pour:tog:0"), fsm, self.Api()))
+        run(self.C.pour_stock_ask(self.CB("pour:st:0"), fsm))
+        run(self.C.pour_stock_save(self.Msg("KEY-A\nKEY-B"), fsm))
+        self.assertEqual(storage.get_pour_stock(self.UID, "11"),
+                         ["KEY-A", "KEY-B"])
+
+    def test_and_says_the_buyer_gets_exactly_those(self):
+        fsm = self.FSM()
+        run(self.C.pour_pick(self.CB("pour:pick"), fsm, self.Api()))
+        run(self.C.pour_toggle_item(self.CB("pour:tog:0"), fsm, self.Api()))
+        run(self.C.pour_stock_ask(self.CB("pour:st:0"), fsm))
+        msg = self.Msg("KEY-A")
+        run(self.C.pour_stock_save(msg, fsm))
+        self.assertTrue(any("получит именно эти" in t for t in msg.said),
+                        msg.said)
+
+    def test_the_stock_button_shows_only_on_chosen_items(self):
+        """У неотмеченного товара задавать остатки незачем: заливать его
+        никто не собирался."""
+        fsm = self.FSM()
+        cb = self.CB("pour:pick")
+        run(self.C.pour_pick(cb, fsm, self.Api()))
+        self.assertNotIn("pour:st:0", self.buttons(cb))
+        run(self.C.pour_toggle_item(self.CB("pour:tog:0"), fsm, self.Api()))
+        cb2 = self.CB("pour:pick")
+        run(self.C.pour_pick(cb2, fsm, self.Api()))
+        self.assertIn("pour:st:0", self.buttons(cb2))
+
     class Msg:
         def __init__(s, text, uid=7):
             s.text = text
@@ -385,6 +715,29 @@ class TheScreenActuallyWiresItUp(Bench):
         async def answer(s, text, reply_markup=None, **kw):
             s.said.append(str(text))
             return s
+
+
+class ThePourHasItsOwnButtonInTheMenu(unittest.TestCase):
+    """Залив живёт под копией, а нужен он каждый день. Кнопка на первом
+    экране — то, ради чего просили; но только тем, кому раздел открыт:
+    кнопка, отвечающая «этого раздела сейчас нет», — дохлая кнопка."""
+
+    def kb(self, **kw):
+        from keyboards.main import main_menu_keyboard
+        return [b.callback_data
+                for row in main_menu_keyboard(**kw).inline_keyboard
+                for b in row]
+
+    def test_it_is_there_for_whoever_the_section_is_open_for(self):
+        self.assertIn("pour:menu", self.kb(pour_shown=True))
+
+    def test_and_absent_for_everyone_else(self):
+        self.assertNotIn("pour:menu", self.kb(pour_shown=False))
+
+    def test_the_rest_of_the_menu_is_unchanged(self):
+        base = self.kb(pour_shown=False)
+        self.assertEqual([x for x in self.kb(pour_shown=True)
+                          if x != "pour:menu"], base)
 
 
 class TheSettingsHaveHonestDefaults(unittest.TestCase):

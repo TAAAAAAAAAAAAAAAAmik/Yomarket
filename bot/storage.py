@@ -709,6 +709,23 @@ def get_pour(user_id: int) -> dict:
         "made": list(conf.get("made") or [])[-_POUR_MADE_MAX:],
         "last_run": float(conf.get("last_run") or 0),
         "log": list(conf.get("log") or [])[-30:],
+        # Окно работы: часы ПРОДАВЦА. Ночью залив ничего не поднимает —
+        # покупатели спят, а объявления тратятся.
+        "from_hour": int(conf.get("from_hour") or 0),
+        "to_hour": int(conf.get("to_hour", 24) if conf.get("to_hour") is not None else 24),
+        # Потолок на товар в сутки: минутный шаг иначе даёт 1440 штук.
+        "cap": max(0, int(conf.get("cap") or 0)),
+        # Сколько копий товара держать на витрине. 0 — «только вчерашние
+        # убирать», как было.
+        "keep": max(0, int(conf.get("keep") or 0)),
+        # Пауза между товарами внутри одного прогона, секунды.
+        "gap": max(0, int(conf.get("gap") or 0)),
+        # Публиковать ли копию сразу.
+        "publish": bool(conf.get("publish", True)),
+        # Сколько создано сегодня — по товарам, чтобы считать потолок.
+        "day": str(conf.get("day") or ""),
+        "today": dict(conf.get("today") or {}),
+        "stock": dict(conf.get("stock") or {}),
     }
 
 
@@ -719,6 +736,33 @@ def save_pour(user_id: int, conf: dict) -> None:
     keep["log"] = list(keep.get("log") or [])[-30:]
     settings["pour"] = keep
     save_settings(user_id, settings)
+
+
+def get_pour_stock(user_id: int, ad_id: str) -> list[str]:
+    """Остатки, заданные для ОДНОГО товара залива. Пусто — своих нет.
+
+    Общая заготовка кладётся всем подряд, и для продавца с разными играми
+    это ключ от чужой игры в чужом заказе. Свой список у товара важнее — а
+    общая остаётся тем, чем была: запасным вариантом.
+    """
+    rows = ((get_settings(user_id).get("pour") or {})
+            .get("stock") or {}).get(str(ad_id)) or []
+    return [str(r) for r in rows if str(r).strip()][:_COPY_STOCK_MAX]
+
+
+def set_pour_stock(user_id: int, ad_id: str, rows: list[str]) -> int:
+    """Задать остатки одного товара залива. → сколько строк сохранено."""
+    clean = [str(r).strip() for r in (rows or []) if str(r).strip()]
+    clean = clean[:_COPY_STOCK_MAX]
+    settings = get_settings(user_id)
+    pour = settings.setdefault("pour", {})
+    stock = pour.setdefault("stock", {})
+    if clean:
+        stock[str(ad_id)] = clean
+    else:
+        stock.pop(str(ad_id), None)
+    save_settings(user_id, settings)
+    return len(clean)
 
 
 def get_all_users() -> list[int]:

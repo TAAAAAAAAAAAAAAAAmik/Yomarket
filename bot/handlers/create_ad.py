@@ -96,6 +96,9 @@ class CreateAdState(StatesGroup):
     panel_select = State()  # choosing category/subcategory/type from panel options
     copy_stock = State()    # список остатков, который бот кладёт новым товарам
     pour_every = State()    # шаг залива в минутах
+    pour_number = State()   # потолок, «держать N», пауза — одно поле на все
+    pour_hours = State()    # окно работы залива
+    pour_stock = State()    # остатки для одного товара залива
 
 
 def _cancel_kb() -> InlineKeyboardMarkup:
@@ -1490,7 +1493,7 @@ async def _fill_stock(api, item_id: str, want, source_id: str = "",
         # Заготовка продавца, если он её задал. Копировать позиции с
         # образца по-прежнему нельзя — они одноразовые, — а свой список он
         # вправе положить один раз и не вводить его каждый раз заново.
-        ready = await _default_stock(uid)
+        ready = await _default_stock(uid, source_id)
         if ready:
             note, ok = await _put_items(api, item_id, ready, uid)
             return note, ok, True
@@ -1520,13 +1523,33 @@ async def _fill_stock(api, item_id: str, want, source_id: str = "",
         return "\n📦 Остаток проставить не вышло — добавь вручную.", False, False
 
 
-async def _default_stock(uid: int) -> list:
-    """Остатки, которые продавец велел класть новым товарам сам."""
+def _plain_note(text) -> str:
+    """Строка отчёта без разметки — для журнала залива.
+
+    В журнал она едет как есть и показывается моноширинно: теги в нём
+    читались бы как мусор, а `<` роняет отправку всего сообщения.
+    """
+    import re as _re
+
+    out = _re.sub(r"<[^>]+>", "", str(text or ""))
+    return " ".join(out.split())[:160]
+
+
+async def _default_stock(uid: int, source_id: str = "") -> list:
+    """Остатки, которые продавец велел класть новым товарам сам.
+
+    Источников ДВА, и порядок между ними задан: сперва список этого
+    товара, потом общая заготовка. Одна заготовка на все товары годится,
+    пока товары одинаковые; у продавца с разными играми она кладёт
+    покупателю ключ от чужой — а «иногда остатки не вписываются» это и
+    есть: у товара, которому список не задан, класть было нечего.
+    """
     if not uid:
         return []
     try:
-        from storage import get_copy_stock
-        return get_copy_stock(uid)
+        from storage import get_copy_stock, get_pour_stock
+        own = get_pour_stock(uid, str(source_id)) if source_id else []
+        return own or get_copy_stock(uid)
     except Exception as e:                                # noqa: BLE001
         logger.info("остатки по умолчанию не прочитались: %s", e)
         return []
@@ -1773,6 +1796,13 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
             stock_note, stock_ok, stock_ready = await _fill_stock(
                 api, item_id, values.get("quantity", 0),
                 names.get("source", ""), uid)
+            # Заливу отчёт на экран не уходит, а знать про остаток он
+            # обязан: товар без остатка маркетплейс не публикует, и
+            # «иногда остатки не вписываются» — это ровно тот случай,
+            # когда причина была написана и выброшена.
+            if silent_run and state is not None:
+                await state.update_data(silent_stock_ok=bool(stock_ok),
+                                        silent_stock=_plain_note(stock_note))
             try:
                 await status_msg.edit_text("⏳ Товар создан, делаю публичным...")
             except Exception:
@@ -1782,11 +1812,21 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
             # действия» (живой отказ 08.09), а `POST /ads/{id}/publish`
             # документирован и им же возвращаются истёкшие объявления.
             from handlers.panel_items import publish_item_sync_first
+            # Залив может публиковать не сразу: продавец иногда сперва
+            # досылает остатки руками. Тогда публикация — его нажатие, а
+            # не наша попытка, о которой он не просил.
+            nopub = bool((await state.get_data()).get("silent_nopub")) \
+                if state is not None else False
             try:
-                pub_ok, pub_msg = await publish_item_sync_first(
-                    api, creds.get("cookies", ""), item_id, uid)
+                pub_ok, pub_msg = (
+                    (False, "публикация выключена в заливе") if nopub else
+                    await publish_item_sync_first(
+                        api, creds.get("cookies", ""), item_id, uid))
             except Exception as e:                        # noqa: BLE001
                 pub_ok, pub_msg = False, f"ошибка: {str(e)[:80]}"
+            if silent_run and state is not None:
+                await state.update_data(silent_pub_ok=bool(pub_ok),
+                                        silent_pub=_plain_note(str(pub_msg)))
             if pub_ok:
                 pub_note = ("\n🕓 Отправлен на модерацию "
                             f"({html.escape(str(pub_msg)[:150])})")
@@ -2501,7 +2541,8 @@ class _MemState:
         self.state = None
 
 
-async def pour_once(uid: int, ad_id: str, cid=None, api=None) -> dict:
+async def pour_once(uid: int, ad_id: str, cid=None, api=None,
+                    publish: bool = True) -> dict:
     """Одна копия товара — без человека. → что вышло.
 
     → `{"ok": bool, "id": номер созданного, "why": причина}`
@@ -2514,7 +2555,8 @@ async def pour_once(uid: int, ad_id: str, cid=None, api=None) -> dict:
     сделает одну копию руками, бот запомнит ответ, и дальше залив пойдёт
     сам.
     """
-    msg, state = _Quiet(), _MemState({"silent": True})
+    msg = _Quiet()
+    state = _MemState({"silent": True, "silent_nopub": not publish})
     try:
         why = await _run_copy(msg, state, uid, str(ad_id), cid, api)
     except Exception as e:                                # noqa: BLE001
@@ -2527,7 +2569,14 @@ async def pour_once(uid: int, ad_id: str, cid=None, api=None) -> dict:
     stop = str(data.get("silent_stop") or "")
     made = str(data.get("silent_made") or "")
     if made:
-        return {"ok": True, "id": made, "why": ""}
+        # Товар создан — но это ещё не «всё хорошо»: без остатка
+        # маркетплейс его не опубликует, и молчание об этом и есть то
+        # самое «иногда остатки не вписываются».
+        return {"ok": True, "id": made, "why": "",
+                "stock_ok": bool(data.get("silent_stock_ok")),
+                "stock": str(data.get("silent_stock") or ""),
+                "published": bool(data.get("silent_pub_ok")),
+                "publish": str(data.get("silent_pub") or "")}
     if stop == "panel":
         return {"ok": False, "id": "", "why": "панель товар не приняла"}
     if stop:
@@ -2928,44 +2977,86 @@ async def _my_ad_numbers(api) -> str:
 # это она и есть — только без нажатия.
 
 
-def _pour_kb(conf: dict, count: int):
+def _window_label(conf: dict) -> str:
+    """Окно работы словами. «Круглосуточно» — это когда границы совпали."""
+    a, b_h = int(conf.get("from_hour") or 0), int(conf.get("to_hour", 24))
+    if a == b_h or (a == 0 and b_h == 24):
+        return "круглосуточно"
+    return f"с {a}:00 до {b_h}:00"
+
+
+def _pour_kb(conf: dict, count: int = 0):
     b = InlineKeyboardBuilder()
-    b.button(text=("⏸ Выключить" if conf.get("enabled") else "▶️ Включить"),
+    b.button(text=("⏸ Выключить залив" if conf.get("enabled")
+                   else "▶️ Включить залив"),
              callback_data="pour:toggle")
-    b.button(text="📦 Какие товары", callback_data="pour:pick")
-    b.button(text=f"⏱ Раз в {conf.get('every', 1)} мин", callback_data="pour:every")
-    if conf.get("log"):
-        b.button(text="📜 Что вышло", callback_data="pour:log")
-    b.button(text="🌊 К заливу", callback_data="create_ad:templates_list")
-    ui.lay(b)
+    b.button(text=f"📦 Товары ({len(conf.get('items') or [])})",
+             callback_data="pour:pick")
+    b.button(text=f"⏱ Раз в {conf.get('every', 1)} мин",
+             callback_data="pour:every")
+    b.button(text=f"🕐 Часы: {_window_label(conf)}", callback_data="pour:hours")
+    cap = int(conf.get("cap") or 0)
+    b.button(text=(f"🚦 Не больше {cap} в сутки" if cap
+                   else "🚦 Без потолка в сутки"), callback_data="pour:cap")
+    keep = int(conf.get("keep") or 0)
+    b.button(text=(f"🧹 Держать {keep} копий" if keep
+                   else "🧹 Убирать вчерашние"), callback_data="pour:keep")
+    gap = int(conf.get("gap") or 0)
+    b.button(text=(f"⏳ Пауза {gap} с" if gap else "⏳ Без пауз"),
+             callback_data="pour:gap")
+    b.button(text=("🚀 Публикую сразу" if conf.get("publish", True)
+                   else "📝 Оставляю черновиком"), callback_data="pour:pub")
+    b.button(text="⚡ Залить сейчас", callback_data="pour:now")
+    b.button(text="📜 Что вышло", callback_data="pour:log")
+    b.button(text="⬅️ Главное меню", callback_data="menu:main")
+    ui.lay(b, solo={"pour:toggle", "pour:now"})
     return b.as_markup()
 
 
 def _pour_text(conf: dict, names: dict) -> str:
+    import time as _time
+
     items = list(conf.get("items") or [])
-    body = [
-        "Бот сам заводит выбранные товары заново — и убирает вчерашние "
-        "свои же копии.",
-        "",
-        f"Шаг: <b>раз в {conf.get('every', 1)} мин</b>",
-        f"Товаров выбрано: <b>{len(items)}</b>",
-    ]
-    for ad_id in items[:10]:
-        body.append(f"• {html.escape(str(names.get(str(ad_id)) or ad_id))[:48]}")
-    if len(items) > 10:
-        body.append(f"…и ещё {len(items) - 10}")
     made = list(conf.get("made") or [])
-    if made:
-        body += ["", f"Сейчас на витрине его копий: <b>{len(made)}</b>"]
+    state = "🟢 включён" if conf.get("enabled") else "🔴 выключен"
+    body = [
+        f"{state} · {_window_label(conf)} · раз в "
+        f"<b>{conf.get('every', 1)}</b> мин",
+        "",
+        "Бот сам заводит выбранные товары заново — и убирает свои старые "
+        "копии.",
+        "",
+        "<b>Товары</b>",
+    ]
+    if not items:
+        body.append("Пока ни одного — жми «📦 Товары».")
+    today = dict(conf.get("today") or {})
+    cap = int(conf.get("cap") or 0)
+    for ad_id in items[:12]:
+        name = html.escape(str(names.get(str(ad_id)) or ad_id))[:34]
+        live = len([r for r in made if str(r.get("src")) == str(ad_id)])
+        done = int(today.get(str(ad_id)) or 0)
+        tail = f" · сегодня {done}" + (f"/{cap}" if cap else "")
+        body.append(f"• {name} — копий на витрине: {live}{tail}")
+    if len(items) > 12:
+        body.append(f"…и ещё {len(items) - 12}")
+
+    last = float(conf.get("last_run") or 0)
+    if last and conf.get("enabled"):
+        left = max(0, int(last + int(conf.get("every") or 1) * 60
+                          - _time.time()))
+        body += ["", f"Следующий залив примерно через <b>{left // 60} мин "
+                 f"{left % 60} с</b>."]
+
     body += ["", "⚠️ <b>Удаляются только копии, созданные ботом.</b> "
              "Заведённое руками он не трогает: удаление необратимо."]
     if conf.get("enabled") and not items:
         body += ["", "🔴 Включено, но товары не выбраны — заливать нечего."]
     if int(conf.get("every") or 1) <= 1:
-        body += ["", "<i>Минутный шаг — это больше тысячи объявлений в сутки "
-                 "на товар. Маркетплейс может ответить ограничением; "
-                 "начни с большего шага и посмотри на журнал.</i>"]
-    return ui.screen("🌊 <b>Залив по часам</b>", body)
+        body += ["", "<i>Минутный шаг — это около 1440 объявлений в сутки на "
+                 "товар. Маркетплейс может ответить ограничением; посмотри "
+                 "«📜 Что вышло» через час.</i>"]
+    return ui.screen("🌊 <b>Залив</b>", body)
 
 
 async def _pour_names(uid: int, api, conf: dict) -> dict:
@@ -3066,6 +3157,262 @@ async def pour_every_save(message: Message, state: FSMContext) -> None:
         reply_markup=b.as_markup())
 
 
+# Настройки, у которых ответ — число. Один обработчик на все: экраны у них
+# одинаковые, а разъехавшись, они однажды сохранили бы час в потолок.
+_POUR_NUMBERS: dict[str, dict] = {
+    "cap": {
+        "title": "🚦 <b>Потолок в сутки</b>",
+        "ask": ["Сколько копий одного товара заводить за сутки, не больше.",
+                "", "<code>0</code> — без потолка.",
+                "<code>50</code> — полсотни в день на товар.", "",
+                "<i>Потолок считается по суткам продавца и обнуляется в его "
+                "полночь.</i>"],
+        "min": 0, "said": "Потолок в сутки: {v}",
+    },
+    "keep": {
+        "title": "🧹 <b>Сколько копий держать</b>",
+        "ask": ["Сколько копий одного товара оставлять на витрине.",
+                "", "<code>0</code> — убирать только вчерашние, как раньше.",
+                "<code>3</code> — держать три последние, остальные удалять.",
+                "",
+                "<i>Удаляются только копии, созданные ботом.</i>"],
+        "min": 0, "said": "Держу копий: {v}",
+    },
+    "gap": {
+        "title": "⏳ <b>Пауза между товарами</b>",
+        "ask": ["Сколько секунд ждать между товарами в одном заливе.",
+                "", "<code>0</code> — подряд, без пауз.",
+                "<code>10</code> — по одному товару в десять секунд.", "",
+                "<i>Десяток объявлений в одну секунду маркетплейс встречает "
+                "ограничением.</i>"],
+        "min": 0, "said": "Пауза: {v} с",
+    },
+}
+
+
+@router.callback_query(F.data.startswith("pour:num:"))
+async def pour_number_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    from features import ad_templates_shown
+
+    if not ad_templates_shown(callback.from_user.id):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    key = callback.data.split(":")[2]
+    spec = _POUR_NUMBERS.get(key)
+    if not spec:
+        await callback.answer("Такой настройки нет", show_alert=True)
+        return
+    await state.set_state(CreateAdState.pour_number)
+    await state.update_data(pour_key=key)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="pour:menu")
+    await callback.message.edit_text(ui.screen(spec["title"], spec["ask"]),
+                                     reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.message(CreateAdState.pour_number)
+async def pour_number_save(message: Message, state: FSMContext) -> None:
+    from storage import get_pour, save_pour
+
+    data = await state.get_data()
+    spec = _POUR_NUMBERS.get(str(data.get("pour_key") or ""))
+    if not spec:
+        await state.clear()
+        await message.answer("Настройка потерялась — открой залив заново.")
+        return
+    try:
+        value = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Нужно число.")
+        return
+    if value < spec["min"]:
+        await message.answer(f"Меньше {spec['min']} нельзя.")
+        return
+    await state.clear()
+    conf = get_pour(message.from_user.id)
+    conf[str(data["pour_key"])] = value
+    save_pour(message.from_user.id, conf)
+    b = InlineKeyboardBuilder()
+    b.button(text="🌊 К заливу", callback_data="pour:menu")
+    await message.answer(
+        ui.screen("✅ <b>Готово</b>", [spec["said"].format(v=value)]),
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "pour:cap")
+async def pour_cap(callback: CallbackQuery, state: FSMContext) -> None:
+    callback.data = "pour:num:cap"
+    await pour_number_ask(callback, state)
+
+
+@router.callback_query(F.data == "pour:keep")
+async def pour_keep(callback: CallbackQuery, state: FSMContext) -> None:
+    callback.data = "pour:num:keep"
+    await pour_number_ask(callback, state)
+
+
+@router.callback_query(F.data == "pour:gap")
+async def pour_gap(callback: CallbackQuery, state: FSMContext) -> None:
+    callback.data = "pour:num:gap"
+    await pour_number_ask(callback, state)
+
+
+@router.callback_query(F.data == "pour:hours")
+async def pour_hours_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    """Окно работы — часами продавца, а не сервера."""
+    from features import ad_templates_shown
+
+    if not ad_templates_shown(callback.from_user.id):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    await state.set_state(CreateAdState.pour_hours)
+    b = InlineKeyboardBuilder()
+    b.button(text="🕐 Круглосуточно", callback_data="pour:hours:0-24")
+    b.button(text="☀️ 9–23", callback_data="pour:hours:9-23")
+    b.button(text="🌤 8–22", callback_data="pour:hours:8-22")
+    b.button(text="❌ Отмена", callback_data="pour:menu")
+    ui.lay(b)
+    await callback.message.edit_text(ui.screen(
+        "🕐 <b>Когда заливать</b>",
+        ["Часы — твои, не серверные.", "",
+         "Пришли <code>9-23</code> — с девяти утра до одиннадцати вечера.",
+         "Или выбери готовое ниже.", "",
+         "<i>Ночью поднимать некому: покупатели спят, а объявления и "
+         "лимиты тратятся так же.</i>"]),
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pour:hours:"))
+async def pour_hours_preset(callback: CallbackQuery, state: FSMContext,
+                            api: YooMarketAPI = None) -> None:
+    from features import ad_templates_shown
+    from storage import get_pour, save_pour
+
+    if not ad_templates_shown(callback.from_user.id):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    try:
+        a, b_h = (int(x) for x in callback.data.split(":")[2].split("-"))
+    except ValueError:
+        await callback.answer("Не разобрал часы", show_alert=True)
+        return
+    await state.clear()
+    conf = get_pour(callback.from_user.id)
+    conf["from_hour"], conf["to_hour"] = a, b_h
+    save_pour(callback.from_user.id, conf)
+    await callback.answer(f"Заливаю {_window_label(conf)}")
+    await pour_menu(callback, state, api)
+
+
+@router.message(CreateAdState.pour_hours)
+async def pour_hours_save(message: Message, state: FSMContext) -> None:
+    from storage import get_pour, save_pour
+
+    text = (message.text or "").replace("—", "-").replace("–", "-")
+    parts = [p.strip() for p in text.split("-")]
+    try:
+        a, b_h = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        await message.answer("Пришли два числа через дефис: <code>9-23</code>.")
+        return
+    if not (0 <= a <= 24 and 0 <= b_h <= 24):
+        await message.answer("Часы бывают от 0 до 24.")
+        return
+    await state.clear()
+    conf = get_pour(message.from_user.id)
+    conf["from_hour"], conf["to_hour"] = a, b_h
+    save_pour(message.from_user.id, conf)
+    b = InlineKeyboardBuilder()
+    b.button(text="🌊 К заливу", callback_data="pour:menu")
+    await message.answer(
+        ui.screen("✅ <b>Готово</b>", [f"Заливаю {_window_label(conf)}."]),
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "pour:pub")
+async def pour_publish_toggle(callback: CallbackQuery, state: FSMContext,
+                              api: YooMarketAPI = None) -> None:
+    from features import ad_templates_shown
+    from storage import get_pour, save_pour
+
+    if not ad_templates_shown(callback.from_user.id):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    conf = get_pour(callback.from_user.id)
+    conf["publish"] = not conf.get("publish", True)
+    save_pour(callback.from_user.id, conf)
+    await callback.answer("Публикую сразу" if conf["publish"]
+                          else "Оставляю черновиком — опубликуешь сам")
+    await pour_menu(callback, state, api)
+
+
+@router.callback_query(F.data == "pour:now")
+async def pour_now(callback: CallbackQuery, state: FSMContext,
+                   api: YooMarketAPI = None) -> None:
+    """Залить прямо сейчас, одним прогоном.
+
+    Настройку без проверки продавец включает вслепую: между «включил» и
+    «увидел результат» проходит целый шаг, а ошибка в разделе к тому
+    времени размножится.
+    """
+    from features import ad_templates_shown
+    from storage import get_pour, save_pour
+
+    uid = callback.from_user.id
+    if not ad_templates_shown(uid):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    conf = get_pour(uid)
+    items = list(conf.get("items") or [])
+    if not items:
+        await callback.answer("Сначала выбери товары", show_alert=True)
+        return await pour_pick(callback, state, api)
+
+    await callback.answer("Заливаю…")
+    await _edit_safely(callback.message,
+                       f"⏳ Заливаю {len(items)} товар(ов)…")
+    lines: list[str] = []
+    for ad_id in items:
+        got = await pour_once(uid, str(ad_id), None, api,
+                              publish=bool(conf.get("publish", True)))
+        if got.get("ok") and got.get("id"):
+            mark = "✅" if got.get("stock_ok") else "⚠️ без остатка"
+            lines.append(f"{ad_id} → {got['id']} {mark}"
+                         + (f" · {got.get('stock')}"
+                            if not got.get("stock_ok") and got.get("stock")
+                            else ""))
+        else:
+            lines.append(f"{ad_id}: {got.get('why') or 'не вышло'}")
+
+    # Созданное ручным прогоном записывается за ботом так же, как в
+    # обычном заливе: иначе завтра эти копии не удалятся — бот не будет
+    # знать, что они его.
+    import localtime as _lt
+    import time as _time
+    from storage import get_settings as _gs
+
+    today = _lt.today_str(_gs(uid))
+    made = list(conf.get("made") or [])
+    for ad_id, line in zip(items, lines):
+        if "→" in line:
+            made.append({"id": line.split("→")[1].split()[0],
+                         "src": str(ad_id), "day": today, "at": _time.time()})
+    conf["made"] = made
+    conf["log"] = (list(conf.get("log") or []) + lines)[-30:]
+    save_pour(uid, conf)
+
+    b = InlineKeyboardBuilder()
+    b.button(text="🌊 К заливу", callback_data="pour:menu")
+    b.button(text="📜 Что вышло", callback_data="pour:log")
+    ui.lay(b)
+    await callback.message.edit_text(ui.screen(
+        "⚡ <b>Залил сейчас</b>",
+        [f"<code>{html.escape(x)[:90]}</code>" for x in lines]),
+        reply_markup=b.as_markup())
+
+
 @router.callback_query(F.data == "pour:log")
 async def pour_log(callback: CallbackQuery) -> None:
     """Что вышло в последних прогонах — с причинами отказов.
@@ -3130,13 +3477,23 @@ async def pour_pick(callback: CallbackQuery, state: FSMContext,
                                                  or a.get("name") or "")}
             for a in ads if isinstance(a, dict) and a.get("id")]
     await state.update_data(pour_ads=rows)
+    from storage import get_pour_stock
+
     b = InlineKeyboardBuilder()
     for i, row in enumerate(rows[:40]):
         mark = "☑️" if row["id"] in picked else "▫️"
         b.button(text=f"{mark} {row['title'][:26] or row['id']}",
                  callback_data=f"pour:tog:{i}")
+        # Остатки — у каждого товара свои: одна заготовка на всех кладёт
+        # покупателю ключ от чужой игры. Кнопка стоит только у отмеченных:
+        # у остальных задавать нечего.
+        if row["id"] in picked:
+            own = len(get_pour_stock(uid, row["id"]))
+            b.button(text=(f"📦 Остатки: {own}" if own
+                           else "📦 Остатки: общие"),
+                     callback_data=f"pour:st:{i}")
     b.button(text="🌊 К заливу", callback_data="pour:menu")
-    b.adjust(1)
+    b.adjust(*([2 if r["id"] in picked else 1 for r in rows[:40]] + [1]))
     await callback.message.edit_text(ui.screen(
         "🌊 <b>Какие товары заливать</b>",
         [f"Отмечено: <b>{len(picked)}</b> из {len(rows)}.",
@@ -3177,6 +3534,100 @@ async def pour_toggle_item(callback: CallbackQuery, state: FSMContext,
     save_pour(uid, conf)
     await callback.answer(f"{row['title'][:24] or row['id']} — {said}")
     await pour_pick(callback, state, api)
+
+
+@router.callback_query(F.data.startswith("pour:st:"))
+async def pour_stock_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    """Остатки ОДНОГО товара залива.
+
+    «Иногда остатки не вписываются» — это про общую заготовку: у товара,
+    которому список не задан, класть было нечего. Свой список у каждого
+    товара это и чинит.
+    """
+    from features import ad_templates_shown
+    from storage import get_pour_stock
+
+    uid = callback.from_user.id
+    if not ad_templates_shown(uid):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    data = await state.get_data()
+    rows = list(data.get("pour_ads") or [])
+    try:
+        row = rows[int(callback.data.split(":")[2])]
+    except (ValueError, IndexError):
+        await callback.answer("Список устарел — открой заново", show_alert=True)
+        return
+    await state.set_state(CreateAdState.pour_stock)
+    await state.update_data(pour_stock_id=row["id"], pour_ads=rows)
+    own = get_pour_stock(uid, row["id"])
+    b = InlineKeyboardBuilder()
+    if own:
+        b.button(text="🗑 Убрать свой список", callback_data="pour:stoff")
+    b.button(text="❌ Отмена", callback_data="pour:pick")
+    ui.lay(b)
+    body = [f"Товар: <b>{html.escape(row['title'][:40] or row['id'])}</b>", ""]
+    if own:
+        body += [f"Сейчас свой список — <b>{len(own)}</b> поз.:",
+                 "<code>" + "\n".join(html.escape(x) for x in own[:10])
+                 + "</code>", ""]
+    else:
+        body += ["Своего списка нет — кладётся общая заготовка.", ""]
+    body += ["Пришли позиции сообщением, <b>по одной в строке</b>.",
+             "",
+             "⚠️ <b>Это то, что получит покупатель</b> — как есть, слово в "
+             "слово."]
+    await callback.message.edit_text(
+        ui.screen("📦 <b>Остатки этого товара</b>", body),
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "pour:stoff")
+async def pour_stock_off(callback: CallbackQuery, state: FSMContext,
+                         api: YooMarketAPI = None) -> None:
+    from features import ad_templates_shown
+    from storage import set_pour_stock
+
+    if not ad_templates_shown(callback.from_user.id):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    data = await state.get_data()
+    ad_id = str(data.get("pour_stock_id") or "")
+    if ad_id:
+        set_pour_stock(callback.from_user.id, ad_id, [])
+    await state.set_state(None)
+    await callback.answer("Убрал — кладу общую заготовку")
+    await pour_pick(callback, state, api)
+
+
+@router.message(CreateAdState.pour_stock)
+async def pour_stock_save(message: Message, state: FSMContext) -> None:
+    from storage import set_pour_stock
+
+    data = await state.get_data()
+    ad_id = str(data.get("pour_stock_id") or "")
+    rows = [ln.strip() for ln in (message.text or "").splitlines() if ln.strip()]
+    if not ad_id:
+        await state.clear()
+        await message.answer("Товар потерялся — открой залив заново.")
+        return
+    if not rows:
+        await message.answer("Пусто — пришли позиции, по одной в строке.")
+        return
+    await state.set_state(None)
+    kept = set_pour_stock(message.from_user.id, ad_id, rows)
+    b = InlineKeyboardBuilder()
+    b.button(text="📦 Товары", callback_data="pour:pick")
+    b.button(text="🌊 К заливу", callback_data="pour:menu")
+    ui.lay(b)
+    await message.answer(ui.screen(
+        "✅ <b>Запомнил</b>",
+        [f"Позиций: <b>{kept}</b>. Буду класть их каждой копии этого "
+         "товара.",
+         "",
+         "⚠️ Покупатель получит именно эти строки."]),
+        reply_markup=b.as_markup())
 
 
 @router.callback_query(F.data == "create_ad:stock")

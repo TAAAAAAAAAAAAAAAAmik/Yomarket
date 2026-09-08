@@ -1394,21 +1394,61 @@ class TaskManager:
         step = max(1, int(conf.get("every") or 1)) * 60
         if now - float(conf.get("last_run") or 0) < step:
             return
-        conf["last_run"] = now
 
+        # ОКНО РАБОТЫ — часы продавца. Ночью поднимать некому: покупатели
+        # спят, а объявления и лимиты тратятся так же.
+        hour = _lt.hour(settings)
+        a, b_h = int(conf.get("from_hour") or 0), int(conf.get("to_hour", 24))
+        inside = (a <= hour < b_h) if a < b_h else (hour >= a or hour < b_h)
+        if a != b_h and not inside:
+            return
+
+        conf["last_run"] = now
         made = list(conf.get("made") or [])
         log: list = []
         today = _lt.today_str(settings)
 
+        # Счётчик суток обнуляется по дню ПРОДАВЦА: по часам сервера сутки
+        # у него из UTC+5 кончались бы в пять утра.
+        if str(conf.get("day") or "") != today:
+            conf["day"], conf["today"] = today, {}
+        done_today: dict = dict(conf.get("today") or {})
+        cap = int(conf.get("cap") or 0)
+        gap = max(0, int(conf.get("gap") or 0))
+
         api = YooMarketAPI(get_token(user_id))
         await api.start()
         try:
-            for ad_id in list(conf.get("items") or []):
-                got = await pour_once(user_id, str(ad_id), None, api)
+            for n, ad_id in enumerate(list(conf.get("items") or [])):
+                if cap and int(done_today.get(str(ad_id)) or 0) >= cap:
+                    # Потолок назван вслух один раз за сутки, а не на
+                    # каждом проходе: минутный залив написал бы эту строку
+                    # тысячу раз и вытеснил из журнала всё остальное.
+                    if int(done_today.get(str(ad_id)) or 0) == cap:
+                        log.append(f"{ad_id}: дневной потолок {cap} — до завтра")
+                        done_today[str(ad_id)] = cap + 1
+                    continue
+                # Пауза между товарами: десяток объявлений подряд в одну
+                # секунду маркетплейс встречает ограничением.
+                if n and gap:
+                    await asyncio.sleep(gap)
+                got = await pour_once(user_id, str(ad_id), None, api,
+                                      publish=bool(conf.get("publish", True)))
                 if got.get("ok") and got.get("id"):
                     made.append({"id": str(got["id"]), "src": str(ad_id),
                                  "day": today, "at": now})
-                    log.append(f"{ad_id} → {got['id']}")
+                    done_today[str(ad_id)] = int(done_today.get(str(ad_id))
+                                                 or 0) + 1
+                    # Товар создан — это ещё не «в продаже»: без остатка
+                    # маркетплейс его не публикует. Молчание об этом и есть
+                    # то самое «иногда остатки не вписываются».
+                    mark = "✅" if got.get("stock_ok") else "⚠️ без остатка"
+                    line = f"{ad_id} → {got['id']} {mark}"
+                    if not got.get("stock_ok") and got.get("stock"):
+                        line += f" · {got['stock']}"
+                    if not got.get("published") and got.get("publish"):
+                        line += f" · не опубликован: {got['publish']}"
+                    log.append(line)
                 else:
                     log.append(f"{ad_id}: {got.get('why') or 'не вышло'}")
         finally:
@@ -1417,12 +1457,25 @@ class TaskManager:
             except Exception:                             # noqa: BLE001
                 pass
 
-        # Вчерашние — это НЕ «созданные раньше суток», а созданные в другой
-        # день продавца: залив включают утром, и копия трёхчасовой давности
-        # сегодняшняя, а вчерашняя вечерняя — уже нет.
+        # ЧТО УБИРАТЬ. По умолчанию — вчерашние: залив включают утром, и
+        # копия трёхчасовой давности сегодняшняя, а вчерашняя вечерняя —
+        # уже нет. Если продавец задал «держать N штук», лишние сверх N
+        # уходят и сегодняшние: иначе за сутки минутного залива их
+        # накопится больше тысячи.
+        keep = int(conf.get("keep") or 0)
+        doomed: set = set()
+        if keep:
+            by_src: dict = {}
+            for row in made:
+                by_src.setdefault(str(row.get("src") or ""), []).append(row)
+            for rows in by_src.values():
+                rows.sort(key=lambda r: float(r.get("at") or 0))
+                for row in rows[:-keep] if keep < len(rows) else []:
+                    doomed.add(id(row))
+
         gone, left = [], []
         for row in made:
-            if str(row.get("day") or "") == today:
+            if str(row.get("day") or "") == today and id(row) not in doomed:
                 left.append(row)
                 continue
             ok, why = await self._pour_delete(user_id, str(row.get("id") or ""))
@@ -1437,6 +1490,7 @@ class TaskManager:
             log.append(f"удалено вчерашних: {len(gone)}")
 
         conf["made"] = left
+        conf["today"] = done_today
         conf["log"] = (list(conf.get("log") or []) + log)[-30:]
         save_pour(user_id, conf)
 

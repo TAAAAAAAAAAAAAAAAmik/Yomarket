@@ -17,7 +17,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 # Поднимается при каждом значимом изменении: по ней видно, доехал ли код.
-BOT_VERSION = "2026-09-08-pour"
+BOT_VERSION = "2026-09-08-pour-tune"
 
 # Метка процесса, разная у каждого запуска. Два контейнера с одним токеном
 # ведут каждый свой фоновый цикл, и продавец получает все уведомления
@@ -103,7 +103,9 @@ async def _send_menu(target: Message | CallbackQuery, user_id: int) -> None:
     name = ui.esc(get_shop_name(user_id) or "Магазин")
     text = (f"🏪 <b>{name}</b>\n\n{menu_header_html()} <b>Главное меню</b>\n"
             "Выбирай, куда идём:")
-    kb = main_menu_keyboard(is_admin_user=is_admin(user_id))
+    from features import ad_templates_shown
+    kb = main_menu_keyboard(is_admin_user=is_admin(user_id),
+                            pour_shown=ad_templates_shown(user_id))
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=kb)
         await target.answer()

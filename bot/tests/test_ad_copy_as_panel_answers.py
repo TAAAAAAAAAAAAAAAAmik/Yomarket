@@ -809,6 +809,36 @@ class ThePourGoesTheSameRoadWithoutAnybodyToAsk(Bench):
         self.pour()
         self.assertEqual(self.created(), {}, "отправлять было нечего")
 
+    def test_it_says_whether_the_stock_stood_up(self):
+        """«Иногда остатки не вписываются» — это про молчание: причина
+        писалась в отчёт копии и выбрасывалась вместе с ним. Заливу она
+        нужна: без остатка маркетплейс товар не публикует."""
+        Api.kind = "auto-delivery"
+        self.default_stock = []               # заготовки нет — класть нечего
+        got = self.pour()
+        self.assertTrue(got["ok"], got)
+        self.assertFalse(got["stock_ok"], got)
+        self.assertIn("остаток", got["stock"].lower(), got)
+        self.assertNotIn("<", got["stock"], "в журнал едет текст, не разметка")
+
+    def test_and_says_it_stood_up_when_it_did(self):
+        Api.kind = "auto-delivery"
+        self.default_stock = ["KEY-1111"]
+        got = self.pour()
+        self.assertTrue(got["stock_ok"], got)
+
+    def test_publishing_can_be_switched_off(self):
+        """Продавец иногда сперва досылает остатки руками — тогда
+        публикация его нажатие, а не наша попытка."""
+        got = asyncio.run(C.pour_once(7, ITEM, 5221, Api(), publish=False))
+        self.assertTrue(got["ok"], got)
+        self.assertFalse(got["published"], got)
+        self.assertIn("выключена", got["publish"], got)
+
+    def test_and_by_default_it_publishes(self):
+        got = self.pour()
+        self.assertTrue(got["published"], got)
+
     def test_a_panel_refusal_is_a_reason_too(self):
         LiveNova.refuse = True
         got = self.pour()

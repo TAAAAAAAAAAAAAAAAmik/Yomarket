@@ -730,7 +730,7 @@ class TheStockIsFilledInWithoutAsking(Bench):
         api.add_ad_items, api.get_ad_items = add_ad_items, get_ad_items
         was = C._default_stock
 
-        async def ready(uid):
+        async def ready(uid, source_id=""):
             return ["KEY-1111", "KEY-2222", "KEY-3333"]
 
         C._default_stock = ready
@@ -760,7 +760,7 @@ class TheStockIsFilledInWithoutAsking(Bench):
         api.add_ad_items, api.get_ad_items = add_ad_items, get_ad_items
         was = C._default_stock
 
-        async def ready(uid):
+        async def ready(uid, source_id=""):
             return ["KEY-1111"]
 
         C._default_stock = ready

@@ -34,7 +34,8 @@ class PaginationCallback(CallbackData, prefix="page"):
 # ---------------------------------------------------------------------------
 
 
-def main_menu_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
+def main_menu_keyboard(is_admin_user: bool = False,
+                       pour_shown: bool = False) -> InlineKeyboardMarkup:
     """Главное меню. Ширина ряда считается по надписям, а не берётся как «2».
 
     Пункты меню продавец переименовывает сам, и жёсткая пара ломалась об
@@ -56,6 +57,12 @@ def main_menu_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
         text = labels.get(key, _default)
         texts.append(text)
         builder.button(text=text, callback_data=cb)
+    # Залив — отдельной кнопкой, и только тем, кому раздел открыт: он
+    # заводит товары на витрине сам, без единого вопроса. Кнопка, за
+    # которой «этого раздела сейчас нет», — дохлая кнопка.
+    if pour_shown:
+        texts.append("🌊 Залив")
+        builder.button(text="🌊 Залив", callback_data="pour:menu")
     spec = ui.sizes(texts)
     if is_admin_user:
         builder.button(text="👑 Админ-панель", callback_data="admin:menu")
