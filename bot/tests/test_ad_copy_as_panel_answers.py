@@ -766,6 +766,73 @@ class AClosedEditFormIsNotADeadEnd(Bench):
         self.assertIn("форму правки", said, said)
 
 
+class ThePourGoesTheSameRoadWithoutAnybodyToAsk(Bench):
+    """Залив — это копия, у которой некого спросить.
+
+    Идти он обязан ТЕМ ЖЕ кодом: разойдись они, залив клал бы товары не
+    туда, куда кладёт копия по нажатию, — и заметить это было бы нечем.
+    Поэтому проверяется он на той же подставной панели, отвечающей как
+    живая.
+    """
+
+    def pour(self):
+        return asyncio.run(C.pour_once(7, ITEM, 5221, Api()))
+
+    def test_it_creates_the_item_and_returns_its_number(self):
+        got = self.pour()
+        self.assertTrue(got["ok"], got)
+        self.assertEqual(got["id"], "900002", got)
+        self.assertTrue(self.created(), "товар не ушёл в панель")
+
+    def test_the_section_goes_out_the_same_way(self):
+        """Тот же раздел, что и у копии по нажатию: путь один."""
+        self.pour()
+        body = self.created()
+        self.assertEqual(str(body.get("category")), "613", body)
+        self.assertEqual(str(body.get("subcategory")), "3", body)
+
+    def test_a_question_becomes_a_skip_with_a_reason(self):
+        """Спросить некого. Тупик здесь был бы тишиной, а тишина — это
+        день, потерянный продавцом."""
+        LiveNova.section_visible = False      # раздела в панели нет
+        Api.path = []                         # и в дереве маркетплейса тоже
+        self.set_description("Аккаунт с виртами, вход по почте.")
+        got = self.pour()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("category", got["why"])
+        self.assertIn("руками", got["why"], "сказано, чем это чинится")
+
+    def test_and_nothing_is_created_then(self):
+        LiveNova.section_visible = False
+        Api.path = []
+        self.set_description("Аккаунт с виртами, вход по почте.")
+        self.pour()
+        self.assertEqual(self.created(), {}, "отправлять было нечего")
+
+    def test_a_panel_refusal_is_a_reason_too(self):
+        LiveNova.refuse = True
+        got = self.pour()
+        self.assertFalse(got["ok"], got)
+        self.assertTrue(got["why"], "молчаливый отказ хуже любого текста")
+
+    def test_an_unreadable_item_is_named_as_such(self):
+        LiveNova.form_open = False
+        LiveNova.card_open = False
+        LiveNova.list_open = False
+        got = self.pour()
+        self.assertFalse(got["ok"], got)
+        self.assertIn("панель", got["why"].lower(), got)
+
+    def test_the_answer_it_remembers_is_reused_next_time(self):
+        """Первый залив запомнил раздел — второй уже не ищет его заново."""
+        self.pour()
+        LiveNova.section_visible = False
+        Api.path = []
+        self.set_description("Аккаунт с виртами, вход по почте.")
+        got = self.pour()
+        self.assertTrue(got["ok"], got)
+
+
 class TheStockIsPutInByTheBotAsFarAsItHonestlyCan(Bench):
     """Что бот может сделать с остатком сам, зависит от вида товара.
 

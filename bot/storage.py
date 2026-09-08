@@ -680,6 +680,47 @@ def set_copy_stock(user_id: int, rows: list[str]) -> int:
     return len(clean)
 
 
+# ─────────────────────────── Залив ───────────────────────────
+#
+# Залив — это копия по расписанию: выбранные товары бот заводит заново сам,
+# а вчерашние свои же копии удаляет. Держится он на одной записи, и в ней
+# важны две вещи.
+#
+# ПЕРВОЕ. `made` — список того, что бот СОЗДАЛ САМ: номер, образец и время.
+# Удалять он будет только по нему. «Вчерашний такой же товар», найденный по
+# названию, мог быть заведён руками — а удаление необратимо, и объяснять
+# продавцу пропажу его товара будет нечем.
+#
+# ВТОРОЕ. Список ограничен: за сутки залив с минутным шагом создаёт больше
+# тысячи записей на товар, и без потолка настройки продавца распухли бы до
+# мегабайтов. Обрезается он с головы — старое удалено и больше не нужно.
+_POUR_MADE_MAX = 3000
+
+
+def get_pour(user_id: int) -> dict:
+    """Настройки залива. Пустой словарь тоже полноценный ответ."""
+    conf = get_settings(user_id).get("pour") or {}
+    return {
+        "enabled": bool(conf.get("enabled")),
+        # Шаг в минутах. Меньше минуты не бывает: общий проход и так раз в
+        # минуту, и обещать чаще значило бы обещать несуществующее.
+        "every": max(1, int(conf.get("every") or 1)),
+        "items": [str(x) for x in (conf.get("items") or [])],
+        "made": list(conf.get("made") or [])[-_POUR_MADE_MAX:],
+        "last_run": float(conf.get("last_run") or 0),
+        "log": list(conf.get("log") or [])[-30:],
+    }
+
+
+def save_pour(user_id: int, conf: dict) -> None:
+    settings = get_settings(user_id)
+    keep = dict(conf)
+    keep["made"] = list(keep.get("made") or [])[-_POUR_MADE_MAX:]
+    keep["log"] = list(keep.get("log") or [])[-30:]
+    settings["pour"] = keep
+    save_settings(user_id, settings)
+
+
 def get_all_users() -> list[int]:
     return [int(uid) for uid in _load().keys()]
 

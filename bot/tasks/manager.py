@@ -1357,6 +1357,108 @@ class TaskManager:
             await self._process_orders(user_id, token, settings)
             await self._check_reminders(user_id, settings)
             await self._maybe_bump_schedule(user_id, settings)
+            await self._maybe_pour(user_id, settings)
+
+    async def _maybe_pour(self, user_id: int, settings: dict) -> None:
+        """ЗАЛИВ: завести выбранные товары заново и убрать вчерашние свои.
+
+        Смысл в том, чтобы объявление снова оказалось наверху выдачи. Бот
+        делает то же, что продавец делал руками, — только сам и по часам.
+
+        Три правила, каждое стоит денег или товара:
+
+        * **удаляются ТОЛЬКО свои копии.** Не «такие же по названию», а те,
+          номера которых бот записал за собой при создании. Удаление
+          необратимо, и объяснять пропажу заведённого руками товара было бы
+          нечем;
+        * **шаг задаёт продавец**, и меньше минуты его не бывает: общий
+          проход и так раз в минуту, обещать чаще — обещать несуществующее;
+        * **каждый отказ записывается.** Залив идёт без человека, и
+          «ничего не создалось» без причины — это тишина, в которой
+          продавец теряет день.
+        """
+        import localtime as _lt
+        from handlers.create_ad import pour_once
+        from storage import get_pour, save_pour
+
+        conf = get_pour(user_id)
+        if not conf.get("enabled") or not conf.get("items"):
+            return
+        # Заслон тот же, что у копии: она создаёт товар на витрине без
+        # единого вопроса, и залив делает это ещё и сам.
+        from features import ad_templates_shown
+        if not ad_templates_shown(user_id):
+            return
+
+        now = time.time()
+        step = max(1, int(conf.get("every") or 1)) * 60
+        if now - float(conf.get("last_run") or 0) < step:
+            return
+        conf["last_run"] = now
+
+        made = list(conf.get("made") or [])
+        log: list = []
+        today = _lt.today_str(settings)
+
+        api = YooMarketAPI(get_token(user_id))
+        await api.start()
+        try:
+            for ad_id in list(conf.get("items") or []):
+                got = await pour_once(user_id, str(ad_id), None, api)
+                if got.get("ok") and got.get("id"):
+                    made.append({"id": str(got["id"]), "src": str(ad_id),
+                                 "day": today, "at": now})
+                    log.append(f"{ad_id} → {got['id']}")
+                else:
+                    log.append(f"{ad_id}: {got.get('why') or 'не вышло'}")
+        finally:
+            try:
+                await api.close()
+            except Exception:                             # noqa: BLE001
+                pass
+
+        # Вчерашние — это НЕ «созданные раньше суток», а созданные в другой
+        # день продавца: залив включают утром, и копия трёхчасовой давности
+        # сегодняшняя, а вчерашняя вечерняя — уже нет.
+        gone, left = [], []
+        for row in made:
+            if str(row.get("day") or "") == today:
+                left.append(row)
+                continue
+            ok, why = await self._pour_delete(user_id, str(row.get("id") or ""))
+            if ok:
+                gone.append(str(row.get("id")))
+            else:
+                # Не удалилось — оставляем в списке: забыть номер значит
+                # потерять единственный след, по которому товар можно убрать.
+                left.append(row)
+                log.append(f"удалить {row.get('id')}: {why}")
+        if gone:
+            log.append(f"удалено вчерашних: {len(gone)}")
+
+        conf["made"] = left
+        conf["log"] = (list(conf.get("log") or []) + log)[-30:]
+        save_pour(user_id, conf)
+
+    async def _pour_delete(self, user_id: int, item_id: str) -> tuple[bool, str]:
+        """Убрать одну свою копию. → (получилось, причина отказа)."""
+        if not item_id:
+            return False, "нет номера"
+        from automation.panel import panel_delete_item_sync
+        from storage import get_panel_creds
+
+        creds = get_panel_creds(user_id) or {}
+        if not creds.get("cookies"):
+            return False, "нет сессии панели"
+        loop = asyncio.get_event_loop()
+        try:
+            ok, said = await asyncio.wait_for(
+                loop.run_in_executor(None, panel_delete_item_sync,
+                                     creds["cookies"], str(item_id), user_id),
+                timeout=40)
+        except Exception as e:                            # noqa: BLE001
+            return False, str(e)[:80]
+        return bool(ok), str(said)[:80]
 
     async def _maybe_bump_schedule(self, user_id: int, settings: dict) -> None:
         """Запускать продвижение по расписанию в назначенные часы.

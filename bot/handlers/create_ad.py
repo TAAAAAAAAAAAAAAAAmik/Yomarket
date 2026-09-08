@@ -95,6 +95,7 @@ class CreateAdState(StatesGroup):
     confirm = State()
     panel_select = State()  # choosing category/subcategory/type from panel options
     copy_stock = State()    # список остатков, который бот кладёт новым товарам
+    pour_every = State()    # шаг залива в минутах
 
 
 def _cancel_kb() -> InlineKeyboardMarkup:
@@ -219,7 +220,7 @@ async def create_ad_start(callback: CallbackQuery, state: FSMContext) -> None:
     """Развилка: заводить товар с нуля или скопировать уже созданный.
 
     Развилка показывается, ТОЛЬКО когда есть что копировать. Кнопка
-    «шаблонная копия» у того, кто ещё ничего не создавал, ведёт в пустой
+    «залив» у того, кто ещё ничего не создавал, ведёт в пустой
     список — то есть обещает то, чего нет, и добавляет лишний шаг перед
     единственным настоящим действием.
     """
@@ -240,7 +241,7 @@ async def create_ad_start(callback: CallbackQuery, state: FSMContext) -> None:
         return
     b = InlineKeyboardBuilder()
     b.button(text="✍️ Создать товар", callback_data="create_ad:new")
-    b.button(text="📋 Шаблонная копия",
+    b.button(text="🌊 Залив",
              callback_data="create_ad:templates_list")
     b.button(text="❌ Отмена", callback_data="menu:ads")
     await callback.message.edit_text(ui.screen("➕ <b>Новый товар</b>", [
@@ -937,6 +938,9 @@ async def _ask_next_select(msg, state: FSMContext, uid: int,
             return
         # Обязательное поле без вариантов — это тупик, показываем диагностику
         if f.get("required") or attr in ("category", "subcategory", "type"):
+            if data.get("silent"):
+                await state.update_data(silent_stop=attr)
+                return
             await state.clear()
             b = InlineKeyboardBuilder()
             b.button(text="🌐 Создать вручную в панели",
@@ -1024,6 +1028,13 @@ async def _ask_next_select(msg, state: FSMContext, uid: int,
         await state.update_data(chosen=chosen, autopicked=notes,
                                 chosen_labels=names, select_queue=queue[1:])
         await _ask_next_select(msg, state, uid, api)
+        return
+
+    # ЗАЛИВ идёт без человека, и спросить ему некого. Вопрос здесь — это
+    # не тупик, а пропуск с причиной: продавец сделает одну копию руками,
+    # бот запомнит ответ, и со следующего раза залив пойдёт сам.
+    if (await state.get_data()).get("silent"):
+        await state.update_data(silent_stop=attr)
         return
 
     # В состояние — сколько влезает; сверка уже прошла по всему списку.
@@ -1732,12 +1743,16 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
         # И ДО закрытия формы: закрытая — это пустое состояние, а раздел,
         # надписи и номер образца лежат именно в нём.
         names = await _remember_selects(uid, state, extra)
-        # Форма отработала — закрываем её. Брошенный экран ловит любое
-        # следующее сообщение, включая команду: так молча не работали
-        # `/chat_debug` и `/withdraw_debug`.
-        if state is not None:
+        # Залив ведёт своё состояние сам и читает из него номер созданного
+        # товара: закрытая форма — пустое состояние, а номер нужен, чтобы
+        # завтра этот товар удалить. У продавца форму закрываем как прежде:
+        # брошенный экран ловит любое следующее сообщение, включая команду.
+        silent_run = bool((await state.get_data()).get("silent")) if state else False
+        if state is not None and not silent_run:
             await state.clear()
         item_id = result_msg if str(result_msg).isdigit() else ""
+        if silent_run and state is not None:
+            await state.update_data(silent_made=item_id)
         pub_note = ""
         pub_ok = False
         stock_note = ""
@@ -1890,10 +1905,16 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
     # туда ли шёл товар. Запоминать при этом нечего: панель товар не приняла.
     seen_names = (await state.get_data()).get("chosen_labels") if state else {}
     if state is not None:
-        asked = await _ask_for_refused_fields(msg, uid, values, extra, picked,
-                                              state, result_msg, api)
+        # Заливу спрашивать некого: недостающее поле для него — причина
+        # пропустить товар, а не вопрос. Отчёт панели при этом остаётся —
+        # он и объяснит, чего ей не хватило.
+        silent = bool((await state.get_data()).get("silent"))
+        asked = (not silent) and await _ask_for_refused_fields(
+            msg, uid, values, extra, picked, state, result_msg, api)
         if asked:
             return
+        if silent:
+            await state.update_data(silent_stop="panel")
         await state.clear()
 
     # ── Ошибка — строим правильный набор кнопок ─────────────────────────────
@@ -2047,6 +2068,7 @@ def _section_screen(groups: dict, back: str):
         b.button(text=f"📂 {name[:24]} ({len(ads)})",
                  callback_data=f"create_ad:sect:{i}")
         rows.append(f"• <b>{html.escape(name[:40])}</b> — {len(ads)}")
+    b.button(text="🌊 Заливать сам", callback_data="pour:menu")
     b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
     b.button(text="📦 Остатки по умолчанию", callback_data="create_ad:stock")
     b.button(text="❌ Отмена", callback_data=back)
@@ -2091,7 +2113,7 @@ async def templates_list(callback: CallbackQuery, state: FSMContext,
         b.button(text="❌ Отмена", callback_data="menu:ads")
         ui.lay(b)
         await callback.message.edit_text(ui.screen(
-            "📋 <b>Шаблонная копия</b>",
+            "🌊 <b>Залив</b>",
             ["Список объявлений прочитать не вышло.", "",
              f"<i>{html.escape(err)}</i>"]),
             reply_markup=b.as_markup())
@@ -2102,7 +2124,7 @@ async def templates_list(callback: CallbackQuery, state: FSMContext,
         b.button(text="❌ Отмена", callback_data="menu:ads")
         ui.lay(b)
         await callback.message.edit_text(ui.screen(
-            "📋 <b>Шаблонная копия</b>",
+            "🌊 <b>Залив</b>",
             ["На витрине нет ни одного объявления — копировать пока нечего."]),
             reply_markup=b.as_markup())
         return
@@ -2130,9 +2152,11 @@ async def templates_list(callback: CallbackQuery, state: FSMContext,
         await _show_section(callback, state, 0)
         return
     await callback.message.edit_text(ui.screen(
-        "📋 <b>Шаблонная копия</b>",
+        "🌊 <b>Залив</b>",
         ["Заведу такое же объявление: те же название, цена, описание, "
-         "раздел и фото.", "", "<b>Разделы</b>"] + rows),
+         "раздел и фото.", "",
+         "<i>Чтобы бот заливал сам по часам — «🌊 Заливать сам».</i>", "",
+         "<b>Разделы</b>"] + rows),
         reply_markup=b.as_markup())
 
 
@@ -2421,6 +2445,98 @@ async def _copy_source_values(uid: int, ad_id: str, api=None,
     return values, extra, labels, words, ""
 
 
+class _Quiet:
+    """Экран, которого нет: залив идёт без человека.
+
+    Отчёты копии никуда не уходят — они написаны для продавца, и слать их
+    в чат по разу в минуту значит завалить переписку. Собираются они всё
+    равно: по ним видно, чем кончился прогон.
+    """
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    async def edit_text(self, text, reply_markup=None, **kw):
+        self.texts.append(str(text))
+        return self
+
+    async def answer(self, text, reply_markup=None, **kw):
+        self.texts.append(str(text))
+        return self
+
+    async def delete(self):
+        return None
+
+
+class _MemState:
+    """Состояние формы в памяти — на один прогон залива.
+
+    Настоящий FSM привязан к чату и к человеку; заливу же нужно то же
+    хранилище на несколько секунд и без всякого чата. Интерфейс тот же,
+    чтобы копия шла ТЕМ ЖЕ кодом, а не вторым таким же.
+    """
+
+    def __init__(self, data: dict | None = None) -> None:
+        self.data = dict(data or {})
+        self.state = None
+
+    async def get_data(self) -> dict:
+        return dict(self.data)
+
+    async def update_data(self, **kw) -> dict:
+        self.data.update(kw)
+        return dict(self.data)
+
+    async def set_data(self, data: dict) -> None:
+        self.data = dict(data)
+
+    async def set_state(self, state=None) -> None:
+        self.state = state
+
+    async def get_state(self):
+        return self.state
+
+    async def clear(self) -> None:
+        self.data = {}
+        self.state = None
+
+
+async def pour_once(uid: int, ad_id: str, cid=None, api=None) -> dict:
+    """Одна копия товара — без человека. → что вышло.
+
+    → `{"ok": bool, "id": номер созданного, "why": причина}`
+
+    Идёт тем же путём, что и копия по нажатию (`_run_copy`), и это не
+    экономия: разойдись они, залив клал бы товары не туда, куда кладёт
+    копия, — и заметить это было бы нечем.
+
+    Вопрос по дороге здесь не тупик, а пропуск: спросить некого. Продавец
+    сделает одну копию руками, бот запомнит ответ, и дальше залив пойдёт
+    сам.
+    """
+    msg, state = _Quiet(), _MemState({"silent": True})
+    try:
+        why = await _run_copy(msg, state, uid, str(ad_id), cid, api)
+    except Exception as e:                                # noqa: BLE001
+        logger.warning("залив %s не прошёл: %s", ad_id, e)
+        return {"ok": False, "id": "", "why": f"сбой: {str(e)[:120]}"}
+    if why:
+        return {"ok": False, "id": "", "why": why}
+
+    data = await state.get_data()
+    stop = str(data.get("silent_stop") or "")
+    made = str(data.get("silent_made") or "")
+    if made:
+        return {"ok": True, "id": made, "why": ""}
+    if stop == "panel":
+        return {"ok": False, "id": "", "why": "панель товар не приняла"}
+    if stop:
+        return {"ok": False, "id": "", "why":
+                f"нечем заполнить поле «{stop}» — сделай одну копию руками, "
+                "бот запомнит ответ"}
+    return {"ok": False, "id": "", "why": "панель не назвала номер товара"}
+
+
 @router.callback_query(F.data.startswith("create_ad:copy:"))
 async def copy_item(callback: CallbackQuery, state: FSMContext,
                     api: YooMarketAPI = None) -> None:
@@ -2463,11 +2579,10 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
 
     await callback.answer("Создаю копию…")
     await callback.message.edit_text("⏳ Читаю товар в панели…")
-    values, extra, labels, words, why = await _copy_source_values(
-        uid, ad_id, api, cid)
+    why = await _run_copy(callback.message, state, uid, ad_id, cid, api)
     if why:
         b = InlineKeyboardBuilder()
-        b.button(text="📋 Ещё копию", callback_data="create_ad:templates_list")
+        b.button(text="🌊 Ещё копию", callback_data="create_ad:templates_list")
         b.button(text="✍️ Создать с нуля", callback_data="create_ad:new")
         b.button(text="📦 Мои товары", callback_data="menu:ads")
         ui.lay(b)
@@ -2476,7 +2591,21 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
             ["Товар прочитать не вышло:", f"<i>{html.escape(why)}</i>", "",
              "Заведи товар мастером — он спросит недостающее."]),
             reply_markup=b.as_markup())
-        return
+
+
+async def _run_copy(msg, state: FSMContext, uid: int, ad_id: str, cid,
+                    api=None) -> str:
+    """Копия товара `ad_id` — от чтения образца до создания. → причина отказа.
+
+    Живёт отдельно от кнопки потому, что нужна двоим: продавцу по нажатию и
+    ЗАЛИВУ, который идёт сам по расписанию. Второй путь обязан быть тем же
+    кодом, а не вторым таким же: разойдутся они молча, и залив однажды
+    начнёт класть товары не туда, куда кладёт копия по нажатию.
+    """
+    values, extra, labels, words, why = await _copy_source_values(
+        uid, ad_id, api, cid)
+    if why:
+        return why
 
     # Раздел, подраздел и тип, выбранные для этого образца раньше. Раздела
     # у товара в панели нет нигде — узнать его второй раз неоткуда, и без
@@ -2515,7 +2644,7 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
 
     # Сверка идёт по живой форме панели, а это ещё пара запросов: без
     # строки о ней экран стоял бы «Читаю товар» и выглядел бы зависшим.
-    await _edit_safely(callback.message, "⏳ Сверяю разделы с формой панели…")
+    await _edit_safely(msg, "⏳ Сверяю разделы с формой панели…")
     form = await _creation_form(uid)
     if form:
         queue = _select_queue(form["fields"])
@@ -2525,12 +2654,13 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
         # Дальше — та же дорога, что у мастера: на каждом списке бот сперва
         # смотрит, что стояло у образца, и спрашивает только там, где взять
         # ответ неоткуда.
-        await _ask_next_select(callback.message, state, uid, api)
-        return
+        await _ask_next_select(msg, state, uid, api)
+        return ""
 
     # Формы нет — создаём напрямую, панель сама скажет, чего не хватает.
-    await _panel_create_and_report(callback.message, uid, values, extra=chosen,
+    await _panel_create_and_report(msg, uid, values, extra=chosen,
                                    state=state, api=api)
+    return ""
 
 
 async def _creation_form(uid: int) -> dict | None:
@@ -2789,6 +2919,264 @@ async def _my_ad_numbers(api) -> str:
             for a in ads[:20]]
     return ("Номер объявления, а потом: <code>/copy_debug НОМЕР</code>\n\n"
             + "\n".join(rows))[:4000]
+
+
+# ───────────────────────────── Залив ─────────────────────────────
+#
+# Залив — копия по расписанию: выбранные товары бот заводит заново сам, а
+# вчерашние свои же копии удаляет. Экран здесь, рядом с копией, потому что
+# это она и есть — только без нажатия.
+
+
+def _pour_kb(conf: dict, count: int):
+    b = InlineKeyboardBuilder()
+    b.button(text=("⏸ Выключить" if conf.get("enabled") else "▶️ Включить"),
+             callback_data="pour:toggle")
+    b.button(text="📦 Какие товары", callback_data="pour:pick")
+    b.button(text=f"⏱ Раз в {conf.get('every', 1)} мин", callback_data="pour:every")
+    if conf.get("log"):
+        b.button(text="📜 Что вышло", callback_data="pour:log")
+    b.button(text="🌊 К заливу", callback_data="create_ad:templates_list")
+    ui.lay(b)
+    return b.as_markup()
+
+
+def _pour_text(conf: dict, names: dict) -> str:
+    items = list(conf.get("items") or [])
+    body = [
+        "Бот сам заводит выбранные товары заново — и убирает вчерашние "
+        "свои же копии.",
+        "",
+        f"Шаг: <b>раз в {conf.get('every', 1)} мин</b>",
+        f"Товаров выбрано: <b>{len(items)}</b>",
+    ]
+    for ad_id in items[:10]:
+        body.append(f"• {html.escape(str(names.get(str(ad_id)) or ad_id))[:48]}")
+    if len(items) > 10:
+        body.append(f"…и ещё {len(items) - 10}")
+    made = list(conf.get("made") or [])
+    if made:
+        body += ["", f"Сейчас на витрине его копий: <b>{len(made)}</b>"]
+    body += ["", "⚠️ <b>Удаляются только копии, созданные ботом.</b> "
+             "Заведённое руками он не трогает: удаление необратимо."]
+    if conf.get("enabled") and not items:
+        body += ["", "🔴 Включено, но товары не выбраны — заливать нечего."]
+    if int(conf.get("every") or 1) <= 1:
+        body += ["", "<i>Минутный шаг — это больше тысячи объявлений в сутки "
+                 "на товар. Маркетплейс может ответить ограничением; "
+                 "начни с большего шага и посмотри на журнал.</i>"]
+    return ui.screen("🌊 <b>Залив по часам</b>", body)
+
+
+async def _pour_names(uid: int, api, conf: dict) -> dict:
+    """Названия выбранных товаров — по номерам. Пусто, если не прочиталось."""
+    try:
+        ads = await api.get_all_ads() if api else []
+    except Exception as e:                                # noqa: BLE001
+        logger.info("названия для залива не прочитались: %s", e)
+        return {}
+    return {str(a.get("id")): str(a.get("title") or a.get("name") or "")
+            for a in ads if isinstance(a, dict)}
+
+
+@router.callback_query(F.data == "pour:menu")
+async def pour_menu(callback: CallbackQuery, state: FSMContext,
+                    api: YooMarketAPI = None) -> None:
+    from features import ad_templates_shown
+    from storage import get_pour
+
+    uid = callback.from_user.id
+    if not ad_templates_shown(uid):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    await state.clear()
+    conf = get_pour(uid)
+    names = await _pour_names(uid, api, conf)
+    await callback.message.edit_text(_pour_text(conf, names),
+                                     reply_markup=_pour_kb(conf, len(names)))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "pour:toggle")
+async def pour_toggle(callback: CallbackQuery, state: FSMContext,
+                      api: YooMarketAPI = None) -> None:
+    from features import ad_templates_shown
+    from storage import get_pour, save_pour
+
+    uid = callback.from_user.id
+    if not ad_templates_shown(uid):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    conf = get_pour(uid)
+    conf["enabled"] = not conf.get("enabled")
+    # Включить и промолчать нельзя: без выбранных товаров залив ничего не
+    # сделает, а продавец будет ждать.
+    save_pour(uid, conf)
+    if conf["enabled"] and not conf.get("items"):
+        await callback.answer("Включил, но товары не выбраны — выбери их",
+                              show_alert=True)
+        return await pour_pick(callback, state, api)
+    await callback.answer("🌊 Заливаю" if conf["enabled"] else "⏸ Остановил")
+    await pour_menu(callback, state, api)
+
+
+@router.callback_query(F.data == "pour:every")
+async def pour_every_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    from features import ad_templates_shown
+
+    if not ad_templates_shown(callback.from_user.id):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    await state.set_state(CreateAdState.pour_every)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="pour:menu")
+    await callback.message.edit_text(ui.screen(
+        "⏱ <b>Шаг залива</b>",
+        ["Пришли число — сколько минут между заливами.",
+         "",
+         "<code>1</code> — каждую минуту, около 1440 объявлений в сутки "
+         "на товар.",
+         "<code>60</code> — раз в час.",
+         "",
+         "<i>Меньше минуты не бывает: общий проход и так раз в минуту.</i>"]),
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.message(CreateAdState.pour_every)
+async def pour_every_save(message: Message, state: FSMContext) -> None:
+    from storage import get_pour, save_pour
+
+    try:
+        every = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Нужно число — сколько минут.")
+        return
+    if every < 1:
+        await message.answer("Меньше минуты не бывает — пришли 1 или больше.")
+        return
+    await state.clear()
+    conf = get_pour(message.from_user.id)
+    conf["every"] = every
+    save_pour(message.from_user.id, conf)
+    b = InlineKeyboardBuilder()
+    b.button(text="🌊 К заливу", callback_data="pour:menu")
+    await message.answer(
+        ui.screen("✅ <b>Готово</b>", [f"Шаг залива: раз в <b>{every}</b> мин."]),
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "pour:log")
+async def pour_log(callback: CallbackQuery) -> None:
+    """Что вышло в последних прогонах — с причинами отказов.
+
+    Залив идёт без человека, и «ничего не создалось» без причины — это
+    тишина, в которой продавец теряет день.
+    """
+    from features import ad_templates_shown
+    from storage import get_pour
+
+    if not ad_templates_shown(callback.from_user.id):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    conf = get_pour(callback.from_user.id)
+    rows = list(conf.get("log") or [])[-20:]
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Обновить", callback_data="pour:log")
+    b.button(text="🌊 К заливу", callback_data="pour:menu")
+    ui.lay(b)
+    await callback.message.edit_text(ui.screen(
+        "📜 <b>Последние заливы</b>",
+        [f"<code>{html.escape(str(r))[:90]}</code>" for r in rows]
+        or ["Пока пусто — залив ещё не запускался."]),
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "pour:pick")
+async def pour_pick(callback: CallbackQuery, state: FSMContext,
+                    api: YooMarketAPI = None) -> None:
+    """Выбор товаров для залива — отметками, а не по одному."""
+    from features import ad_templates_shown
+    from storage import get_pour
+
+    uid = callback.from_user.id
+    if not ad_templates_shown(uid):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    if not api:
+        await callback.answer("Не настроен API-токен", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_safely(callback.message, "⏳ Читаю объявления…")
+    try:
+        ads = await api.get_all_ads()
+    except Exception as e:                                # noqa: BLE001
+        b = InlineKeyboardBuilder()
+        b.button(text="🌊 К заливу", callback_data="pour:menu")
+        await callback.message.edit_text(ui.screen(
+            "🌊 <b>Какие товары заливать</b>",
+            ["Список объявлений прочитать не вышло.", "",
+             f"<i>{html.escape(str(e)[:150])}</i>"]),
+            reply_markup=b.as_markup())
+        return
+
+    conf = get_pour(uid)
+    picked = {str(x) for x in (conf.get("items") or [])}
+    # Номера едут в состояние, а не в кнопку: в `callback_data` 64 байта, и
+    # номер там помещается, но список «устарел» ловится тем же способом,
+    # что и у копии, — по месту в разложенном списке.
+    rows = [{"id": str(a.get("id")), "title": str(a.get("title")
+                                                 or a.get("name") or "")}
+            for a in ads if isinstance(a, dict) and a.get("id")]
+    await state.update_data(pour_ads=rows)
+    b = InlineKeyboardBuilder()
+    for i, row in enumerate(rows[:40]):
+        mark = "☑️" if row["id"] in picked else "▫️"
+        b.button(text=f"{mark} {row['title'][:26] or row['id']}",
+                 callback_data=f"pour:tog:{i}")
+    b.button(text="🌊 К заливу", callback_data="pour:menu")
+    b.adjust(1)
+    await callback.message.edit_text(ui.screen(
+        "🌊 <b>Какие товары заливать</b>",
+        [f"Отмечено: <b>{len(picked)}</b> из {len(rows)}.",
+         "",
+         "Каждый отмеченный бот будет заводить заново по своему шагу, а "
+         "вчерашние свои копии — удалять."]
+        + (["", f"<i>Показаны первые 40 из {len(rows)}.</i>"]
+           if len(rows) > 40 else [])),
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("pour:tog:"))
+async def pour_toggle_item(callback: CallbackQuery, state: FSMContext,
+                           api: YooMarketAPI = None) -> None:
+    from features import ad_templates_shown
+    from storage import get_pour, save_pour
+
+    uid = callback.from_user.id
+    if not ad_templates_shown(uid):
+        await callback.answer("Этого раздела сейчас нет", show_alert=True)
+        return
+    data = await state.get_data()
+    rows = list(data.get("pour_ads") or [])
+    try:
+        row = rows[int(callback.data.split(":")[2])]
+    except (ValueError, IndexError):
+        await callback.answer("Список устарел — открой заново", show_alert=True)
+        return
+    conf = get_pour(uid)
+    items = [str(x) for x in (conf.get("items") or [])]
+    if row["id"] in items:
+        items.remove(row["id"])
+        said = "убрал"
+    else:
+        items.append(row["id"])
+        said = "буду заливать"
+    conf["items"] = items
+    save_pour(uid, conf)
+    await callback.answer(f"{row['title'][:24] or row['id']} — {said}")
+    await pour_pick(callback, state, api)
 
 
 @router.callback_query(F.data == "create_ad:stock")
