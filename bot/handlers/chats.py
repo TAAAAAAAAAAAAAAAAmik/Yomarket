@@ -10,7 +10,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import ui
 
-from api.yoomarket import YooMarketAPI, next_cursor
+from api.yoomarket import YooMarketAPI
+# Под своим именем: в этих обработчиках есть локальная
+# `next_cursor`, а одноимённая переменная делает имя
+# ЛОКАЛЬНЫМ на всю функцию — вызов до присваивания падает
+# «cannot access local variable».
+from api.yoomarket import next_cursor as _next_cursor
 from keyboards.main import ChatCallback, PaginationCallback, back_keyboard
 from aiogram.filters import Command
 from storage import get_settings, save_settings
@@ -440,7 +445,7 @@ async def show_chats(callback: CallbackQuery, api: YooMarketAPI) -> None:
     try:
         data = await api.get_orders()
         orders: list[dict] = data.get("data") or data.get("items") or []
-        next_cursor: str | None = next_cursor(data)
+        next_cursor: str | None = _next_cursor(data)
         if orders:
             text = "💬 <b>Чаты</b>\n" + _legend(orders, details)
         else:
@@ -484,7 +489,7 @@ async def paginate_chat_orders(
     try:
         data = await api.get_orders(cursor=callback_data.cursor)
         orders: list[dict] = data.get("data") or data.get("items") or []
-        next_cursor: str | None = next_cursor(data)
+        next_cursor: str | None = _next_cursor(data)
         s = get_settings(callback.from_user.id)
         details = s.get("known_order_details") or {}
         text = "💬 <b>Чаты</b>\n" + _legend(orders, details)

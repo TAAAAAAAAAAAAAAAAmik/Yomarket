@@ -7,7 +7,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import ui
 
-from api.yoomarket import YooMarketAPI, next_cursor
+from api.yoomarket import YooMarketAPI
+# Под своим именем: в этих обработчиках есть локальная
+# `next_cursor`, а одноимённая переменная делает имя
+# ЛОКАЛЬНЫМ на всю функцию — вызов до присваивания падает
+# «cannot access local variable».
+from api.yoomarket import next_cursor as _next_cursor
 from keyboards.main import AdCallback, PaginationCallback, back_keyboard
 
 router = Router()
@@ -157,7 +162,7 @@ async def ads_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
         if not total:
             total = len(await api.get_all_ads())
         text = _fmt_list(ads, total)
-        keyboard = _ads_keyboard(ads, next_cursor(data))
+        keyboard = _ads_keyboard(ads, _next_cursor(data))
     except Exception as e:
         text = _load_error(e)
         b = InlineKeyboardBuilder()
@@ -181,7 +186,7 @@ async def paginate_ads(
         data = await api.get_ads(cursor=callback_data.cursor)
         ads: list[dict] = data.get("data") or data.get("items") or []
         meta = data.get("meta", {})
-        next_cursor: str | None = next_cursor(data)
+        next_cursor: str | None = _next_cursor(data)
         total: int | None = meta.get("total")
         text = _fmt_list(ads, total)
         keyboard = _ads_keyboard(ads, next_cursor)

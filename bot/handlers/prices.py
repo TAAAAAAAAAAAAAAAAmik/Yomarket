@@ -19,7 +19,12 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import ui
 
-from api.yoomarket import YooMarketAPI, next_cursor
+from api.yoomarket import YooMarketAPI
+# Под своим именем: в этих обработчиках есть локальная
+# `next_cursor`, а одноимённая переменная делает имя
+# ЛОКАЛЬНЫМ на всю функцию — вызов до присваивания падает
+# «cannot access local variable».
+from api.yoomarket import next_cursor as _next_cursor
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -65,7 +70,7 @@ async def _load_ads(api: YooMarketAPI, uid: int, force: bool = False) -> list[di
         data = await api.get_ads(cursor=cursor) if cursor else await api.get_ads()
         chunk = data.get("data") or data.get("items") or []
         ads.extend(a for a in chunk if isinstance(a, dict))
-        cursor = next_cursor(data)
+        cursor = _next_cursor(data)
         if not cursor or not chunk:
             break
     _cache[uid] = (time.time(), ads)

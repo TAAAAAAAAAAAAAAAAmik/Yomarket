@@ -110,5 +110,96 @@ class TheAdsScreenCountsEveryPage(unittest.TestCase):
         self.assertEqual(api.bulk, 0, "лишний обход страниц")
 
 
+class Msg:
+    def __init__(self):
+        self.texts: list = []
+        self.kbs: list = []
+
+    async def edit_text(self, text, reply_markup=None, **kw):
+        self.texts.append(text)
+        self.kbs.append(reply_markup)
+        return self
+
+    async def answer(self, text, reply_markup=None, **kw):
+        self.texts.append(text)
+        self.kbs.append(reply_markup)
+        return self
+
+
+class CB:
+    def __init__(self, data=""):
+        self.data, self.message = data, Msg()
+        self.from_user = type("U", (), {"id": 7})()
+
+    async def answer(self, *a, **kw):
+        pass
+
+
+class OrdersApi:
+    """Маркетплейс отвечает как живой: курсор в `links`."""
+
+    def __init__(self, with_next=True):
+        self.with_next = with_next
+
+    async def get_orders(self, cursor=None):
+        body = {"data": [{"id": 1, "status": "paid",
+                          "price": {"amount": 100}}],
+                "meta": {"per_page": 15, "has_more": self.with_next}}
+        if self.with_next:
+            body["links"] = {"next_cursor": "eyJpZCI6MQ", "prev_cursor": None}
+        return body
+
+
+def buttons(kb) -> list:
+    return [b.text for row in (kb.inline_keyboard if kb else []) for b in row]
+
+
+class TheOrdersScreenOpensAndPages(unittest.TestCase):
+    """Экран заказов не проверял никто, и одна опечатка в имени уронила его
+    целиком: «cannot access local variable 'next_cursor'». Проверка на то,
+    что экран ОТКРЫВАЕТСЯ, стоит дешевле любого разбора."""
+
+    def open(self, api):
+        from handlers import orders as O
+        cb = CB("menu:orders")
+        run(O.show_orders(cb, api))
+        return cb
+
+    def test_it_opens_without_an_error(self):
+        cb = self.open(OrdersApi())
+        said = cb.message.texts[-1]
+        self.assertNotIn("Ошибка", said, said)
+        self.assertNotIn("next_cursor", said, said)
+
+    def test_the_next_button_appears_on_the_live_shape(self):
+        """Курсор в `links.next_cursor`, и раньше кнопки не было вовсе."""
+        cb = self.open(OrdersApi(with_next=True))
+        self.assertTrue(any("Следующая" in b for b in buttons(cb.message.kbs[-1])),
+                        buttons(cb.message.kbs[-1]))
+
+    def test_and_not_on_the_last_page(self):
+        cb = self.open(OrdersApi(with_next=False))
+        self.assertFalse(any("Следующая" in b for b in buttons(cb.message.kbs[-1])))
+
+
+class TheChatsScreenOpensAndPages(unittest.TestCase):
+    def open(self, api):
+        from handlers import chats as CH
+        cb = CB("chats:list")
+        run(CH.show_chats(cb, api))
+        return cb
+
+    def test_it_opens_without_an_error(self):
+        cb = self.open(OrdersApi())
+        said = cb.message.texts[-1]
+        self.assertNotIn("Ошибка", said, said)
+        self.assertNotIn("next_cursor", said, said)
+
+    def test_the_next_button_appears(self):
+        cb = self.open(OrdersApi(with_next=True))
+        self.assertTrue(any("Следующая" in b for b in buttons(cb.message.kbs[-1])),
+                        buttons(cb.message.kbs[-1]))
+
+
 if __name__ == "__main__":
     unittest.main()
