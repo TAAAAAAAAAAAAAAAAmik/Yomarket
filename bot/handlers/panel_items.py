@@ -793,22 +793,31 @@ async def _category_names(api: YooMarketAPI, uid: int,
                           wanted: set[int] | None = None) -> dict[int, str]:
     """category_id → название, с запоминанием по продавцу.
 
-    Плоский справочник покрывает только верх дерева, поэтому номера, которые
-    на самом деле стоят у товаров, спрашиваются поимённо, а не обходом всех
-    ветвей.
+    Номера спрашиваются ПОИМЁННО, а не обходом справочника: разделов у
+    этого маркетплейса больше четырёх тысяч, а у товаров продавца их
+    единицы. Обход стоил бы сорок запросов на каждый экран и всё равно не
+    дошёл бы до конца.
     """
     names = _CATS_NAMES.setdefault(uid, {})
-    if not names:
+
+    # Справочник целиком НЕ вычитывается. Пока курсор не работал, это был
+    # один запрос на сотню верхних разделов и стоило дёшево; с починенным
+    # листанием — сорок запросов и четыре тысячи строк на каждый экран, и
+    # всё равно `has_more: true` (живой ответ 08.09). А нужны нам имена
+    # ровно тех номеров, что стоят у товаров, — их единицы, и каждый
+    # спрашивается адресно.
+    missing = {c for c in (wanted or ()) if c not in names}
+    if not wanted and not names:
+        # Ничего конкретного не спросили — тогда верх дерева, одной
+        # страницей: это подсказка для экранов, а не источник истины.
         try:
-            for c in await api.get_categories():
+            for c in await api.get_categories(max_pages=1):
                 cid = c.get("id")
                 label = c.get("name") or c.get("title")
                 if cid is not None and label:
                     names[int(cid)] = str(label)
         except Exception as e:
             logger.info("categories fetch failed: %s", e)
-
-    missing = {c for c in (wanted or ()) if c not in names}
     for cid in sorted(missing):
         try:
             label = await api.resolve_category(cid)
@@ -962,14 +971,20 @@ async def ads_debug(message: Message, api: YooMarketAPI) -> None:
             cid = ad.get("category_id")
             names = await _category_names(
                 api, message.from_user.id, {int(cid)} if cid else set())
-            lines += ["", f"категорий в справочнике: {len(names)}",
+            # «Категорий в справочнике» было НАШИМ числом — сколько строк
+            # мы успели вычитать, а не сколько их есть. Сначала это была
+            # ровно одна страница, потом упор в потолок листания, и оба раза
+            # число выглядело фактом о маркетплейсе. Спрашиваем адресно и
+            # так и пишем: разобрался номер или нет.
+            lines += ["", f"имён разделов разобрано: {len(names)}",
                       f"category_id {cid} → {names.get(int(cid)) if cid else None!r}"]
             # Форма самого справочника: дерево ли это, есть ли страницы?
             try:
                 raw = await api.categories_raw()
                 rows = raw.get("data") or raw.get("items") or []
-                lines.append(f"meta: {_json.dumps(raw.get('meta'), ensure_ascii=False)[:120]}")
-                lines.append(f"links: {_json.dumps(raw.get('links'), ensure_ascii=False)[:120]}")
+                lines.append("страница /categories: "
+                             f"meta {_json.dumps(raw.get('meta'), ensure_ascii=False)[:100]}, "
+                             f"links {_json.dumps(raw.get('links'), ensure_ascii=False)[:100]}")
                 if rows:
                     lines.append(f"пример категории: "
                                  f"{_json.dumps(rows[0], ensure_ascii=False)[:200]}")

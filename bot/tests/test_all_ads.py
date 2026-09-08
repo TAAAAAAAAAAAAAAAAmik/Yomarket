@@ -207,5 +207,54 @@ class TheExpiredRestoreSeesEveryPageToo(unittest.TestCase):
         self.assertEqual(report["total"], 2, report)
 
 
+class TheCategoryReferenceIsNotReadWholeForNames(unittest.TestCase):
+    """Имена разделов спрашиваются ПОИМЁННО.
+
+    Пока курсор не работал, обход справочника стоил один запрос на сотню
+    строк. С починенным листанием он стал сорока запросами и четырьмя
+    тысячами строк на каждый экран — и всё равно `has_more: true` (живой
+    ответ 08.09). А нужны имена ровно тех номеров, что стоят у товаров:
+    их единицы.
+    """
+
+    def setUp(self):
+        from handlers import panel_items as PI
+        self.PI = PI
+        PI._CATS_NAMES.clear()
+
+    def tearDown(self):
+        self.PI._CATS_NAMES.clear()
+
+    class Api:
+        def __init__(self):
+            self.bulk = 0
+            self.asked: list = []
+
+        async def get_categories(self, max_pages=40, parent_id=None):
+            self.bulk += 1
+            return [{"id": 1, "title": "Brawl Stars"}]
+
+        async def resolve_category(self, cid):
+            self.asked.append(int(cid))
+            return {81: "Аккаунты с виртами", 77: "Black Russia"}.get(int(cid), "")
+
+        async def find_categories(self, wanted):
+            return {}
+
+    def test_only_the_wanted_ids_are_asked(self):
+        api = self.Api()
+        names = run(self.PI._category_names(api, 7, {81, 77}))
+        self.assertEqual(names, {81: "Аккаунты с виртами", 77: "Black Russia"})
+        self.assertEqual(sorted(api.asked), [77, 81])
+        self.assertEqual(api.bulk, 0, "справочник вычитан целиком")
+
+    def test_a_known_name_is_not_asked_twice(self):
+        """Экранов, спрашивающих разделы, несколько, и открывают их подряд."""
+        api = self.Api()
+        run(self.PI._category_names(api, 7, {81}))
+        run(self.PI._category_names(api, 7, {81}))
+        self.assertEqual(api.asked, [81])
+
+
 if __name__ == "__main__":
     unittest.main()
