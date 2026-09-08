@@ -170,10 +170,16 @@ class Bench(unittest.TestCase):
         storage.get_token = lambda uid: "tok"
         features.ad_templates_shown = lambda uid: True
         self.api = Api()
+        # Бот ждёт, пока маркетплейс покажет присланные позиции: кладёт он
+        # их не мгновенно. В прогоне ждать нечего — ответ подставной.
+        from api import yoomarket as Y
+        self.Y = Y
+        self._waits, Y._CONFIRM_WAITS = Y._CONFIRM_WAITS, (0.0,)
 
     def tearDown(self):
         storage.get_token = self._token
         features.ad_templates_shown = self._shown
+        self.Y._CONFIRM_WAITS = self._waits
 
     def kb(self, cb):
         return [b.callback_data for row in cb.message.kbs[-1].inline_keyboard

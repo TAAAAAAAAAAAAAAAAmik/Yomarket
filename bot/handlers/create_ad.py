@@ -1532,31 +1532,40 @@ async def _put_items(api, item_id: str, rows: list,
     И говорится вслух, что покупатель получит именно эти строки: заготовка,
     забытая на витрине, — это оплаченный заказ с мусором внутри.
     """
-    from orderfields import ad_items_free
+    from api.yoomarket import confirm_items, items_accepted
 
     answer: dict = {}
+    want = len([r for r in rows if str(r).strip()])
     try:
         answer = await api.add_ad_items(item_id, list(rows)) or {}
-        left = await api.get_ad_items(item_id)
-        free = ad_items_free(left)
+        free = await confirm_items(api, item_id, want)
     except Exception as e:                                # noqa: BLE001
         logger.warning("позиции товару %s не добавились: %s", item_id, e)
         return ("\n📦 Остатки по умолчанию положить не вышло: "
                 f"{html.escape(str(e)[:120])}"), False
-    if not free:
-        # «Отправлено, а в наличии нет» — это не отчёт, а загадка: причина
-        # лежит в ответе маркетплейса, и он единственный, кто её знает.
-        # Живой случай 08.09: три позиции ушли, публикация отказала
-        # `empty_stock`, а что ответил маркетплейс на саму отправку — бот
-        # выбрасывал.
-        return ("\n📦 Остатки отправлены, но в наличии их нет."
-                f"\n<i>Маркетплейс на отправку ответил:</i> "
-                f"<code>{html.escape(str(answer)[:200])}</code>"
-                + ui.admin_hint(uid, f"\n<i>Разбор:</i> <code>/stock_debug "
-                                     f"{html.escape(str(item_id))}</code>")), False
-    return (f"\n📦 Остаток проставлен: {len(free)} поз. — твоя заготовка."
-            "\n<i>Покупатель получит именно эти строки. Заменишь на "
-            "настоящие — кнопка «📦 Прислать остатки».</i>"), True
+    if free >= want > 0:
+        return (f"\n📦 Остаток проставлен: {free} поз. — твоя заготовка."
+                "\n<i>Покупатель получит именно эти строки. Заменишь на "
+                "настоящие — кнопка «📦 Прислать остатки».</i>"), True
+
+    # Маркетплейс кладёт позиции НЕ СРАЗУ: на отправку он отвечает
+    # `{"status": "ok", "accepted": 1}`, а в списке они появляются позже
+    # (живая проба 08.09). Значит «в наличии их нет» сразу после отправки —
+    # это ещё не отказ, и называть его отказом нельзя: продавец пойдёт
+    # присылать те же ключи второй раз.
+    took = items_accepted(answer)
+    if took > 0 or free > 0:
+        return ("\n📦 <b>Остатки отправлены</b>"
+                + (f", маркетплейс принял: {took}." if took > 0 else ".")
+                + (f" В списке пока {free}." if free >= 0 else "")
+                + "\n<i>Он кладёт их не мгновенно. Через минуту жми"
+                " «🔄 Проверить остаток» — второй раз слать те же ключи не"
+                " надо, они лягут дважды.</i>"), False
+    return ("\n📦 Остатки отправлены, но в наличии их нет."
+            f"\n<i>Маркетплейс на отправку ответил:</i> "
+            f"<code>{html.escape(str(answer)[:200])}</code>"
+            + ui.admin_hint(uid, f"\n<i>Разбор:</i> <code>/stock_debug "
+                                 f"{html.escape(str(item_id))}</code>")), False
 
 
 async def _source_items_left(api, source_id: str) -> str:
@@ -1795,6 +1804,12 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
             # советует «заменишь на настоящие — кнопка ниже».
             b.button(text="📦 Прислать остатки",
                      callback_data=f"pitem_stock:{item_id}")
+            if stock_ready:
+                # Заготовка уже ушла, и маркетплейс кладёт её не мгновенно:
+                # пересчёт нужен раньше, чем второй список. Прислать те же
+                # ключи второй раз — значит выложить их на витрину дважды.
+                b.button(text="🔄 Проверить остаток",
+                         callback_data=f"pitem_recount:{item_id}")
             # И вторая — чтобы не присылать их руками каждый раз. Настройка
             # лежит на экране копии, и найти её оттуда никому не пришло бы
             # в голову: спрашивают-то здесь.

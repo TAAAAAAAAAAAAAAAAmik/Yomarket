@@ -333,13 +333,18 @@ class Api:
     # может взять не все строки, а публикует он по второму числу.
     sent: list = []
     accepts: int | None = None
+    # Что он отвечает на саму отправку. Живой ответ 08.09 — «принял»,
+    # и это не то же самое, что «положил».
+    answer: dict | None = None
 
     async def add_ad_items(self, ad_id, items):
         rows = list(items)
         Api.sent.append((str(ad_id), rows))
         take = len(rows) if Api.accepts is None else Api.accepts
         Api.items_left = [{"status": "available"} for _ in rows[:take]]
-        return {"data": {"added": take}}
+        if Api.answer is not None:
+            return dict(Api.answer)
+        return {"status": "ok", "accepted": len(rows)}
 
     # Дерево разделов маркетплейса. Товар лежит в ЛИСТЕ («Аккаунты»), а
     # панель раскладывает по играм («Standoff 2»): нужное слово стоит на
@@ -421,7 +426,12 @@ class Bench(unittest.TestCase):
         Api.stock, Api.refills = 0, []
         Api.path = ["Игры", "Black Russia", "Аккаунты"]
         Api.kind, Api.value_block, Api.items_left, Api.updated = "", {}, [], []
-        Api.sent, Api.accepts = [], None
+        Api.sent, Api.accepts, Api.answer = [], None, None
+        # Маркетплейс кладёт позиции не мгновенно, и бот его ждёт. В
+        # прогоне ждать нечего: ответ подставной и меняться не будет.
+        from api import yoomarket as Y
+        self._waits, Y._CONFIRM_WAITS = Y._CONFIRM_WAITS, (0.0,)
+        self.Y = Y
         # Заготовка остатков — своя на каждый тест. По умолчанию её нет:
         # подставленная за продавца, она уехала бы живому покупателю.
         self.default_stock: list = []
@@ -429,6 +439,7 @@ class Bench(unittest.TestCase):
         storage.get_copy_stock = lambda uid: list(self.default_stock)
 
     def tearDown(self):
+        self.Y._CONFIRM_WAITS = self._waits
         if hasattr(self, "_was_content"):
             for f in EDIT_FIELDS:
                 if f["attribute"] == "content":
@@ -765,13 +776,33 @@ class TheStockIsPutInByTheBotAsFarAsItHonestlyCan(Bench):
         self.default_stock = ["KEY-1111", "KEY-2222", "KEY-3333"]
         Api.accepts = 1                      # взял одну из трёх
         said = self.press().message.texts[-1]
-        self.assertIn("1 поз.", said, said)
-        self.assertNotIn("3 поз.", said, said)
+        self.assertIn("пока 1", said, said)
+        self.assertNotIn("Остаток проставлен", said, said)
 
-    def test_nothing_in_stock_after_sending_is_not_called_success(self):
+    def test_a_marketplace_that_says_it_took_them_is_not_called_a_refusal(self):
+        """Живая проба 08.09: на отправку он отвечает `{"status": "ok",
+        "accepted": 1}`, а в списке позиции появляются позже. «В наличии
+        их нет» сразу после отправки — это ещё не отказ, и назвать его
+        отказом значит послать продавца выложить те же ключи дважды."""
         Api.kind = "auto-delivery"
         self.default_stock = ["KEY-1111"]
-        Api.accepts = 0
+        Api.accepts = 0                      # список ещё не обновился
+        cb = self.press()
+        said = cb.message.texts[-1]
+        self.assertIn("Остатки отправлены", said)
+        self.assertIn("принял: 1", said, said)
+        self.assertIn("не мгновенно", said)
+        self.assertIn("слать те же ключи не", said,
+                      "второй список положил бы те же ключи дважды")
+        self.assertNotIn("в наличии их нет", said, said)
+        self.assertIn("🔄 Проверить остаток", self.keyboard_texts(cb))
+
+    def test_but_a_silent_marketplace_is_still_a_refusal(self):
+        """Ни одной позиции, и о принятых он не сказал ни слова — тогда
+        «отправлено» без «в наличии» было бы обещанием."""
+        Api.kind = "auto-delivery"
+        self.default_stock = ["KEY-1111"]
+        Api.accepts, Api.answer = 0, {"status": "ok"}
         said = self.press().message.texts[-1]
         self.assertIn("в наличии их нет", said, said)
 
@@ -781,10 +812,10 @@ class TheStockIsPutInByTheBotAsFarAsItHonestlyCan(Bench):
         выбрасывал — и «отправлены, но их нет» осталось загадкой."""
         Api.kind = "auto-delivery"
         self.default_stock = ["KEY-1111"]
-        Api.accepts = 0
+        Api.accepts, Api.answer = 0, {"status": "ok"}
         said = self.press().message.texts[-1]
         self.assertIn("Маркетплейс на отправку ответил", said)
-        self.assertIn("added", said, said)
+        self.assertIn("status", said, said)
 
     def test_a_marketplace_that_refuses_the_list_says_so(self):
         """Исключение отсюда съело бы весь отчёт о созданном товаре."""

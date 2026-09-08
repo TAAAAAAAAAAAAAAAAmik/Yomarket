@@ -698,6 +698,32 @@ async def item_delete_do(callback: CallbackQuery, api: YooMarketAPI) -> None:
 # Остаток — без него товар в продажу не выставить
 # ---------------------------------------------------------------------------
 
+@router.callback_query(F.data.startswith("pitem_recount:"))
+async def item_stock_recount(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    """Перечитать остаток товара и сказать число. Ничего не отправляет.
+
+    Маркетплейс кладёт присланные позиции НЕ СРАЗУ: на отправку он
+    отвечает «принял», а в списке они появляются позже (живая проба
+    08.09). Без этой кнопки продавцу оставалось одно — прислать те же
+    ключи второй раз, то есть выложить их на витрину дважды.
+    """
+    item_id = callback.data.split(":", 1)[1]
+    if not api:
+        await callback.answer("Нет токена — отправь /start", show_alert=True)
+        return
+    try:
+        from orderfields import ad_items_free
+        rows = await api.get_all_ad_items(item_id)
+        free = len(ad_items_free(rows))
+    except Exception as e:                                # noqa: BLE001
+        await callback.answer(f"Не прочитал: {str(e)[:150]}", show_alert=True)
+        return
+    await callback.answer(
+        f"Свободных позиций: {free}" if free
+        else "Пока пусто. Если только что отправлял — подожди минуту.",
+        show_alert=True)
+
+
 @router.callback_query(F.data.startswith("pitem_stock:"))
 async def item_stock_start(callback: CallbackQuery, state: FSMContext) -> None:
     """Спросить, сколько остатка добавить.
@@ -756,23 +782,29 @@ async def item_stock_save(message: Message, state: FSMContext,
         else:
             items = [ln.strip() for ln in text.splitlines() if ln.strip()]
             answer = await api.add_ad_items(item_id, items) or {}
-            # ПЕРЕЧИТЫВАЕМ. «Отправлено 3» и «в наличии 3» — разные
-            # утверждения, а публиковать маркетплейс даёт по второму:
-            # 08.09 три позиции ушли без ошибки, и публикация тут же
-            # отказала `empty_stock`. Отчёт «добавлено позиций: 3» в этом
-            # случае был бодрым враньём.
-            from orderfields import ad_items_free
-            try:
-                free = len(ad_items_free(await api.get_ad_items(item_id)))
-            except Exception as e:                        # noqa: BLE001
-                logger.info("остатки %s не перечитались: %s", item_id, e)
-                free = -1
-            if free < 0:
-                done = (f"отправлено позиций: {len(items)} "
-                        "(перечитать не вышло — проверь список у товара)")
-            elif free >= len(items):
+            # ПЕРЕЧИТЫВАЕМ, и не один раз. «Отправлено 3» и «в наличии 3» —
+            # разные утверждения, а публиковать маркетплейс даёт по
+            # второму. При этом кладёт он их НЕ СРАЗУ: на отправку
+            # отвечает `{"status": "ok", "accepted": 1}`, а в списке они
+            # появляются позже (живая проба 08.09). Отчёт «добавлено
+            # позиций: 3» был бодрым враньём, а немедленное «их нет» —
+            # враньём испуганным.
+            from api.yoomarket import confirm_items, items_accepted
+            free = await confirm_items(api, item_id, len(items))
+            took = items_accepted(answer)
+            if free >= len(items):
                 done = f"в наличии позиций: {free}"
                 landed = True
+            elif free < 0:
+                done = (f"отправлено позиций: {len(items)} "
+                        "(перечитать не вышло — проверь список у товара)")
+            elif took > 0 or free > 0:
+                done = (f"отправлено {len(items)}"
+                        + (f", маркетплейс принял {took}" if took > 0 else "")
+                        + f", в списке пока {free}"
+                        "\n<i>Он кладёт их не мгновенно — жми «🔄 Проверить "
+                        "остаток» через минуту. Второй раз слать те же "
+                        "ключи не надо: они лягут дважды.</i>")
             else:
                 # Причину знает только маркетплейс, и он на отправку
                 # ответил. Выбросить его ответ значит оставить продавцу
@@ -802,8 +834,12 @@ async def item_stock_save(message: Message, state: FSMContext,
             # Кнопка идёт по исходу, а не по тексту отчёта: советовать
             # модерацию там, где остатка нет, — значит послать продавца
             # получить отказ `empty_stock`.
-            b.button(text="📦 Прислать ещё раз",
-                     callback_data=f"pitem_stock:{item_id}")
+            #
+            # И это ПЕРЕСЧЁТ, а не «пришли ещё раз»: маркетплейс кладёт
+            # позиции не мгновенно, и второй список положил бы те же
+            # ключи на витрину дважды.
+            b.button(text="🔄 Проверить остаток",
+                     callback_data=f"pitem_recount:{item_id}")
         b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
         ui.lay(b)
         # Запомненное называется вслух: эти строки уходят покупателям, и
@@ -813,10 +849,10 @@ async def item_stock_save(message: Message, state: FSMContext,
                 " строки. Поменять: «📋 Шаблонная копия → 📦 Остатки по"
                 " умолчанию».</i>" if kept else "")
         head = ("✅ <b>Готово</b>" if landed
-                else "⚠️ <b>Остаток не встал</b>")
+                else "⏳ <b>Остаток ещё не виден</b>")
         tail = ("\n\nТеперь товар можно отправить на модерацию." if landed
-                else "\n\nБез остатка публиковать нечего: маркетплейс "
-                     "отказывает — <code>empty_stock</code>.")
+                else "\n\nПока его не видно, публиковать нечего: "
+                     "маркетплейс отказывает — <code>empty_stock</code>.")
         await status.edit_text(head + f" — {done}." + tail + note,
                                reply_markup=b.as_markup())
     except Exception as e:

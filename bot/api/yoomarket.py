@@ -47,6 +47,67 @@ def next_cursor(data: dict) -> str:
     return ""
 
 
+# Сколько раз и с какими паузами перечитывать остаток после отправки.
+# Маркетплейс отвечает `{"status": "ok", "accepted": 1}` — это «принял», а
+# не «положил»: живая проба 08.09 показала, что список сразу после отправки
+# остаётся прежним, а позиции появляются позже. Немедленный перечёт
+# объявлял успешную отправку неудачей.
+_CONFIRM_WAITS = (0.0, 3.0, 7.0)
+
+
+async def confirm_items(api, ad_id, want: int, waits=None) -> int:
+    """Сколько свободных позиций у товара после отправки. −1 — не прочитали.
+
+    Ждём ровно до тех пор, пока их не станет достаточно: дождавшись на
+    первой попытке, дальше не сидим. Ждать бесконечно тоже нельзя — на том
+    конце продавец смотрит в «⏳».
+    """
+    from orderfields import ad_items_free
+
+    # Паузы берутся из модуля, а не из значения по умолчанию: подменённые
+    # в тесте, они иначе не подменяются вовсе — значение вычисляется один
+    # раз при загрузке, и прогон честно ждал бы по десять секунд на каждой
+    # проверке.
+    seen = -1
+    for i, pause in enumerate(waits if waits is not None else _CONFIRM_WAITS):
+        if pause:
+            await asyncio.sleep(pause)
+        try:
+            rows = await api.get_all_ad_items(ad_id) \
+                if hasattr(api, "get_all_ad_items") \
+                else (await api.get_ad_items(ad_id))
+            seen = len(ad_items_free(rows))
+        except Exception as e:                            # noqa: BLE001
+            logger.info("остатки %s не перечитались (%d): %s", ad_id, i, e)
+            continue
+        if want <= 0 or seen >= want:
+            return seen
+    return seen
+
+
+def items_accepted(answer) -> int:
+    """Сколько позиций маркетплейс объявил принятыми. −1 — не сказал.
+
+    `{"status": "ok", "accepted": 1}` — живой ответ 08.09. Это не «в
+    наличии», это «взял в работу», и разница между двумя числами — весь
+    смысл отчёта.
+    """
+    node = answer
+    if isinstance(node, dict) and isinstance(node.get("data"), dict):
+        node = node["data"]
+    if not isinstance(node, dict):
+        return -1
+    for key in ("accepted", "added", "created", "count"):
+        val = node.get(key)
+        if isinstance(val, bool):
+            continue
+        if isinstance(val, int):
+            return val
+        if isinstance(val, str) and val.isdigit():
+            return int(val)
+    return -1
+
+
 class YooMarketAPI:
     def __init__(self, token: str) -> None:
         self.token = token
@@ -612,6 +673,27 @@ class YooMarketAPI:
                 last = await self._post(f"/ads/{ad_id}/items",
                                         json={"items": batch})
         return last
+
+    async def get_all_ad_items(self, ad_id: int | str,
+                               max_pages: int = 10) -> list:
+        """ВСЕ позиции объявления — с проходом по страницам.
+
+        Живой ответ 08.09 приходит с `meta` и `links`: список отдаётся
+        курсором, как и всё остальное у этого маркетплейса. У товара с
+        сотней ключей одна страница — это не «все», а «сколько поместилось».
+        """
+        from orderfields import ad_items_rows
+
+        out: list = []
+        cursor = ""
+        for _ in range(max_pages):
+            page = await self.get_ad_items(ad_id, cursor or None)
+            out += ad_items_rows(page)
+            nxt = next_cursor(page)
+            if not nxt or nxt == cursor:
+                break
+            cursor = nxt
+        return out
 
     async def delete_ad_item(self, ad_id: int | str, item_id: int | str) -> dict:
         """Убрать одну непроданную позицию."""

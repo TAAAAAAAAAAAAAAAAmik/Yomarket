@@ -112,19 +112,28 @@ class TheHandlerActuallyWiresItUp(unittest.TestCase):
         self.features = features
         self._shown = features.ad_templates_shown
         features.ad_templates_shown = lambda uid: True
+        # Бот ждёт, пока маркетплейс покажет присланное. В прогоне ждать
+        # нечего: ответ подставной и меняться не будет.
+        from api import yoomarket as Y
+        self.Y = Y
+        self._waits, Y._CONFIRM_WAITS = Y._CONFIRM_WAITS, (0.0,)
 
     def tearDown(self):
         storage._BLOBS["settings"] = self._blob
         self.features.ad_templates_shown = self._shown
+        self.Y._CONFIRM_WAITS = self._waits
         self.tmp.cleanup()
 
-    def send(self, text="KEY-1111\nKEY-2222\nKEY-3333", shows=None):
+    def send(self, text="KEY-1111\nKEY-2222\nKEY-3333", shows=None,
+             answer=None):
         class Sent:
             def __init__(s):
                 s.texts: list = []
+                s.kbs: list = []
 
             async def edit_text(s, t, reply_markup=None, **kw):
                 s.texts.append(t)
+                s.kbs.append(reply_markup)
                 return s
 
         class Msg:
@@ -157,9 +166,15 @@ class TheHandlerActuallyWiresItUp(unittest.TestCase):
             async def get_ad(s, ad_id):
                 return {"data": {"type": "auto-delivery"}}
 
+            # Что он отвечает на отправку. Живой ответ 08.09 — «принял»,
+            # и это не то же самое, что «положил».
+            answer: dict | None = None
+
             async def add_ad_items(s, ad_id, items):
                 Api.added.append(list(items))
-                return {"data": {"added": len(items)}}
+                if Api.answer is not None:
+                    return dict(Api.answer)
+                return {"status": "ok", "accepted": len(items)}
 
             async def get_ad_items(s, ad_id, cursor=None):
                 rows = [r for batch in Api.added for r in batch]
@@ -169,9 +184,10 @@ class TheHandlerActuallyWiresItUp(unittest.TestCase):
                                  for r in rows]}
 
         self.Api = Api
-        Api.added, Api.shows = [], shows
+        Api.added, Api.shows, Api.answer = [], shows, answer
         m = Msg()
         run(PI.item_stock_save(m, FSM(), Api()))
+        self.sent = m.sent
         return m.sent.texts[-1], Api.added
 
     def test_the_list_reaches_the_marketplace_and_the_settings(self):
@@ -187,37 +203,59 @@ class TheHandlerActuallyWiresItUp(unittest.TestCase):
         self.assertIn("Запомнил этот список", said)
         self.assertIn("получит именно эти строки", said)
 
-    def test_a_list_the_marketplace_did_not_take_is_not_called_done(self):
-        """Живой случай 08.09: три позиции ушли без ошибки, маркетплейс
-        отдал ноль, а публикация отказала `empty_stock`. «✅ Готово —
-        добавлено позиций: 3» здесь было бодрым враньём."""
+    def test_a_list_the_marketplace_did_not_show_yet_is_not_called_done(self):
+        """Живой случай 08.09: три позиции ушли без ошибки, а в списке их
+        ещё не было. «✅ Готово — добавлено позиций: 3» здесь было бодрым
+        враньём: публиковать по этому числу маркетплейс не даст."""
         said, added = self.send(shows=0)
         self.assertEqual(added, [["KEY-1111", "KEY-2222", "KEY-3333"]],
                          "отправить всё равно пробуем")
         self.assertNotIn("Готово", said)
-        self.assertIn("не встал", said)
-        self.assertIn("отправлено 3, а в наличии 0", said)
+        self.assertIn("ещё не виден", said)
+        self.assertIn("в списке пока 0", said)
         self.assertNotIn("можно отправить на модерацию", said)
+
+    def test_and_it_does_not_ask_for_the_same_keys_a_second_time(self):
+        """Второй такой же список положил бы те же ключи на витрину
+        дважды — и покупатели получили бы один код вдвоём."""
+        said, _added = self.send(shows=0)
+        self.assertIn("Проверить остаток", said)
+        self.assertIn("слать те же ключи не надо", said)
+        # Кнопка сверяется по адресу, а не по надписи: надпись правят, и
+        # проверка по словам молча перестаёт работать.
+        kb = next((k for k in reversed(self.sent.kbs) if k), None)
+        data = [b.callback_data
+                for row in (kb.inline_keyboard if kb else []) for b in row]
+        self.assertIn("pitem_recount:250730", data, data)
+        self.assertNotIn("pitem_stock:250730", data, data)
 
     def test_and_it_shows_what_the_marketplace_answered(self):
         """Причину знает только он: наш отчёт её не содержит."""
-        said, _added = self.send(shows=0)
+        said, _added = self.send(shows=0, answer={"status": "ok"})
         self.assertIn("Маркетплейс ответил", said)
-        self.assertIn("added", said, said)
+        self.assertIn("status", said, said)
+
+    def test_a_silent_marketplace_is_still_called_a_failure(self):
+        """«Принял» он не сказал, и в списке пусто — тогда «отправлено»
+        без «в наличии» было бы обещанием."""
+        said, _added = self.send(shows=0, answer={"status": "ok"})
+        self.assertIn("а в наличии 0", said)
 
     def test_but_the_diagnostic_is_advised_only_to_the_owner(self):
         """`/stock_debug` продавцу скрыта, и на скрытую команду бот
         отвечает то же, что на несуществующую. Совет набрать её — это
         совет невозможного; владельцу тот же экран обязан подсказать."""
         was = storage.is_admin
+        quiet = {"status": "ok"}
         storage.is_admin = lambda uid: False
         try:
-            self.assertNotIn("/stock_debug", self.send(shows=0)[0])
+            self.assertNotIn("/stock_debug",
+                             self.send(shows=0, answer=quiet)[0])
         finally:
             storage.is_admin = was
         storage.is_admin = lambda uid: True
         try:
-            self.assertIn("/stock_debug", self.send(shows=0)[0])
+            self.assertIn("/stock_debug", self.send(shows=0, answer=quiet)[0])
         finally:
             storage.is_admin = was
 
@@ -281,6 +319,182 @@ class TheStockListIsReadByOnePlace(unittest.TestCase):
         for payload in ({}, {"data": None}, [], None, "текст"):
             with self.subTest(payload=payload):
                 self.assertEqual(self.free(payload), [])
+
+
+class TheMarketplacePutsThemInLater(unittest.TestCase):
+    """Живая проба 08.09 по товару 250845.
+
+    Отправили одну строку — ответ `{"status": "ok", "accepted": 1}`, а
+    список СРАЗУ после этого прежний: те же шесть позиций, та же первая
+    строка. Позиции появляются позже. Значит один немедленный перечёт
+    объявляет успешную отправку неудачей — и продавец идёт слать те же
+    ключи второй раз, то есть кладёт их на витрину дважды.
+    """
+
+    def setUp(self):
+        from api import yoomarket as Y
+        self.Y = Y
+        self._waits, Y._CONFIRM_WAITS = Y._CONFIRM_WAITS, (0.0, 0.0, 0.0)
+
+    def tearDown(self):
+        self.Y._CONFIRM_WAITS = self._waits
+
+    class Api:
+        """Маркетплейс, показывающий присланное не с первого раза."""
+
+        def __init__(self, appear_on=2, rows=1):
+            self.reads = 0
+            self.appear_on, self.rows = appear_on, rows
+
+        async def get_ad_items(self, ad_id, cursor=None):
+            self.reads += 1
+            seen = self.rows if self.reads >= self.appear_on else 0
+            return {"data": [{"status": "available"} for _ in range(seen)]}
+
+    def test_the_shipped_pauses_are_long_enough_to_matter(self):
+        """Все проверки подменяют паузы на нулевые, и с ними мутация
+        «ждать перестали» проходит незамеченной. Значит сверять надо само
+        отправленное значение: одна попытка — это тот же немедленный
+        перечёт, из-за которого всё и началось."""
+        waits = self._waits
+        self.assertGreaterEqual(len(waits), 2, waits)
+        self.assertGreaterEqual(sum(waits), 5, waits)
+        self.assertLessEqual(sum(waits), 30, "на том конце ждёт человек")
+
+    def test_it_waits_for_them_instead_of_calling_it_a_refusal(self):
+        api = self.Api(appear_on=2, rows=3)
+        got = run(self.Y.confirm_items(api, "250845", 3))
+        self.assertEqual(got, 3)
+        self.assertEqual(api.reads, 2, "перечитал, а не поверил первому разу")
+
+    def test_but_it_does_not_wait_forever(self):
+        """На том конце продавец смотрит в «⏳»."""
+        api = self.Api(appear_on=99)
+        got = run(self.Y.confirm_items(api, "250845", 3))
+        self.assertEqual(got, 0)
+        self.assertEqual(api.reads, 3, "по числу пауз, и ни разу больше")
+
+    def test_and_it_stops_as_soon_as_they_are_there(self):
+        api = self.Api(appear_on=1, rows=3)
+        run(self.Y.confirm_items(api, "250845", 3))
+        self.assertEqual(api.reads, 1, "дождался с первого — дальше не сидим")
+
+    def test_a_marketplace_that_will_not_answer_is_not_zero(self):
+        """«Не прочитали» и «их нет» — разные вещи: по первому продавцу
+        нельзя говорить, что остаток пуст."""
+        class Dead:
+            async def get_ad_items(self, ad_id, cursor=None):
+                raise RuntimeError("HTTP 500")
+
+        self.assertEqual(run(self.Y.confirm_items(Dead(), "1", 3)), -1)
+
+    def test_it_reads_every_page_when_the_client_can(self):
+        """Ответ приходит с `meta` и `links` — список тоже курсорный."""
+        class Paged:
+            def __init__(s):
+                s.asked = []
+
+            async def get_ad_items(s, ad_id, cursor=None):
+                s.asked.append(cursor)
+                if not cursor:
+                    return {"data": [{"status": "available"}],
+                            "meta": {"has_more": True},
+                            "links": {"next_cursor": "eyJpZCI6MX0"}}
+                return {"data": [{"status": "available"}],
+                        "meta": {"has_more": False}}
+
+        from api.yoomarket import YooMarketAPI
+        api = Paged()
+        api.get_all_ad_items = YooMarketAPI.get_all_ad_items.__get__(api)
+        self.assertEqual(run(self.Y.confirm_items(api, "1", 2)), 2)
+        self.assertEqual(api.asked, [None, "eyJpZCI6MX0"])
+
+
+class TheAnswerToTheSendIsReadForItsNumber(unittest.TestCase):
+    """`accepted` — это «взял в работу», а не «в наличии». Разница между
+    этими двумя числами и есть весь смысл отчёта."""
+
+    def took(self, answer):
+        from api.yoomarket import items_accepted
+        return items_accepted(answer)
+
+    def test_the_live_answer(self):
+        self.assertEqual(self.took({"status": "ok", "accepted": 1}), 1)
+
+    def test_the_other_words_it_used(self):
+        self.assertEqual(self.took({"data": {"added": 3}}), 3)
+
+    def test_silence_is_not_zero(self):
+        """«Не сказал» и «принял ноль» — разные ответы, и второй значит
+        отказ. Спутать их значит объявить отказом успешную отправку."""
+        for answer in ({"status": "ok"}, {}, None, "текст", {"accepted": True}):
+            with self.subTest(answer=answer):
+                self.assertEqual(self.took(answer), -1)
+
+    def test_a_flat_zero_is_a_zero(self):
+        self.assertEqual(self.took({"accepted": 0}), 0)
+
+
+class TheRecountButtonOnlyCounts(unittest.TestCase):
+    """Кнопка «🔄 Проверить остаток» появилась вместо «прислать ещё раз».
+
+    Маркетплейс кладёт присланное не сразу, и продавцу оставалось одно —
+    отправить те же ключи второй раз. Тогда один и тот же код лёг бы на
+    витрину дважды, и двое покупателей получили бы его оба.
+    """
+
+    class Api:
+        rows: int = 0
+        sent: list = []
+
+        async def get_all_ad_items(self, ad_id, max_pages=10):
+            return [{"status": "available"}
+                    for _ in range(TheRecountButtonOnlyCounts.Api.rows)]
+
+        async def add_ad_items(self, ad_id, items):
+            TheRecountButtonOnlyCounts.Api.sent.append(list(items))
+            return {}
+
+    def setUp(self):
+        self.Api.rows, self.Api.sent = 0, []
+
+    def press(self, api=None):
+        said = []
+
+        class CB:
+            data = "pitem_recount:250845"
+
+            async def answer(s, text="", show_alert=False):
+                said.append(text)
+
+        run(PI.item_stock_recount(CB(), api if api is not None else self.Api()))
+        return said[-1] if said else ""
+
+    def test_it_says_the_number(self):
+        self.Api.rows = 6
+        self.assertIn("6", self.press())
+
+    def test_it_sends_nothing_of_its_own(self):
+        """Пересчёт, который что-то досылает, — это вторая отправка."""
+        self.Api.rows = 6
+        self.press()
+        self.assertEqual(self.Api.sent, [])
+
+    def test_an_empty_answer_advises_waiting_not_resending(self):
+        """Ноль сразу после отправки — это «ещё не показал», а не «не
+        взял». Совет «пришли ещё раз» здесь удваивает ключи."""
+        said = self.press()
+        self.assertIn("подожди", said.lower(), said)
+        self.assertNotIn("пришли", said.lower(), said)
+
+    def test_a_refusal_to_read_is_not_reported_as_zero(self):
+        class Dead:
+            async def get_all_ad_items(self, ad_id, max_pages=10):
+                raise RuntimeError("HTTP 500")
+
+        said = self.press(Dead())
+        self.assertIn("не прочитал", said.lower())
+        self.assertIn("HTTP 500", said)
 
 
 class TheStockDiagnosticShowsWhatTheMarketplaceSays(unittest.TestCase):
