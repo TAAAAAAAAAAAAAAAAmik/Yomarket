@@ -717,6 +717,181 @@ class TheScreenActuallyWiresItUp(Bench):
             return s
 
 
+class TheSameItemsAreFoldedIntoOne(Bench):
+    """Залив заводит копии с ТЕМ ЖЕ названием — иначе это был бы другой
+    товар. После суток минутного шага список объявлений это одно название
+    тысячу раз, и остальных товаров в нём не найти."""
+
+    def fold(self, rows, made=()):
+        return self.C._group_same(rows, made)
+
+    def test_the_same_title_becomes_one_row(self):
+        got = self.fold([{"id": "1", "title": "Аккаунт"},
+                         {"id": "2", "title": "Аккаунт"},
+                         {"id": "3", "title": "Вирты"}])
+        self.assertEqual(len(got), 2, got)
+
+    def test_and_carries_how_many_there_are(self):
+        got = self.fold([{"id": "1", "title": "Аккаунт"},
+                         {"id": "2", "title": "Аккаунт"},
+                         {"id": "3", "title": "Аккаунт"}])
+        self.assertEqual(got[0]["count"], 3)
+
+    def test_case_and_spaces_do_not_split_a_pair(self):
+        """«Аккаунт  BR» и «аккаунт br» — один товар: копия заводится тем
+        же названием, но пробелы по дороге схлопываются."""
+        got = self.fold([{"id": "1", "title": "Аккаунт  BR"},
+                         {"id": "2", "title": "аккаунт br"}])
+        self.assertEqual(len(got), 1, got)
+
+    def test_the_sample_is_never_one_of_the_bots_copies(self):
+        """Свои копии бот завтра удалит, и залив, привязанный к удалённому
+        номеру, назавтра встанет с «панель не нашла этот товар»."""
+        got = self.fold([{"id": "900", "title": "Аккаунт"},
+                         {"id": "12", "title": "Аккаунт"}],
+                        made=["900"])
+        self.assertEqual(got[0]["id"], "12")
+
+    def test_and_among_its_own_it_takes_the_oldest(self):
+        """Заведённый руками — самый старый номер."""
+        got = self.fold([{"id": "900", "title": "Аккаунт"},
+                         {"id": "800", "title": "Аккаунт"}],
+                        made=["900", "800"])
+        self.assertEqual(got[0]["id"], "800")
+
+    def test_nothing_is_lost_in_the_fold(self):
+        rows = [{"id": str(i), "title": f"Товар {i % 3}"} for i in range(9)]
+        got = self.fold(rows)
+        self.assertEqual(sum(g["count"] for g in got), 9)
+
+
+class TheChoiceScreenShowsEveryItem(Bench):
+    """«В добавление товаров в залив я вижу не все товары» — список резался
+    на сороковом молча, то есть остальные для залива не существовали."""
+
+    class CB:
+        def __init__(s, data="pour:pick", uid=7):
+            s.data = data
+            s.from_user = type("U", (), {"id": uid})()
+            s.said: list = []
+            s.kb = None
+            outer = s
+
+            class Msg:
+                async def edit_text(m, text, reply_markup=None, **kw):
+                    outer.said.append(str(text))
+                    outer.kb = reply_markup
+                    return m
+
+                async def answer(m, text, reply_markup=None, **kw):
+                    outer.said.append(str(text))
+                    return m
+
+            s.message = Msg()
+
+        async def answer(s, text="", show_alert=False):
+            pass
+
+    class FSM:
+        def __init__(s):
+            s.data: dict = {}
+
+        async def get_data(s):
+            return dict(s.data)
+
+        async def update_data(s, **kw):
+            s.data.update(kw)
+            return dict(s.data)
+
+        async def set_state(s, st=None):
+            s.state = st
+
+        async def clear(s):
+            s.data = {}
+
+    def api(self, n=50, title=None):
+        rows = [{"id": 100 + i, "title": title or f"Товар {i}"}
+                for i in range(n)]
+
+        class Api:
+            async def get_all_ads(self, max_pages=25):
+                return list(rows)
+
+        return Api()
+
+    def screen(self, api, page=0, fsm=None):
+        cb = self.CB()
+        run(self.C.pour_pick(cb, fsm or self.FSM(), api, page=page))
+        return cb
+
+    def buttons(self, cb):
+        return [b.callback_data
+                for row in (cb.kb.inline_keyboard if cb.kb else []) for b in row]
+
+    def test_the_list_is_paged_not_cut(self):
+        cb = self.screen(self.api(50))
+        self.assertIn("pour:pick:1", self.buttons(cb), "листалки нет")
+        self.assertIn("Страница 1 из", cb.said[-1])
+
+    def test_every_page_is_reachable(self):
+        """Пятьдесят товаров по двенадцати — пять страниц, и на последней
+        лежат те, которых раньше не было видно вовсе."""
+        seen: set = set()
+        fsm = self.FSM()
+        for page in range(5):
+            cb = self.screen(self.api(50), page=page, fsm=fsm)
+            rows = list((run(fsm.get_data())).get("pour_ads") or [])
+            for data in self.buttons(cb):
+                if data.startswith("pour:tog:"):
+                    seen.add(rows[int(data.split(":")[2])]["id"])
+        self.assertEqual(len(seen), 50, len(seen))
+
+    def test_a_page_past_the_end_shows_the_last_one(self):
+        """Кнопка из старого сообщения указывает за конец укоротившегося
+        списка — это не повод показать пустой экран."""
+        cb = self.screen(self.api(50), page=99)
+        self.assertTrue([d for d in self.buttons(cb)
+                         if d.startswith("pour:tog:")])
+
+    def test_the_same_items_are_one_row_with_the_count(self):
+        cb = self.screen(self.api(20, title="Аккаунт Black Russia"))
+        rows = [b.text for row in (cb.kb.inline_keyboard if cb.kb else [])
+                for b in row if b.text.startswith(("▫️", "☑️"))]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("(20)", rows[0])
+
+    def test_and_says_what_the_number_means(self):
+        cb = self.screen(self.api(20, title="Аккаунт"))
+        self.assertIn("сколько копий", cb.said[-1])
+
+    def test_a_single_item_gets_no_brackets(self):
+        """«(1)» рядом с каждым товаром — шум, а не сведения."""
+        cb = self.screen(self.api(3))
+        rows = [b.text for row in (cb.kb.inline_keyboard if cb.kb else [])
+                for b in row if b.text.startswith(("▫️", "☑️"))]
+        self.assertTrue(rows and not any("(" in t for t in rows), rows)
+
+    def test_a_tick_keeps_you_on_the_same_page(self):
+        """Отметив товар на третьей странице, продавец оказывался в начале
+        списка и искал место заново — а отмечают обычно несколько подряд."""
+        api, fsm = self.api(50), self.FSM()
+        self.screen(api, page=2, fsm=fsm)          # третья страница
+        rows = list((run(fsm.get_data())).get("pour_ads") or [])
+        idx = 26                                    # товар с этой страницы
+        cb = self.CB(f"pour:tog:{idx}")
+        run(self.C.pour_toggle_item(cb, fsm, api))
+        self.assertIn("Страница 3 из", cb.said[-1], cb.said[-1])
+        self.assertIn(rows[idx]["id"], storage.get_pour(self.UID)["items"])
+
+    def test_the_totals_are_named_honestly(self):
+        """Свёрнутый список показывает два числа: товаров и объявлений.
+        Одно из них без другого читается как «половина пропала»."""
+        cb = self.screen(self.api(20, title="Аккаунт"))
+        said = cb.said[-1]
+        self.assertIn("товаров: 1", said)
+        self.assertIn("всего объявлений: 20", said)
+
+
 class ThePourHasItsOwnButtonInTheMenu(unittest.TestCase):
     """Залив живёт под копией, а нужен он каждый день. Кнопка на первом
     экране — то, ради чего просили; но только тем, кому раздел открыт:

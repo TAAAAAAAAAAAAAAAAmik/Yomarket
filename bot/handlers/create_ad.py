@@ -2090,13 +2090,34 @@ async def _ads_by_section(api, uid: int):
     except Exception as e:                                # noqa: BLE001
         return {}, _readable(str(e))
 
+    from storage import get_pour
+
+    mine = [r.get("id") for r in (get_pour(uid).get("made") or [])]
     groups: dict[str, list] = {}
     for ad in ads:
         raw = ad.get("id")
         if raw is None or not str(raw).strip():
             continue                      # кнопка без номера скопирует не то
         groups.setdefault(_ad_category(ad, names), []).append(ad)
-    return groups, ""
+
+    # ОДИНАКОВЫЕ СВОРАЧИВАЮТСЯ В ОДИН. Залив заводит копии с тем же
+    # названием — иначе это был бы другой товар, — и после суток минутного
+    # шага раздел это одно название тысячу раз: остальных товаров в нём не
+    # видно вовсе. Число копий едет с образцом (`same`), а образцом
+    # берётся тот, которого бот НЕ создавал: свои копии он завтра удалит.
+    out: dict[str, list] = {}
+    for name, rows in groups.items():
+        folded = _group_same([{"id": a.get("id"),
+                               "title": a.get("title") or a.get("name") or ""}
+                              for a in rows], mine)
+        by_id = {str(a.get("id")): a for a in rows}
+        kept = []
+        for g in folded:
+            ad = dict(by_id.get(g["id"]) or {})
+            ad["same"] = g["count"]
+            kept.append(ad)
+        out[name] = kept
+    return out, ""
 
 
 def _section_screen(groups: dict, back: str):
@@ -2185,6 +2206,9 @@ async def templates_list(callback: CallbackQuery, state: FSMContext,
                           # Он уже прочитан ради группировки — спрашивать
                           # его второй раз незачем.
                           "category_id": a.get("category_id"),
+                          # Сколько таких же на витрине: свёрнутые копии
+                          # иначе доехали бы до экрана без своего числа.
+                          "same": a.get("same") or 1,
                           "price": a.get("price")} for a in ads]
                   for name, ads in groups.items()})
     # Раздел один — показывать выбор из одного не из чего: сразу объявления.
@@ -2228,9 +2252,14 @@ async def _show_section(callback: CallbackQuery, state: FSMContext,
     rows = []
     for j, ad in enumerate(ads[start:start + _COPY_LIMIT], start=start):
         title = str(ad.get("title") or ad.get("name") or "без названия")
-        b.button(text=f"📋 {title[:30]}",
+        # Сколько таких же на витрине. Залив плодит копии с тем же
+        # названием, и без числа список читается как «одно и то же
+        # двадцать раз» — а это и есть двадцать раз, только счётом.
+        same = int(ad.get("same") or 1)
+        tail = f" ({same})" if same > 1 else ""
+        b.button(text=f"📋 {title[:28]}{tail}",
                  callback_data=f"create_ad:copy:{idx}:{j}"[:64])
-        rows.append(f"• <b>{html.escape(title[:40])}</b> — "
+        rows.append(f"• <b>{html.escape(title[:40])}</b>{tail} — "
                     f"{int(ad_price(ad) or 0)} ₽")
     ui.lay(b)
     if pages > 1:
@@ -3440,10 +3469,62 @@ async def pour_log(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+# Сколько товаров показывать на одном экране выбора. Больше — это уже не
+# список, а стена кнопок; меньше — лишнее листание.
+_POUR_PER_PAGE = 12
+
+
+def _same_key(title: str) -> str:
+    """Ключ «это тот же товар»: название без регистра и лишних пробелов.
+
+    Копия заводится с ТЕМ ЖЕ названием — иначе это был бы другой товар, и
+    покупатель не нашёл бы его по прежнему поиску. Значит одинаковое
+    название и есть признак «это копии одного».
+    """
+    return " ".join(str(title or "").split()).casefold()
+
+
+def _group_same(rows: list, made_ids=()) -> list:
+    """Свернуть одинаковые товары в один. → [{id, title, count, ids}]
+
+    После суток минутного залива список объявлений — это одно название,
+    повторённое тысячу раз: найти в нём остальные товары нельзя. Поэтому
+    одинаковые сворачиваются в строку с числом копий.
+
+    ОБРАЗЦОМ группы берётся НЕ первый попавшийся, а тот, который бот НЕ
+    создавал сам: свои копии он завтра удалит, и залив, привязанный к
+    удалённому номеру, назавтра встанет с «панель не нашла этот товар».
+    Среди своих же — самый старый: он и есть заведённый руками.
+    """
+    mine = {str(x) for x in (made_ids or ())}
+    groups: dict = {}
+    for row in rows:
+        key = _same_key(row.get("title"))
+        groups.setdefault(key, []).append(row)
+
+    def rank(row) -> tuple:
+        rid = str(row.get("id") or "")
+        return (rid in mine, int(rid) if rid.isdigit() else 0)
+
+    out = []
+    for key, items in groups.items():
+        head = sorted(items, key=rank)[0]
+        out.append({"id": str(head.get("id")), "title": str(head.get("title")
+                                                            or head.get("id")),
+                    "count": len(items),
+                    "ids": [str(x.get("id")) for x in items]})
+    return out
+
+
 @router.callback_query(F.data == "pour:pick")
 async def pour_pick(callback: CallbackQuery, state: FSMContext,
-                    api: YooMarketAPI = None) -> None:
-    """Выбор товаров для залива — отметками, а не по одному."""
+                    api: YooMarketAPI = None, page: int = 0) -> None:
+    """Выбор товаров для залива — отметками, а не по одному.
+
+    Одинаковые товары свёрнуты в один: копия заводится с тем же названием,
+    и после суток минутного залива список это одно название тысячу раз.
+    Показываются страницами — обрезок молчал о том, что за ним что-то есть.
+    """
     from features import ad_templates_shown
     from storage import get_pour
 
@@ -3470,19 +3551,33 @@ async def pour_pick(callback: CallbackQuery, state: FSMContext,
 
     conf = get_pour(uid)
     picked = {str(x) for x in (conf.get("items") or [])}
+    # Одинаковые сворачиваются в один: после суток минутного залива список
+    # это одно название тысячу раз, и остальные товары в нём не найти.
+    flat = [{"id": str(a.get("id")), "title": str(a.get("title")
+                                                 or a.get("name") or "")}
+            for a in ads if isinstance(a, dict) and a.get("id")]
+    rows = _group_same(flat, [r.get("id") for r in (conf.get("made") or [])])
     # Номера едут в состояние, а не в кнопку: в `callback_data` 64 байта, и
     # номер там помещается, но список «устарел» ловится тем же способом,
     # что и у копии, — по месту в разложенном списке.
-    rows = [{"id": str(a.get("id")), "title": str(a.get("title")
-                                                 or a.get("name") or "")}
-            for a in ads if isinstance(a, dict) and a.get("id")]
     await state.update_data(pour_ads=rows)
     from storage import get_pour_stock
 
+    # СТРАНИЦАМИ, а не первыми сорока. Обрезок молчал о том, что за ним
+    # что-то есть, — то есть половина товаров для залива не существовала.
+    pages = max(1, (len(rows) + _POUR_PER_PAGE - 1) // _POUR_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    start = page * _POUR_PER_PAGE
+    shown = rows[start:start + _POUR_PER_PAGE]
+
     b = InlineKeyboardBuilder()
-    for i, row in enumerate(rows[:40]):
+    sizes: list = []
+    for i, row in enumerate(shown, start=start):
         mark = "☑️" if row["id"] in picked else "▫️"
-        b.button(text=f"{mark} {row['title'][:26] or row['id']}",
+        # Число копий — в скобках у названия: столько этого товара сейчас
+        # на витрине, включая сам образец.
+        tail = f" ({row['count']})" if row["count"] > 1 else ""
+        b.button(text=f"{mark} {row['title'][:24] or row['id']}{tail}",
                  callback_data=f"pour:tog:{i}")
         # Остатки — у каждого товара свои: одна заготовка на всех кладёт
         # покупателю ключ от чужой игры. Кнопка стоит только у отмеченных:
@@ -3492,17 +3587,49 @@ async def pour_pick(callback: CallbackQuery, state: FSMContext,
             b.button(text=(f"📦 Остатки: {own}" if own
                            else "📦 Остатки: общие"),
                      callback_data=f"pour:st:{i}")
+            sizes.append(2)
+        else:
+            sizes.append(1)
+    if pages > 1:
+        from aiogram.types import InlineKeyboardButton
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                text="◀️", callback_data=f"pour:pick:{page - 1}"))
+        nav.append(InlineKeyboardButton(
+            text=f"{page + 1}/{pages}", callback_data="create_ad:noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(
+                text="▶️", callback_data=f"pour:pick:{page + 1}"))
     b.button(text="🌊 К заливу", callback_data="pour:menu")
-    b.adjust(*([2 if r["id"] in picked else 1 for r in rows[:40]] + [1]))
+    b.adjust(*(sizes + [1]))
+    if pages > 1:
+        b.row(*nav)
     await callback.message.edit_text(ui.screen(
         "🌊 <b>Какие товары заливать</b>",
-        [f"Отмечено: <b>{len(picked)}</b> из {len(rows)}.",
+        [f"Отмечено: <b>{len(picked)}</b> · товаров: {len(rows)}"
+         + (f" · всего объявлений: {len(flat)}" if len(flat) != len(rows)
+            else ""),
          "",
          "Каждый отмеченный бот будет заводить заново по своему шагу, а "
-         "вчерашние свои копии — удалять."]
-        + (["", f"<i>Показаны первые 40 из {len(rows)}.</i>"]
-           if len(rows) > 40 else [])),
+         "старые свои копии — удалять."]
+        + (["", "<i>В скобках — сколько копий этого товара сейчас на "
+            "витрине.</i>"] if any(r["count"] > 1 for r in rows) else [])
+        + (["", f"<i>Страница {page + 1} из {pages}.</i>"]
+           if pages > 1 else [])),
         reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("pour:pick:"))
+async def pour_pick_page(callback: CallbackQuery, state: FSMContext,
+                         api: YooMarketAPI = None) -> None:
+    """Страница списка выбора. Отдельный обработчик, а не хвост у «pick»:
+    кнопка без обработчика — мёртвая кнопка."""
+    try:
+        page = int(callback.data.split(":")[2])
+    except (ValueError, IndexError):
+        page = 0
+    await pour_pick(callback, state, api, page=page)
 
 
 @router.callback_query(F.data.startswith("pour:tog:"))
@@ -3518,7 +3645,8 @@ async def pour_toggle_item(callback: CallbackQuery, state: FSMContext,
     data = await state.get_data()
     rows = list(data.get("pour_ads") or [])
     try:
-        row = rows[int(callback.data.split(":")[2])]
+        idx = int(callback.data.split(":")[2])
+        row = rows[idx]
     except (ValueError, IndexError):
         await callback.answer("Список устарел — открой заново", show_alert=True)
         return
@@ -3533,7 +3661,10 @@ async def pour_toggle_item(callback: CallbackQuery, state: FSMContext,
     conf["items"] = items
     save_pour(uid, conf)
     await callback.answer(f"{row['title'][:24] or row['id']} — {said}")
-    await pour_pick(callback, state, api)
+    # Возвращаемся на ТУ ЖЕ страницу: отметив товар на третьей, продавец
+    # оказывался в начале списка и искал место заново.
+    page = int(idx) // _POUR_PER_PAGE
+    await pour_pick(callback, state, api, page=page)
 
 
 @router.callback_query(F.data.startswith("pour:st:"))

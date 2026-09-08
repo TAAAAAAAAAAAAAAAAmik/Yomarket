@@ -240,10 +240,12 @@ class TheListIsGroupedBySection(Bench):
         return cb, fsm
 
     def test_each_section_gets_a_button_with_a_count(self):
+        # Названия РАЗНЫЕ: одинаковые сворачиваются в один товар, и число
+        # на кнопке раздела считает товары, а не объявления.
         self.api.ads = [
-            dict(self.api.CARD, id=11, category_id=512),
-            dict(self.api.CARD, id=12, category_id=512),
-            dict(self.api.CARD, id=13, category_id=7),
+            dict(self.api.CARD, id=11, category_id=512, title="1000 Robux"),
+            dict(self.api.CARD, id=12, category_id=512, title="2000 Robux"),
+            dict(self.api.CARD, id=13, category_id=7, title="Apple 10 TRY"),
         ]
         cb, _fsm = self.sections()
         said = cb.message.texts[-1]
@@ -251,6 +253,39 @@ class TheListIsGroupedBySection(Bench):
         self.assertIn("Гифт-карты", said)
         self.assertIn("(2)", " ".join(
             b.text for row in cb.message.kbs[-1].inline_keyboard for b in row))
+
+    def test_the_same_item_many_times_is_one_row_with_a_count(self):
+        """Залив заводит копии с ТЕМ ЖЕ названием, и после суток минутного
+        шага раздел — это одно название тысячу раз: остальных товаров в нём
+        не видно вовсе."""
+        self.api.ads = [
+            dict(self.api.CARD, id=11, category_id=512, title="1000 Robux"),
+            dict(self.api.CARD, id=12, category_id=512, title="1000 Robux"),
+            dict(self.api.CARD, id=13, category_id=512, title="1000 Robux"),
+            dict(self.api.CARD, id=14, category_id=512, title="Другой товар"),
+        ]
+        cb, _fsm = self.sections()
+        texts = [b.text for row in cb.message.kbs[-1].inline_keyboard
+                 for b in row if b.text.startswith("📋")]
+        self.assertEqual(len(texts), 2, texts)
+        self.assertTrue(any("(3)" in t for t in texts), texts)
+        self.assertTrue(any("Другой товар" in t for t in texts), texts)
+
+    def test_and_the_sample_is_not_one_of_the_bots_own_copies(self):
+        """Свои копии бот завтра удалит, и залив, привязанный к удалённому
+        номеру, назавтра встанет с «панель не нашла этот товар»."""
+        import storage
+        storage.save_pour(self.UID, {"made": [{"id": "11", "src": "12"}]})
+        try:
+            self.api.ads = [
+                dict(self.api.CARD, id=11, category_id=512, title="Аккаунт"),
+                dict(self.api.CARD, id=12, category_id=512, title="Аккаунт"),
+            ]
+            cb, fsm = self.sections()
+        finally:
+            storage.save_pour(self.UID, {})
+        left = (fsm.data.get("copy_ads") or {}).get("Telegram Звёзды") or []
+        self.assertEqual([str(a["id"]) for a in left], ["12"], left)
 
     def test_a_single_section_is_not_a_choice_of_one(self):
         """Меню из одного пункта — лишний тап перед единственным
