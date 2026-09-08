@@ -486,11 +486,25 @@ class TheCopyIsARunThroughTheSameCreation(Bench):
         self.assertEqual(self.sent, [])
         self.assertIn("419", cb.message.texts[-1])
 
-    def test_without_a_picture_it_does_not_even_try(self):
+    def test_a_picture_missing_in_the_panel_is_taken_from_the_marketplace(self):
+        """У товара с закрытой формой правки медиа-поля панель не отдаёт
+        вовсе. Но тот же товар есть у маркетплейса, и картинка у него
+        своя — идти за ней туда дешевле, чем отказывать."""
+        self.read = (True, self.read[1], self.read[2], self.read[3], "", "")
+        _cb, _fsm = self.tap()
+        self.assertEqual(len(self.sent), 1, "копия должна была уйти")
+        self.assertTrue(self.sent[0]["values"].get("photo_path"))
+
+    def test_but_without_a_picture_anywhere_it_does_not_even_try(self):
         """Без картинки объявление не создастся — отправлять заведомо
         отвергаемое значит показать продавцу отказ вместо причины."""
         self.read = (True, self.read[1], self.read[2], self.read[3], "", "")
-        cb, _fsm = self.tap()
+        was = self.api.card
+        self.api.card = {k: v for k, v in was.items() if k != "images"}
+        try:
+            cb, _fsm = self.tap()
+        finally:
+            self.api.card = was
         self.assertEqual(self.sent, [])
         self.assertIn("картинк", cb.message.texts[-1])
 

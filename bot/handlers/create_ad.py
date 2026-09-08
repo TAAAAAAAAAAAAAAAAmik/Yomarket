@@ -2235,6 +2235,22 @@ async def _ad_card(api, ad_id: str) -> dict:
     return (raw.get("data") or raw) if isinstance(raw, dict) else {}
 
 
+def _text_of(node, keys: tuple[str, ...]) -> str:
+    """Первое непустое строковое поле карточки по этим именам.
+
+    Названия у маркетплейса и у панели разные (`content` против
+    `description`), а перебирать их в трёх местах — верный способ однажды
+    прочитать не то поле.
+    """
+    if not isinstance(node, dict):
+        return ""
+    for key in keys:
+        val = node.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
 async def _price_from_api(api, ad_id: str):
     """Цена объявления. Читается `ad_price` — маркетплейс отдаёт её
     объектом, и прочитанная как скаляр она превращается в ноль."""
@@ -2338,12 +2354,29 @@ async def _copy_source_values(uid: int, ad_id: str, api=None,
     if values.get("quantity") in (None, ""):
         values["quantity"] = await _stock_from_api(api, ad_id)
 
+    # Карточка маркетплейса читается ОДИН раз: она отвечает сразу на три
+    # вопроса — название, описание и вид выдачи, — и три запроса за одним и
+    # тем же ответом только тормозили копию.
+    card = await _ad_card(api, ad_id)
+
+    # Название и описание обычно даёт форма правки, но у некоторых товаров
+    # панель её не отдаёт (живой отказ 08.09 — 403 на своём же товаре).
+    # Тогда их берёт маркетплейс: он знает тот же товар со своей стороны.
+    if not str(values.get("title") or "").strip():
+        values["title"] = _text_of(card, ("title", "name"))
+    if not str(values.get("description") or "").strip():
+        values["description"] = _text_of(card, ("description", "content",
+                                                "text"))
+    if not str(values.get("title") or "").strip():
+        return {}, {}, {}, [], ("названия товара не отдали ни панель, ни "
+                                "маркетплейс — копировать нечего")
+
     # ТИП ВЫДАЧИ берётся у маркетплейса, и это не догадка о словах.
     # Значения поля панели и значения `type` у объявления — ОДИН словарь:
     # отчёт печатает «надпись (значение)», и у живого товара там стояло
     # «Авто-выдача (auto-delivery)», а карточка маркетплейса того же товара
     # отвечает `type = auto-delivery`. Совпадение не по смыслу, а буквой.
-    kind = str((await _ad_card(api, ad_id)).get("type") or "")
+    kind = str(card.get("type") or "")
     if kind:
         values["ad_type"] = kind
     try:
@@ -2362,8 +2395,15 @@ async def _copy_source_values(uid: int, ad_id: str, api=None,
     words += [w for w in _title_words(values) if w not in words]
 
     if not url:
-        return {}, {}, {}, [], ("у товара в панели не нашлось картинки, а без "
-                                "неё объявление не создать")
+        # Картинку тоже ищем у маркетплейса: при закрытой форме правки
+        # медиа-поля панель не отдаёт вовсе, а объявление без картинки
+        # панель не примет. `_media_url_of` берёт и относительный адрес.
+        from automation.panel import _media_url_of
+        url = _media_url_of(card)
+    if not url:
+        return {}, {}, {}, [], ("картинки товара нет ни в панели, ни у "
+                                "маркетплейса, а без неё объявление не "
+                                "создать")
     data = await loop.run_in_executor(None, panel_fetch_image_sync,
                                       cookies, url)
     if not data:

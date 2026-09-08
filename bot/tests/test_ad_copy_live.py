@@ -63,6 +63,10 @@ ITEM_FIELDS = [
 DETAIL_FIELDS = [
     {"attribute": "id", "value": 219206},
     {"attribute": "title", "value": "Аккаунт Standoff 2 с виртами"},
+    # Живая карточка называет картинку по-русски и без компонента (ответ
+    # 07.09: «изображение», «заголовок», «статус»). Английская проверка
+    # такое поле не видела вовсе.
+    {"attribute": "изображение", "value": "/media/photo.jpg"},
     # Цена на карточке уже оформлена — числа из такой строки не достать.
     # Поэтому карточка отдаёт только поля раздела, а цену берут у
     # маркетплейса: прочитанная отсюда, она сорвала бы копию.
@@ -135,6 +139,11 @@ class Nova(BaseHTTPRequestHandler):
     # Закрыта ли карточка записи: Nova разрешает список и карточку
     # независимо, и «403 на карточку» ещё не значит «раздела не узнать»
     card_closed: bool = False
+    # То же самое с формой правки. Живой отказ 08.09: `update-fields: 403`
+    # у СВОЕГО товара — а карточка при этом открыта.
+    form_closed: bool = False
+    # И со списком: третий ответ панели закрывается независимо от первых двух.
+    list_closed: bool = False
 
     def log_message(self, *a):
         pass
@@ -156,7 +165,7 @@ class Nova(BaseHTTPRequestHandler):
         if "/update-fields" in self.path:
             # Чужой или несуществующий номер живая панель отдаёт отказом на
             # правку и «нет такого» на карточку — не пустыми полями.
-            if not self._is_ours():
+            if not self._is_ours() or Nova.form_closed:
                 self._json(403, {"message": "нет доступа"})
                 return
             self._json(200, {"fields": ITEM_FIELDS})
@@ -177,6 +186,9 @@ class Nova(BaseHTTPRequestHandler):
             self._json(200, {"resource": {"fields": DETAIL_FIELDS}})
             return
         if self.path.split("?")[0] == "/nova-api/items":
+            if Nova.list_closed:
+                self._json(403, {"message": "нет доступа"})
+                return
             # Список товаров: строка того же товара с теми же связями
             self._json(200, {"resources": [
                 {"id": {"value": int(ITEM_ID)}, "fields": DETAIL_FIELDS}]})
@@ -365,16 +377,50 @@ class TheSourceItemIsReadAsCreationExpectsIt(Bench):
         data = P.panel_fetch_image_sync("session=1", url)
         self.assertTrue(data.startswith(b"\xff\xd8"), "это не картинка")
 
-    def test_a_panel_that_says_nothing_is_a_refusal(self):
-        """«Пустые поля» — не пустой товар, а неудачное чтение."""
+    def test_a_closed_edit_form_is_not_the_end(self):
+        """Живой отказ 08.09: `update-fields: 403` на СВОЁМ товаре — и
+        копия отказывалась целиком, «Товар прочитать не вышло».
+
+        Три ответа панели Nova разрешает независимо. Закрытая форма правки
+        значит только то, что название и остаток надо взять в другом
+        месте, — раздел и тип по-прежнему на карточке."""
+        Nova.form_closed = True
+        try:
+            ok, values, extra, _l, _u, err = self.read()
+        finally:
+            Nova.form_closed = False
+        self.assertTrue(ok, err)
+        self.assertEqual(str(extra.get("category")), "12",
+                         "раздел с карточки — он там и лежит")
+
+    def test_and_a_closed_form_does_not_lose_the_picture(self):
+        """Медиа-поле живёт в форме правки. Без картинки панель товар не
+        примет, и копия встала бы уже на ней."""
+        Nova.form_closed = True
+        try:
+            _ok, _v, _e, _l, url, _err = self.read()
+        finally:
+            Nova.form_closed = False
+        self.assertTrue(url, "картинку надо было взять с карточки")
+
+    def test_a_panel_that_says_nothing_anywhere_is_a_refusal(self):
+        """«Пустые поля» — не пустой товар, а неудачное чтение. Но теперь
+        молчать должны ВСЕ ТРИ ответа: одного закрытого мало."""
         old = ITEM_FIELDS[:]
+        Nova.form_closed = Nova.card_closed = Nova.list_closed = True
         try:
             ITEM_FIELDS.clear()
             ok, _v, _e, _l, _u, err = self.read()
             self.assertFalse(ok)
             self.assertTrue(err)
+            # Код панели остаётся — по нему отличают 403 от 404, — но
+            # ВЕДЁТ русская фраза: «update-fields: 403» само по себе не
+            # говорит продавцу ничего.
+            self.assertTrue(err.startswith("панель"), err)
+            self.assertIn("форму правки", err)
         finally:
             ITEM_FIELDS.extend(old)
+            Nova.form_closed = Nova.card_closed = Nova.list_closed = False
 
 
 class TheCopyGoesOutAsARealCreation(Bench):

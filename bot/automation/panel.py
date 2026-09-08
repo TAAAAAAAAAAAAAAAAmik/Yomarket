@@ -2894,6 +2894,57 @@ def _media_url_of(value) -> str:
     return (PANEL_URL.rstrip("/") + found) if found else ""
 
 
+# Отказ панели на человеческом языке. «update-fields: 403» на экране
+# продавца — это отписка: он не знает ни что такое update-fields, ни что
+# делать дальше. Причина при этом сохраняется — она едет в скобках.
+_PANEL_READ_REASONS: tuple[tuple[str, str], ...] = (
+    ("403", "панель не дала прочитать форму правки этого товара"),
+    ("404", "панель не нашла этот товар"),
+    ("419", "сессия панели истекла — войди заново"),
+    ("401", "сессия панели истекла — войди заново"),
+    ("500", "панель ответила ошибкой"),
+)
+
+
+def _panel_read_reason(err: str) -> str:
+    """Почему товар не прочитался — словами, с кодом в скобках."""
+    text = str(err or "").strip()
+    if not text:
+        return ""
+    for code, human in _PANEL_READ_REASONS:
+        if code in text:
+            return f"{human} ({text})"
+    return text
+
+
+# Как панель называет картинку. В форме правки это `images` с компонентом
+# `advanced-media-library-field`, а на КАРТОЧКЕ — показное поле с русским
+# именем «изображение» и без компонента вовсе (живой ответ 07.09). Пока
+# проверка была английской, копия с закрытой формой правки уходила без
+# картинки — и панель её не принимала.
+_MEDIA_WORDS = ("изображен", "картинк", "фото", "снимок", "image", "photo",
+                "picture", "media", "preview", "thumb")
+
+
+# Поля, которые карточка показывает ОФОРМЛЕННЫМИ: «1 490 ₽», «осталось 3».
+# Из формы правки те же поля приходят числами, поэтому запрет касается
+# только чтения с карточки и из строки списка.
+_FORMATTED_WORDS = ("price", "cost", "cena", "цена", "стоим", "сумм",
+                    "quantity", "qty", "count", "stock", "остат", "колич")
+
+
+def _is_formatted_number_attr(attr: str) -> bool:
+    al = str(attr or "").lower()
+    return any(w in al for w in _FORMATTED_WORDS)
+
+
+def _is_media_attr(attr_lower: str, component: str = "") -> bool:
+    comp = str(component or "").lower()
+    if "media" in comp or "file" in comp:
+        return True
+    return any(w in attr_lower for w in _MEDIA_WORDS)
+
+
 def _is_section_attr(attr: str) -> bool:
     """Поле раздела: то, что панель показывает, но править не даёт.
 
@@ -2962,27 +3013,51 @@ def panel_item_values_sync(
     hdrs = _panel_xsrf_headers(session, cookie_string)
     fields, err = _get_update_fields(session, hdrs, str(item_id))
     _save_refreshed_cookies(uid, cookie_string, session)
-    if not fields:
-        return False, {}, {}, {}, "", (err or "панель не отдала поля товара")
 
-    # Карточка — второй источник, и только для полей раздела: цену и остаток
-    # она показывает уже оформленными («129 ₽»), а число из такой строки не
-    # достаётся. Что редактируется — берём из формы правки, что нет — отсюда.
+    # ФОРМА ПРАВКИ — не единственный источник, и её закрытость не конец.
+    # Живой отказ 08.09: `update-fields: 403` у СВОЕГО товара, и копия
+    # отказывалась целиком. Nova разрешает форму правки, карточку и список
+    # независимо — ровно так же, как карточку и список между собой. Когда
+    # форма закрыта, берём с карточки и из строки списка ВСЁ, что там есть,
+    # а не только поля раздела; чего не окажется и там (название, описание,
+    # цена), вызывающий дочитает у маркетплейса.
+    form_closed = not fields
+    fields = list(fields)
     seen = {str(f.get("attribute") or "") for f in fields}
 
-    def _take(extra_fields) -> int:
+    def _take(extra_fields, only_section: bool = True) -> int:
         got = 0
         for f in extra_fields:
             attr = str(f.get("attribute") or "")
-            if attr and attr not in seen and _is_section_attr(attr):
-                fields.append(f)
-                seen.add(attr)
-                got += 1
+            if not attr or attr in seen:
+                continue
+            if only_section and not _is_section_attr(attr):
+                continue
+            # Цену и остаток с карточки не берём НИКОГДА. Там они уже
+            # оформлены («1 490 ₽»), числа из такой строки не достать, а
+            # прочитанные как есть они срывают копию на разборе. Оба знает
+            # маркетплейс — вызывающий их и подставит.
+            if not only_section and _is_formatted_number_attr(attr):
+                continue
+            fields.append(f)
+            seen.add(attr)
+            got += 1
         return got
 
-    if not _take(_get_detail_fields(session, hdrs, str(item_id))):
+    # Карточка — второй источник. При живой форме правки берём с неё только
+    # поля раздела: цену и остаток она показывает уже оформленными
+    # («129 ₽»), а число из такой строки не достаётся.
+    took = _take(_get_detail_fields(session, hdrs, str(item_id)),
+                 only_section=not form_closed)
+    if not took:
         # Карточка закрыта или раздела в ней нет — остаётся строка списка.
-        _take(_get_index_fields(session, hdrs, str(item_id)))
+        _take(_get_index_fields(session, hdrs, str(item_id)),
+              only_section=not form_closed)
+
+    if not fields:
+        # Молчат все три ответа — вот теперь читать правда нечего.
+        return False, {}, {}, {}, "", (_panel_read_reason(err)
+                                       or "панель не отдала поля товара")
 
     # `None` — «поля не было», а не «пусто». Разница здесь существенная:
     # у товара в панели ЦЕНЫ НЕТ ВОВСЕ (давняя запись в CLAUDE.md), и
@@ -2999,7 +3074,7 @@ def panel_item_values_sync(
             continue
         al = attr.lower()
         comp = str(f.get("component") or "")
-        if "media" in comp or "file" in comp or al in ("images", "image"):
+        if _is_media_attr(al, comp):
             image_url = image_url or _media_url_of(f.get("value"))
             continue
         sub = _field_submit_value(f)
@@ -3036,8 +3111,11 @@ def panel_item_values_sync(
             # молчала бы ровно там, где нужна.
             if (label := _field_label_value(f)):
                 labels[attr] = label
-    if not values["title"]:
-        return False, {}, {}, {}, "", "в полях товара нет названия"
+    # Названия может не быть, и это НЕ повод отказывать здесь: при закрытой
+    # форме правки его отдаёт маркетплейс — он знает тот же товар со своей
+    # стороны. Отказ на этом месте объявлял непрочитанным товар, который
+    # прочитать можно. Решает вызывающий, у которого есть второй источник;
+    # без названия не создаст и он.
     return True, values, extra, labels, image_url, ""
 
 

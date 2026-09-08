@@ -122,6 +122,9 @@ class LiveNova(BaseHTTPRequestHandler):
     # карточке (11), ни в строке списка (6). Раздел задаётся один раз при
     # создании, и больше его в панели не видно.
     section_visible: bool = True
+    # Отдаёт ли панель ФОРМУ ПРАВКИ. Живой отказ 08.09: `update-fields:
+    # 403` у своего же товара, при живой карточке.
+    form_open: bool = True
     refuse: bool = False
 
     def log_message(self, *a):
@@ -149,6 +152,9 @@ class LiveNova(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if path.endswith("/update-fields"):
+            if not LiveNova.form_open:
+                self._json(403, {"message": "нет доступа"})
+                return
             self._json(200, {"fields": EDIT_FIELDS})
             return
         if path.endswith("/creation-fields"):
@@ -300,6 +306,9 @@ class Api:
     и совпадать с надписью панели оно не обязано."""
 
     section = "Аккаунты"
+    # Адрес картинки у маркетплейса — свой; подставляется в setUpClass,
+    # когда известен порт подставной панели.
+    image = ""
 
     async def get_ads(self, cursor=None):
         return {"data": [{"id": int(ITEM), "category_id": 5221,
@@ -315,10 +324,21 @@ class Api:
     items_left: list = []
     updated: list = []
 
+    # Молчит ли и маркетплейс тоже: тогда брать название неоткуда вовсе.
+    nameless: bool = False
+
     async def get_ad(self, ad_id):
-        return {"data": {"id": ad_id, "stock": 3, "category_id": 5221,
-                         "type": Api.kind,
-                         "price": {"amount": 1490, "currency": "RUB"}}}
+        # Маркетплейс знает тот же товар со своей стороны: название,
+        # описание и картинку. При закрытой форме правки панели это
+        # единственное место, откуда их взять.
+        card = {"id": ad_id, "stock": 3, "category_id": 5221,
+                "type": Api.kind, "title": TITLE, "description": DESCRIPTION,
+                "images": [{"original_url": Api.image}],
+                "price": {"amount": 1490, "currency": "RUB"}}
+        if Api.nameless:
+            card.pop("title")
+            card.pop("description")
+        return {"data": card}
 
     async def get_ad_value(self, ad_id):
         return {"data": dict(Api.value_block)}
@@ -387,6 +407,7 @@ class Bench(unittest.TestCase):
         for f in EDIT_FIELDS:
             if f["attribute"] == "images":
                 f["value"] = [{"original_url": f"{cls.base}/media/photo.jpg"}]
+        Api.image = f"{cls.base}/media/photo.jpg"
 
     @classmethod
     def tearDownClass(cls):
@@ -421,12 +442,14 @@ class Bench(unittest.TestCase):
         LiveNova.card_open = True
         LiveNova.list_open = True
         LiveNova.section_visible = True
+        LiveNova.form_open = True
         LiveNova.refuse = False
         Api.section = "Аккаунты"
         Api.stock, Api.refills = 0, []
         Api.path = ["Игры", "Black Russia", "Аккаунты"]
         Api.kind, Api.value_block, Api.items_left, Api.updated = "", {}, [], []
         Api.sent, Api.accepts, Api.answer = [], None, None
+        Api.nameless = False
         # Маркетплейс кладёт позиции не мгновенно, и бот его ждёт. В
         # прогоне ждать нечего: ответ подставной и меняться не будет.
         from api import yoomarket as Y
@@ -687,6 +710,60 @@ class ThreeSourcesOfTheTypeAndTheOrderBetweenThem(Bench):
         # А пропуски память всё так же заполняет — иначе тест выше
         # проходил бы и на выброшенной памяти.
         self.assertEqual(str(body.get("category")), "613", body)
+
+
+class AClosedEditFormIsNotADeadEnd(Bench):
+    """Живой отказ 08.09: «❌ Копия не создалась — Товар прочитать не
+    вышло: update-fields: 403».
+
+    Панель закрыла ОДИН из трёх своих ответов, а копия отказалась целиком.
+    Это та же ошибка, что была с карточкой: Nova разрешает форму правки,
+    карточку и список независимо, и закрытая форма правки значит только
+    то, что название, описание и картинку надо взять в другом месте.
+    """
+
+    def test_the_copy_still_goes_out(self):
+        LiveNova.form_open = False
+        cb = self.press()
+        body = self.created()
+        self.assertTrue(body, "копия не ушла: " + str(cb.message.texts[-1]))
+        self.assertEqual(str(body.get("category")), "613", body)
+
+    def test_the_name_and_the_text_come_from_the_marketplace(self):
+        """Их знает форма правки — а она закрыта. Но тот же товар есть у
+        маркетплейса, и там они тоже есть."""
+        LiveNova.form_open = False
+        self.press()
+        body = self.created()
+        self.assertEqual(body.get("title"), TITLE, body)
+        self.assertIn("Black Russia", str(body.get("content")), body)
+
+    def test_and_it_still_asks_nothing(self):
+        LiveNova.form_open = False
+        cb = self.press()
+        asked = [t for t in cb.message.texts if "Выбери" in t]
+        self.assertEqual(asked, [], asked)
+
+    def test_a_nameless_item_is_a_refusal_and_says_so(self):
+        """Название — единственное, без чего создавать нечего. Молчат оба
+        источника — это отказ, а не товар с пустым заголовком на витрине."""
+        LiveNova.form_open = False
+        Api.nameless = True
+        cb = self.press()
+        self.assertEqual(self.created(), {}, "отправлять было нечего")
+        self.assertIn("названия", cb.message.texts[-1].lower())
+
+    def test_but_all_three_closed_is_a_refusal_in_russian(self):
+        """Когда молчат все три, отказ честный — и не кодом панели:
+        «update-fields: 403» не говорит продавцу ничего."""
+        LiveNova.form_open = False
+        LiveNova.card_open = False
+        LiveNova.list_open = False
+        cb = self.press()
+        said = cb.message.texts[-1]
+        self.assertEqual(self.created(), {}, "отправлять было нечего")
+        self.assertIn("панель", said.lower(), said)
+        self.assertIn("форму правки", said, said)
 
 
 class TheStockIsPutInByTheBotAsFarAsItHonestlyCan(Bench):
