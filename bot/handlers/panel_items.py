@@ -741,6 +741,7 @@ async def item_stock_save(message: Message, state: FSMContext,
     await state.clear()
     status = await message.answer("⏳ Добавляю остатки...")
 
+    kept = False
     try:
         ad = await api.get_ad(item_id)
         inner = ad.get("data") or ad
@@ -753,15 +754,25 @@ async def item_stock_save(message: Message, state: FSMContext,
             items = [ln.strip() for ln in text.splitlines() if ln.strip()]
             await api.add_ad_items(item_id, items)
             done = f"добавлено позиций: {len(items)}"
+            # Тот же список пригодится следующей копии. Просить продавца
+            # найти для этого отдельный экран — значит просить его вводить
+            # одно и то же после каждой копии.
+            kept = _remember_stock(message.from_user.id, items)
 
         b = InlineKeyboardBuilder()
         b.button(text="🚀 Отправить на модерацию",
                  callback_data=f"pitem_show:{item_id}")
         b.button(text="⬅️ К товару", callback_data=f"pitem:{item_id}")
         ui.lay(b)
+        # Запомненное называется вслух: эти строки уходят покупателям, и
+        # молчаливая заготовка однажды уедет вместо товара.
+        note = ("\n\n📦 Запомнил этот список — буду класть его каждому новому"
+                " товару с авто-выдачей.\n<i>Покупатель получит именно эти"
+                " строки. Поменять: «📋 Шаблонная копия → 📦 Остатки по"
+                " умолчанию».</i>" if kept else "")
         await status.edit_text(
             f"✅ <b>Готово</b> — {done}.\n\n"
-            f"Теперь товар можно отправить на модерацию.",
+            f"Теперь товар можно отправить на модерацию." + note,
             reply_markup=b.as_markup(),
         )
     except Exception as e:
@@ -771,6 +782,26 @@ async def item_stock_save(message: Message, state: FSMContext,
             f"❌ Не удалось добавить остатки:\n<code>{str(e)[:300]}</code>",
             reply_markup=b.as_markup(),
         )
+
+
+def _remember_stock(uid: int, items: list) -> bool:
+    """Запомнить присланный список как остатки по умолчанию.
+
+    Пишется ТОЛЬКО когда своего списка ещё нет: перезаписать заготовку тем,
+    что продавец прислал одному товару, значит подменить её молча — а её
+    строки уходят живым покупателям.
+    """
+    try:
+        from features import ad_templates_shown
+        from storage import get_copy_stock, set_copy_stock
+        if not ad_templates_shown(uid) or get_copy_stock(uid):
+            return False
+        set_copy_stock(uid, items)
+        logger.info("остатки по умолчанию запомнены: %d поз.", len(items))
+        return True
+    except Exception as e:                                # noqa: BLE001
+        logger.info("остатки по умолчанию не запомнились: %s", e)
+    return False
 
 
 def _ad_price(ad: dict) -> int:

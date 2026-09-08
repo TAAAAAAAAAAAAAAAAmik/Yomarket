@@ -821,6 +821,11 @@ def _pick_option(options: list, value, label: str, words: list,
     return None, ""
 
 
+# С какой длины список считается возможно ОБРЕЗАННЫМ. Панель отдаёт сотни
+# разделов и режет их; четыре типа выдачи — это весь список целиком, и
+# значения, которого в нём нет, у поля просто не существует.
+_MAYBE_TRIMMED = 100
+
 # Раздел, подраздел и тип выдачи. Их значение по умолчанию не берётся
 # никогда: раздел решает, где покупатель увидит товар, а тип — как заказ
 # будет выдаваться. Молча ошибиться здесь дороже, чем спросить.
@@ -992,13 +997,18 @@ async def _ask_next_select(msg, state: FSMContext, uid: int,
             guess, took = ({"value": default, "label": str(default)},
                            "по умолчанию формы")
 
-    if guess is None and src not in (None, ""):
+    if guess is None and src not in (None, "") and len(options) >= _MAYBE_TRIMMED:
         # Номер взят с карточки ЭТОЙ ЖЕ панели, у ЭТОГО ЖЕ товара, и поле у
         # формы создания то же самое — значит и нумерация та же. Не сошлось
         # ни со списком, ни с поиском — отправляем как есть и говорим об
         # этом: панель, если номер не тот, ответит отказом по полю, и отказ
         # станет вопросом. Выбросить номер — это тупик вместо вопроса, и
         # ровно в него копия и упиралась.
+        #
+        # Но только когда список ДЛИННЫЙ. Сотни строк панель обрезает, и
+        # «нет в списке» там ничего не доказывает; а четыре типа выдачи —
+        # это весь список целиком, и значения, которого в нём нет, у поля
+        # не существует. Отправить такое значит отправить заведомо чужое.
         guess = {"value": src, "label": hint or str(src)}
         took = "как у образца, со списком не сверился"
 
@@ -1417,8 +1427,16 @@ async def _ask_for_refused_fields(msg, uid: int, values: dict,
 
 
 async def _fill_stock(api, item_id: str, want, source_id: str = "",
-                      uid: int = 0) -> tuple[str, bool]:
-    """Проставить остаток новому товару. → (строка отчёта, проставлен ли).
+                      uid: int = 0) -> tuple[str, bool, bool]:
+    """Проставить остаток новому товару.
+
+    → (строка отчёта, проставлен ли, заготовка ли это).
+
+    Третье значение — не то же, что второе. Заготовка продавца остаток
+    ПРОСТАВЛЯЕТ, но строки в ней его собственные и общие на все товары:
+    кнопку «прислать настоящие» после неё надо оставить, а отчёт о ней
+    прямо на неё и показывает. Решать это по тексту отчёта нельзя — разбор
+    своей же прозы ломается на первой же правке слов.
 
     Без остатка панель товар не публикует, и продавцу приходилось жать
     «📦 Добавить остатки» и вводить число, которое мастер уже спрашивал.
@@ -1445,17 +1463,17 @@ async def _fill_stock(api, item_id: str, want, source_id: str = "",
     except (TypeError, ValueError):
         want = 0
     if not api or not item_id:
-        return "", False
+        return "", False, False
 
     try:
         ad = await api.get_ad(item_id)
         kind = str(((ad.get("data") or ad) or {}).get("type") or "")
     except Exception as e:                                # noqa: BLE001
         logger.warning("вид товара %s не прочитался: %s", item_id, e)
-        return "\n📦 Остаток проставить не вышло — добавь вручную.", False
+        return "\n📦 Остаток проставить не вышло — добавь вручную.", False, False
 
     if kind == "unlimited":
-        return "\n📦 Остаток не нужен — товар безлимитный.", True
+        return "\n📦 Остаток не нужен — товар безлимитный.", True, False
 
     if kind == "auto-delivery":
         # Заготовка продавца, если он её задал. Копировать позиции с
@@ -1463,30 +1481,32 @@ async def _fill_stock(api, item_id: str, want, source_id: str = "",
         # вправе положить один раз и не вводить его каждый раз заново.
         ready = await _default_stock(uid)
         if ready:
-            return await _put_items(api, item_id, ready)
+            note, ok = await _put_items(api, item_id, ready)
+            return note, ok, True
         need = await _source_items_left(api, source_id)
         return ("\n📦 <b>Остаток — это сам товар</b>: коды или аккаунты, и они"
                 " одноразовые. Скопировать их с образца нельзя — это значит"
                 " продать одно и то же дважды."
                 + (f"\nУ образца сейчас {need}." if need else "")
-                + "\nПришли своим списком — кнопка ниже."), False
+                + "\nПришли своим списком — кнопка ниже."), False, False
 
     if kind == "auto-value":
-        return await _fill_value_stock(api, item_id, want, source_id)
+        note, ok = await _fill_value_stock(api, item_id, want, source_id)
+        return note, ok, False
 
     try:
         if want <= 0:
-            return "", False
+            return "", False, False
         await api.refill_ad_value(item_id, want)
         _has, said = await api.ad_stock(item_id)
         got = _stock_number(said)
         if got >= want:
-            return f"\n📦 Остаток проставлен: {got}", True
+            return f"\n📦 Остаток проставлен: {got}", True, False
         return (f"\n📦 Остаток проставить не вышло — сейчас {got} "
-                f"из {want}. Добавь вручную."), False
+                f"из {want}. Добавь вручную."), False, False
     except Exception as e:                                # noqa: BLE001
         logger.warning("остаток товару %s не проставлен: %s", item_id, e)
-        return "\n📦 Остаток проставить не вышло — добавь вручную.", False
+        return "\n📦 Остаток проставить не вышло — добавь вручную.", False, False
 
 
 async def _default_stock(uid: int) -> list:
@@ -1704,6 +1724,9 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
         # Проставлен ли остаток. Кнопка «прислать» нужна ровно тогда, когда
         # нет: у авто-выдачи остаток — это сам товар, и бот его не выдумает.
         stock_ok = True
+        # Заготовка остаток ставит, но строки в ней общие на все товары:
+        # кнопку «прислать настоящие» после неё надо оставить.
+        stock_ready = False
         if item_id:
             # Остаток — ПЕРЕД публикацией: без него панель публиковать
             # отказывается, и «добавь остатки» после отказа было лишним
@@ -1712,7 +1735,7 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
                 await status_msg.edit_text("⏳ Товар создан, ставлю остаток…")
             except Exception:
                 pass
-            stock_note, stock_ok = await _fill_stock(
+            stock_note, stock_ok, stock_ready = await _fill_stock(
                 api, item_id, values.get("quantity", 0),
                 names.get("source", ""), uid)
             try:
@@ -1753,10 +1776,12 @@ async def _panel_create_and_report(msg, uid: int, values: dict,
                 pub_note += (f"\n\n<i>{html.escape(str(pub_msg)[:400])}</i>")
 
         b = InlineKeyboardBuilder()
-        if item_id and not stock_ok:
+        if item_id and (not stock_ok or stock_ready):
             # Первым делом то, чего не хватает. Раньше кнопка зависела от
             # того, ушёл ли товар на модерацию, — а нужна она ровно тогда,
-            # когда остатка нет: без него публиковать нечего.
+            # когда остатка нет: без него публиковать нечего. И после
+            # заготовки: её строки общие на все товары, а отчёт о ней сам
+            # советует «заменишь на настоящие — кнопка ниже».
             b.button(text="📦 Прислать остатки",
                      callback_data=f"pitem_stock:{item_id}")
             # И вторая — чтобы не присылать их руками каждый раз. Настройка
@@ -2286,6 +2311,15 @@ async def _copy_source_values(uid: int, ad_id: str, api=None,
         values["price"] = await _price_from_api(api, ad_id)
     if values.get("quantity") in (None, ""):
         values["quantity"] = await _stock_from_api(api, ad_id)
+
+    # ТИП ВЫДАЧИ берётся у маркетплейса, и это не догадка о словах.
+    # Значения поля панели и значения `type` у объявления — ОДИН словарь:
+    # отчёт печатает «надпись (значение)», и у живого товара там стояло
+    # «Авто-выдача (auto-delivery)», а карточка маркетплейса того же товара
+    # отвечает `type = auto-delivery`. Совпадение не по смыслу, а буквой.
+    kind = str((await _ad_card(api, ad_id)).get("type") or "")
+    if kind:
+        values["ad_type"] = kind
     try:
         if float(values["price"]) <= 0:
             raise ValueError
@@ -2392,7 +2426,15 @@ async def copy_item(callback: CallbackQuery, state: FSMContext,
     marks = get_copy_marks(uid, ad_id)
     if not marks.get("values") and cid not in (None, "", 0):
         marks = get_copy_marks(uid, f"cat:{cid}")
-    chosen = {**marks.get("values", {}), **extra}
+
+    # Тип выдачи — от маркетплейса, тем же словом, каким его называет
+    # панель. Он свежее запомненного (товар мог сменить вид выдачи) и
+    # уступает только тому, что панель сказала о себе сама.
+    from_market = {}
+    kind = str(values.pop("ad_type", "") or "")
+    if kind:
+        from_market["type"] = kind
+    chosen = {**marks.get("values", {}), **from_market, **extra}
     hints = {**marks.get("labels", {}), **labels}
 
     # Состояние живое: отказ по недостающему полю станет вопросом, а не

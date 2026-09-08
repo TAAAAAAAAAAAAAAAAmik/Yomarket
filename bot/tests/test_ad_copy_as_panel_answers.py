@@ -69,8 +69,8 @@ CARD_FIELDS = [
      "belongsToId": 613, "component": "belongs-to-field"},
     {"attribute": "subcategory", "value": {"display": "Аккаунты"},
      "belongsToId": 3, "component": "belongs-to-field"},
-    {"attribute": "type", "value": {"display": "Мгновенная выдача"},
-     "belongsToId": 1, "component": "belongs-to-field"},
+    {"attribute": "type", "value": {"display": "Авто-выдача"},
+     "belongsToId": "auto-delivery", "component": "belongs-to-field"},
     {"attribute": "filter__8", "value": "Россия"},
 ]
 
@@ -102,10 +102,13 @@ CATEGORY_OPTIONS = [{"value": 613 if g == "Black Russia" else 1000 + i,
 SUBCATEGORY_OPTIONS = [{"value": 3, "display": "Аккаунты с виртами"},
                        {"value": 4, "display": "Ключи"},
                        {"value": 5, "display": "Валюта"}]
-TYPE_OPTIONS = [{"value": 1, "display": "Мгновенная выдача"},
-                {"value": 2, "display": "Ручная выдача"},
-                {"value": 3, "display": "По запросу"},
-                {"value": 4, "display": "Предзаказ"}]
+# Значения — те же слова, какими маркетплейс называет `type` у объявления:
+# отчёт живого бота печатал «Авто-выдача (auto-delivery)», а карточка того
+# же товара отвечает `type = auto-delivery`.
+TYPE_OPTIONS = [{"value": "auto-delivery", "display": "Авто-выдача"},
+                {"value": "auto-value", "display": "Авто-выбор"},
+                {"value": "unlimited", "display": "Безлимитная"},
+                {"value": "simple", "display": "Ограниченная выдача"}]
 
 _DETAIL = re.compile(r"^/nova-api/[\w-]+/\d+$")
 
@@ -326,6 +329,18 @@ class Api:
     async def get_ad_items(self, ad_id, cursor=None):
         return {"data": list(Api.items_left)}
 
+    # Что приняли и что видно при перечитывании — РАЗНЫЕ вещи: маркетплейс
+    # может взять не все строки, а публикует он по второму числу.
+    sent: list = []
+    accepts: int | None = None
+
+    async def add_ad_items(self, ad_id, items):
+        rows = list(items)
+        Api.sent.append((str(ad_id), rows))
+        take = len(rows) if Api.accepts is None else Api.accepts
+        Api.items_left = [{"status": "available"} for _ in rows[:take]]
+        return {"data": {"added": take}}
+
     # Дерево разделов маркетплейса. Товар лежит в ЛИСТЕ («Аккаунты»), а
     # панель раскладывает по играм («Standoff 2»): нужное слово стоит на
     # среднем уровне, и одним именем листа его не достать.
@@ -406,6 +421,12 @@ class Bench(unittest.TestCase):
         Api.stock, Api.refills = 0, []
         Api.path = ["Игры", "Black Russia", "Аккаунты"]
         Api.kind, Api.value_block, Api.items_left, Api.updated = "", {}, [], []
+        Api.sent, Api.accepts = [], None
+        # Заготовка остатков — своя на каждый тест. По умолчанию её нет:
+        # подставленная за продавца, она уехала бы живому покупателю.
+        self.default_stock: list = []
+        self._get_stock = storage.get_copy_stock
+        storage.get_copy_stock = lambda uid: list(self.default_stock)
 
     def tearDown(self):
         if hasattr(self, "_was_content"):
@@ -416,6 +437,7 @@ class Bench(unittest.TestCase):
         self.storage.get_copy_marks = self._get_marks
         self.storage.remember_copy_marks = self._set_marks
         self.storage.forget_copy_marks = self._del_marks
+        self.storage.get_copy_stock = self._get_stock
         self.storage.get_panel_creds = self._creds
         self.storage._DATA_DIR = self._dir
         self.features.ad_templates_shown = self._shown
@@ -442,7 +464,7 @@ class Bench(unittest.TestCase):
         asyncio.run(C.copy_item(cb, fsm, api))
         # Копия могла остановиться на вопросе — тогда создания нет вовсе, и
         # проверять надо ВЫБРАННОЕ, а не отправленное.
-        self.fsm = fsm
+        self.fsm, self.cb = fsm, cb
         self.chosen = dict(fsm.data.get("chosen") or {})
         return cb
 
@@ -471,7 +493,7 @@ class TheCopyAsksNothingWhenTheSampleHasTheAnswers(Bench):
         body = self.created()
         self.assertEqual(str(body.get("category")), "613", body)
         self.assertEqual(str(body.get("subcategory")), "3", body)
-        self.assertEqual(str(body.get("type")), "1", body)
+        self.assertEqual(str(body.get("type")), "auto-delivery", body)
 
     def test_the_rest_of_the_item_travels_too(self):
         self.press()
@@ -554,6 +576,41 @@ class ThePanelShowsNoSectionAtAllAndItStillWorks(Bench):
         self.assertEqual(self.chosen.get("category"), 613, self.chosen)
         self.assertEqual(self.chosen.get("subcategory"), 3, self.chosen)
 
+    def test_not_a_single_question_even_with_nothing_remembered(self):
+        """Ради этого всё и делалось.
+
+        Панель не показывает ни раздела, ни подраздела, ни типа. Памяти
+        нет. И всё равно спрашивать нечего: раздел и подраздел находятся в
+        тексте товара, а тип выдачи маркетплейс называет тем же словом,
+        каким его называет панель — `auto-delivery`."""
+        Api.path = []
+        Api.kind = "auto-delivery"
+        cb = self.press()
+        asked = [t for t in cb.message.texts if "Выбери" in t]
+        self.assertEqual(asked, [], asked)
+        body = self.created()
+        self.assertEqual(str(body.get("category")), "613", body)
+        self.assertEqual(str(body.get("subcategory")), "3", body)
+        self.assertEqual(str(body.get("type")), "auto-delivery", body)
+
+    def test_the_type_is_not_asked_when_the_marketplace_names_it(self):
+        """Тип выдачи был последним, что бот спрашивал у каждой копии."""
+        Api.path = []
+        Api.kind = "auto-value"
+        cb = self.press()
+        self.assertFalse([t for t in cb.message.texts if "Выбери" in t],
+                         cb.message.texts)
+        self.assertEqual(str(self.created().get("type")), "auto-value")
+
+    def test_a_type_the_panel_does_not_know_is_still_asked(self):
+        """Словарь мог разойтись — тогда вопрос честнее подстановки."""
+        Api.path = []
+        Api.kind = "чего-то-такого-нет"
+        cb = self.press()
+        asked = [t for t in cb.message.texts if "Выбери" in t]
+        self.assertEqual(len(asked), 1, asked)
+        self.assertIn("type", asked[0])
+
     def test_the_game_is_taken_from_the_description(self):
         """Ради этого правка и делалась. Раздел панели — игра, а в НАЗВАНИИ
         товара её нет: «💖Аккаунт 💖Баланс: 3.000.000 ₽». Зато она есть в
@@ -584,6 +641,41 @@ class ThePanelShowsNoSectionAtAllAndItStillWorks(Bench):
         cb = self.press()
         asked = [t for t in cb.message.texts if "Выбери" in t]
         self.assertTrue(any("category" in t for t in asked), asked)
+
+
+class ThreeSourcesOfTheTypeAndTheOrderBetweenThem(Bench):
+    """Вид выдачи бот берёт из трёх мест, и порядок между ними не случаен.
+
+    Панель отвечает о СВОЁМ поле — том самом, в которое значение и уедет.
+    Маркетплейс называет тот же товар, но своей стороной. Память — ответ,
+    подходивший раньше. Разъехаться они могут молча, и тогда копия уйдёт
+    с другим способом доставки: покупатель нажмёт «купить» и получит не
+    то, что у образца.
+    """
+
+    def test_the_panel_beats_the_marketplace(self):
+        """Карточка панели показывает `type` = auto-delivery. Маркетплейс
+        того же товара в этом тесте говорит другое — и уступает: значение
+        уедет в форму ПАНЕЛИ, и о её поле она сказала сама."""
+        Api.kind = "auto-value"
+        self.press()
+        body = self.created()
+        self.assertEqual(str(body.get("type")), "auto-delivery", body)
+
+    def test_but_the_marketplace_beats_what_we_remembered(self):
+        """Запомненное — прошлогодний ответ: товар мог сменить вид выдачи
+        после того, как копию делали в прошлый раз. Панель здесь молчит
+        (живой случай), и спор идёт между памятью и маркетплейсом."""
+        LiveNova.section_visible = False
+        self.marks[ITEM] = {"values": {"type": "unlimited", "category": 613,
+                                       "subcategory": 3}, "labels": {}}
+        Api.kind = "auto-value"
+        self.press()
+        body = self.created()
+        self.assertEqual(str(body.get("type")), "auto-value", body)
+        # А пропуски память всё так же заполняет — иначе тест выше
+        # проходил бы и на выброшенной памяти.
+        self.assertEqual(str(body.get("category")), "613", body)
 
 
 class TheStockIsPutInByTheBotAsFarAsItHonestlyCan(Bench):
@@ -642,6 +734,65 @@ class TheStockIsPutInByTheBotAsFarAsItHonestlyCan(Bench):
         self.assertIn("📦 Прислать остатки", texts, texts)
         self.assertNotIn("⚙️ Класть их всегда", texts, texts)
 
+    def test_the_default_list_is_put_in_without_a_single_question(self):
+        """Ради этого правка и делалась: продавец задал заготовку один раз,
+        и дальше остатки у копии появляются сами."""
+        Api.kind = "auto-delivery"
+        self.default_stock = ["KEY-1111", "KEY-2222", "KEY-3333"]
+        cb = self.press()
+        said = cb.message.texts[-1]
+        self.assertEqual([rows for _id, rows in Api.sent],
+                         [["KEY-1111", "KEY-2222", "KEY-3333"]], Api.sent)
+        self.assertNotEqual(Api.sent[0][0], ITEM,
+                            "позиции кладутся КОПИИ, а не образцу")
+        self.assertIn("Остаток проставлен: 3 поз.", said)
+        self.assertNotIn("одноразовые", said, "просить нечего — список есть")
+
+    def test_and_it_warns_whose_rows_the_buyer_will_get(self):
+        """Заготовка, забытая на витрине, — это оплаченный заказ с мусором
+        внутри. Молчание здесь дороже лишней строки."""
+        Api.kind = "auto-delivery"
+        self.default_stock = ["KEY-1111"]
+        said = self.press().message.texts[-1]
+        self.assertIn("получит именно эти строки", said)
+        self.assertIn("📦 Прислать остатки", self.keyboard_texts(self.cb),
+                      "заменить заготовку настоящими — тут же")
+
+    def test_the_number_comes_from_the_re_read_not_from_what_we_sent(self):
+        """«Отправлено 3» и «в наличии 3» — разные утверждения, а
+        публиковать маркетплейс даёт по второму."""
+        Api.kind = "auto-delivery"
+        self.default_stock = ["KEY-1111", "KEY-2222", "KEY-3333"]
+        Api.accepts = 1                      # взял одну из трёх
+        said = self.press().message.texts[-1]
+        self.assertIn("1 поз.", said, said)
+        self.assertNotIn("3 поз.", said, said)
+
+    def test_nothing_in_stock_after_sending_is_not_called_success(self):
+        Api.kind = "auto-delivery"
+        self.default_stock = ["KEY-1111"]
+        Api.accepts = 0
+        said = self.press().message.texts[-1]
+        self.assertIn("в наличии их нет", said, said)
+
+    def test_a_marketplace_that_refuses_the_list_says_so(self):
+        """Исключение отсюда съело бы весь отчёт о созданном товаре."""
+        Api.kind = "auto-delivery"
+        self.default_stock = ["KEY-1111"]
+
+        async def boom(ad_id, items):
+            raise RuntimeError("остатки не принимаются")
+
+        was = Api.add_ad_items
+        Api.add_ad_items = lambda self, ad_id, items: boom(ad_id, items)
+        try:
+            said = self.press().message.texts[-1]
+        finally:
+            Api.add_ad_items = was
+        self.assertIn("Товар создан", said, said)
+        self.assertIn("не вышло", said, said)
+        self.assertIn("остатки не принимаются", said, said)
+
     def test_an_unlimited_copy_is_not_nagged_about_stock(self):
         Api.kind = "unlimited"
         cb = self.press()
@@ -677,7 +828,7 @@ class AnAnswerGivenOnceIsNotAskedAgain(Bench):
                 break
             want = next((i for i, o in enumerate(options)
                          if o["label"] in ("Black Russia", "Аккаунты с виртами",
-                                           "Мгновенная выдача")), 0)
+                                           "Авто-выдача")), 0)
             pick = CB(f"cadopt:{want}")
             pick.message = cb.message
             asyncio.run(C.choose_select_option(pick, fsm, Api()))
@@ -727,7 +878,7 @@ class AnAnswerGivenOnceIsNotAskedAgain(Bench):
 
     def test_the_second_copy_does_not_ask_the_same_thing(self):
         self.marks[ITEM] = {"values": {"category": 613, "subcategory": 3,
-                                       "type": 1},
+                                       "type": "auto-delivery"},
                             "labels": {"category": "Black Russia"}}
         cb = self.press()
         self.assertEqual([t for t in cb.message.texts if "Выбери" in t], [])
@@ -735,7 +886,7 @@ class AnAnswerGivenOnceIsNotAskedAgain(Bench):
 
     def test_the_report_names_the_section_not_its_number(self):
         self.marks[ITEM] = {"values": {"category": 613, "subcategory": 3,
-                                       "type": 1},
+                                       "type": "auto-delivery"},
                             "labels": {"category": "Black Russia"}}
         cb = self.press()
         self.assertIn("раздел: Black Russia", cb.message.texts[-1])

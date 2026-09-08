@@ -650,7 +650,11 @@ class TheStockIsFilledInWithoutAsking(Bench):
             return {"data": list(self.src_items)}
 
     def fill(self, api, want=5, source=""):
-        return run(C._fill_stock(api, "55", want, source))
+        """→ (отчёт, проставлен ли). Третье значение — «это заготовка» —
+        остаётся в `self.ready`: спрашивают о нём два теста, а остальным
+        оно только мешало бы читаться."""
+        said, ok, self.ready = run(C._fill_stock(api, "55", want, source))
+        return said, ok
 
     def test_it_tops_up_to_the_asked_number(self):
         api = self.Api(stock=0, after=5)
@@ -716,6 +720,8 @@ class TheStockIsFilledInWithoutAsking(Bench):
             C._default_stock = was
         self.assertEqual(api.added, [["KEY-1111", "KEY-2222", "KEY-3333"]])
         self.assertTrue(ok)
+        self.assertTrue(self.ready, "заготовка названа заготовкой — по ней "
+                        "остаётся кнопка «прислать настоящие»")
         self.assertIn("3 поз.", said)
         self.assertIn("получит именно эти строки", said,
                       "заготовка на витрине — оплаченный заказ с мусором")
@@ -768,6 +774,7 @@ class TheStockIsFilledInWithoutAsking(Bench):
         о беде, которой нет."""
         said, ok = self.fill(self.Api(kind="unlimited"))
         self.assertTrue(ok)
+        self.assertFalse(self.ready, "заготовки тут не было")
         self.assertIn("безлимит", said.lower())
         self.assertNotIn("не вышло", said)
 

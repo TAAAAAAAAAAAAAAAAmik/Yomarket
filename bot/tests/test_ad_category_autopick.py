@@ -448,13 +448,28 @@ class ACutOffListDoesNotDenyTheSectionTheItemAlreadyHas(unittest.TestCase):
 
         Выброшенный номер вопросом не становится — он становится списком из
         сотен чужих строк, в котором нужного нет. Ровно в это копия и
-        упиралась."""
-        self.wizard(many(20), {"category": 12}, {"category": "Standoff 2"})
+        упиралась.
+
+        Список для этого должен быть ДЛИННЫМ: сотни строк панель обрезает,
+        и «нет в списке» там ничего не доказывает."""
+        self.wizard(many(_PANEL_GIVES), {"category": 12},
+                    {"category": "Standoff 2"})
         self.assertEqual(self.asked, [])
         self.assertEqual(self.created[0]["extra"], {"category": 12})
         self.assertTrue(
             any("не сверился" in p for p in self.created[0]["picked"]),
             self.created[0]["picked"])
+
+    def test_but_a_short_list_denies_the_number_for_real(self):
+        """Четыре типа выдачи — это весь список целиком, и значения,
+        которого в нём нет, у поля просто не существует. Отправить такое
+        значит отправить заведомо чужое: панель ответит отказом, а продавец
+        получит круг вместо ответа."""
+        options = [{"label": "Авто-выдача", "value": "auto-delivery"},
+                   {"label": "Ручная", "value": "manual"}]
+        self.wizard(options, {"category": "чего-то-такого-нет"}, {})
+        self.assertEqual(self.asked, ["category"])
+        self.assertEqual(self.created, [])
 
     def test_it_asks_the_panel_by_name_before_giving_up(self):
         """Листать за продавца обрезок бессмысленно — нужного в нём не было.
