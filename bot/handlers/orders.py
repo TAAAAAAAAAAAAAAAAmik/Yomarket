@@ -11,7 +11,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import ui
 
-from api.yoomarket import YooMarketAPI
+from api.yoomarket import YooMarketAPI, next_cursor
 from keyboards.main import OrderCallback, PaginationCallback, back_keyboard, order_actions_keyboard
 from orderfields import (BACK, DONE, describe, money, status_icon,
                          status_ru)
@@ -150,7 +150,7 @@ async def show_orders(callback: CallbackQuery, api: YooMarketAPI) -> None:
     try:
         data = await api.get_orders()
         orders: list[dict] = data.get("data") or data.get("items") or []
-        next_cursor: str | None = data.get("meta", {}).get("next_cursor")
+        next_cursor: str | None = next_cursor(data)
         details = get_settings(callback.from_user.id).get("known_order_details") or {}
         text = _format_orders_text(orders, details)
         keyboard = _build_orders_keyboard(orders, next_cursor, details)
@@ -171,7 +171,7 @@ async def paginate_orders(
     try:
         data = await api.get_orders(cursor=callback_data.cursor)
         orders: list[dict] = data.get("data") or data.get("items") or []
-        next_cursor: str | None = data.get("meta", {}).get("next_cursor")
+        next_cursor: str | None = next_cursor(data)
         details = get_settings(callback.from_user.id).get("known_order_details") or {}
         text = _format_orders_text(orders, details)
         keyboard = _build_orders_keyboard(orders, next_cursor, details)

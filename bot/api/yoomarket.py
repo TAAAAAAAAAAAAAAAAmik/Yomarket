@@ -9,6 +9,44 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
+def next_cursor(data: dict) -> str:
+    """Курсор следующей страницы — так, как его кладёт ЭТОТ маркетплейс.
+
+    Живой ответ 08.09:
+
+        "meta":  {"per_page": 100, "has_more": true}
+        "links": {"next_cursor": "eyJpZCI6MTA5…", "prev_cursor": null}
+
+    То есть курсор лежит в `links.next_cursor`. Мы искали
+    `meta.next_cursor`, `meta.next` и `links.next` — ни одного из них
+    здесь нет, и листание не начиналось ВООБЩЕ: и товары, и справочник
+    разделов обрывались на первой странице. Продавец видел 15
+    объявлений из полусотни, а справочник — ровно 100 разделов.
+
+    `has_more: false` — это стоп даже при непустом курсоре: он у
+    последней страницы остаётся от предыдущей.
+
+    Место, знающее это, ОДНО на весь бот. Семь экранов читали
+    `meta.next_cursor` каждый у себя, и у всех семи кнопка «Следующая →»
+    не появлялась вовсе: заказы, чаты и цены обрывались на первой
+    странице ровно так же, как товары.
+    """
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    if meta.get("has_more") is False:
+        return ""
+    for block in (data.get("links"), meta, data):
+        if not isinstance(block, dict):
+            continue
+        for key in ("next_cursor", "nextCursor", "cursor_next", "next"):
+            val = block.get(key)
+            # `links.next` у Laravel бывает полным адресом страницы, а
+            # не курсором: отправленный как `cursor`, он вернул бы ту же
+            # страницу и закрутил бы цикл.
+            if val and not str(val).startswith("http"):
+                return str(val)
+    return ""
+
+
 class YooMarketAPI:
     def __init__(self, token: str) -> None:
         self.token = token
@@ -139,37 +177,9 @@ class YooMarketAPI:
         return await self._get("/ads", params=params)
 
     @staticmethod
-    def _next_cursor(data: dict) -> str:
-        """Курсор следующей страницы — так, как его кладёт ЭТОТ маркетплейс.
-
-        Живой ответ 08.09:
-
-            "meta":  {"per_page": 100, "has_more": true}
-            "links": {"next_cursor": "eyJpZCI6MTA5…", "prev_cursor": null}
-
-        То есть курсор лежит в `links.next_cursor`. Мы искали
-        `meta.next_cursor`, `meta.next` и `links.next` — ни одного из них
-        здесь нет, и листание не начиналось ВООБЩЕ: и товары, и справочник
-        разделов обрывались на первой странице. Продавец видел 15
-        объявлений из полусотни, а справочник — ровно 100 разделов.
-
-        `has_more: false` — это стоп даже при непустом курсоре: он у
-        последней страницы остаётся от предыдущей.
-        """
-        meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
-        if meta.get("has_more") is False:
-            return ""
-        for block in (data.get("links"), meta, data):
-            if not isinstance(block, dict):
-                continue
-            for key in ("next_cursor", "nextCursor", "cursor_next", "next"):
-                val = block.get(key)
-                # `links.next` у Laravel бывает полным адресом страницы, а
-                # не курсором: отправленный как `cursor`, он вернул бы ту же
-                # страницу и закрутил бы цикл.
-                if val and not str(val).startswith("http"):
-                    return str(val)
-        return ""
+    def next_cursor(data: dict) -> str:
+        """Курсор следующей страницы. Тело — в `next_cursor` модуля."""
+        return next_cursor(data)
 
     async def get_all_ads(self, max_pages: int = 25) -> list[dict]:
         """ВСЕ объявления продавца — с проходом по страницам.
@@ -201,7 +211,7 @@ class YooMarketAPI:
                 if rid:
                     seen_ids.add(rid)
                 out.append(row)
-            cursor = self._next_cursor(data)
+            cursor = self.next_cursor(data)
             if not cursor or not rows or cursor in used:
                 break
             used.add(cursor)
@@ -894,7 +904,7 @@ class YooMarketAPI:
             data = await self._get("/categories", params=params or None)
             rows = data.get("data") or data.get("items") or []
             out.extend(r for r in rows if isinstance(r, dict))
-            nxt = self._next_cursor(data)
+            nxt = self.next_cursor(data)
             if not nxt or not rows or nxt == cursor:
                 break
             cursor = nxt

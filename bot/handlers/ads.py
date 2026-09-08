@@ -7,7 +7,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import ui
 
-from api.yoomarket import YooMarketAPI
+from api.yoomarket import YooMarketAPI, next_cursor
 from keyboards.main import AdCallback, PaginationCallback, back_keyboard
 
 router = Router()
@@ -149,10 +149,15 @@ async def ads_menu(callback: CallbackQuery, api: YooMarketAPI) -> None:
         data = await api.get_ads()
         ads: list[dict] = data.get("data") or data.get("items") or []
         meta = data.get("meta", {})
-        next_cursor: str | None = meta.get("next_cursor")
+        # «Всего товаров» — единственное, что этот экран сообщает, и своего
+        # числа маркетплейс не называет: в `meta` только `per_page` и
+        # `has_more`. Значит считаем по всем страницам, иначе на экране
+        # стоит размер первой страницы, выданный за размер магазина.
         total: int | None = meta.get("total")
+        if not total:
+            total = len(await api.get_all_ads())
         text = _fmt_list(ads, total)
-        keyboard = _ads_keyboard(ads, next_cursor)
+        keyboard = _ads_keyboard(ads, next_cursor(data))
     except Exception as e:
         text = _load_error(e)
         b = InlineKeyboardBuilder()
@@ -176,7 +181,7 @@ async def paginate_ads(
         data = await api.get_ads(cursor=callback_data.cursor)
         ads: list[dict] = data.get("data") or data.get("items") or []
         meta = data.get("meta", {})
-        next_cursor: str | None = meta.get("next_cursor")
+        next_cursor: str | None = next_cursor(data)
         total: int | None = meta.get("total")
         text = _fmt_list(ads, total)
         keyboard = _ads_keyboard(ads, next_cursor)

@@ -19,7 +19,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import ui
 
-from api.yoomarket import YooMarketAPI
+from api.yoomarket import YooMarketAPI, next_cursor
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ async def _load_ads(api: YooMarketAPI, uid: int, force: bool = False) -> list[di
         data = await api.get_ads(cursor=cursor) if cursor else await api.get_ads()
         chunk = data.get("data") or data.get("items") or []
         ads.extend(a for a in chunk if isinstance(a, dict))
-        cursor = (data.get("meta") or {}).get("next_cursor")
+        cursor = next_cursor(data)
         if not cursor or not chunk:
             break
     _cache[uid] = (time.time(), ads)

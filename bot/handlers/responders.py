@@ -11,6 +11,7 @@ import ui
 from storage import get_settings, save_settings
 
 import autoreply as ar
+from api.yoomarket import next_cursor
 import localtime as _lt
 from datetime import datetime
 
@@ -102,7 +103,7 @@ async def _load_all_ads(api, uid: int = 0) -> list[dict]:
         if not items:
             break
         ads.extend(items)
-        cursor = data.get("cursor") or data.get("next_cursor")
+        cursor = next_cursor(data)
         if not cursor:
             break
     return ads
