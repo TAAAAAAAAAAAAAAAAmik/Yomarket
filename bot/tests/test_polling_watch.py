@@ -66,22 +66,30 @@ class WatchCase(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)      # даём отправке уйти в задачу
         return self.bot.sent
 
+    async def stuck(self, text=None):
+        """Сбой, который ДЕРЖИТСЯ: одна неудачная попытка проходит сама, и
+        тревога по ней — ложная. Здесь первая попытка отодвигается в
+        прошлое, как это и бывает у настоящей беды."""
+        await self.emit(text or CONFLICT)
+        M.POLLING["failing_since"] = time.time() - M._POLLING_GRACE - 1
+        return await self.emit(text or CONFLICT)
+
 
 class ADeafBotSaysSoInsteadOfGoingQuiet(WatchCase):
     async def test_the_seller_is_told(self):
         """Раньше об этом знал только лог контейнера."""
-        sent = await self.emit(CONFLICT)
+        sent = await self.stuck()
         self.assertEqual(len(sent), 1)
 
     async def test_the_message_goes_to_the_owner(self):
         from storage import OWNER_ID
-        sent = await self.emit(CONFLICT)
+        sent = await self.stuck()
         self.assertEqual(sent[0][0], OWNER_ID)
 
     async def test_a_second_instance_is_named_in_plain_words(self):
         """«Conflict: terminated by other getUpdates request» на экране
         продавца — отписка. Он должен прочитать, что делать."""
-        sent = await self.emit(CONFLICT)
+        sent = await self.stuck()
         said = sent[0][1]
         self.assertIn("дважды", said)
         self.assertIn("токен", said)
@@ -90,12 +98,12 @@ class ADeafBotSaysSoInsteadOfGoingQuiet(WatchCase):
     async def test_the_message_explains_why_it_arrived_at_all(self):
         """Сообщение «я не получаю сообщений», которое пришло, выглядит
         противоречием — пока не сказано, что ломается только приём."""
-        sent = await self.emit(CONFLICT)
+        sent = await self.stuck()
         self.assertIn("Отправлять", sent[0][1])
 
     async def test_another_failure_is_reported_as_it_came(self):
         """Незнакомую причину переводить нечем — но и молчать о ней нельзя."""
-        sent = await self.emit(NETWORK)
+        sent = await self.stuck(NETWORK)
         self.assertIn("Request timeout", sent[0][1])
 
 
@@ -104,13 +112,13 @@ class ItDoesNotFloodTheChat(WatchCase):
     бы одинаковыми строчками, и продавец выключил бы уведомления."""
 
     async def test_the_same_trouble_is_told_once(self):
-        await self.emit(CONFLICT)
+        await self.stuck()
         await self.emit(CONFLICT)
         await self.emit(CONFLICT)
         self.assertEqual(len(self.bot.sent), 1)
 
     async def test_after_the_pause_it_reminds(self):
-        await self.emit(CONFLICT)
+        await self.stuck()
         M.POLLING["told_at"] = time.time() - 601
         await self.emit(CONFLICT)
         self.assertEqual(len(self.bot.sent), 2)
@@ -118,17 +126,101 @@ class ItDoesNotFloodTheChat(WatchCase):
     async def test_a_recovery_resets_the_silence(self):
         """Связь восстановилась — следующий сбой должен быть слышен сразу,
         а не через десять минут."""
-        await self.emit(CONFLICT)
+        await self.stuck()
         await self.emit("Connection established (tryings = 3, bot id = 1)",
                         logging.INFO)
         self.assertEqual(M.POLLING["error"], "")
-        await self.emit(CONFLICT)
-        self.assertEqual(len(self.bot.sent), 2)
+        await self.stuck()
+        self.assertEqual(len([s for s in self.bot.sent
+                              if "не получает" in s[1]]), 2)
 
     async def test_ordinary_log_lines_are_ignored(self):
         await self.emit("Run polling for bot @x id=1", logging.INFO)
         await self.emit("Update id=1 is handled.", logging.INFO)
         self.assertEqual(self.bot.sent, [])
+
+
+class OneBlipIsNotDeafness(WatchCase):
+    """Живой случай 09.09: владельцу пришло «🔇 Бот не получает сообщения»
+    на одном `Request timeout`, а бот в ту же минуту рисовал ему экраны.
+
+    Тревога соврала — и соврала в самую дорогую сторону: «сломано» там,
+    где цело. По такой идут перезапускать здоровый бот.
+    """
+
+    async def test_a_single_timeout_says_nothing(self):
+        await self.emit(NETWORK)
+        self.assertEqual(self.bot.sent, [])
+
+    async def test_and_health_still_says_ok(self):
+        await self.emit(NETWORK)
+        self.assertEqual(M.health_payload()["status"], "ok")
+
+    async def test_but_a_lasting_one_is_told(self):
+        """Конфликт двух ботов и вебхук сами не проходят: полторы минуты
+        ожидания настоящей беде ничего не стоят."""
+        sent = await self.stuck(NETWORK)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Не получается уже", sent[0][1])
+
+    async def test_an_arriving_update_proves_the_ear_works(self):
+        """Пришедшее обновление важнее неудачной попытки рядом: приём
+        работает, чем бы та ни кончилась."""
+        await self.emit(NETWORK)
+        M.POLLING["failing_since"] = time.time() - M._POLLING_GRACE - 1
+        M.POLLING["last_update"] = time.time()
+        await self.emit(NETWORK)
+        self.assertEqual(self.bot.sent, [])
+
+    async def test_and_health_is_not_deaf_then(self):
+        await self.emit(NETWORK)
+        M.POLLING["failing_since"] = time.time() - M._POLLING_GRACE - 1
+        M.POLLING["last_update"] = time.time()
+        self.assertEqual(M.health_payload()["status"], "ok")
+
+
+class TheAllClearIsSaidToo(WatchCase):
+    """Молча вернуться нельзя: последним словом осталось бы «бот не
+    получает сообщения», и владелец пошёл бы перезапускать исправный бот."""
+
+    async def test_a_recovery_after_the_alarm_is_announced(self):
+        await self.stuck()
+        await self.emit("Connection established (tryings = 3, bot id = 1)",
+                        logging.INFO)
+        await asyncio.sleep(0)
+        self.assertEqual(len(self.bot.sent), 2)
+        self.assertIn("снова приходят", self.bot.sent[1][1])
+
+    async def test_but_a_recovery_without_an_alarm_is_silent(self):
+        """О беде не говорили — значит и отбой некому давать."""
+        await self.emit(NETWORK)
+        await self.emit("Connection established (tryings = 3, bot id = 1)",
+                        logging.INFO)
+        await asyncio.sleep(0)
+        self.assertEqual(self.bot.sent, [])
+
+    async def test_an_incoming_update_gives_the_all_clear(self):
+        """Самое верное доказательство: обновление ПРИШЛО."""
+        await self.stuck()
+
+        async def handler(event, data):
+            return "ok"
+
+        mw = M.NoticeUpdates(self.watch)
+        await mw(handler, object(), {})
+        await asyncio.sleep(0)
+        self.assertEqual(len(self.bot.sent), 2)
+        self.assertIn("снова приходят", self.bot.sent[1][1])
+        self.assertEqual(M.POLLING["error"], "")
+
+    async def test_and_the_next_trouble_is_heard_again(self):
+        """Отбой обнуляет выдержку: следующая беда — снова с начала."""
+        await self.stuck()
+        await self.emit("Connection established", logging.INFO)
+        await asyncio.sleep(0)
+        await self.stuck()
+        self.assertEqual(len([s for s in self.bot.sent
+                              if "не получает" in s[1]]), 2)
 
 
 class HealthTellsAliveApartFromHearing(unittest.TestCase):
@@ -153,9 +245,13 @@ class HealthTellsAliveApartFromHearing(unittest.TestCase):
         """Текст берётся полностью, как его присылает Telegram: по обрезанному
         причину не различить, и ответ будет «одна из двух» — а это уже другое
         поведение, проверяемое в test_webhook.py."""
+        # Сбой ДЕРЖИТСЯ: по одной неудачной попытке бот глухим не
+        # объявляется — это проверяется в OneBlipIsNotDeafness.
         M.POLLING.update({"error": "TelegramConflictError: Telegram server "
                                    "says - Conflict: terminated by other "
-                                   "getUpdates request"})
+                                   "getUpdates request",
+                          "failing_since": time.time() - 600,
+                          "last_update": 0.0})
         got = M.health_payload()
         self.assertNotEqual(got["status"], "ok")
         self.assertIn("дважды", got["polling"])

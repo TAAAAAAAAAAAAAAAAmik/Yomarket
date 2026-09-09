@@ -1359,6 +1359,10 @@ class TaskManager:
             await self._maybe_bump_schedule(user_id, settings)
             await self._maybe_pour(user_id, settings)
 
+    # Сколько товаров залив заводит за один проход. Больше — и проход,
+    # идущий раз в минуту, не будет успевать завершиться до следующего.
+    _POUR_PER_PASS = 5
+
     async def _maybe_pour(self, user_id: int, settings: dict) -> None:
         """ЗАЛИВ: завести выбранные товары заново и убрать вчерашние свои.
 
@@ -1416,10 +1420,26 @@ class TaskManager:
         cap = int(conf.get("cap") or 0)
         gap = max(0, int(conf.get("gap") or 0))
 
+        # ЗА ОДИН ПРОХОД — НЕ БОЛЬШЕ ГОРСТИ. Копия товара это чтение
+        # панели, создание, остатки с ожиданием и публикация — секунд
+        # пятнадцать на товар. Восемнадцать отмеченных заняли бы проход
+        # на пять минут, а в этом же проходе идут заказы и напоминания, и
+        # на общем замке ждёт опрос чатов: письмо покупателя лежало бы всё
+        # это время. Остальные пойдут следующим проходом — очередь
+        # круговая, и никто не остаётся навсегда последним.
+        items = list(conf.get("items") or [])
+        start = int(conf.get("next_i") or 0) % max(1, len(items))
+        order = items[start:] + items[:start]
+        order = order[:self._POUR_PER_PASS]
+        conf["next_i"] = (start + len(order)) % max(1, len(items))
+        if len(items) > len(order):
+            log.append(f"в этот проход {len(order)} из {len(items)}, "
+                       "остальные — следующим")
+
         api = YooMarketAPI(get_token(user_id))
         await api.start()
         try:
-            for n, ad_id in enumerate(list(conf.get("items") or [])):
+            for n, ad_id in enumerate(order):
                 if cap and int(done_today.get(str(ad_id)) or 0) >= cap:
                     # Потолок назван вслух один раз за сутки, а не на
                     # каждом проходе: минутный залив написал бы эту строку

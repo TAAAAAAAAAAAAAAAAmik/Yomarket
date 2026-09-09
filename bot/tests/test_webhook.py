@@ -119,7 +119,13 @@ class TheTwoReasonsForSilenceAreNotConfused(unittest.TestCase):
         M.POLLING.update(self.was)
 
     def why(self, error):
-        M.POLLING["error"] = error
+        # Сбой ДЕРЖИТСЯ: `polling_trouble` молчит, пока он не стойкий —
+        # тревога по одной неудачной попытке ложная (test_polling_watch).
+        # Здесь проверяется РАЗБОР причины, и он не должен от этого
+        # зависеть.
+        import time as _time
+        M.POLLING.update({"error": error, "last_update": 0.0,
+                          "failing_since": _time.time() - 600})
         return M.polling_trouble()
 
     def test_a_webhook_conflict_names_the_webhook_and_only_it(self):

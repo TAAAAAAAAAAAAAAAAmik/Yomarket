@@ -326,6 +326,11 @@ _LAST_ERROR_AT: dict[int, float] = {}
 
 # Состояние получения обновлений. Собирается в dict, а не в текст: правило
 # «не управляйте логикой по тексту собственного отчёта» здесь тоже действует.
+# Тот самый наблюдатель за опросом — один на процесс. Нужен он двоим:
+# слушателю логов и middleware, отмечающему пришедшие обновления, — а
+# создаётся в `main()`, куда middleware не заглядывает.
+_WATCH: dict = {}
+
 POLLING: dict = {
     "last_update": 0.0,     # когда пришло последнее обновление от Telegram
     "error": "",            # чем именно кончилась последняя попытка
@@ -343,13 +348,46 @@ _TWIN_MARKS = ("terminated by other getupdates",)
 _WEBHOOK_MARKS = ("webhook is active", "can't use getupdates")
 
 
+# Сколько сбой должен продержаться, прежде чем называть бота глухим.
+#
+# Одна неудачная попытка `getUpdates` — это НЕ «бот не получает сообщения»:
+# сеть до Telegram икает, aiogram повторяет через несколько секунд, и всё
+# идёт дальше. Живой случай 09.09: владельцу пришло «🔇 Бот не получает
+# сообщения» на одном `Request timeout`, а бот в ту же минуту рисовал ему
+# экраны — то есть тревога соврала, и соврала в самую дорогую сторону:
+# «сломано» там, где цело.
+#
+# Конфликт двух ботов и вебхук на токене сами по себе не проходят, поэтому
+# полторы минуты ожидания не стоят ничего: настоящая беда за это время
+# никуда не денется, а икота — уйдёт.
+_POLLING_GRACE = 90.0
+
+
+def polling_silent(now: float | None = None) -> bool:
+    """Правда ли бот не получает сообщения. → да/нет.
+
+    Два условия, и оба обязательны: попытки не удаются ДОЛЬШЕ выдержки — и
+    за это время не пришло ни одного обновления. Второе важнее первого:
+    пришедшее обновление доказывает, что приём работает, чем бы ни
+    кончилась соседняя попытка.
+    """
+    if not POLLING["error"] or not POLLING["failing_since"]:
+        return False
+    now = _t.time() if now is None else now
+    if now - POLLING["failing_since"] < _POLLING_GRACE:
+        return False
+    return POLLING["last_update"] <= POLLING["failing_since"]
+
+
 def polling_trouble() -> str:
     """Что мешает боту получать сообщения. Пусто — ничего.
 
     Отдельной функцией, потому что ответ нужен и `/health`, и `/version`, и
-    сообщению продавцу.
+    сообщению продавцу. Молчит, пока сбой не стал стойким: «бот глухой» по
+    одному таймауту — это ложная тревога, и по ней идут перезапускать
+    здоровый бот.
     """
-    if not POLLING["error"]:
+    if not polling_silent():
         return ""
     low = POLLING["error"].lower()
     if any(m in low for m in _WEBHOOK_MARKS):
@@ -397,11 +435,29 @@ class WatchPolling(logging.Handler):
             POLLING["error_at"] = now
             if not POLLING["failing_since"]:
                 POLLING["failing_since"] = now
-            self._tell(now)
+            # Говорим не по факту сбоя, а по факту МОЛЧАНИЯ: одна неудачная
+            # попытка проходит сама, и тревога по ней — ложная.
+            if polling_silent(now):
+                self._tell(now)
         elif "Connection established" in text and POLLING["error"]:
-            POLLING["error"] = ""
-            POLLING["failing_since"] = 0.0
-            POLLING["told_at"] = 0.0
+            self.recovered()
+
+    def recovered(self) -> None:
+        """Связь вернулась. Если о беде говорили — сказать и об отбое.
+
+        Молча вернуться нельзя: последним словом осталось бы «бот не
+        получает сообщения», и владелец пошёл бы перезапускать исправный
+        бот. Отбой — это вторая половина той же тревоги.
+        """
+        told = bool(POLLING["told_at"])
+        POLLING["error"] = ""
+        POLLING["failing_since"] = 0.0
+        POLLING["error_at"] = 0.0
+        POLLING["told_at"] = 0.0
+        if told:
+            self._say("✅ <b>Входящие снова приходят</b>\n\n"
+                      "<i>Связь с Telegram восстановилась сама — делать "
+                      "ничего не нужно.</i>")
 
     def _tell(self, now: float) -> None:
         """Сказать владельцу — один раз в десять минут, не чаще.
@@ -414,10 +470,14 @@ class WatchPolling(logging.Handler):
             return
         POLLING["told_at"] = now
         why = polling_trouble()
-        text = ("🔇 <b>Бот не получает сообщения</b>\n\n"
-                f"{why}\n\n"
-                "<i>Отправлять я по-прежнему могу — это сообщение тому "
-                "доказательство. Не приходят именно входящие.</i>")
+        mins = int((now - POLLING["failing_since"]) // 60)
+        self._say("🔇 <b>Бот не получает сообщения</b>\n\n"
+                  f"{why}\n\n"
+                  f"<i>Не получается уже {mins} мин. Отправлять я "
+                  "по-прежнему могу — это сообщение тому доказательство. "
+                  "Не приходят именно входящие.</i>")
+
+    def _say(self, text: str) -> None:
         try:
             import asyncio as _a
             from storage import OWNER_ID
@@ -482,10 +542,24 @@ class NoticeUpdates:
 
     Без этого «жив» и «слышит» неразличимы: процесс может держать порт и
     отвечать на health, ничего не получая от Telegram.
+
+    И это же — САМОЕ ВЕРНОЕ доказательство, что приём работает: пришедшее
+    обновление отменяет любую тревогу о молчании, чем бы ни кончилась
+    соседняя попытка `getUpdates`.
     """
+
+    def __init__(self, watch=None):
+        self.watch = watch
 
     async def __call__(self, handler, event, data):
         POLLING["last_update"] = _t.time()
+        if POLLING["error"] or POLLING["told_at"]:
+            watch = self.watch or _WATCH.get("it")
+            if watch is not None:
+                watch.recovered()
+            else:                                          # pragma: no cover
+                POLLING.update({"error": "", "failing_since": 0.0,
+                                "told_at": 0.0})
         return await handler(event, data)
 
 
@@ -632,7 +706,9 @@ async def main() -> None:
     _install_error_reporter(dp)
     # Слушаем логгер aiogram: он единственный знает, что получение обновлений
     # не работает, и по умолчанию рассказывает об этом только логу.
-    logging.getLogger("aiogram.dispatcher").addHandler(WatchPolling(bot))
+    watch = WatchPolling(bot)
+    _WATCH["it"] = watch
+    logging.getLogger("aiogram.dispatcher").addHandler(watch)
 
     dp.include_router(admin.router)
     dp.include_router(start.router)

@@ -3070,6 +3070,15 @@ def _pour_text(conf: dict, names: dict) -> str:
     if len(items) > 12:
         body.append(f"…и ещё {len(items) - 12}")
 
+    # Сколько успевает проход — говорится вслух: молчание читается как
+    # «залив берёт только первые пять и на этом всё».
+    from tasks.manager import TaskManager as _TM
+    per = int(getattr(_TM, "_POUR_PER_PASS", 5))
+    if len(items) > per:
+        body += ["", f"<i>За один проход бот заводит не больше {per} — "
+                 "иначе проход не успевал бы закончиться до следующего. "
+                 "Остальные идут по кругу следующими.</i>"]
+
     last = float(conf.get("last_run") or 0)
     if last and conf.get("enabled"):
         left = max(0, int(last + int(conf.get("every") or 1) * 60

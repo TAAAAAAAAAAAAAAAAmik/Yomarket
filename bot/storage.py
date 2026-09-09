@@ -726,6 +726,9 @@ def get_pour(user_id: int) -> dict:
         "day": str(conf.get("day") or ""),
         "today": dict(conf.get("today") or {}),
         "stock": dict(conf.get("stock") or {}),
+        # С какого товара начинать следующий проход: за один проход залив
+        # успевает горсть, остальные идут дальше по кругу.
+        "next_i": max(0, int(conf.get("next_i") or 0)),
     }
 
 

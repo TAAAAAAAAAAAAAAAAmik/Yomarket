@@ -167,6 +167,59 @@ class TheStepIsRespected(Bench):
         self.assertEqual(self.made, ["11"])
 
 
+class OnePassIsNotTheWholeShift(Bench):
+    """Копия товара — это чтение панели, создание, остатки с ожиданием и
+    публикация, секунд пятнадцать на товар. Восемнадцать отмеченных заняли
+    бы проход на пять минут, а в том же проходе идут заказы и напоминания,
+    и на общем замке ждёт опрос чатов: письмо покупателя лежало бы всё это
+    время."""
+
+    def many(self, n=18):
+        return [str(100 + i) for i in range(n)]
+
+    def test_a_pass_takes_only_a_handful(self):
+        self.pour(items=self.many())
+        self.assertEqual(len(self.made), self.mgr._POUR_PER_PASS, self.made)
+
+    def test_the_rest_go_on_the_next_pass(self):
+        """Очередь круговая: никто не остаётся навсегда последним."""
+        conf = self.pour(items=self.many())
+        first = list(self.made)
+        self.made.clear()
+        conf["last_run"] = 0.0
+        storage.save_pour(self.UID, conf)
+        run(self.mgr._maybe_pour(self.UID, storage.get_settings(self.UID)))
+        self.assertEqual(self.made, [str(100 + i) for i in range(5, 10)],
+                         self.made)
+        self.assertNotEqual(self.made, first)
+
+    def test_the_circle_closes(self):
+        """Пройдя всех, залив начинает сначала, а не встаёт."""
+        items = self.many(7)
+        conf = self.pour(items=items)
+        for _ in range(3):
+            conf["last_run"] = 0.0
+            storage.save_pour(self.UID, conf)
+            run(self.mgr._maybe_pour(self.UID, storage.get_settings(self.UID)))
+            conf = storage.get_pour(self.UID)
+        self.assertEqual(sorted(set(self.made)), sorted(items),
+                         "кто-то не получил очереди")
+
+    def test_a_short_list_goes_whole(self):
+        self.pour(items=["11", "12"])
+        self.assertEqual(self.made, ["11", "12"])
+
+    def test_and_says_that_the_rest_are_waiting(self):
+        """Молчание здесь читается как «залив берёт только первые пять»."""
+        conf = self.pour(items=self.many())
+        self.assertTrue(any("следующим" in r for r in conf["log"]),
+                        conf["log"])
+
+    def test_a_full_list_says_nothing_of_the_kind(self):
+        conf = self.pour(items=["11", "12"])
+        self.assertFalse([r for r in conf["log"] if "следующим" in r])
+
+
 class OnlyItsOwnCopiesAreDeleted(Bench):
     """Самое дорогое место: удаление необратимо."""
 
@@ -567,6 +620,23 @@ class TheScreenActuallyWiresItUp(Bench):
         run(self.C.pour_menu(cb, self.FSM(), self.Api()))
         self.assertTrue(any("1440" in t or "тысяч" in t for t in cb.said),
                         cb.said)
+
+    def test_the_screen_says_how_many_fit_in_one_pass(self):
+        """Молчание читается как «залив берёт только первые пять и всё»."""
+        conf = storage.get_pour(self.UID)
+        conf["items"] = [str(i) for i in range(18)]
+        storage.save_pour(self.UID, conf)
+        cb = self.CB("pour:menu")
+        run(self.C.pour_menu(cb, self.FSM(), self.Api()))
+        self.assertIn("по кругу", cb.said[-1])
+
+    def test_but_a_short_list_is_not_lectured(self):
+        conf = storage.get_pour(self.UID)
+        conf["items"] = ["11"]
+        storage.save_pour(self.UID, conf)
+        cb = self.CB("pour:menu")
+        run(self.C.pour_menu(cb, self.FSM(), self.Api()))
+        self.assertNotIn("по кругу", cb.said[-1])
 
     def test_and_that_it_deletes_only_its_own(self):
         cb = self.CB("pour:menu")
