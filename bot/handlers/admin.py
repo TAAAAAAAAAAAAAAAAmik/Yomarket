@@ -1,5 +1,5 @@
-"""Owner/admin panel: subscriptions, blacklist, stats, bot price, broadcasts,
-granting admin. Access limited to the owner and granted admins."""
+"""Панель владельца: подписки, чёрный список, статистика, цена бота,
+рассылки, выдача админки. Доступ — только владельцу и выданным админам."""
 from __future__ import annotations
 
 import asyncio
@@ -11,14 +11,18 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from storage import (
+    PRICE_TIERS,
+    POLICY_DOCS,
     CUSTOM_TEXTS, MENU_BUTTONS, add_admin, block_user, clear_custom_text,
     clear_header_emoji, count_subscribers, count_users, get_all_users,
     get_bot_price, get_custom_text, get_header_emoji, get_menu_labels,
     get_subscription, grant_subscription, is_admin, is_custom_text_set,
     is_owner, list_admins, list_blocked, remove_admin,
     require_subscription_enabled, reset_menu_labels, revoke_subscription,
-    set_bot_price, set_custom_text, set_header_emoji, set_menu_label,
+    set_custom_text, set_header_emoji, set_menu_label,
     set_require_subscription, subscription_days_left, unblock_user,
 )
 
@@ -31,13 +35,18 @@ class AdminState(StatesGroup):
     sub_days = State()
     block_user = State()
     unblock_user = State()
-    price = State()
     broadcast = State()
     add_admin = State()
     remove_admin = State()
+    doc_url = State()
+    tier_price = State()
+    trial_days = State()
+    trial_channel = State()
     menu_label = State()
     header_emoji = State()
     edit_text = State()
+    pay_title = State()
+    pay_details = State()
 
 
 def _menu_kb(uid: int):
@@ -45,18 +54,20 @@ def _menu_kb(uid: int):
     b.button(text="📊 Статистика", callback_data="admin:stats")
     b.button(text="🎫 Выдать подписку", callback_data="admin:sub")
     b.button(text="🚫 Чёрный список", callback_data="admin:blacklist")
-    b.button(text="💰 Цена бота", callback_data="admin:price")
+    b.button(text="💰 Тарифы", callback_data="admin:prices")
     b.button(text="📢 Рассылка", callback_data="admin:broadcast")
     b.button(text="🎨 Оформление", callback_data="admin:appearance")
     b.button(text="📝 Тексты сообщений", callback_data="admin:texts")
+    b.button(text="📄 Правовые документы", callback_data="admin:docs")
+    b.button(text="💳 Способы оплаты", callback_data="admin:pays")
     b.button(text="🔐 Требовать подписку", callback_data="admin:toggle_sub")
     if is_owner(uid):
         b.button(text="👑 Управление админами", callback_data="admin:admins")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
     if is_owner(uid):
-        b.adjust(2, 2, 2, 2, 1, 1)  # 9 actions (2-per-row) + nav on its own row
+        b.adjust(2, 2, 2, 2, 2, 1)  # 10 действий по двое + навигация
     else:
-        b.adjust(2, 2, 2, 2, 1)  # 8 actions (2-per-row) + nav on its own row
+        b.adjust(2, 2, 2, 2, 1, 1)  # 9 действий + навигация
     return b.as_markup()
 
 
@@ -66,7 +77,7 @@ async def _show_menu(msg, uid: int, edit: bool = True) -> None:
         "👑 <b>Админ-панель</b>\n\n"
         f"👥 Пользователей: <b>{count_users()}</b>\n"
         f"🎫 С подпиской: <b>{count_subscribers()}</b>\n"
-        f"💰 Цена бота: <b>{get_bot_price()} ₽</b>\n"
+        f"💰 Тарифов задано: <b>{len(_prices())}</b> из {len(PRICE_TIERS)}\n"
         f"🔐 Требовать подписку: <b>{req}</b>"
     )
     if edit:
@@ -136,7 +147,7 @@ async def sub_start(callback: CallbackQuery, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="admin:menu")
     await callback.message.edit_text(
-        "🎫 <b>Выдать подписку</b>\n\nВведите <b>ID пользователя</b>:",
+        "🎫 <b>Выдать подписку</b>\n\nВведи <b>ID пользователя</b>:",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -150,7 +161,7 @@ async def sub_user_input(message: Message, state: FSMContext) -> None:
     try:
         target = int((message.text or "").strip())
     except ValueError:
-        await message.answer("❌ ID должен быть числом. Введите ещё раз:")
+        await message.answer("❌ ID должен быть числом. Введи ещё раз:")
         return
     await state.update_data(sub_target=target)
     await state.set_state(AdminState.sub_days)
@@ -161,7 +172,7 @@ async def sub_user_input(message: Message, state: FSMContext) -> None:
     b.adjust(2, 2, 1)
     await message.answer(
         f"🎫 Пользователь <code>{target}</code>\n\n"
-        "Выберите срок или введите число дней:",
+        "Выбери срок или введи число дней:",
         reply_markup=b.as_markup(),
     )
 
@@ -188,7 +199,7 @@ async def sub_days_input(message: Message, state: FSMContext) -> None:
         if days <= 0 or days > 3650:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число дней (1–3650):")
+        await message.answer("❌ Введи число дней (1–3650):")
         return
     await _do_grant(message, state, days, message.from_user.id, message.bot)
 
@@ -198,14 +209,19 @@ async def _do_grant(msg, state: FSMContext, days: int, admin_id: int, bot: Bot) 
     target = data.get("sub_target")
     await state.clear()
     if not target:
-        await msg.answer("❌ Потеряна цель. Начните заново.")
+        await msg.answer("❌ Потеряна цель. Начни заново.")
         return
     grant_subscription(target, days, by=admin_id)
     left = subscription_days_left(target)
+    import logs
+    await logs.log_event(msg.bot, "payment",
+                         [f"Выдано <b>{days} дн.</b> — осталось {left} дн.",
+                          f"Кто выдал: <code>{admin_id}</code>"],
+                         user=target)
     b = InlineKeyboardBuilder()
     b.button(text="🎫 Ещё подписку", callback_data="admin:sub")
     b.button(text="⬅️ Админ-панель", callback_data="admin:menu")
-    b.adjust(1)
+    ui.lay(b)
     text = (f"✅ Подписка выдана!\n\n"
             f"👤 <code>{target}</code>\n"
             f"➕ {days} дн.  →  всего <b>{left} дн.</b>")
@@ -216,13 +232,36 @@ async def _do_grant(msg, state: FSMContext, days: int, admin_id: int, bot: Bot) 
             await msg.answer(text, reply_markup=b.as_markup())
     else:
         await msg.answer(text, reply_markup=b.as_markup())
-    # notify the client
+    # Здороваемся с клиентом и сразу ставим его на шаг подключения. Состояние
+    # «жду токен» здесь не мелочь: приветствие просит прислать токен, а без
+    # состояния его ответ не поймает никто.
     try:
-        from storage import render_custom_text
+        from storage import get_token, render_custom_text
         await bot.send_message(
-            target, render_custom_text("sub_granted", days=days, left=left))
-    except Exception:
-        pass
+            target, render_custom_text("sub_granted", days=days, left=left),
+            disable_web_page_preview=True)
+        if not get_token(target):
+            await _arm_token_state(state, target, bot)
+    except Exception as e:
+        logger.warning("sub_granted notify %s: %s", target, e)
+
+
+async def _arm_token_state(state: FSMContext, target: int, bot: Bot) -> None:
+    """Поставить ЧУЖУЮ форму в состояние «жду токен».
+
+    Приветствие уходит клиенту, а не админу, который выдал подписку, — значит
+    и состояние записывается по ключу клиента. По своему ключу оно ловило бы
+    ответы админа, а клиента бот бы не услышал.
+    """
+    from aiogram.fsm.storage.base import StorageKey
+
+    from handlers.start import AuthState
+
+    storage = getattr(state, "storage", None)
+    if storage is None:
+        return
+    key = StorageKey(bot_id=bot.id, chat_id=int(target), user_id=int(target))
+    await storage.set_state(key, AuthState.waiting_for_token)
 
 
 # ── Чёрный список ───────────────────────────────────────────────────────────
@@ -254,7 +293,7 @@ async def block_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.block_user)
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="admin:blacklist")
-    await callback.message.edit_text("🚫 Введите ID для блокировки:",
+    await callback.message.edit_text("🚫 Введи ID для блокировки:",
                                      reply_markup=b.as_markup())
     await callback.answer()
 
@@ -285,7 +324,7 @@ async def unblock_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.unblock_user)
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="admin:blacklist")
-    await callback.message.edit_text("➖ Введите ID для разблокировки:",
+    await callback.message.edit_text("➖ Введи ID для разблокировки:",
                                      reply_markup=b.as_markup())
     await callback.answer()
 
@@ -311,39 +350,8 @@ async def unblock_input(message: Message, state: FSMContext) -> None:
 
 # ── Цена бота ───────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "admin:price")
-async def price_start(callback: CallbackQuery, state: FSMContext) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    await state.set_state(AdminState.price)
-    b = InlineKeyboardBuilder()
-    b.button(text="❌ Отмена", callback_data="admin:menu")
-    await callback.message.edit_text(
-        f"💰 <b>Цена бота</b>\n\nТекущая: <b>{get_bot_price()} ₽</b>\n\n"
-        "Введите новую цену (число):",
-        reply_markup=b.as_markup(),
-    )
-    await callback.answer()
 
 
-@router.message(AdminState.price)
-async def price_input(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-    try:
-        price = int((message.text or "").strip().replace(" ", ""))
-        if price < 0:
-            raise ValueError
-    except ValueError:
-        await message.answer("❌ Введите число:")
-        return
-    await state.clear()
-    set_bot_price(price)
-    b = InlineKeyboardBuilder()
-    b.button(text="⬅️ Админ-панель", callback_data="admin:menu")
-    await message.answer(f"✅ Цена бота: <b>{price} ₽</b>", reply_markup=b.as_markup())
 
 
 # ── Требовать подписку ──────────────────────────────────────────────────────
@@ -354,8 +362,16 @@ async def toggle_sub(callback: CallbackQuery) -> None:
         await callback.answer("Нет доступа", show_alert=True)
         return
     set_require_subscription(not require_subscription_enabled())
-    state_txt = "включено" if require_subscription_enabled() else "выключено"
-    await callback.answer(f"Требование подписки {state_txt}", show_alert=True)
+    on = require_subscription_enabled()
+    # Включение меняет смысл приветствия: там обещано «бесплатно и сразу —
+    # подключить магазин», а за воротами подключение оказывается платным.
+    # Владелец этого не увидит: он админ и проходит мимо проверки. Поэтому
+    # последствие называется здесь, а не выясняется по жалобам.
+    note = ("Требование подписки включено.\n\nПриветствие обещает "
+            "подключение магазина бесплатно — теперь это неправда. Поправь "
+            "текст в «Тексты бота» или выключи обратно."
+            if on else "Требование подписки выключено.")
+    await callback.answer(note, show_alert=True)
     await _show_menu(callback.message, callback.from_user.id)
 
 
@@ -371,7 +387,7 @@ async def broadcast_start(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data="admin:menu")
     await callback.message.edit_text(
         "📢 <b>Рассылка</b>\n\n"
-        "Отправьте сообщение (текст, фото или видео с подписью) — "
+        "Отправь сообщение (текст, фото или видео с подписью) — "
         "оно будет разослано всем пользователям бота.",
         reply_markup=b.as_markup(),
     )
@@ -437,7 +453,7 @@ async def add_admin_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.add_admin)
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="admin:admins")
-    await callback.message.edit_text("👑 Введите ID нового админа:",
+    await callback.message.edit_text("👑 Введи ID нового админа:",
                                      reply_markup=b.as_markup())
     await callback.answer()
 
@@ -459,7 +475,7 @@ async def add_admin_input(message: Message, state: FSMContext) -> None:
     await message.answer(f"👑 <code>{target}</code> теперь админ.",
                          reply_markup=b.as_markup())
     try:
-        await message.bot.send_message(target, "👑 Вам выдали права админа бота! /admin")
+        await message.bot.send_message(target, "👑 Тебе выдали права админа бота! /admin")
     except Exception:
         pass
 
@@ -472,7 +488,7 @@ async def rm_admin_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.remove_admin)
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="admin:admins")
-    await callback.message.edit_text("➖ Введите ID админа для снятия:",
+    await callback.message.edit_text("➖ Введи ID админа для снятия:",
                                      reply_markup=b.as_markup())
     await callback.answer()
 
@@ -512,7 +528,7 @@ async def appearance_menu(callback: CallbackQuery, state: FSMContext) -> None:
                    if he else "🔣 Кастом-эмодзи шапки: <b>нет</b>")
     text = (
         "🎨 <b>Оформление</b>\n\n"
-        "Настройте подписи кнопок главного меню (эмодзи + текст) и "
+        "Настрой подписи кнопок главного меню (эмодзи + текст) и "
         "кастом-эмодзи в шапке.\n\n"
         f"{header_line}\n\n"
         "ℹ️ <i>Цвет кнопок Telegram менять не даёт — «покрасить» можно "
@@ -552,7 +568,7 @@ async def label_start(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data="admin:appearance")
     await callback.message.edit_text(
         f"✏️ <b>Кнопка меню</b>\n\nТекущая: <b>{cur}</b>\n\n"
-        "Отправьте новую подпись (эмодзи + текст).\n"
+        "Отправь новую подпись (эмодзи + текст).\n"
         "Пример: <code>🟢 Мои товары</code>\n\n"
         "<i>Цветные кружки для «покраски»: 🔴🟢🟡🔵🟣🟠⚫⚪🟤</i>",
         reply_markup=b.as_markup(),
@@ -601,7 +617,7 @@ async def header_emoji_start(callback: CallbackQuery, state: FSMContext) -> None
     b.button(text="❌ Отмена", callback_data="admin:appearance")
     await callback.message.edit_text(
         "🔣 <b>Кастом-эмодзи в шапку меню</b>\n\n"
-        "Отправьте сообщение, в котором есть <b>кастом-эмодзи</b> "
+        "Отправь сообщение, в котором есть <b>кастом-эмодзи</b> "
         "(премиум/из набора). Бот запомнит первый и поставит его в заголовок "
         "«Главное меню».\n\n"
         "<i>Обычные эмодзи тоже подойдут — возьму первый символ.</i>",
@@ -616,13 +632,13 @@ async def header_emoji_save(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
     await state.clear()
-    # find a custom_emoji entity
+    # ищем в сообщении кастомное эмодзи
     emoji_id = None
     fallback = "🏠"
     for ent in (message.entities or []):
         if ent.type == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
             emoji_id = ent.custom_emoji_id
-            # the fallback glyph is the text the entity covers
+            # запасной значок — это тот текст, который эмодзи собой закрывает
             txt = message.text or ""
             fallback = txt[ent.offset:ent.offset + ent.length] or "🏠"
             break
@@ -632,11 +648,11 @@ async def header_emoji_save(message: Message, state: FSMContext) -> None:
         set_header_emoji(emoji_id, fallback)
         await message.answer(
             f"✅ Кастом-эмодзи сохранён (запасной символ: {fallback}).\n"
-            "Откройте /start — увидите его в шапке меню.",
+            "Открой /start — увидишь его в шапке меню.",
             reply_markup=b.as_markup())
     else:
-        # no custom emoji — use the first plain glyph as the header
-        # (id="" → menu_header_html renders the fallback glyph directly)
+        # кастомного эмодзи нет — берём в заголовок первый обычный значок
+        # (id="" → menu_header_html нарисует запасной значок как есть)
         txt = (message.text or "").strip()
         if txt:
             set_header_emoji("", txt[0])
@@ -645,7 +661,7 @@ async def header_emoji_save(message: Message, state: FSMContext) -> None:
                 reply_markup=b.as_markup())
         else:
             await message.answer(
-                "❌ Не нашёл эмодзи в сообщении. Пришлите сообщение с эмодзи.",
+                "❌ Не нашёл эмодзи в сообщении. Пришли сообщение с эмодзи.",
                 reply_markup=b.as_markup())
 
 
@@ -682,7 +698,7 @@ async def texts_menu(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="⬅️ Назад", callback_data="admin:menu")
     await callback.message.edit_text(
         "📝 <b>Тексты сообщений</b>\n\n"
-        "Измените тексты, которые бот шлёт пользователям. "
+        "Измени тексты, которые бот шлёт пользователям. "
         "Можно вставлять <b>кастом-эмодзи</b> и форматирование "
         "(жирный, курсив) — бот сохранит как есть.\n\n"
         "✏️ = изменён, ○ = стандартный",
@@ -707,7 +723,7 @@ async def text_view(callback: CallbackQuery, state: FSMContext) -> None:
     if meta.get("vars"):
         vars_line = ("\n\n🔤 Доступные подстановки: "
                      + ", ".join(f"<code>{v}</code>" for v in meta["vars"])
-                     + "\n<i>Вставьте их в текст — бот подставит значения.</i>")
+                     + "\n<i>Вставь их в текст — бот подставит значения.</i>")
     b = InlineKeyboardBuilder()
     b.button(text="✏️ Изменить", callback_data=f"admin:txtedit:{key}")
     if is_custom_text_set(key):
@@ -717,7 +733,7 @@ async def text_view(callback: CallbackQuery, state: FSMContext) -> None:
         b.adjust(2, 1)  # 2 actions on one row + nav on its own row
     else:
         b.adjust(1)
-    # show a live preview (render placeholders with sample values)
+    # показываем живой предпросмотр: подстановки заполнены примерами
     sample = {"price": " 💰 500 ₽", "days": "30", "left": "30"}
     preview = get_custom_text(key)
     for v in meta.get("vars", []):
@@ -751,7 +767,7 @@ async def text_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
     b.button(text="❌ Отмена", callback_data=f"admin:txt:{key}")
     await callback.message.edit_text(
         f"✏️ <b>{meta['title']}</b>\n\n"
-        "Отправьте новый текст сообщением. Можно использовать "
+        "Отправь новый текст сообщением. Можно использовать "
         "<b>кастом-эмодзи</b>, жирный, курсив и переносы строк.{}".format(vars_line),
         reply_markup=b.as_markup(),
     )
@@ -767,20 +783,20 @@ async def text_edit_save(message: Message, state: FSMContext) -> None:
     key = data.get("text_key")
     await state.clear()
     if not key or key not in CUSTOM_TEXTS:
-        await message.answer("❌ Потерян ключ текста. Начните заново.")
+        await message.answer("❌ Потерян ключ текста. Начни заново.")
         return
-    # html_text preserves formatting AND custom emoji as <tg-emoji>
+    # html_text сохраняет и разметку, и кастомные эмодзи как <tg-emoji>
     html = message.html_text if message.text else ""
     if not html.strip():
-        await message.answer("❌ Пустой текст. Пришлите текст сообщением.")
+        await message.answer("❌ Пустой текст. Пришли текст сообщением.")
         return
     set_custom_text(key, html)
     b = InlineKeyboardBuilder()
     b.button(text="👁 Посмотреть", callback_data=f"admin:txt:{key}")
     b.button(text="📝 К текстам", callback_data="admin:texts")
-    b.adjust(1)
+    ui.lay(b)
     await message.answer("✅ Текст сохранён!", reply_markup=b.as_markup())
-    # show how it will actually look
+    # показываем, как это будет выглядеть на самом деле
     try:
         await message.answer("<b>Так это увидят пользователи:</b>")
         await message.answer(html)
@@ -797,3 +813,551 @@ async def text_reset(callback: CallbackQuery, state: FSMContext) -> None:
     clear_custom_text(key)
     await callback.answer("Текст сброшен к стандартному", show_alert=True)
     await text_view(callback, state)
+
+
+def _esc(value) -> str:
+    """Ссылка приходит от человека и уходит в HTML-сообщение: одиночный «<»
+    в ней уронил бы отправку целиком."""
+    return ui.esc(value)
+
+
+# ── Правовые документы ──────────────────────────────────────────────────────
+#
+# Соглашение, оферта и политика — общие на весь бот: они про продукт, а не
+# про магазин конкретного продавца. Экран показывает, что задано, а что нет,
+# потому что незаполненная ссылка означает отсутствующую кнопку у клиента —
+# и об этом лучше узнать здесь, а не от него.
+
+@router.callback_query(F.data == "admin:docs")
+async def docs_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    from storage import get_policy_links
+    links = get_policy_links()
+
+    body = []
+    b = InlineKeyboardBuilder()
+    for key, title in POLICY_DOCS:
+        url = links.get(key)
+        body.append(f"{'✅' if url else '○'} {title}")
+        body.append(f"   <code>{_esc(url)}</code>" if url
+                    else "   <i>ссылка не задана — кнопки у клиента нет</i>")
+        b.button(text=("✏️ " if url else "➕ ") + title.split(" ", 1)[-1],
+                 callback_data=f"admin:docset:{key}")
+    b.button(text="👁 Как это видит клиент", callback_data="menu:policy")
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
+
+    await callback.message.edit_text(ui.screen(
+        "📄 <b>Правовые документы</b>", body,
+        footer="<i>Кнопка появляется у клиента только там, где задана ссылка: "
+               "кнопка без адреса не «ведёт никуда», а роняет отправку экрана "
+               "целиком — такую клавиатуру Telegram не принимает.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:docset:"))
+async def docs_set_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    key = callback.data.split(":")[-1]
+    title = dict(POLICY_DOCS).get(key)
+    if not title:
+        await callback.answer()
+        return
+    await state.set_state(AdminState.doc_url)
+    await state.update_data(doc_key=key)
+    from storage import get_policy_links
+    cur = get_policy_links().get(key, "")
+
+    b = InlineKeyboardBuilder()
+    if cur:
+        b.button(text="🗑 Убрать ссылку", callback_data=f"admin:docdel:{key}")
+    b.button(text="⬅️ К документам", callback_data="admin:docs")
+    await callback.message.edit_text(ui.screen(
+        f"📄 <b>{title}</b>",
+        [f"Сейчас: <code>{_esc(cur)}</code>" if cur else "Сейчас: не задана",
+         "",
+         "Пришли ссылку на документ одним сообщением."],
+        footer="<i>Адрес должен начинаться с http:// или https:// — другие "
+               "Telegram в кнопке не принимает, и экран не отправится.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.message(AdminState.doc_url)
+async def docs_set_input(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    key = str((await state.get_data()).get("doc_key") or "")
+    title = dict(POLICY_DOCS).get(key)
+    if not title:
+        await state.clear()
+        return
+
+    url = (message.text or "").strip()
+    # Проверка не придирка: кнопку с другим адресом Telegram отвергает, и
+    # вместе с ней не уходит весь экран. Отказать здесь — значит объяснить;
+    # пропустить — значит сломать экран у клиента и не узнать об этом.
+    if not url.lower().startswith(("http://", "https://")):
+        await message.answer(
+            "❌ Ссылка должна начинаться с <code>http://</code> или "
+            "<code>https://</code>.\n\nПришли ещё раз:")
+        return
+
+    from storage import set_policy_link
+    set_policy_link(key, url)
+    await state.clear()
+    b = InlineKeyboardBuilder()
+    b.button(text="👁 Как это видит клиент", callback_data="menu:policy")
+    b.button(text="⬅️ К документам", callback_data="admin:docs")
+    await message.answer(ui.screen(
+        "✅ <b>Ссылка сохранена</b>",
+        [f"{title}", f"<code>{_esc(url)}</code>"]),
+        reply_markup=ui.lay(b).as_markup())
+
+
+@router.callback_query(F.data.startswith("admin:docdel:"))
+async def docs_clear(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    key = callback.data.split(":")[-1]
+    if key not in dict(POLICY_DOCS):
+        await callback.answer()
+        return
+    from storage import clear_policy_link
+    clear_policy_link(key)
+    await state.clear()
+    await callback.answer("Ссылка убрана — кнопки у клиента больше нет",
+                          show_alert=True)
+    await docs_menu(callback, state)
+
+
+# ── Тарифы и пробный период ─────────────────────────────────────────────────
+#
+# Цена была одним числом, а документы обещают градацию по срокам со скидкой
+# за длинный срок. Цена, которой клиент нигде не видит, обещанием не
+# является — поэтому тарифы задаются здесь и показываются на экране
+# «нужна подписка».
+
+def _prices() -> dict:
+    from storage import get_prices
+    return get_prices()
+
+
+@router.callback_query(F.data == "admin:prices")
+async def prices_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    from storage import get_trial_days, price_lines
+
+    prices = _prices()
+    body = []
+    b = InlineKeyboardBuilder()
+    for days, label in PRICE_TIERS:
+        price = prices.get(days)
+        body.append(f"{'✅' if price else '○'} {label} — "
+                    + (f"<b>{price} ₽</b>" if price else
+                       "<i>не задан, клиенту не показывается</i>"))
+        b.button(text=("✏️ " if price else "➕ ") + label,
+                 callback_data=f"admin:tier:{days}")
+
+    trial = get_trial_days()
+    from storage import get_trial_channel
+    channel = get_trial_channel()
+    body += ["", f"🎁 Пробный период: "
+             + (f"<b>{trial} дн.</b>" if trial else "<b>выключен</b>")
+             + (f"  ·  открывается подпиской на канал "
+                f"<code>{ui.esc(channel)}</code>"
+                if channel and trial else
+                "  ·  <i>выдаётся сразу, без условий</i>" if trial else "")]
+    b.button(text="🎁 Пробный период", callback_data="admin:trial")
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
+
+    # Приветствие рекламирует «от N ₽» — самый дешёвый ЗАДАННЫЙ тариф. Не
+    # видя этого числа здесь, владелец ищет его в коде: «почему от 499, я
+    # же ставил 249». Причина всегда одна из двух, и обе названы вслух.
+    from storage import get_bot_price
+    shown = price_lines()
+    tiers = [p for p in prices.values() if p]
+    old_price = get_bot_price()
+    if tiers:
+        head = f"<i>На витрине:</i> <b>Подписка — от {min(tiers)} ₽</b>"
+    elif old_price:
+        head = (f"<i>На витрине:</i> <b>Подписка — от {old_price} ₽</b>\n"
+                "⚠️ <i>Это старая единая цена, а не тариф: ни один тариф "
+                "выше не задан. Задай их — и она перестанет показываться.</i>")
+    else:
+        head = "<i>На витрине цена не показывается вовсе.</i>"
+    footer = head + (("\n\n<i>На экране «Получить доступ»:</i>\n"
+                      + "\n".join(shown)) if shown else "")
+    await callback.message.edit_text(
+        ui.screen("💰 <b>Тарифы</b>", body, footer=footer),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:tier:"))
+async def tier_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        days = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    label = dict(PRICE_TIERS).get(days)
+    if not label:
+        await callback.answer()
+        return
+    await state.set_state(AdminState.tier_price)
+    await state.update_data(tier_days=days)
+    cur = _prices().get(days)
+
+    b = InlineKeyboardBuilder()
+    if cur:
+        b.button(text="🗑 Убрать тариф", callback_data=f"admin:tierdel:{days}")
+    b.button(text="⬅️ К тарифам", callback_data="admin:prices")
+    await callback.message.edit_text(ui.screen(
+        f"💰 <b>{label}</b>",
+        [f"Сейчас: <b>{cur} ₽</b>" if cur else "Сейчас: тариф не задан", "",
+         "Введи цену в рублях числом."],
+        footer="<i>Ноль убирает тариф: «0 ₽» на экране читается как "
+               "«бесплатно», а это обещание, за которое спросят.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.message(AdminState.tier_price)
+async def tier_input(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    days = int((await state.get_data()).get("tier_days") or 0)
+    if days not in dict(PRICE_TIERS):
+        await state.clear()
+        return
+    try:
+        price = int((message.text or "").strip().replace(" ", ""))
+    except ValueError:
+        await message.answer("❌ Нужно число в рублях. Введи ещё раз:")
+        return
+    if price < 0:
+        await message.answer("❌ Цена не может быть отрицательной. Ещё раз:")
+        return
+
+    from storage import set_price
+    set_price(days, price)
+    await state.clear()
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ К тарифам", callback_data="admin:prices")
+    label = dict(PRICE_TIERS)[days]
+    await message.answer(ui.screen(
+        "✅ <b>Тариф сохранён</b>",
+        [f"{label} — " + (f"<b>{price} ₽</b>" if price else
+                          "<i>убран, клиенту не показывается</i>")]),
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("admin:tierdel:"))
+async def tier_clear(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        days = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    if days in dict(PRICE_TIERS):
+        from storage import set_price
+        set_price(days, 0)
+    await state.clear()
+    await callback.answer("Тариф убран — клиенту он больше не показывается",
+                          show_alert=True)
+    await prices_menu(callback, state)
+
+
+@router.callback_query(F.data == "admin:trial")
+async def trial_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminState.trial_days)
+    from storage import get_trial_days
+    cur = get_trial_days()
+    from storage import get_trial_channel
+    channel = get_trial_channel()
+    b = InlineKeyboardBuilder()
+    b.button(text="📣 Канал-условие", callback_data="admin:trial_ch")
+    b.button(text="⬅️ К тарифам", callback_data="admin:prices")
+    await callback.message.edit_text(ui.screen(
+        "🎁 <b>Пробный период</b>",
+        [f"Сейчас: <b>{cur} дн.</b>" if cur else "Сейчас: <b>выключен</b>",
+         "Условие: " + (f"подписка на <code>{ui.esc(channel)}</code>"
+                        if channel else "<i>нет, выдаётся сразу</i>"),
+         "",
+         "Введи число дней. Ноль — выключить."],
+        footer="<i>Это БЕСПЛАТНЫЙ доступ к боту на срок — не путать с "
+               "платной подпиской. Канал-условие к оплате отношения не "
+               "имеет: подписка на него лишь открывает бесплатную неделю.\n"
+               "Даётся один раз на человека. Отметка о выданной пробе "
+               "переживает удаление данных: иначе /forget_me становится "
+               "способом брать её бесконечно — это оговорено в политике "
+               "конфиденциальности.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:trial_ch")
+async def trial_channel_start(callback: CallbackQuery,
+                              state: FSMContext) -> None:
+    """Канал, подпиской на который открывается пробный период."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    from storage import get_trial_channel
+    await state.set_state(AdminState.trial_channel)
+    cur = get_trial_channel()
+    b = InlineKeyboardBuilder()
+    if cur:
+        b.button(text="🗑 Убрать условие", callback_data="admin:trial_ch_off")
+    b.button(text="⬅️ Назад", callback_data="admin:trial")
+    await callback.message.edit_text(ui.screen(
+        "📣 <b>Канал-условие для бесплатной недели</b>",
+        [f"Сейчас: <code>{ui.esc(cur)}</code>" if cur else
+         "Сейчас условия нет — бесплатная неделя выдаётся сразу.",
+         "",
+         "Пришли <code>@имя_канала</code>.",
+         "",
+         "<b>Бота надо добавить в канал администратором</b> — иначе он не "
+         "может спросить у Telegram, подписан человек или нет."],
+        footer="<i>Если проверить не выйдет, пробный период всё равно "
+               "выдаётся, а в журнал уходит причина: отказывать продавцу "
+               "за нашу поломку — терять клиента, а не экономить.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:trial_ch_off")
+async def trial_channel_off(callback: CallbackQuery,
+                            state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    from storage import set_trial_channel
+    set_trial_channel("")
+    await state.clear()
+    await callback.answer("Условие убрано — неделя выдаётся сразу",
+                          show_alert=True)
+    await trial_start(callback, state)
+
+
+@router.message(AdminState.trial_channel)
+async def trial_channel_input(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    value = (message.text or "").strip()
+    if not value:
+        await message.answer("❌ Пусто. Пришли @имя_канала:")
+        return
+
+    # «Сохранил» — не доказательство: канал мог быть написан с опечаткой, а
+    # бота в него могли не добавить. Спрашиваем Telegram прямо сейчас.
+    from storage import set_trial_channel
+    ok, why = True, ""
+    try:
+        chat = await message.bot.get_chat(value)
+        title = getattr(chat, "title", "") or value
+    except Exception as e:                                  # noqa: BLE001
+        ok, why, title = False, str(e)[:150], value
+
+    set_trial_channel(value)
+    await state.clear()
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ К пробному периоду", callback_data="admin:trial")
+    body = [f"Канал: <code>{ui.esc(value)}</code>"]
+    if ok:
+        body += [f"Название: <b>{ui.esc(title)}</b>", "",
+                 "✅ Канал виден боту."]
+    else:
+        body += ["", f"⚠️ <b>Канал боту не виден:</b> <code>{ui.esc(why)}</code>",
+                 "",
+                 "Добавь бота в канал администратором. Пока он не видит "
+                 "канал, проверить подписку на него нельзя — бесплатная неделя будет "
+                 "выдаваться всем, а в журнал уйдёт причина."]
+    await message.answer(ui.screen(
+        "📣 <b>Канал сохранён</b>" if ok else "📣 <b>Сохранил, но не вижу</b>",
+        body), reply_markup=ui.lay(b).as_markup())
+
+
+@router.message(AdminState.trial_days)
+async def trial_input(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    try:
+        days = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ Нужно число дней. Введи ещё раз:")
+        return
+    if days < 0:
+        await message.answer("❌ Отрицательного срока не бывает. Ещё раз:")
+        return
+
+    from storage import set_trial_days
+    set_trial_days(days)
+    await state.clear()
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ К тарифам", callback_data="admin:prices")
+    await message.answer(ui.screen(
+        "✅ <b>Сохранено</b>",
+        [f"Пробный период: <b>{days} дн.</b>" if days else
+         "Пробный период <b>выключен</b> — бот о нём не упоминает."]),
+        reply_markup=b.as_markup())
+
+
+# ── Способы оплаты ──────────────────────────────────────────────────────────
+#
+# Приёма денег внутри бота нет: продавец платит владельцу напрямую, а бот
+# показывает, куда именно. Реквизиты задаются здесь — вписать за владельца
+# «Сбербанк» или «СБП» значит выдумать чужие реквизиты.
+
+@router.callback_query(F.data == "admin:pays")
+async def pays_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    from storage import get_pay_methods
+    methods = get_pay_methods()
+
+    body = []
+    b = InlineKeyboardBuilder()
+    for m in methods:
+        filled = bool(m.get("details"))
+        body.append(f"{'✅' if filled else '○'} <b>{ui.esc(m['title'])}</b>"
+                    + ("" if filled else
+                       " — <i>реквизиты не заданы, продавцу не показывается</i>"))
+        b.button(text=f"✏️ {m['title']}", callback_data=f"admin:pay:{m['id']}")
+    b.button(text="➕ Добавить способ", callback_data="admin:pay:new")
+    b.button(text="⬅️ Назад", callback_data="admin:menu")
+    await callback.message.edit_text(
+        ui.screen("💳 <b>Способы оплаты</b>",
+                  body or ["Ни одного способа не задано — продавцу платить "
+                           "некуда, и экран оплаты честно об этом говорит."],
+                  footer="<i>Продавец выбирает срок, потом способ, видит "
+                         "реквизиты и жмёт «Я оплатил». Проверяешь и "
+                         "выдаёшь дни ты.</i>"),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:pay:new")
+async def pay_new(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminState.pay_title)
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="admin:pays")
+    await callback.message.edit_text(ui.screen(
+        "➕ <b>Новый способ оплаты</b>",
+        ["Пришли название — коротко, оно встанет на кнопку.", "",
+         "Например: <code>СБП</code>, <code>Карта</code>, "
+         "<code>USDT TRC20</code>."]),
+        reply_markup=ui.lay(b).as_markup())
+    await callback.answer()
+
+
+@router.message(AdminState.pay_title)
+async def pay_title_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    from storage import add_pay_method
+    title = (message.text or "").strip()
+    if not title:
+        await message.answer("Название пустое — пришли ещё раз.")
+        return
+    if len(title) > 32:
+        # Длинная надпись расползается на кнопке и обрезается Telegram
+        # посередине слова: продавец увидит огрызок и не поймёт, чем платит.
+        await message.answer("Слишком длинно для кнопки — до 32 знаков.")
+        return
+    mid = add_pay_method(title)
+    await state.set_state(AdminState.pay_details)
+    await state.update_data(pay_id=mid)
+    await message.answer(ui.screen(
+        f"💳 <b>{ui.esc(title)}</b>",
+        ["Теперь пришли реквизиты — то, что увидит продавец.", "",
+         "Номер карты, телефон для СБП, адрес кошелька — как есть, целиком. "
+         "Можно несколькими строками."],
+        footer="<i>Пока реквизиты пусты, способ продавцу не показывается: "
+               "кнопка, за которой ничего нет, — обещание невозможного.</i>"))
+
+
+@router.message(AdminState.pay_details)
+async def pay_details_save(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    from storage import set_pay_method
+    data = await state.get_data()
+    mid = str(data.get("pay_id") or "")
+    details = (message.text or "").strip()
+    if not details:
+        await message.answer("Реквизиты пустые — пришли ещё раз.")
+        return
+    set_pay_method(mid, details=details)
+    await state.clear()
+    await message.answer("✅ Способ готов — продавцы его увидят.")
+    await _show_menu(message, message.from_user.id, edit=False)
+
+
+@router.callback_query(F.data.startswith("admin:pay:"))
+async def pay_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    mid = callback.data.split(":")[-1]
+    from storage import pay_method
+    method = pay_method(mid)
+    if not method:
+        await callback.answer()
+        await pays_menu(callback, state)
+        return
+    await state.set_state(AdminState.pay_details)
+    await state.update_data(pay_id=mid)
+    b = InlineKeyboardBuilder()
+    b.button(text="🗑 Удалить способ", callback_data=f"admin:paydel:{mid}")
+    b.button(text="⬅️ Назад", callback_data="admin:pays")
+    await callback.message.edit_text(ui.screen(
+        f"💳 <b>{ui.esc(method['title'])}</b>",
+        # Тем же способом, что и у продавца: владелец должен видеть ровно
+        # то, что увидит тот, — включая, что именно копируется нажатием.
+        ["Сейчас продавец видит:", "",
+         ui.copyable(method["details"]) if method["details"]
+         else "<i>ничего — реквизиты не заданы</i>", "",
+         "Пришли новые реквизиты, чтобы заменить."]),
+        reply_markup=ui.lay(b, solo={f"admin:paydel:{mid}"}).as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:paydel:"))
+async def pay_delete(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    from storage import del_pay_method
+    del_pay_method(callback.data.split(":")[-1])
+    await state.clear()
+    await callback.answer("Способ удалён", show_alert=True)
+    await pays_menu(callback, state)

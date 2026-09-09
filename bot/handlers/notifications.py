@@ -6,6 +6,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from storage import get_settings, save_settings
 
 router = Router()
@@ -35,6 +37,12 @@ def _notif_text(s: dict) -> str:
     bl: list = s.get("blacklist", [])
 
     lines = ["🔔 <b>Уведомления</b>\n"]
+    lines.append(f"🛒 <b>Новый заказ</b> — "
+                 f"{_st(s.get('notify_orders', {}).get('enabled', True))}")
+    lines.append(f"💬 <b>Сообщения из чатов</b> — "
+                 f"{_st(s.get('notify_messages', {}).get('enabled', True))}")
+    lines.append("   <i>Заказы, поддержка и модерация</i>")
+    lines.append("")
     lines.append(f"⏰ <b>Напоминания о заказах</b> — {_st(rem_on)}")
     if rem_on:
         lines.append(f"   Через <b>{rem_h} ч</b>")
@@ -59,7 +67,14 @@ def _notif_kb(s: dict):
     dr = s.get("daily_report", {})
     dr_on = dr.get("enabled", False)
 
+    orders_on = s.get("notify_orders", {}).get("enabled", True)
+    msgs_on = s.get("notify_messages", {}).get("enabled", True)
+
     b = InlineKeyboardBuilder()
+    b.button(text=f"🛒 Новый заказ: {'🟢 вкл' if orders_on else '🔴 выкл'}",
+             callback_data="notif:toggle:orders")
+    b.button(text=f"💬 Сообщения из чатов: {'🟢 вкл' if msgs_on else '🔴 выкл'}",
+             callback_data="notif:toggle:messages")
     b.button(
         text=f"{'🔴 Выкл' if rem_on else '🟢 Вкл'} напоминания",
         callback_data="notif:toggle:reminders",
@@ -86,7 +101,7 @@ def _notif_kb(s: dict):
         callback_data="notif:toggle:reviews",
     )
     b.button(text="⬅️ Настройки", callback_data="settings:menu")
-    b.adjust(1)
+    ui.lay(b)
     return b.as_markup()
 
 
@@ -108,6 +123,34 @@ async def notif_menu(callback: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Заказы и письма из чатов
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data == "notif:toggle:orders")
+async def toggle_order_notify(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    n = s.setdefault("notify_orders", {"enabled": True})
+    n["enabled"] = not n.get("enabled", True)
+    save_settings(callback.from_user.id, s)
+    await callback.answer("Новые заказы: "
+                          + ("вкл" if n["enabled"] else "выкл"))
+    await _refresh(callback)
+
+
+@router.callback_query(F.data == "notif:toggle:messages")
+async def toggle_message_notify(callback: CallbackQuery) -> None:
+    s = get_settings(callback.from_user.id)
+    n = s.setdefault("notify_messages", {"enabled": True})
+    n["enabled"] = not n.get("enabled", True)
+    save_settings(callback.from_user.id, s)
+    await callback.answer(
+        "Сообщения из чатов: " + ("вкл" if n["enabled"] else "выкл")
+        + ("" if n["enabled"] else " · жалобы всё равно придут"),
+        show_alert=not n["enabled"])
+    await _refresh(callback)
+
+
+# ---------------------------------------------------------------------------
 # Reminders
 # ---------------------------------------------------------------------------
 
@@ -125,7 +168,7 @@ async def set_rem_hours(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(NotifState.waiting_reminder_hours)
     cur = get_settings(callback.from_user.id).get("reminders", {}).get("hours", 24)
     await callback.message.edit_text(
-        f"⏰ Через сколько часов напоминать?\nТекущее: <b>{cur} ч</b>\n\nВведите число (1–72):",
+        f"⏰ Через сколько часов напоминать?\nТекущее: <b>{cur} ч</b>\n\nВведи число (1–72):",
         reply_markup=_cancel_kb(),
     )
     await callback.answer()
@@ -138,7 +181,7 @@ async def save_rem_hours(message: Message, state: FSMContext) -> None:
         if not 1 <= hours <= 72:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число от 1 до 72")
+        await message.answer("❌ Введи число от 1 до 72")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -166,7 +209,7 @@ async def set_balance_threshold(callback: CallbackQuery, state: FSMContext) -> N
     await state.set_state(NotifState.waiting_balance_threshold)
     cur = get_settings(callback.from_user.id).get("balance_notify", {}).get("threshold", 1000)
     await callback.message.edit_text(
-        f"💰 Порог уведомления о балансе (сейчас: <b>{cur} ₽</b>)\n\nВведите сумму:",
+        f"💰 Порог уведомления о балансе (сейчас: <b>{cur} ₽</b>)\n\nВведи сумму:",
         reply_markup=_cancel_kb(),
     )
     await callback.answer()
@@ -179,7 +222,7 @@ async def save_balance_threshold(message: Message, state: FSMContext) -> None:
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите положительное число")
+        await message.answer("❌ Введи положительное число")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -207,7 +250,7 @@ async def set_report_hour(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(NotifState.waiting_report_hour)
     cur = get_settings(callback.from_user.id).get("daily_report", {}).get("hour", 20)
     await callback.message.edit_text(
-        f"🕐 В какой час отправлять отчёт? (сейчас: <b>{cur}:00</b>)\n\nВведите час (0–23):",
+        f"🕐 В какой час отправлять отчёт? (сейчас: <b>{cur}:00</b>)\n\nВведи час (0–23):",
         reply_markup=_cancel_kb(),
     )
     await callback.answer()
@@ -220,7 +263,7 @@ async def save_report_hour(message: Message, state: FSMContext) -> None:
         if not 0 <= hour <= 23:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите число от 0 до 23")
+        await message.answer("❌ Введи число от 0 до 23")
         return
     await state.clear()
     s = get_settings(message.from_user.id)
@@ -255,7 +298,10 @@ def _bl_kb(s: dict):
         b.button(text="🗑 Удалить последнего", callback_data="bl:del_last")
         b.button(text="🧹 Очистить всё", callback_data="bl:clear")
     b.button(text="⬅️ Уведомления", callback_data="notif:menu")
-    b.adjust(1)
+    # «Очистить всё» стирает список без вопроса, поэтому в паре с соседней
+    # кнопкой не ставится: промахнуться в «Назад» и стереть чужой список —
+    # не то, что чинится нажатием ещё раз.
+    ui.lay(b, solo={"bl:clear"})
     return b.as_markup()
 
 
@@ -281,8 +327,8 @@ async def bl_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     b = InlineKeyboardBuilder()
     b.button(text="❌ Отмена", callback_data="notif:blacklist")
     await callback.message.edit_text(
-        "⛔ Введите имя покупателя:\n\n"
-        "<i>Укажите точно так, как отображается в уведомлениях о заказах</i>",
+        "⛔ Введи имя покупателя:\n\n"
+        "<i>Укажи точно так, как отображается в уведомлениях о заказах</i>",
         reply_markup=b.as_markup(),
     )
     await callback.answer()
@@ -292,7 +338,7 @@ async def bl_add_start(callback: CallbackQuery, state: FSMContext) -> None:
 async def bl_add_save(message: Message, state: FSMContext) -> None:
     name = (message.text or "").strip()
     if not name:
-        await message.answer("❌ Введите имя")
+        await message.answer("❌ Введи имя")
         return
     await state.clear()
     s = get_settings(message.from_user.id)

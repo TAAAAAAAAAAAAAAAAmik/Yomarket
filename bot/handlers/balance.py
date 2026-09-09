@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from datetime import datetime
@@ -8,8 +9,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import ui
+
 from api.yoomarket import YooMarketAPI
 from keyboards.main import back_keyboard
+import localtime as _lt
 from storage import get_settings, save_settings
 
 router = Router()
@@ -18,30 +22,315 @@ logger = logging.getLogger(__name__)
 
 class WithdrawState(StatesGroup):
     waiting_amount = State()
+    waiting_threshold = State()
+    waiting_auto_min = State()
+    waiting_req_value = State()      # a requisite field in the panel withdraw wizard
+    waiting_panel_amount = State()   # amount for a manual panel withdrawal
+    waiting_option_search = State()  # filtering a long option list by name
+
+
+def _pick(*sources_and_keys) -> object | None:
+    """Первое значение, ключ которого действительно есть в ответе.
+
+    Обычная цепочка `a.get(x) or a.get(y)` теряет настоящий баланс в ноль:
+    ноль ложен, значение отбрасывается, и поиск идёт дальше.
+    """
+    sources, keys = sources_and_keys[0], sources_and_keys[1:]
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for key in keys:
+            if key in src and src[key] not in (None, ""):
+                return src[key]
+    return None
+
+
+_MONEY_KEYS = ("balance", "wallet", "money", "balance_rub", "amount")
+_PENDING_KEYS = ("pending_balance", "pending", "hold", "frozen")
+
+
+def _money(value):
+    """Число из того, во что маркетплейс завернул сумму. None — не число.
+
+    Разбор один на весь бот — в `orderfields.parse_amount`. Здешняя версия
+    убирала пробелы и запятые, но не символ валюты: «1 234,56 ₽»
+    становилось «1234.56₽», float падал молча, и баланс показывался
+    прочерком при том, что панель его прислала.
+    """
+    from orderfields import parse_amount
+    return parse_amount(value)
+
+
+def _plain(value) -> str:
+    """Число строкой — без разрядов, но и без потери копеек.
+
+    Эту строку ещё будут превращать во `float` перед выводом средств, так
+    что пробел в разрядах здесь недопустим. А `.2f` округлял «586,226 ₽» до
+    586.23 и расходился с панелью на экране, который ровно для совпадения
+    с ней и существует.
+    """
+    return f"{float(value):.3f}".rstrip("0").rstrip(".")
+
+
+def _deep_find(node, keys, depth: int = 4):
+    """Первое значение под любым из `keys`, поиск в ширину.
+
+    Просмотр на один уровень не находил баланс, лежащий словарём глубже, и
+    показывал ноль — а это читается как «в магазине нет денег», а не как
+    «бот туда не заглянул».
+    """
+    level = [node]
+    for _ in range(depth):
+        nxt = []
+        for cur in level:
+            if not isinstance(cur, dict):
+                continue
+            for k in keys:
+                if k in cur and cur[k] not in (None, ""):
+                    got = _money(cur[k]) if keys is _MONEY_KEYS else cur[k]
+                    if got is not None:
+                        return got
+            nxt.extend(v for v in cur.values() if isinstance(v, (dict, list)))
+        level = [x for v in nxt for x in (v if isinstance(v, list) else [v])]
+        if not level:
+            break
+    return None
+
+
+def _shape(data, limit: int = 12) -> str:
+    """Какие ключи в ответе есть на самом деле — чтобы объяснить, почему ничего
+        не нашлось. «Не найдено» без формы ответа не даёт сделать следующий шаг."""
+    if isinstance(data, dict):
+        inner = [f"{k}:{_shape(v, 4)}" if isinstance(v, dict) else k
+                 for k in list(data)[:limit] for v in [data[k]]]
+        return "{" + ", ".join(inner) + "}"
+    return type(data).__name__
+
+
+async def _run_panel(uid, fn, *args):
+    """Выполнить блокирующий вызов панели и распаковать его (ok, payload).
+
+    Функция была удалена 05.08 вместе с соседней, а четыре её вызова и
+    импорт из `stats_source` остались. Ловилось это только в бою и молча:
+    статистика на каждый экран получала ImportError, уходила в запасной
+    источник и подписывалась «история бота — cannot import name
+    '_run_panel'», а баланс, реквизиты и вывод падали на NameError.
+    Из-за этого же цифры не сходились с панелью: их туда просто не спрашивали.
+
+    Все `panel_*` возвращают (ok, data). Отдавать этот кортеж как есть
+    нельзя: вызывающий проверял `isinstance(res, list)` против кортежа,
+    проверка не срабатывала, и весь сырой ответ уезжал в сообщение длиннее
+    телеграмного предела — «загружаю…» так и оставалось на экране.
+    """
+    import asyncio as _a
+    from storage import get_panel_creds
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
+        return None, "нужен вход в панель продавца"
+    loop = _a.get_event_loop()
+    try:
+        result = await _a.wait_for(
+            loop.run_in_executor(None, fn, creds["cookies"], *args),
+            timeout=60)
+    except _a.TimeoutError:
+        return None, "панель не ответила за 60 секунд"
+    except Exception as e:
+        return None, str(e)[:150] or type(e).__name__
+    if (isinstance(result, tuple) and len(result) == 2
+            and isinstance(result[0], bool)):
+        ok, payload = result
+        return (payload, "") if ok else (None, str(payload)[:250])
+    return result, ""
+
+
+async def _panel_balance(uid: int) -> tuple[str | None, str]:
+    """Баланс так, как его называет панель → (готовая строка, ошибка).
+
+    В Integration API баланса нет нигде: /check отвечает только «кто вы».
+    Раздел балансов в панели — единственный источник, и вывод средств
+    работает с ним же, поэтому показанная сумма и выводимая совпадают.
+    """
+    import asyncio as _a
+    from storage import get_panel_creds
+    creds = get_panel_creds(uid)
+    if not creds or not creds.get("cookies"):
+        return None, "нужен вход в панель продавца"
+    from automation.panel import panel_balances_sync, panel_shop_balance_sync
+    loop = _a.get_event_loop()
+
+    # Где панель показывает его на самом деле: на странице самого магазина.
+    # Раздел `balances` был прежней догадкой и на этой панели не отвечает ничем.
+    #
+    # Имя магазина — чтобы читать баланс СВОЕГО. Одна панельная сессия видит
+    # все магазины продавца, и без имени бот брал первый попавшийся: под
+    # вторым аккаунтом показал бы деньги первого.
+    from storage import get_shop_name
+    try:
+        ok, got = await _a.wait_for(
+            loop.run_in_executor(None, panel_shop_balance_sync,
+                                 creds["cookies"], "", get_shop_name(uid)),
+            timeout=45)
+    except Exception as e:
+        ok, got = False, f"не ответила: {str(e)[:60]}"
+    if ok and isinstance(got, dict):
+        amt = got.get("amount")
+        return _plain(amt), ""
+    shop_err = str(got)[:200]
+
+    try:
+        ok, rows = await _a.wait_for(
+            loop.run_in_executor(None, panel_balances_sync, creds["cookies"]),
+            timeout=45)
+    except Exception as e:
+        return None, f"магазин: {shop_err} · balances: {str(e)[:50]}"
+    if not ok or not isinstance(rows, list):
+        # И причину второй попытки тоже: «магазин: …» без неё выглядит так,
+        # будто balances вообще не спрашивали.
+        return None, f"магазин: {shop_err} · balances: {str(rows)[:120]}"
+
+    # Строк может быть несколько — по одной на валюту. Продавец имеет в виду
+    # рублёвую, а единственная строка однозначна и без выбора.
+    best = None
+    for row in rows:
+        amt = _money(row.get("amount"))
+        if amt is None:
+            continue
+        cur = str(row.get("currency") or "").lower()
+        if "rub" in cur or "руб" in cur or "₽" in cur or not cur:
+            return _plain(amt), ""
+        best = best if best is not None else amt
+    if best is not None:
+        return _plain(best), ""
+    # Дошли сюда — значит `balances` ответил, но суммы в строках нет. Прежний
+    # текст «панель не показала сумму» выбрасывал разбор страницы магазина,
+    # где как раз перечислены найденные поля, — то есть ровно то, ради чего
+    # эту причину и печатают. Показываем обе попытки и то, что в строках было.
+    seen = []
+    for row in rows[:3]:
+        fields = [str(f.get("name") or f.get("attribute"))
+                  for f in ((row.get("raw") or {}).get("fields") or [])
+                  if isinstance(f, dict)]
+        seen.append(f"строка {row.get('id')}: "
+                    + (", ".join(n for n in fields if n) or "без полей"))
+    return None, (f"магазин: {shop_err} · balances: строк {len(rows)}, "
+                  "суммы ни в одной; " + "; ".join(seen))[:400]
+
+
+def _other_account_hint(uid: int) -> str:
+    """Строка про вход в панель у соседнего аккаунта, или пусто.
+
+    Куки панели — свои у каждого магазина. После переключения баланс
+    пропадает не потому, что он ноль, а потому что в панель второго
+    магазина никто не входил. Продавец же видит «баланс не показывается» и
+    ищет поломку там, где её нет.
+    """
+    from storage import accounts_with_panel, get_accounts, get_active_account
+    if len(get_accounts(uid)) < 2:
+        return ""
+    others = [n for n in accounts_with_panel(uid) if n != get_active_account(uid)]
+    if not others:
+        return ""
+    active = get_active_account(uid) or "текущий"
+    return (f"\n<i>Сейчас активен аккаунт «{_esc(active)}». Вход в панель "
+            f"есть у: {_esc(', '.join(others))}. У каждого магазина своя "
+            f"панель — войди ещё раз, уже под этим.</i>")
 
 
 def _parse_check(data: dict) -> tuple[str, str, str | None]:
-    """Parse /check response → (name, balance, pending)."""
+    """Разбор ответа /check → (название, баланс, ожидает зачисления)."""
     logger.info("CHECK raw response: %s", data)
     shop = data.get("shop") or data.get("data") or data
     if not isinstance(shop, dict):
         shop = data
-    name = (
-        shop.get("name") or shop.get("shop_name") or shop.get("title") or
-        data.get("name") or "—"
-    )
-    balance = (
-        shop.get("balance") or shop.get("wallet") or shop.get("money") or
-        shop.get("balance_rub") or shop.get("amount") or
-        data.get("balance") or data.get("wallet") or data.get("money")
-    )
-    pending = (
-        shop.get("pending_balance") or shop.get("pending") or
-        shop.get("hold") or shop.get("frozen")
-    )
-    bal_str = str(balance) if balance is not None and balance != "" else "0"
-    pend_str = str(pending) if pending is not None and pending != "" else None
+    srcs = (shop, data)
+
+    # Название магазина лежит так же глубоко, как баланс: просмотр на один
+    # уровень показывал «—» для магазина, прямо названного в ответе.
+    name = (_pick(srcs, "name", "shop_name", "title")
+            or _deep_find(data, ("name", "shop_name", "title")) or "—")
+    balance = _deep_find(data, _MONEY_KEYS)
+    pending = _deep_find(data, _PENDING_KEYS)
+
+    # Пусто, а не «0»: баланс, которого в ответе не было, — это не баланс в
+    # zero, and showing zero for it reads as «денег нет» instead of «не нашёл».
+    bal_str = _plain(balance) if balance is not None else ""
+    pend = _money(pending) if pending is not None else None
+    pend_str = _plain(pend) if pend else None
     return str(name), bal_str, pend_str
+
+
+from orderfields import DONE as _DONE
+from orderfields import money as _RUB       # 1234 → «1 234», 1234.5 → «1 234,5»
+
+
+def _shown(value) -> str:
+    """Сумму на экран — с разрядами. «586226 ₽» читается пересчётом цифр.
+
+    Разбор и показ разведены нарочно: наружу из `_panel_balance` уходит
+    голое число, которое ещё будут превращать во `float` перед выводом
+    средств. Пробел в разрядах там сломал бы `float`, и баланс стал бы
+    нулём — «выводить нечего» при полном счёте.
+    """
+    from orderfields import parse_amount
+    num = parse_amount(value)
+    return _RUB(num) if num is not None else str(value)
+
+
+def _earned(details: dict, known: dict, since: float) -> tuple[int, int]:
+    """(закрытых продаж, выручка ₽) по заказам, впервые увиденным с `since`.
+
+    Считается по тому, что фоновый опрос уже сохранил, — поэтому экран
+    баланса показывает сегодняшнее и недельное, не ходя лишний раз в API.
+    """
+    sales = revenue = 0
+    for oid, det in details.items():
+        seen = det.get("seen_at", 0)
+        if not seen or seen < since:
+            continue
+        st = str(known.get(oid) or known.get(str(oid)) or "")
+        if st not in _DONE:
+            continue
+        sales += 1
+        try:
+            revenue += int(float(str(det.get("price", 0))))
+        except (ValueError, TypeError):
+            pass
+    return sales, revenue
+
+
+def _bump_spent(s: dict, since: float) -> float:
+    """Траты на продвижение, которые вычитаются из выручки.
+
+    Точно учитывается только сегодняшнее; за неделю это лучшее из того, что
+    есть, и выдавать его за точное нельзя.
+    """
+    bs = s.get("bump_schedule", {})
+    if bs.get("spent_day") == _lt.today_str(s):
+        return float(bs.get("spent_today", 0) or 0)
+    return 0.0
+
+
+def _activity_block(uid: int) -> str:
+    s = get_settings(uid)
+    details = s.get("known_order_details", {})
+    known = s.get("known_orders", {})
+    now = time.time()
+    from stats_source import day_start as _day_start
+    day_start = _day_start(now, s)
+    week_start = now - 7 * 86400
+
+    d_sales, d_rev = _earned(details, known, day_start)
+    w_sales, w_rev = _earned(details, known, week_start)
+    d_spent = _bump_spent(s, day_start)
+
+    lines = ["", "📊 <b>Продажи</b>"]
+    net = d_rev - d_spent
+    today = f"├ Сегодня: <b>{_RUB(d_rev)} ₽</b> ({d_sales})"
+    if d_spent:
+        today += f"  ·  чистыми {_RUB(net)} ₽"
+    lines.append(today)
+    lines.append(f"└ 7 дней: <b>{_RUB(w_rev)} ₽</b> ({w_sales})")
+    return "\n".join(lines)
 
 
 def _kb() -> InlineKeyboardMarkup:
@@ -49,9 +338,12 @@ def _kb() -> InlineKeyboardMarkup:
     b.button(text="💸 Вывести средства", callback_data="balance:withdraw")
     b.button(text="📋 Активные выводы", callback_data="balance:active")
     b.button(text="📜 История выводов", callback_data="balance:history")
+    b.button(text="📊 Статистика", callback_data="menu:stats")
+    b.button(text="🔔 Порог уведомления", callback_data="balance:threshold")
+    b.button(text="💳 Реквизиты вывода", callback_data="balance:auto")
     b.button(text="🔄 Обновить", callback_data="menu:balance")
     b.button(text="⬅️ Главное меню", callback_data="menu:main")
-    b.adjust(2, 1, 2)
+    b.adjust(2, 2, 1, 2)
     return b.as_markup()
 
 
@@ -60,7 +352,7 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.message.edit_text("⏳ Загружаю баланс...")
     if not api:
         await callback.message.edit_text(
-            "❌ Нужен API-токен. Отправьте /start и введите токен.",
+            "❌ Нужен API-токен. Отправь /start и введи токен.",
             reply_markup=back_keyboard())
         await callback.answer()
         return
@@ -77,7 +369,7 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
         err = str(e)[:200]
         logger.error("Balance check error: %s", e)
 
-    # If /check didn't give a usable number, try the dedicated balance endpoints
+    # Если из /check пригодного числа не вышло — пробуем отдельные адреса баланса
     if balance in (None, "", "0", "—"):
         try:
             amount, bal_str = await api.get_balance()
@@ -87,24 +379,66 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
             if err is None:
                 err = str(e)[:200]
 
+    # /check отдаёт {status, shop:{id,title}, integration:{…}, ts} — проверку
+    # доступа, в которой денег нет вовсе; отсюда и вечный ноль в балансе.
+    # Сумма живёт в панели, и вывод средств читает её оттуда же
+    # it from.
+    panel_err = ""
+    if balance in (None, "", "—"):
+        panel_bal, panel_err = await _panel_balance(callback.from_user.id)
+        if panel_bal is not None:
+            balance = panel_bal
+
+    if balance in (None, "", "—"):
+        # Не ответил ни один источник. Показываем обе попытки, а не только
+        # форму ответа API: прежняя версия прятала причину от панели за
+        # сообщением про /check, и два круга прошли, не узнав, что ответила
+        # панель. Метка сборки здесь по той же причине, что и на экране
+        # возврата в продажу: вывод из устаревшего контейнера выглядит так
+        # же. Видит её только админ — продавцу код сборки не говорит ничего.
+        from storage import get_panel_creds
+        has_panel = bool((get_panel_creds(callback.from_user.id) or {}).get("cookies"))
+        lines = [f"💰 <b>Баланс</b>{ui.build_mark(callback.from_user.id)}", ""]
+        lines.append("<b>API:</b> в ответе нет баланса — это только проверка "
+                     "доступа:")
+        lines.append(f"<code>{_esc(_shape(raw))[:400]}</code>" if raw
+                     else f"<code>{_esc(err or 'нет ответа')[:200]}</code>")
+        lines.append("")
+        lines.append(f"<b>Панель:</b> {'вход есть' if has_panel else '❌ вход не выполнен'}"
+                     + (f" — {_esc(panel_err)[:200]}" if panel_err else ""))
+        if not has_panel:
+            lines.append("<i>Баланс есть только в панели. Войди: "
+                         "«Настройки» → «Панель продавца».</i>")
+            lines.append(_other_account_hint(callback.from_user.id))
+        await callback.message.edit_text("\n".join(lines), reply_markup=_kb())
+        await callback.answer()
+        return
+
     if balance not in (None, "", "—"):
         text = (
             f"🏪 <b>{name}</b>\n\n"
-            f"💰 Баланс: <b>{balance} ₽</b>\n"
+            f"💰 Баланс: <b>{_shown(balance)} ₽</b>\n"
         )
         if pending:
-            text += f"⏳ В ожидании: <b>{pending} ₽</b>\n"
-        text += "✅ Статус: Активен"
+            text += f"⏳ В ожидании: <b>{_shown(pending)} ₽</b>\n"
+        # Привязываем число к тому, из чего оно вышло: баланс без продаж рядом
+        # is just a figure
+        text += _activity_block(callback.from_user.id)
+        threshold = get_settings(callback.from_user.id).get(
+            "balance_notify", {})
+        if threshold.get("enabled"):
+            text += (f"\n\n🔔 Уведомлю при достижении "
+                     f"<b>{_RUB(float(threshold.get('threshold', 0) or 0))} ₽</b>")
         kb = _kb()
     else:
-        # Nothing usable — show diagnostics so the real response shape is visible
+        # Пригодного нет — показываем диагностику, чтобы была видна форма ответа
         text = "❌ <b>Не удалось получить баланс</b>\n\n"
         if err:
             text += f"Ошибка: <code>{err}</code>\n\n"
         if raw is not None:
             text += f"Ответ API <code>/check</code>:\n<code>{str(raw)[:400]}</code>"
         else:
-            text += "API не ответил. Проверьте токен и попробуйте снова."
+            text += "API не ответил. Проверь токен и попробуй снова."
         kb = _kb()
 
     await callback.message.edit_text(text, reply_markup=kb)
@@ -113,24 +447,54 @@ async def show_balance(callback: CallbackQuery, api: YooMarketAPI) -> None:
 
 # ── Вывод средств ───────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "balance:withdraw")
-async def withdraw_start(callback: CallbackQuery, state: FSMContext, api: YooMarketAPI) -> None:
-    bal_str = "?"
-    if api:
-        try:
-            amount, bal_str = await api.get_balance()
-        except Exception:
-            pass
-    await state.set_state(WithdrawState.waiting_amount)
+def _payout_ready(uid: int) -> bool:
+    """Настроен ли способ выплаты. Без него выводить нечем."""
+    aw = get_settings(uid).get("auto_withdraw", {})
+    return bool(aw.get("panel_balance_id") and aw.get("panel_values"))
+
+
+def _setup_first_kb():
+    b = InlineKeyboardBuilder()
+    b.button(text="⚙️ Настроить вывод", callback_data="balance:auto")
+    b.button(text="⬅️ Баланс", callback_data="menu:balance")
+    ui.lay(b)
+    return b.as_markup()
+
+
+async def _ask_amount(message, uid: int, api: YooMarketAPI,
+                      state: FSMContext) -> None:
+    """Экран «сколько вывести». Деньги уходят через панель — в API вывода нет.
+
+    Прежние кнопки ходили в /withdraw, /wallet/withdraw и ещё три пути,
+    которых у Юмаркета не существует: вывод всегда заканчивался ошибкой,
+    хотя рядом, в мастере, тот же вывод работал через панель.
+    """
+    from tasks.manager import shop_balance
+    if not _payout_ready(uid):
+        await message.edit_text(
+            "💸 <b>Вывод средств</b>\n\n"
+            "Сначала нужно указать, <b>куда</b> выводить: способ выплаты и "
+            "реквизиты. Бот прочитает форму вывода прямо из панели.",
+            reply_markup=_setup_first_kb())
+        return
+    _amount, bal_str = await shop_balance(uid, api)
+    await state.set_state(WithdrawState.waiting_panel_amount)
     b = InlineKeyboardBuilder()
     b.button(text="💸 Вывести всё", callback_data="balance:withdraw_all")
     b.button(text="❌ Отмена", callback_data="menu:balance")
     b.adjust(1)
-    await callback.message.edit_text(
-        f"💸 <b>Вывод средств</b>\n\nДоступно: <b>{bal_str} ₽</b>\n\n"
-        "Введите сумму для вывода или нажмите «Вывести всё»:",
-        reply_markup=b.as_markup(),
-    )
+    await message.edit_text(
+        # `shop_balance` отдаёт строку уже со знаком рубля. Второй здесь
+        # давал «586226 ₽ ₽».
+        f"💸 <b>Вывод средств</b>\n\nДоступно: <b>{bal_str}</b>\n\n"
+        "Пришли сумму в ₽ или жми «Вывести всё»:",
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "balance:withdraw")
+async def withdraw_start(callback: CallbackQuery, state: FSMContext,
+                         api: YooMarketAPI) -> None:
+    await _ask_amount(callback.message, callback.from_user.id, api, state)
     await callback.answer()
 
 
@@ -145,45 +509,636 @@ def _log_withdrawal(uid: int, amount: float, wtype: str, ok: bool) -> None:
     save_settings(uid, s)
 
 
-async def _do_withdraw(msg, uid: int, api: YooMarketAPI, amount: float | None) -> None:
-    if not api:
-        await msg.answer("❌ Нужен API-токен.")
-        return
-    status = await msg.answer("⏳ Оформляю вывод…")
-    try:
-        ok, result = await api.withdraw_balance(amount=amount)
-    except Exception as e:
-        ok, result = False, f"Ошибка: {str(e)[:120]}"
-    # log the requested amount (0 = full — we log the balance if known)
-    log_amt = amount if amount is not None else 0.0
-    _log_withdrawal(uid, log_amt, "manual", ok)
-    b = InlineKeyboardBuilder()
-    b.button(text="📜 История", callback_data="balance:history")
-    b.button(text="⬅️ Баланс", callback_data="menu:balance")
-    b.adjust(2)
-    await status.edit_text(
-        (f"✅ {result}" if ok else f"❌ {result}"), reply_markup=b.as_markup())
-
-
 @router.callback_query(F.data == "balance:withdraw_all")
-async def withdraw_all(callback: CallbackQuery, state: FSMContext, api: YooMarketAPI) -> None:
+async def withdraw_all(callback: CallbackQuery, state: FSMContext,
+                       api: YooMarketAPI) -> None:
+    """«Всё» — это столько, сколько панель показывает на счету."""
+    from tasks.manager import shop_balance
     await state.clear()
+    uid = callback.from_user.id
+    if not _payout_ready(uid):
+        await callback.message.edit_text(
+            "💸 <b>Вывод средств</b>\n\nСначала настрой способ выплаты.",
+            reply_markup=_setup_first_kb())
+        await callback.answer()
+        return
+    await callback.answer("⏳ Смотрю баланс…")
+    amount, bal_str = await shop_balance(uid, api)
+    if not amount or amount < 1:
+        # Ноль на экране подтверждения — заявка в никуда.
+        await callback.message.edit_text(
+            f"💸 <b>Вывод средств</b>\n\nНа счету <b>{bal_str}</b> — "
+            "выводить нечего.",
+            reply_markup=_setup_first_kb())
+        return
+    await _confirm_payout(callback.message, uid, int(amount))
+
+
+# ── Порог уведомления о балансе ─# ── Порог уведомления о балансе ──────────────────────────────────────────────
+
+@router.callback_query(F.data == "balance:threshold")
+async def threshold_start(callback: CallbackQuery, state: FSMContext) -> None:
+    s = get_settings(callback.from_user.id)
+    bn = s.get("balance_notify", {})
+    cur = bn.get("threshold", 1000)
+    on = bn.get("enabled", False)
+    await state.set_state(WithdrawState.waiting_threshold)
+    b = InlineKeyboardBuilder()
+    if on:
+        b.button(text="🔕 Выключить уведомление", callback_data="balance:threshold_off")
+    b.button(text="❌ Отмена", callback_data="menu:balance")
+    b.adjust(1)
+    await callback.message.edit_text(
+        f"🔔 <b>Порог уведомления о балансе</b>\n\n"
+        f"Сейчас: {'включено, ' + str(cur) + ' ₽' if on else 'выключено'}\n\n"
+        f"Пришли сумму — бот напишет, когда баланс её достигнет, "
+        f"чтобы вовремя вывести средства.",
+        reply_markup=b.as_markup())
     await callback.answer()
-    await _do_withdraw(callback.message, callback.from_user.id, api, None)
 
 
-@router.message(WithdrawState.waiting_amount)
-async def withdraw_amount(message: Message, state: FSMContext, api: YooMarketAPI) -> None:
+@router.callback_query(F.data == "balance:threshold_off")
+async def threshold_off(callback: CallbackQuery, state: FSMContext, api: YooMarketAPI) -> None:
+    await state.clear()
+    s = get_settings(callback.from_user.id)
+    s.setdefault("balance_notify", {})["enabled"] = False
+    save_settings(callback.from_user.id, s)
+    await callback.answer("Уведомление выключено", show_alert=True)
+    await show_balance(callback, api)
+
+
+@router.message(WithdrawState.waiting_threshold)
+async def threshold_save(message: Message, state: FSMContext) -> None:
     raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
     try:
         amount = float(raw)
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите сумму числом, например: <b>500</b>")
+        await message.answer("❌ Введи сумму числом, например: <b>1000</b>")
         return
     await state.clear()
-    await _do_withdraw(message, message.from_user.id, api, amount)
+    s = get_settings(message.from_user.id)
+    bn = s.setdefault("balance_notify", {})
+    bn["threshold"] = amount
+    bn["enabled"] = True
+    # Взводим заново, чтобы уже высокий баланс сработал один раз на следующем
+    # проходе, а не считался «об этом уже сообщали».
+    bn["last_notified_balance"] = 0.0
+    save_settings(message.from_user.id, s)
+    b = InlineKeyboardBuilder()
+    b.button(text="💰 К балансу", callback_data="menu:balance")
+    await message.answer(
+        f"✅ Уведомлю, когда баланс достигнет <b>{_RUB(amount)} ₽</b>.",
+        reply_markup=b.as_markup())
+
+
+# ── Реквизиты вывода ─────────────────────────────────────────────────────────
+#
+# Автовывод убран: деньги переводит человек, а не расписание. Здесь остаётся
+# то, без чего ручной вывод невозможен, — способ выплаты и реквизиты,
+# прочитанные из формы самой панели.
+
+def _auto_text(s: dict) -> str:
+    aw = s.get("auto_withdraw", {})
+    vals = aw.get("panel_values") or {}
+    ready = bool(aw.get("panel_balance_id") and vals)
+    lines = ["💳 <b>Реквизиты вывода</b>\n"]
+    if ready:
+        masked = ", ".join(
+            f"{k}={_mask(v) if k in ('card', 'wallet', 'phone', 'steam_wallet') else v}"
+            for k, v in vals.items() if k != "system")
+        lines.append("Статус: 🟢 настроены")
+        lines.append(f"Куда: {_esc(masked) or '—'}")
+    else:
+        lines.append("Статус: 🔴 не настроены")
+        lines.append("")
+        lines.append("Вывод идёт через панель — у Юмаркета нет вывода через "
+                     "API. Бот прочитает форму выплаты прямо из панели и "
+                     "спросит только то, что в ней есть.")
+    lim = aw.get("limits") or {}
+    if lim.get("max"):
+        lines.append(f"Потолок одной выплаты: {_RUB(float(lim['max']))} ₽")
+    if aw.get("last_result"):
+        lines.append(f"\nПоследнее: {_esc(aw['last_result'])}")
+    lines.append("\n<i>Автоматического вывода нет: заявку отправляешь ты.</i>")
+    return "\n".join(lines)
+
+
+def _mask(value) -> str:
+    """Показать реквизит, не показывая его целиком.
+
+    Экран подтверждения выплаты нужен, чтобы заметить чужую карту, а не
+    чтобы светить свою в переписке.
+    """
+    s = str(value or "")
+    if len(s) <= 6:
+        return s
+    return f"{s[:4]}…{s[-4:]}"
+
+
+def _esc(t) -> str:
+    return (str(t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _auto_kb(s: dict) -> InlineKeyboardMarkup:
+    aw = s.get("auto_withdraw", {})
+    ready = bool(aw.get("panel_balance_id") and aw.get("panel_values"))
+    b = InlineKeyboardBuilder()
+    b.button(text="⚙️ Настроить вывод через панель",
+             callback_data="balance:auto_setup")
+    if ready:
+        b.button(text="💸 Вывести сейчас", callback_data="wd:manual")
+    b.button(text="⬅️ Баланс", callback_data="menu:balance")
+    ui.lay(b)
+    return b.as_markup()
+
+
+@router.callback_query(F.data == "balance:auto")
+async def auto_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    s = get_settings(callback.from_user.id)
+    await callback.message.edit_text(_auto_text(s), reply_markup=_auto_kb(s))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "balance:auto_setup")
+async def auto_setup(callback: CallbackQuery, state: FSMContext) -> None:
+    """Начало мастера вывода: с какого баланса выводим."""
+    from automation.panel import panel_balances_sync
+    await state.clear()
+    await callback.answer("⏳")
+    await callback.message.edit_text("⏳ Читаю счета из панели...")
+    res, err = await _run_panel(callback.from_user.id, panel_balances_sync)
+    ok = isinstance(res, list)
+    if not ok:
+        b = InlineKeyboardBuilder()
+        b.button(text="⬅️ Назад", callback_data="balance:auto")
+        await callback.message.edit_text(
+            f"❌ Не удалось прочитать счета: {_esc(err or res)}",
+            reply_markup=b.as_markup())
+        return
+    # Держим только нужное следующему шагу: полные строки Nova в "raw" велики
+    # и раздували бы состояние формы без всякой пользы.
+    slim = [{"id": bl["id"], "currency": bl.get("currency", ""),
+             "amount": bl.get("amount", "")} for bl in res]
+    await state.update_data(wd_balances=slim)
+    b = InlineKeyboardBuilder()
+    for i, bl in enumerate(slim):
+        cur = (bl.get("currency") or "").split("  ")[0][:28]
+        b.button(text=f"💳 {cur} · {bl.get('amount') or '—'}",
+                 callback_data=f"wd:bal:{i}")
+    b.button(text="⬅️ Назад", callback_data="balance:auto")
+    b.adjust(1)
+    await callback.message.edit_text(
+        "⚙️ <b>Вывод через панель</b>\n\n"
+        "С какого счёта выводить? Обычно это <b>Баланс Магазина</b> "
+        "(счёт для продаж).",
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("wd:bal:"))
+async def wd_pick_balance(callback: CallbackQuery, state: FSMContext) -> None:
+    from automation.panel import panel_withdraw_fields_sync
+    data = await state.get_data()
+    balances = data.get("wd_balances") or []
+    try:
+        bl = balances[int(callback.data.split(":")[-1])]
+    except (ValueError, IndexError):
+        await callback.answer("Список устарел, начни заново", show_alert=True)
+        return
+    await callback.answer("⏳")
+    await callback.message.edit_text("⏳ Читаю форму вывода...")
+    res, err = await _run_panel(callback.from_user.id,
+                                panel_withdraw_fields_sync, bl["id"])
+    if not isinstance(res, dict):
+        await callback.message.edit_text(
+            f"❌ {_esc(err or res)}",
+            reply_markup=_one_btn("⬅️ Назад", "balance:auto"))
+        return
+    sys_field = next((f for f in res["fields"] if f["attribute"] == "system"), None)
+    if not sys_field or not sys_field["options"]:
+        await callback.message.edit_text(
+            "❌ Панель не отдала список способов вывода. Возможно, вывод "
+            "закрыт, пока профиль не прошёл проверку.",
+            reply_markup=_one_btn("⬅️ Назад", "balance:auto"))
+        return
+    await state.update_data(wd_balance_id=bl["id"], wd_action=res["key"],
+                            wd_systems=sys_field["options"], wd_values={})
+    b = InlineKeyboardBuilder()
+    for i, o in enumerate(sys_field["options"][:20]):
+        b.button(text=str(o["label"])[:40], callback_data=f"wd:sys:{i}")
+    b.button(text="❌ Отмена", callback_data="balance:auto")
+    b.adjust(1)
+    await callback.message.edit_text(
+        "💸 <b>Способ вывода</b>\n\n"
+        "Выбери, куда выводить средства:",
+        reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data.startswith("wd:sys:"))
+async def wd_pick_system(callback: CallbackQuery, state: FSMContext) -> None:
+    from automation.panel import panel_withdraw_fields_sync
+    data = await state.get_data()
+    systems = data.get("wd_systems") or []
+    try:
+        sysopt = systems[int(callback.data.split(":")[-1])]
+    except (ValueError, IndexError):
+        await callback.answer("Начни заново", show_alert=True)
+        return
+    await callback.answer(str(sysopt["label"])[:60])
+    await callback.message.edit_text("⏳ Уточняю, какие нужны реквизиты...")
+    # Перечитываем форму с выбранной системой: панель тогда делает видимыми
+    # те реквизиты, которые нужны этому способу.
+    res, err = await _run_panel(callback.from_user.id,
+                                panel_withdraw_fields_sync,
+                                data["wd_balance_id"], {"system": sysopt["value"]})
+    reqs = []
+    if isinstance(res, dict):
+        for f in res["fields"]:
+            if (f["visible"] and not f["skip"] and not f["is_amount"]
+                    and f["attribute"] != "system"):
+                reqs.append(f)
+    if not reqs:
+        # Запасной список, если перечитывание не изменило видимость полей
+        reqs = _fallback_reqs(str(sysopt["label"]), res)
+    values = {"system": sysopt["value"]}
+    # Едет в состоянии формы: разбор вариантов ниже требует сессии панели, а у
+    # шага, который его делает, на руках только сообщение.
+    await state.update_data(wd_values=values, wd_system_label=str(sysopt["label"]),
+                            wd_queue=reqs, wd_qi=0, wd_uid=callback.from_user.id)
+    await _wd_ask_next(callback.message, state)
+
+
+def _fallback_reqs(system_label: str, res) -> list:
+    """Если Nova не перестроила форму — спросить реквизиты, которые выбранный
+    способ очевидно требует, по названиям его же полей.
+    """
+    lab = system_label.lower()
+    fields = {f["attribute"]: f for f in (res.get("fields") if isinstance(res, dict) else [])}
+    want: list[str] = []
+    if "карт" in lab or "card" in lab:
+        want = ["card"]
+    elif "steam" in lab:
+        want = ["steam_wallet"]
+    elif "сбп" in lab or "sbp" in lab:
+        want = ["bank_id", "phone"]
+    elif any(t in lab for t in ("usdt", "trc", "крипт", "crypto")):
+        want = ["wallet"]
+    return [fields[a] for a in want if a in fields]
+
+
+async def _wd_ask_next(message, state: FSMContext) -> None:
+    data = await state.get_data()
+    queue = data.get("wd_queue") or []
+    qi = data.get("wd_qi", 0)
+    # Пропускаем поля, на которые уже ответили
+    while qi < len(queue) and queue[qi]["attribute"] in (data.get("wd_values") or {}):
+        qi += 1
+    if qi >= len(queue):
+        await _wd_finish(message, state)
+        return
+    f = queue[qi]
+    await state.update_data(wd_qi=qi)
+    label = _esc(f["label"])
+    hint = f"\n<i>{_esc(f['help'])}</i>" if f.get("help") else ""
+
+    # Зависимый список приходит с `options: []` до тех пор, пока не выбрано то,
+    # on are known — «Банк» arrives empty and only fills in once the payment
+    # от чего он зависит. Не спросив их, мастер сваливался в ввод текстом и
+    # заставлял продавца печатать название банка руками. В продвижении зависимые
+    # списки уже разбирались так же — теперь и в выводе.
+    if (not f["options"] and f.get("component", "").endswith("select-field")
+            and not f.get("_looked_up")):
+        f["_looked_up"] = True
+        from storage import get_panel_creds
+        from automation.panel import panel_action_field_options_sync
+        creds = get_panel_creds(data.get("wd_uid") or message.chat.id) or {}
+        if creds.get("cookies"):
+            await message.edit_text(f"⏳ Узнаю список: {label}…")
+            try:
+                opts, _trace = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, panel_action_field_options_sync,
+                        creds["cookies"], str(data.get("wd_balance_id") or ""),
+                        str(data.get("wd_action") or ""), f["attribute"],
+                        dict(data.get("wd_values") or {}),
+                        f.get("component_key") or "", f.get("depends_on") or {}),
+                    timeout=45)
+                f["options"] = opts or []
+            except Exception as e:
+                logger.info("Withdraw options for %s: %s", f["attribute"], e)
+        queue[qi] = f
+        await state.update_data(wd_queue=queue)
+
+    if f["options"]:
+        # Номера указывают в полный список, а не в отфильтрованный вид: обработчик
+        # ответа ищет их в `f["options"]`.
+        query = (data.get("wd_filter") or "").strip().lower()
+        shown = [(i, o) for i, o in enumerate(f["options"])
+                 if not query or query in str(o["label"]).lower()]
+        total = len(f["options"])
+        # Список банков СБП заметно длиннее тридцати, и обрезка на этом месте
+        # молча прятала все банки после тридцатого — «Яндекс Банк» в их числе.
+        # То, что не влезло, теперь находится по названию, а не теряется.
+        clipped = shown[:_WD_MAX_BUTTONS]
+
+        b = InlineKeyboardBuilder()
+        for i, o in clipped:
+            b.button(text=str(o["label"])[:40], callback_data=f"wd:opt:{i}")
+        rows = [1] * len(clipped)
+        if total > len(clipped) or query:
+            b.button(text="🔎 Найти по названию", callback_data="wd:find")
+            rows.append(1)
+        if query:
+            b.button(text="↩️ Весь список", callback_data="wd:findoff")
+            rows.append(1)
+        if not f["required"]:
+            b.button(text="⏭ Пропустить", callback_data="wd:skip")
+            rows.append(1)
+        b.button(text="❌ Отмена", callback_data="balance:auto")
+        rows.append(1)
+        b.adjust(*rows)
+
+        head = f"💳 <b>{label}</b>{hint}\n\n"
+        if query:
+            head += (f"По запросу «{_esc(query)}»: {len(shown)} из {total}.\n"
+                     if shown else
+                     f"По запросу «{_esc(query)}» ничего нет ({total} всего).\n")
+        elif total > len(clipped):
+            head += f"Показаны первые {len(clipped)} из {total}.\n"
+        await message.edit_text(head + "Выбери:", reply_markup=b.as_markup())
+    else:
+        await state.set_state(WithdrawState.waiting_req_value)
+        b = InlineKeyboardBuilder()
+        if not f["required"]:
+            b.button(text="⏭ Пропустить", callback_data="wd:skip")
+        b.button(text="❌ Отмена", callback_data="balance:auto")
+        ui.lay(b)
+        ph = f.get("placeholder")
+        await message.edit_text(
+            f"✍️ <b>{label}</b>{hint}\n\n"
+            f"Пришли значение{f' ({_esc(ph)})' if ph else ''}:",
+            reply_markup=b.as_markup())
+
+
+_WD_MAX_BUTTONS = 30
+
+
+@router.callback_query(F.data == "wd:find")
+async def wd_find(callback: CallbackQuery, state: FSMContext) -> None:
+    """Спросить несколько букв: длинный список иначе не пролистать."""
+    await state.set_state(WithdrawState.waiting_option_search)
+    b = InlineKeyboardBuilder()
+    b.button(text="↩️ Весь список", callback_data="wd:findoff")
+    await callback.message.edit_text(
+        "🔎 Введи часть названия — например «яндекс»:",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+@router.message(WithdrawState.waiting_option_search)
+async def wd_find_apply(message: Message, state: FSMContext) -> None:
+    await state.update_data(wd_filter=(message.text or "").strip())
+    await state.set_state(None)
+    sent = await message.answer("⏳")
+    await _wd_ask_next(sent, state)
+
+
+@router.callback_query(F.data == "wd:findoff")
+async def wd_find_off(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(wd_filter="")
+    await state.set_state(None)
+    await _wd_ask_next(callback.message, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("wd:opt:"))
+async def wd_pick_option(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    queue = data.get("wd_queue") or []
+    qi = data.get("wd_qi", 0)
+    if qi >= len(queue):
+        await callback.answer("Начни заново", show_alert=True)
+        return
+    f = queue[qi]
+    try:
+        o = f["options"][int(callback.data.split(":")[-1])]
+    except (ValueError, IndexError):
+        await callback.answer("Ошибка выбора", show_alert=True)
+        return
+    values = dict(data.get("wd_values") or {})
+    values[f["attribute"]] = o["value"]
+    await callback.answer(str(o["label"])[:40])
+    # Сбрасывается вместе с шагом: слово, набранное для поиска банка, не
+    # должно перейти на следующее поле и спрятать бо́льшую часть его вариантов.
+    await state.update_data(wd_values=values, wd_qi=qi + 1, wd_filter="")
+    await _wd_ask_next(callback.message, state)
+
+
+@router.callback_query(F.data == "wd:skip")
+async def wd_skip(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.set_state(None)
+    await callback.answer("Пропущено")
+    await state.update_data(wd_qi=data.get("wd_qi", 0) + 1)
+    await _wd_ask_next(callback.message, state)
+
+
+@router.message(WithdrawState.waiting_req_value)
+async def wd_req_value(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    queue = data.get("wd_queue") or []
+    qi = data.get("wd_qi", 0)
+    if qi >= len(queue):
+        await state.clear()
+        await message.answer("Начни заново: «Настроить вывод».")
+        return
+    f = queue[qi]
+    raw = (message.text or "").strip()
+    if not raw:
+        await message.answer("❌ Пришли значение или жми «Пропустить».")
+        return
+    # В числовых полях только цифры; текстовые оставляем как набрали
+    if str(f.get("component", "")).startswith("number") or f.get("attribute") in (
+            "card", "phone", "link_id"):
+        cleaned = "".join(ch for ch in raw if ch.isdigit())
+        val = cleaned or raw
+    else:
+        val = raw
+    values = dict(data.get("wd_values") or {})
+    values[f["attribute"]] = val
+    await state.set_state(None)
+    await state.update_data(wd_values=values, wd_qi=qi + 1)
+    await _wd_ask_next(message, state)
+
+
+async def _wd_finish(message, state: FSMContext) -> None:
+    """Реквизиты собраны: сохраняем способ и показываем, что настроено."""
+    data = await state.get_data()
+    uid = message.chat.id
+    s = get_settings(uid)
+    aw = s.setdefault("auto_withdraw", {})
+    aw["method"] = "panel"
+    aw["panel_balance_id"] = data.get("wd_balance_id", "")
+    aw["panel_action_key"] = data.get("wd_action", "")
+    aw["panel_values"] = data.get("wd_values", {})   # system + requisites, no amount
+    save_settings(uid, s)
+    await state.clear()
+
+    lines = ["✅ <b>Способ вывода сохранён</b>\n",
+             f"Способ: <b>{_esc(data.get('wd_system_label') or '—')}</b>"]
+    for k, v in (data.get("wd_values") or {}).items():
+        if k == "system":
+            continue
+        shown = _mask(v) if k in ("card", "wallet", "phone", "steam_wallet") else _esc(str(v))
+        lines.append(f"• {_esc(k)}: {shown}")
+    lines.append("\nТеперь можно вывести сумму вручную или включить автовывод.")
+    b = InlineKeyboardBuilder()
+    b.button(text="💸 Вывести сейчас", callback_data="wd:manual")
+    b.button(text="🤖 К автовыводу", callback_data="balance:auto")
+    b.button(text="💰 Баланс", callback_data="menu:balance")
+    b.adjust(1, 2)
+    await message.answer("\n".join(lines), reply_markup=b.as_markup())
+
+
+@router.callback_query(F.data == "wd:manual")
+async def wd_manual_start(callback: CallbackQuery, state: FSMContext) -> None:
+    s = get_settings(callback.from_user.id)
+    aw = s.get("auto_withdraw", {})
+    if not (aw.get("panel_balance_id") and aw.get("panel_values")):
+        await callback.answer("Сначала настрой способ вывода", show_alert=True)
+        return
+    await state.set_state(WithdrawState.waiting_panel_amount)
+    b = InlineKeyboardBuilder()
+    b.button(text="❌ Отмена", callback_data="balance:auto")
+    await callback.message.edit_text(
+        "💸 <b>Сумма вывода</b>\n\nПришли сумму в ₽:",
+        reply_markup=b.as_markup())
+    await callback.answer()
+
+
+async def _confirm_payout(message, uid: int, amount: int) -> None:
+    """Последний экран перед реальными деньгами: сумма и куда."""
+    aw = get_settings(uid).get("auto_withdraw", {})
+    vals = aw.get("panel_values") or {}
+    masked = ", ".join(
+        f"{k}={_mask(v) if k in ('card', 'wallet', 'phone', 'steam_wallet') else v}"
+        for k, v in vals.items() if k != "system")
+    b = InlineKeyboardBuilder()
+    b.button(text=f"✅ Вывести {_RUB(amount)} ₽", callback_data=f"wd:go:{amount}")
+    b.button(text="❌ Отмена", callback_data="menu:balance")
+    b.adjust(1)
+    send = getattr(message, "edit_text", None) or message.answer
+    await send(
+        f"⚠️ <b>Подтверди вывод</b>\n\n"
+        # Разряды именно здесь важнее всего: экран последний перед деньгами,
+        # и «5862 ₽» от «58620 ₽» без пробела отличаются одним взглядом.
+        f"Сумма: <b>{_RUB(amount)} ₽</b>\n"
+        f"Реквизиты: {_esc(masked) or '—'}\n\n"
+        f"Заявка уйдёт в панель. Проверь реквизиты — ошибку не отменить.",
+        reply_markup=b.as_markup())
+
+
+@router.message(WithdrawState.waiting_panel_amount)
+async def wd_manual_amount(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        amount = int(float(raw))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введи сумму числом, например: <b>500</b>")
+        return
+    await state.clear()
+    await _confirm_payout(message, message.from_user.id, amount)
+
+
+@router.callback_query(F.data.startswith("wd:go:"))
+async def wd_execute(callback: CallbackQuery, api: YooMarketAPI) -> None:
+    from automation.panel import panel_withdraw_sync
+    try:
+        amount = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    uid = callback.from_user.id
+    s = get_settings(uid)
+    aw = s.get("auto_withdraw", {})
+    values = {**(aw.get("panel_values") or {}), "amount": amount}
+    # Отметка времени до запроса: по ней потом отличается свежая заявка от
+    # старой, уже лежавшей в журнале.
+    started = time.time()
+    await callback.answer("⏳ Оформляю вывод...")
+    await callback.message.edit_text("⏳ Отправляю заявку на вывод...")
+    res, err = await _run_panel(uid, panel_withdraw_sync,
+                                aw.get("panel_balance_id"),
+                                aw.get("panel_action_key"), values, uid, True)
+    # `_run_panel` уже разбирает (ok, тело): при успехе отдаёт (тело, ""), при
+    # отказе — (None, причина). Повторная проверка на кортеж здесь делала
+    # отказом ЛЮБОЙ исход: прошедшая выплата показывалась как «❌ не удалось»
+    # без причины — то есть приглашала повторить её настоящими деньгами.
+    ok = err == "" and res is not None
+    msg = str(res) if ok else (err or "панель не ответила")
+    _log_withdrawal(uid, float(amount), "manual", bool(ok))
+    b = InlineKeyboardBuilder()
+    b.button(text="📜 История", callback_data="balance:history")
+    b.button(text="💰 Баланс", callback_data="menu:balance")
+    b.adjust(2)
+    tail = await _payout_readback(uid, started) if ok else ""
+    await callback.message.edit_text(
+        (f"✅ {_esc(msg)}{tail}" if ok else f"❌ {_esc(msg)}"),
+        reply_markup=b.as_markup())
+
+
+async def _payout_readback(uid: int, since: float) -> str:
+    """Видно ли заявку в журнале панели — перечитыванием, а не по коду ответа.
+
+    Первое правило проекта: HTTP 200 не доказательство. Здесь оно дороже
+    всего — «бот сказал «отправлено», а в панели пусто» это чужие деньги.
+    Но и обратное враньё запрещено: заявка на выплату баланс сразу не
+    уменьшает, она ждёт модерации. Поэтому три исхода названы по-разному,
+    и «не вижу» не выдаётся за «не создана».
+    """
+    from stats_source import events_for, invalidate
+    invalidate(uid)
+    try:
+        events, source, perr = await events_for(uid, force=True)
+    except Exception as e:
+        return ("\n\n<i>Журнал панели перечитать не удалось "
+                f"({_esc(str(e)[:60])}) — проверь раздел выплат сам.</i>")
+    if source != "panel":
+        return ("\n\n<i>Журнал панели недоступен"
+                + (f" ({_esc(perr[:60])})" if perr else "")
+                + " — заявку проверь в панели сам.</i>")
+    fresh = [e for e in events
+             if e.get("kind") == "payout" and float(e.get("ts") or 0) >= since]
+    if fresh:
+        return "\n\n✅ Заявка видна в журнале панели."
+    return ("\n\n<i>В журнале панели заявка пока не видна. Так бывает: она "
+            "появляется не сразу. Если через несколько минут её там нет — "
+            "вывод не создан, и это надо решать в панели.</i>")
+
+
+def _one_btn(text: str, cb: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text=text, callback_data=cb)
+    return b.as_markup()
+
+
+async def _safe_edit(message, text: str, reply_markup=None) -> None:
+    """Правка сообщения, переживающая и предел Telegram в 4096 знаков, и отказ
+    в правке: не обновившееся сообщение и есть то, из-за чего бот выглядит
+    зависшим.
+    """
+    text = text[:4000]
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        try:
+            await message.answer(text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.warning("safe_edit failed: %s", e)
 
 
 # ── Активные выводы ─────────────────────────────────────────────────────────
@@ -215,7 +1170,7 @@ async def active_withdrawals(callback: CallbackQuery, api: YooMarketAPI) -> None
         text = "📋 <b>Активные выводы</b>\n\nНет выводов в обработке."
     else:
         text = ("📋 <b>Активные выводы</b>\n\n"
-                "API не отдаёт список выводов. Смотрите статус в панели "
+                "API не отдаёт список выводов. Смотри статус в панели "
                 "или в «Истории выводов» бота.")
     await callback.message.edit_text(text, reply_markup=b.as_markup())
 
@@ -226,7 +1181,7 @@ async def active_withdrawals(callback: CallbackQuery, api: YooMarketAPI) -> None
 async def withdrawal_history(callback: CallbackQuery, api: YooMarketAPI) -> None:
     await callback.answer()
     uid = callback.from_user.id
-    # prefer the API history; fall back to the local log
+    # Сначала история из API, если её нет — собственный журнал
     api_items = []
     if api:
         try:
@@ -253,13 +1208,14 @@ async def withdrawal_history(callback: CallbackQuery, api: YooMarketAPI) -> None
         else:
             lines = [f"📜 <b>История выводов</b> ({len(hist)})\n"
                      "<i>(локальный журнал бота)</i>\n"]
+            s = get_settings(callback.from_user.id)
             for w in hist[:25]:
                 amt = w.get("amount", 0)
-                amt_str = f"{amt:.0f} ₽" if amt else "всё"
+                amt_str = f"{_RUB(amt)} ₽" if amt else "всё"
                 wtype = "🤖" if w.get("type") == "auto" else "✋"
                 st = "✅" if w.get("status") == "requested" else "❌"
                 try:
-                    date = datetime.fromtimestamp(w.get("ts", 0)).strftime("%d.%m %H:%M")
+                    date = _lt.fmt(w.get("ts", 0), s)
                 except Exception:
                     date = ""
                 lines.append(f"{st} {wtype} <b>{amt_str}</b>  {date}")
