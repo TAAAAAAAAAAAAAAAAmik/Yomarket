@@ -60,6 +60,14 @@ def _load_error(e: Exception) -> str:
     """
     s = str(e) or type(e).__name__
     low = s.lower()
+    # Блокировка магазина — первой: она отменяет все остальные советы разом.
+    # Соседние ветки ведут к «создай токен заново», а здесь это бесполезное
+    # действие, и продавец, получив его, пойдёт чинить то, что не сломано.
+    from autoreply import shop_blocked
+    said = shop_blocked(s)
+    if said:
+        return ("🚫 <b>Магазин заблокирован</b>\n\n"
+                + said[0].upper() + said[1:] + ".")
     if "timeout" in low or "timed out" in low:
         return ("⏱ <b>Юмаркет не ответил вовремя</b>\n\n"
                 "Маркетплейс сейчас медленный или недоступен. Попробуй ещё раз.")

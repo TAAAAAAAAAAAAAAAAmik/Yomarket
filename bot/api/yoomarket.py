@@ -1051,6 +1051,16 @@ def auth_trouble(err: str, sent: str = "") -> tuple[str, str, bool]:
     замечание лишь помогает прочесть его ответ.
     """
     low = (err or "").lower()
+    # Блокировка проверяется ДО словаря: по словам она попала бы в ветку
+    # «403 → у токена сняты права» и получила бы совет создать новый токен.
+    # Он не помогает, а выглядит как решение — значит продавец потратит на
+    # него время и вернётся с той же бедой.
+    from autoreply import shop_blocked as _blocked
+    said = _blocked(err)
+    if said:
+        return ("Магазин заблокирован на Юмаркете",
+                said[0].upper() + said[1:] + ".", False)
+
     why, what, ours = "", "", True
     for needles, text, advice, blame in _AUTH_TROUBLE:
         if any(n in low for n in needles):

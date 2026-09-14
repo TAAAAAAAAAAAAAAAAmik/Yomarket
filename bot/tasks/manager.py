@@ -1354,10 +1354,54 @@ class TaskManager:
             settings = get_settings(user_id)
             if not _claim_sender(settings):
                 return
-            await self._process_orders(user_id, token, settings)
+            try:
+                await self._process_orders(user_id, token, settings)
+            except Exception as e:
+                # Заблокированный магазин валит проход каждую минуту, а
+                # продавцу до сих пор не доставалось ни слова: бот выглядел
+                # живым и молча ничего не делал. Сказать надо здесь —
+                # дальше исключение идёт своим путём, в лог.
+                await self._note_shop_block(user_id, settings, e)
+                raise
+            # Успешный проход по заказам — доказательство, что магазин
+            # работает. Другая ошибка отметку не снимает: она про другое.
+            await self._note_shop_block(user_id, settings, None)
             await self._check_reminders(user_id, settings)
             await self._maybe_bump_schedule(user_id, settings)
             await self._maybe_pour(user_id, settings)
+
+    async def _note_shop_block(self, user_id: int, settings: dict,
+                               err) -> None:
+        """Сказать, что магазин заблокирован, — один раз. И дать отбой.
+
+        Один раз: проход идёт раз в минуту, и без отметки это уведомление
+        раз в минуту. Отбой обязателен по той же причине, по какой он
+        обязателен у наблюдения за приёмом обновлений: молча вернувшись к
+        работе, бот оставил бы последним словом «магазин заблокирован», и
+        продавец считал бы его сломанным.
+        """
+        from autoreply import shop_blocked
+        said = shop_blocked(err) if err is not None else ""
+        was = bool(settings.get("_shop_blocked"))
+
+        if said and not was:
+            settings["_shop_blocked"] = True
+            save_settings(user_id, settings)
+            await self._notify(user_id, _card(
+                "🚫 <b>МАГАЗИН ЗАБЛОКИРОВАН</b>",
+                [said[0].upper() + said[1:] + ".",
+                 "",
+                 "Бот продолжает проверять сам и скажет, когда магазин "
+                 "снова заработает."]))
+            return
+
+        if err is None and was:
+            settings["_shop_blocked"] = False
+            save_settings(user_id, settings)
+            await self._notify(user_id, _card(
+                "✅ <b>МАГАЗИН СНОВА РАБОТАЕТ</b>",
+                ["Юмаркет отвечает как обычно. Авто-функции продолжают "
+                 "работу."]))
 
     # Сколько товаров залив заводит за один проход. Больше — и проход,
     # идущий раз в минуту, не будет успевать завершиться до следующего.
