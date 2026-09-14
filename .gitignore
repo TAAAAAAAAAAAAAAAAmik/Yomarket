@@ -12,3 +12,4 @@ bot/data/
 # Fragment secrets (never commit)
 bot/data/fragment_creds.json
 fragment_creds.json
+build/
