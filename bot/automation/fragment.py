@@ -1,20 +1,23 @@
-"""Telegram Stars auto-delivery via Fragment (fragment.com) + TON wallet.
+"""Автовыдача звёзд Telegram через Fragment (fragment.com) и кошелёк TON.
 
-Flow (all blocking — call through loop.run_in_executor):
-  1. searchStarsRecipient(username)   → recipient id
-  2. initBuyStarsRequest(recipient, quantity) → req_id
-  3. derive TON wallet from mnemonic  → address
-  4. getBuyStarsLink(req_id, address) → transaction messages
-  5. for each message: build signed BOC, send to TonCenter, confirmReq
-  6. wait for the wallet seqno to advance = on-chain confirmation
+Цепочка (всё блокирующее — вызывать через loop.run_in_executor):
+  1. searchStarsRecipient(ник)                → id получателя
+  2. initBuyStarsRequest(получатель, сколько) → req_id
+  3. кошелёк TON из seed-фразы                → адрес
+  4. getBuyStarsLink(req_id, адрес)           → сообщения транзакции
+  5. на каждое: собрать подписанный BOC, отправить в TonCenter, confirmReq
+  6. дождаться, пока у кошелька вырастет seqno — это и есть подтверждение
+     в сети
 
-Secrets (Fragment cookies, wallet mnemonic) are passed in by the caller and
-never logged. Based on the seller-provided fragment_utils API sample.
+Секреты — куки Fragment и seed-фраза кошелька — приходят от вызывающего и
+в логи не попадают никогда: это доступ к чужому кошельку. За истину взята
+документация рабочего клиента, которую дал продавец.
 """
 from __future__ import annotations
 
 import base64
 import logging
+import re
 import time
 from decimal import Decimal
 
@@ -24,11 +27,28 @@ logger = logging.getLogger(__name__)
 
 FRAGMENT_API_URL = "https://fragment.com/api"
 TONCENTER_SEND = "https://toncenter.com/api/v2/sendBoc"
+# Запасной узел — он есть в документации, у нас его не было. Транзакция уже
+# подписана: если основной узел не ответил, деньги не ушли, а заказ считался
+# бы проваленным на ровном месте.
+TONCENTER_SEND_FALLBACK = "https://toncenter.net/api/v2/sendBoc"
 TONCENTER_RUN = "https://toncenter.com/api/v2/runGetMethod"
 MAINNET_CHAIN = "-239"
-DEFAULT_HASH = "af142ec36cafbbfa89"
+# Зашитого хеша больше нет. Он был чужой, из образца, и это первая из пяти
+# причин, по которым выдача не работала: Fragment отвечал «Bad request», а
+# продавцу предлагалось лезть в F12. Хеш всегда читается со страницы покупки.
+DEFAULT_HASH = ""
 SEQNO_POLL_SECS = 3
 SEQNO_MAX_WAIT_SECS = 120
+# Сколько раз перечитать счётчик кошелька, прежде чем поверить нулю.
+_SEQNO_READ_TRIES = 3
+
+# Сколько ждать покупку целиком — одно число на всех, кто её зовёт. Считается
+# по самой цепочке: страница с хешем 30 + до трёх написаний ника по 30 +
+# заявка 30 + ссылка 30 + seqno 15 + отправка 20 + подтверждение 30, и сверху
+# ожидание сети. Раньше у трёх мест было три разных числа (180, 180, 200),
+# все меньше цепочки, — то есть обрыв приходился ровно туда, где деньги уже
+# могли уйти, а повтор покупал звёзды второй раз.
+BUY_TIMEOUT_SECS = 245 + SEQNO_MAX_WAIT_SECS
 
 
 def _fix_base64(s: str) -> str:
@@ -36,33 +56,143 @@ def _fix_base64(s: str) -> str:
     return s + ("=" * (-len(s) % 4))
 
 
-def _make_session(cookies: dict) -> requests.Session:
+def _apply_proxy(session: requests.Session, proxy: str) -> requests.Session:
+    """Пустить запросы через прокси продавца, если он его задал.
+
+    Fragment выдаёт сессию браузеру на конкретном адресе, а бот живёт в
+    дата-центре. Признаки сходятся: куки, снятые на телефоне, у нас
+    «протухают» за полчаса, а покупка отказывает с первой секунды, хотя
+    страница показывает вход. Проверяется это одним способом — послать
+    запросы с адреса продавца.
+    """
+    url = (proxy or "").strip()
+    if url:
+        session.proxies.update({"http": url, "https": url})
+    return session
+
+
+def proxy_problem(proxy: str) -> str:
+    """Что мешает пользоваться этим прокси. Пусто — ничего.
+
+    Без этой проверки socks5 падает уже внутри запроса, и продавец видит
+    «Missing dependencies for SOCKS support» вместо ответа — английский код
+    ошибки на экране это отписка, а не сообщение.
+    """
+    url = (proxy or "").strip().lower()
+    if url.startswith("socks"):
+        try:
+            import socks  # noqa: F401
+        except ImportError:
+            return ("для socks5 нужен пакет PySocks — он добавлен в "
+                    "requirements.txt, но этот бот собран без него. "
+                    "Пока возьми адрес вида http://…")
+    return ""
+
+
+def proxy_label(proxy: str) -> str:
+    """Как показать прокси в отчёте: только хост и порт.
+
+    В строке прокси обычно логин и пароль. Печатать их нельзя — это те же
+    чужие доступы, что и куки.
+    """
+    url = (proxy or "").strip()
+    if not url:
+        return "не задан"
+    tail = url.rsplit("@", 1)[-1]
+    return tail.split("//")[-1][:40] or "задан"
+
+
+# Куда сходить, чтобы узнать свой адрес. Два — на случай, если один не
+# отвечает: строка «адрес не узнать» в отчёте бесполезна.
+_IP_SERVICES = ("https://api.ipify.org", "https://ifconfig.me/ip")
+
+
+def outbound_ip(proxy: str = "") -> str:
+    """С какого адреса нас видит интернет. Пусто — не удалось узнать.
+
+    Сессия берётся через `_make_session` не для кук, а чтобы у тестов была
+    одна точка подмены: с прямым `requests.Session()` прогон уходил в
+    настоящую сеть и растягивался на полминуты.
+    """
+    for url in _IP_SERVICES:
+        try:
+            s = _make_session({}, proxy)
+            r = s.get(url, timeout=10)
+            ip = (r.text or "").strip()
+            if r.status_code == 200 and 6 < len(ip) < 46:
+                return ip
+        except Exception:
+            continue
+    return "адрес не узнать"
+
+
+def _make_session(cookies: dict, proxy: str = "") -> requests.Session:
     s = requests.Session()
     s.cookies.update(cookies or {})
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0 Safari/537.36",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": "https://fragment.com",
-        "Referer": "https://fragment.com/stars",
-    })
-    return s
+    # Заголовки — как в документации рабочего клиента: только User-Agent.
+    # Свои X-Requested-With / Origin / Referer убраны: они добавлялись по
+    # догадке, а сверять поведение надо с тем, что заведомо работает.
+    s.headers.update({"User-Agent": "Mozilla/5.0"})
+    return _apply_proxy(s, proxy)
+
+
+def _api_call(session: requests.Session, api_hash: str, method: str,
+              extra: dict):
+    """Один запрос к Fragment API — ровно как в документации рабочего клиента.
+
+    Всё уходит в строку запроса: и `method`, и `hash`, и аргументы. У нас
+    было по-своему — метод и аргументы в теле, — и на этом стояла выдача:
+    поиск получателя проходил, а покупка отвечала «Access denied». Своих
+    вариантов здесь больше нет: документация описывает клиента, который
+    доводит покупку до конца, и расхождения с ней мы не сочиняем.
+    """
+    return session.post(FRAGMENT_API_URL,
+                        params={"method": method, "hash": api_hash, **extra},
+                        timeout=20)
 
 
 def _extract_recipient(resp: dict) -> str:
-    """Pull the recipient id out of a searchStarsRecipient response."""
+    """Получатель из ответа `searchStarsRecipient` — ровно `found.recipient`.
+
+    В документации значение одно: `data["found"]["recipient"]`. У нас рядом
+    стоял перебор `id`, `myself`, `value` «на всякий случай» — и `myself` там
+    настоящее поле, булево: у своего же аккаунта Fragment отвечает
+    `{"myself": true, "recipient": "..."}`. Стоило `recipient` не прийти — и
+    в заявку ушло бы `recipient=True`, а разбираться пришлось бы с ответом
+    «Access denied», который выглядит точно так же, как отказ по правам.
+    """
     if not isinstance(resp, dict):
         return ""
     found = resp.get("found")
-    if isinstance(found, dict):
-        for k in ("recipient", "id", "myself", "value"):
-            if found.get(k):
-                return str(found[k])
-    for k in ("recipient", "id"):
-        if resp.get(k):
-            return str(resp[k])
+    if isinstance(found, dict) and found.get("recipient"):
+        return str(found["recipient"])
+    if resp.get("recipient"):
+        return str(resp["recipient"])
     return ""
+
+
+def _query_forms(username: str) -> list[str]:
+    """Как документация ищет ник: «@Username, @username, Username, username».
+
+    Fragment отвечает не на любое написание, и рабочий клиент перебирает
+    четыре. Мы слали одно — то, что ввёл продавец, без «собаки». На своём
+    аккаунте это проходило, и гадать, почему у покупателя «получатель не
+    найден», пришлось бы вслепую.
+    """
+    bare = (username or "").strip().lstrip("@")
+    if not bare:
+        return []
+    # Порядок ровно как в документации: @Username, @username, Username,
+    # username. У нас он был свой — сначала оба написания «как ввели»,
+    # потом оба в нижнем регистре. Разница видна только на нике со
+    # заглавными, но сверяться так сверяться.
+    low = bare.lower()
+    forms = [f"@{bare}", f"@{low}", bare, low]
+    out: list[str] = []
+    for f in forms:
+        if f not in out:
+            out.append(f)
+    return out
 
 
 def _wallet_from_mnemonic(mnemonic: str, version: str):
@@ -77,19 +207,56 @@ def _wallet_from_mnemonic(mnemonic: str, version: str):
 
 
 def _build_signed_boc(wallet, to_addr: str, amount_nano, payload_b64: str, seqno: int) -> str:
-    """Build and sign a transfer carrying Fragment's payload cell."""
+    """Перевод с комментарием — как в `build_boc_with_comment` образца.
+
+    Образец не передаёт ячейку Fragment как есть: он раскодирует её в текст
+    и собирает комментарий заново — 32 нулевых бита, потом байты текста.
+    Мы передавали ячейку без изменений. Это наш вариант, а не описанный, и
+    поэтому он убран.
+
+    Замечание, которое стоит помнить, если шаг когда-нибудь не сойдётся:
+    `get_top_upped_array()` отдаёт вместе с текстом и четыре нулевых байта
+    заголовка, а `.strip()` их не снимает — это не пробелы. То есть
+    комментарий получается с лишним нулевым префиксом. У автора образца
+    покупка при этом доходит до конца, и вероятная причина в том, что
+    Fragment сверяет платёж по самому BOC: `confirmReq` шлёт ему BOC
+    целиком. Проверить это можно будет только на удавшейся покупке.
+    """
+    # Комментарий — это то, чем Fragment узнаёт платёж. Без него перевод
+    # уходит обычными деньгами на обычный адрес, и связать его с заявкой
+    # нечем: звёзды не начислятся, а TON уже не вернуть.
+    #
+    # Раньше здесь стояло «не разобрали — отправим без комментария», с
+    # записью в лог контейнера. То есть на любой неожиданности в ответе
+    # Fragment бот отправлял деньги в никуда и докладывал об успехе.
+    #
+    # Проверка стоит до кошелька и до tonsdk намеренно: отказывать надо
+    # раньше, чем что-то подписано.
+    if not payload_b64:
+        raise ValueError(
+            "Fragment не прислал комментарий к переводу — платёж без него "
+            "не с чем связать, деньги ушли бы впустую")
+
     from tonsdk.utils import Address, to_nano
     from tonsdk.boc import Cell
 
     amount_ton = Decimal(int(amount_nano)) / Decimal(1_000_000_000)
 
-    payload_cell = None
-    if payload_b64:
-        try:
-            payload_cell = Cell.one_from_boc(base64.b64decode(_fix_base64(payload_b64)))
-        except Exception as e:
-            logger.warning("payload decode failed, sending without payload: %s", e)
-            payload_cell = None
+    try:
+        src = Cell.one_from_boc(base64.b64decode(_fix_base64(payload_b64)))
+        text = src.bits.get_top_upped_array().decode("utf-8",
+                                                     errors="ignore").strip()
+    except Exception as e:
+        raise ValueError(
+            f"Комментарий Fragment не разобрать ({str(e)[:60]}) — без него "
+            f"платёж не с чем связать") from e
+    if not text:
+        raise ValueError(
+            "Комментарий Fragment оказался пустым — платёж без него не с чем "
+            "связать")
+    payload_cell = Cell()
+    payload_cell.bits.write_uint(0, 32)
+    payload_cell.bits.write_bytes(text.encode("utf-8"))
 
     transfer = wallet.create_transfer_message(
         to_addr=Address(to_addr),
@@ -102,36 +269,82 @@ def _build_signed_boc(wallet, to_addr: str, amount_nano, payload_b64: str, seqno
     return base64.b64encode(boc_bytes).decode()
 
 
-def _get_seqno(address_str: str) -> int:
+def _read_seqno(address_str: str) -> tuple[int, bool]:
+    """Счётчик отправок кошелька → (seqno, прочитан ли достоверно).
+
+    Второе значение важнее первого. У неразвёрнутого кошелька seqno и правда
+    ноль — первый же перевод его и разворачивает, — но точно такой же ноль
+    получался, когда TonCenter просто не ответил как надо. С чужим нулём
+    вместо настоящего счётчика перевод подписывается недействительным: сеть
+    его не проведёт, а бот, увидев принятый узлом BOC, доложит об отправке.
+    Деньги при этом остаются на месте — но продавец считает, что выдал.
+    """
     r = requests.post(TONCENTER_RUN,
                       json={"address": address_str, "method": "seqno", "stack": []},
                       timeout=15)
     r.raise_for_status()
     data = r.json()
     if not data.get("ok"):
-        # Fresh (undeployed) wallet → seqno 0
-        return 0
+        # Неразвёрнутый кошелёк — законный ноль. Отличить его от сбоя по
+        # этому ответу нельзя, поэтому «достоверно» здесь не ставится, и
+        # решает вызывающий: повторить или сказать честно.
+        return 0, False
     try:
-        return int(data["result"]["stack"][0][1], 16)
+        return int(data["result"]["stack"][0][1], 16), True
     except (KeyError, IndexError, ValueError):
-        return 0
+        return 0, False
+
+
+def _get_seqno(address_str: str) -> int:
+    """Счётчик отправок кошелька. Повтор — против одиночного сбоя TonCenter.
+
+    Ноль здесь бывает настоящим: у кошелька, с которого ещё ни разу не
+    отправляли, seqno и правда ноль, а первый перевод его разворачивает.
+    Отличить такой ноль от «сервер не ответил» по одному ответу нельзя, а
+    цена ошибки разная: с чужим нулём перевод подписывается недействительным,
+    сеть его не проводит, и деньги остаются на месте — но бот, увидев
+    принятый узлом BOC, доложил бы об отправке.
+
+    Гадать не будем, а повторить чтение дёшево: запрос только на чтение, и
+    он закрывает самую вероятную причину — секундную неудачу TonCenter.
+    Если ноль всё-таки чужой, это увидит ожидание seqno после отправки, и в
+    ответе будет сказано, что подтверждения в сети не было.
+    """
+    last = 0
+    for attempt in range(_SEQNO_READ_TRIES):
+        value, sure = _read_seqno(address_str)
+        if sure:
+            return value
+        last = value
+        if attempt + 1 < _SEQNO_READ_TRIES:
+            time.sleep(1)
+    return last
 
 
 def _send_boc(boc_b64: str) -> bool:
-    try:
-        r = requests.post(TONCENTER_SEND, json={"boc": boc_b64}, timeout=20)
-        r.raise_for_status()
-        return bool(r.json().get("ok"))
-    except Exception as e:
-        logger.error("sendBoc failed: %s", e)
-        return False
+    """Отправить подписанную транзакцию. Второй узел — как в документации.
+
+    Повтор безопасен: тот же BOC с тем же seqno сеть примет один раз, а
+    второй отклонит как дубль. Опасно обратное — считать заказ проваленным
+    из-за одного не ответившего узла.
+    """
+    for url in (TONCENTER_SEND, TONCENTER_SEND_FALLBACK):
+        try:
+            r = requests.post(url, json={"boc": boc_b64}, timeout=20)
+            r.raise_for_status()
+            if r.json().get("ok"):
+                return True
+            logger.error("sendBoc: %s ответил без ok", url)
+        except Exception as e:
+            logger.error("sendBoc failed on %s: %s", url, e)
+    return False
 
 
 def get_wallet_balance_sync(
     mnemonic: str, wallet_version: str = "v4r2",
 ) -> tuple[bool, object]:
-    """Return (True, {"ton": float, "nano": int, "address": str}) or (False, err).
-    Blocking — run in an executor."""
+    """Баланс кошелька: (True, {"ton", "nano", "address"}) или (False, ошибка).
+    Блокирующая — вызывать через executor."""
     if not mnemonic or len(mnemonic.split()) < 12:
         return False, "Не настроена seed-фраза кошелька"
     try:
@@ -163,13 +376,27 @@ def buy_stars_sync(
     username: str,
     quantity: int,
     wallet_version: str = "v4r2",
-    api_hash: str = DEFAULT_HASH,
+    api_hash: str = "",
     wait_confirm: bool = True,
+    report: dict | None = None,
+    proxy: str = "",
 ) -> tuple[bool, str]:
+    """Покупка звёзд — по документации рабочего клиента, шаг в шаг.
+
+    Собрано заново и намеренно линейно: восемь шагов раздела 9 в том же
+    порядке и с теми же полями. Прежняя версия обросла нашими домыслами —
+    перебор страниц с хешем, повтор с освежённым хешем, оплата всех
+    сообщений подряд, своя сборка комментария, — и каждый такой домысел
+    приходилось потом опровергать отдельным прогоном. Здесь их нет.
+
+    Своё оставлено только там, где документ молчит, а бот обязан не врать:
+    ответ `confirmReq` проверяется, а факт списания записывается в `report`,
+    чтобы менеджер не повторил покупку, за которую уже заплачено.
+
+    Блокирующая — звать через executor. Секреты не логируются.
     """
-    Buy `quantity` Telegram Stars for `username`. Returns (ok, human_message).
-    Blocking — run in an executor. Secrets are never logged.
-    """
+    import json
+
     username = (username or "").strip().lstrip("@")
     if not username:
         return False, "Пустой username"
@@ -181,104 +408,217 @@ def buy_stars_sync(
         quantity = int(quantity)
     except (TypeError, ValueError):
         return False, "Некорректное количество звёзд"
-    if quantity < 50:
-        return False, "Fragment принимает заказы от 50 звёзд"
 
-    session = _make_session(cookies)
+    # 1. Сессия: куки и единственный заголовок User-Agent. Прокси — то
+    # единственное, что документ не описывает, но и не запрещает: он у
+    # автора образца и не нужен, потому что тот работает со своей машины.
+    session = _make_session(cookies, proxy)
 
-    def _post(method: str, extra: dict) -> dict:
-        params = {"method": method, "hash": api_hash, **extra}
+    def post(method: str, args: dict) -> dict:
+        """Один запрос: всё в строке запроса, как в разделах 3–8."""
         try:
-            r = session.post(FRAGMENT_API_URL, params=params, timeout=20)
+            r = session.post(FRAGMENT_API_URL,
+                             params={"method": method, "hash": h, **args},
+                             timeout=30)
             r.raise_for_status()
-            return r.json()
+            data = r.json()
         except requests.exceptions.RequestException as e:
-            return {"ok": False, "error": f"сеть: {str(e)[:80]}"}
+            return {"error": f"сеть: {str(e)[:80]}"}
         except ValueError:
-            return {"ok": False, "error": "не JSON от Fragment"}
+            return {"error": "не JSON от Fragment"}
+        return data if isinstance(data, dict) else {"error": str(data)[:80]}
 
-    # 1. find recipient
-    search = _post("searchStarsRecipient", {"query": username})
-    recipient = _extract_recipient(search)
+    # 2. Хеш. Если продавец задал его руками — берём его и не спорим: это
+    # осознанная подстановка, и смысл поля ровно в том, чтобы перебить
+    # автоматику. Своё «страница всегда важнее» тут её обесценивало: хеш,
+    # снятый в браузере, где покупка проходит, просто не доходил до запроса.
+    # Не задан — читаем со страницы покупки, той же сессией, как в
+    # документации.
+    #
+    # Документ страницу не читает вовсе: хеш у него в настройках. Это
+    # последнее, чем наша покупка от него отличается, — и отличие не
+    # безобидное. Ответ страницы приносит свои `Set-Cookie`, и они ложатся
+    # поверх кук продавца в той же банке. Дальше поиск получателя проходит
+    # (он работает и без входа — это проверено), а заявка, единственная,
+    # которой вход нужен, отвечает «Access denied». И отвечает одинаково на
+    # живых куках и на протухших — ровно то, что мы наблюдали и не могли
+    # объяснить.
+    #
+    # Поэтому куки продавца возвращаются на место сразу после чтения
+    # страницы. Сессия остаётся одна (хеш Fragment выдаёт сессии), но
+    # покупка идёт с теми куками, которые продавец дал, а не с теми, что
+    # страница успела подсунуть.
+    h = (api_hash or "").strip()
+    if not h:
+        try:
+            before = dict(session.cookies)
+        except Exception:       # банка кук бывает не только словарём
+            before = {}
+        try:
+            page = session.get("https://fragment.com/stars/buy", timeout=30)
+            body = page.text or ""
+        except Exception as e:
+            return False, f"Страница fragment.com/stars/buy: {str(e)[:80]}"
+        changed = [k for k, v in before.items()
+                   if session.cookies.get(k) != v]
+        if changed:
+            logger.warning("страница покупки переписала куки: %s",
+                           ", ".join(sorted(changed)))
+            if report is not None:
+                report["cookies_rewritten"] = sorted(changed)
+            session.cookies.update(before)
+        for pattern in _HASH_PATTERNS:
+            m = re.search(pattern, body)
+            if m:
+                h = m.group(1)
+                break
+    if not h:
+        return False, ("Не удалось прочитать hash со страницы "
+                       "fragment.com/stars/buy — проверь куки Fragment")
+
+    # 3. Получатель. Написания перебираются, как в разделе 3.
+    search: dict = {}
+    recipient = ""
+    for form in _query_forms(username):
+        search = post("searchStarsRecipient", {"query": form})
+        recipient = _extract_recipient(search)
+        if recipient:
+            break
     if not recipient:
-        err = search.get("error") or search.get("error_message") or "получатель не найден"
-        return False, f"@{username}: {err}. Проверьте username и cookies."
+        err = search.get("error") or search.get("error_message") or "не найден"
+        return False, f"@{username}: {err}. Проверь username и cookies."
 
-    # 2. init request
-    init = _post("initBuyStarsRequest", {"recipient": recipient, "quantity": quantity})
-    req_id = init.get("req_id") or init.get("id")
+    # 4. Заявка → req_id.
+    init = post("initBuyStarsRequest", {"recipient": recipient,
+                                        "quantity": quantity})
+    req_id = init.get("req_id")
     if not req_id:
-        err = init.get("error") or init.get("error_message") or str(init)[:120]
+        err = str(init.get("error") or init.get("error_message")
+                  or str(init)[:120])
+        if "access denied" in err.lower():
+            return False, (
+                "Fragment: «Access denied» — заявку на покупку он не "
+                "принимает. Поиск получателя при этом проходит, но он "
+                "проходит и без входа, так что правами это не считается.\n\n"
+                "Что уже проверено и причиной не является: форма запроса, "
+                "api-hash, свежесть кук, подключённый TON-кошелёк, себе "
+                "или чужому, и адрес, с которого мы ходим (пробовали через "
+                "прокси — ответ тот же).\n\n"
+                "Остался один невыполненный пункт: на fragment.com/my/profile "
+                "стоит «Identity Verified», а «Wallet Verified» нет. "
+                "Проверь кошелёк там и повтори.")
         return False, f"initBuyStarsRequest не дал req_id: {err}"
 
-    # 3. wallet
+    # 5. Кошелёк: сырой адрес для `account`, обычный — для seqno.
     try:
         wallet = _wallet_from_mnemonic(mnemonic, wallet_version)
-        raw_addr = wallet.address.to_string(False, False, False)      # 0:hex
-        bounce_addr = wallet.address.to_string(True, True, True)      # EQ...
+        raw_addr = wallet.address.to_string(False)
+        bounce_addr = wallet.address.to_string(True, True, True)
     except Exception as e:
-        return False, f"Ошибка кошелька (проверьте seed-фразу): {str(e)[:80]}"
+        return False, f"Ошибка кошелька (проверь seed-фразу): {str(e)[:80]}"
 
-    # 4. transaction link
-    link = _post("getBuyStarsLink", {
-        "id": req_id, "transaction": 1, "show_sender": 1,
-        "account": _json_account(raw_addr),
-        "device": _json_device(),
+    account = json.dumps({"address": raw_addr, "chain": MAINNET_CHAIN})
+    device = json.dumps({
+        "platform": "browser",
+        "appName": "telegram-wallet",
+        "appVersion": "1",
+        "maxProtocolVersion": 2,
+        "features": ["SendTransaction",
+                     {"name": "SendTransaction", "maxMessages": 4}],
     })
-    messages = _extract_messages(link)
+
+    # 6. Данные TON-транзакции.
+    link = post("getBuyStarsLink", {"id": req_id, "transaction": 1,
+                                    "show_sender": 1, "account": account,
+                                    "device": device})
+    tx = link.get("transaction") or {}
+    messages = tx.get("messages") or []
     if not messages:
         err = link.get("error") or link.get("error_message") or str(link)[:150]
         return False, f"getBuyStarsLink не дал транзакцию: {err}"
 
-    # 5. sign + send each message, confirm
+    # Раздел 6 документа: берётся первое сообщение. Мы платили по всем
+    # подряд — это была наша предусмотрительность, и на лишнем сообщении
+    # она списала бы деньги второй раз.
+    msg = messages[0]
+    try:
+        destination = msg["address"]
+        amount_nano = int(msg["amount"])
+        payload = msg.get("payload", "")
+    except (KeyError, TypeError, ValueError):
+        return False, f"Fragment вернул сообщение без адреса или суммы: {str(msg)[:100]}"
+
+    # 7. Подпись и отправка.
     try:
         seqno = _get_seqno(bounce_addr)
     except Exception as e:
         return False, f"Не удалось получить seqno кошелька: {str(e)[:80]}"
+    try:
+        boc = _build_signed_boc(wallet, destination, amount_nano, payload, seqno)
+    except Exception as e:
+        return False, f"Ошибка сборки транзакции: {str(e)[:100]}"
+    if not _send_boc(boc):
+        return False, "TonCenter отклонил транзакцию (проверь баланс кошелька)"
 
-    valid_msgs = [m for m in messages
-                  if m.get("address") and m.get("amount") is not None]
-    if not valid_msgs:
-        return False, "Fragment не вернул ни одного платёжного сообщения"
+    # Деньги ушли. Дальше любой провал означает «заплатили и не получили»,
+    # и повторять покупку нельзя — заплатим дважды. Документ об этом молчит,
+    # но молчать об этом продавцу нельзя.
+    if report is not None:
+        report["sent_onchain"] = True
+        report["nano"] = amount_nano
+        report["ton"] = amount_nano / 1_000_000_000
+        if len(messages) > 1:
+            report["extra_messages"] = len(messages) - 1
 
-    # Each external message needs the previous one confirmed on-chain before the
-    # next seqno is accepted, so send sequentially and wait for seqno to advance
-    # between messages (a Stars purchase is normally a single message).
-    sent = 0
-    for i, msg in enumerate(valid_msgs):
-        try:
-            boc = _build_signed_boc(
-                wallet, msg["address"], msg["amount"], msg.get("payload", ""), seqno)
-        except Exception as e:
-            if sent:
-                break
-            return False, f"Ошибка сборки транзакции: {str(e)[:100]}"
-        if not _send_boc(boc):
-            if sent:
-                break
-            return False, "TonCenter отклонил транзакцию (проверьте баланс кошелька)"
-        _post("confirmReq", {"id": req_id, "boc": boc,
-                             "account": _json_account(raw_addr)})
-        sent += 1
-        # Wait for this tx to land (seqno advances) before sending the next
-        if wait_confirm or i < len(valid_msgs) - 1:
-            confirmed = _wait_seqno_advance(bounce_addr, seqno)
-            if confirmed:
-                seqno += 1
-            elif i < len(valid_msgs) - 1:
-                # can't safely send the next message without confirmation
-                return True, (f"⏳ {quantity}⭐ для @{username}: часть транзакций "
-                              "отправлена, подтверждение в сети ещё идёт")
-
-    if not sent:
-        return False, "Не удалось отправить ни одной транзакции"
+    # Документ ждёт seqno до confirmReq — так и делаем. Ответ этого ожидания
+    # раньше выбрасывался, а в итоговом сообщении всё равно стояло
+    # «подтверждено в TON»: приписка держалась на том, что ждать мы вообще
+    # собирались, а не на том, что дождались. Сеть могла не показать движения
+    # за две минуты — и продавцу всё равно сообщали о подтверждении.
+    landed = True
     if wait_confirm:
-        return True, f"✅ {quantity}⭐ отправлены на @{username} (подтверждено в TON)"
-    return True, f"✅ {quantity}⭐ отправлены на @{username}"
+        landed = _wait_seqno_advance(bounce_addr, seqno)
+        if report is not None:
+            report["seqno_advanced"] = landed
 
+    # 8. Подтверждение. Его ответ и решает, засчитана ли оплата.
+    confirm = post("confirmReq", {"id": req_id, "boc": boc,
+                                  "account": account})
+    cerr = confirm.get("error") or confirm.get("error_message")
+    if cerr:
+        if report is not None:
+            report["confirm_error"] = str(cerr)[:120]
+        return False, (
+            f"⚠️ TON ушёл ({amount_nano / 1_000_000_000:.4f}), но Fragment "
+            f"не засчитал оплату: {str(cerr)[:80]}. Повтор не делаю — "
+            "заплатили бы дважды. Проверь начисление на fragment.com и "
+            "выдай вручную, если звёзд нет.")
+
+    tail = ""
+    if len(messages) > 1:
+        tail = (f"\n⚠️ Fragment попросил ещё {len(messages) - 1} перевод(а) — "
+                "оплачен только первый, как в документации. Проверь, "
+                "начислились ли звёзды.")
+    if wait_confirm and not landed:
+        # Fragment оплату засчитал, а кошелёк движения за отведённое время не
+        # показал. Это не провал: перевод подписан, отправлен и принят узлом,
+        # сеть просто могла не успеть. Но и «подтверждено» здесь — неправда.
+        return True, (
+            f"✅ {quantity}⭐ отправлены на @{username}{tail}\n"
+            f"⚠️ Подтверждения в сети за {SEQNO_MAX_WAIT_SECS} с не увидел — "
+            f"перевод отправлен и Fragment его засчитал, но проверь "
+            f"начисление на fragment.com.")
+    if wait_confirm:
+        return True, (f"✅ {quantity}⭐ отправлены на @{username} "
+                      f"(подтверждено в TON){tail}")
+    return True, f"✅ {quantity}⭐ отправлены на @{username}{tail}"
 
 def _wait_seqno_advance(address: str, from_seqno: int) -> bool:
-    """Poll until wallet seqno exceeds from_seqno. Returns True if advanced."""
+    """Ждать, пока seqno кошелька станет больше `from_seqno`.
+
+        Выросший seqno — единственное доказательство, что перевод дошёл до сети:
+        ответ `sendBoc` говорит лишь о том, что его приняли в очередь.
+        """
     deadline = time.time() + SEQNO_MAX_WAIT_SECS
     while time.time() < deadline:
         try:
@@ -290,50 +630,1457 @@ def _wait_seqno_advance(address: str, from_seqno: int) -> bool:
     return False
 
 
-def _json_account(raw_addr: str) -> str:
-    import json
-    return json.dumps({"address": raw_addr, "chain": MAINNET_CHAIN})
+def _page_session(cookies: dict, proxy: str = "") -> requests.Session:
+    """Сессия для обычной страницы, а не для API.
 
-
-def _json_device() -> str:
-    import json
-    return json.dumps({
-        "platform": "browser",
-        "appName": "telegram-wallet",
-        "appVersion": "1",
-        "maxProtocolVersion": 2,
-        "features": ["SendTransaction",
-                     {"name": "SendTransaction", "maxMessages": 4}],
+    У API-сессии стоит `X-Requested-With: XMLHttpRequest` — с ним Fragment
+    отвечает как на XHR, и разметки со скриптами в ответе может не оказаться.
+    А хеш лежит именно в скриптах страницы.
+    """
+    s = requests.Session()
+    s.cookies.update(cookies or {})
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru,en;q=0.9",
     })
+    return _apply_proxy(s, proxy)
 
 
-def _extract_messages(link: dict) -> list[dict]:
-    """Pull transaction messages out of a getBuyStarsLink response."""
-    if not isinstance(link, dict):
-        return []
-    tx = link.get("transaction")
-    if isinstance(tx, dict) and isinstance(tx.get("messages"), list):
-        return [m for m in tx["messages"] if isinstance(m, dict)]
-    if isinstance(link.get("messages"), list):
-        return [m for m in link["messages"] if isinstance(m, dict)]
-    return []
+def session_alive_sync(cookies: dict, proxy: str = "") -> tuple[bool, str]:
+    """Жива ли сессия Fragment. Один запрос, только чтение.
+
+    Куки Fragment живут недолго: в один и тот же день проба видела личный
+    раздел, через полчаса — гостевую страницу с теми же куками. Выяснялось
+    это в худший момент — когда покупатель уже прислал ник и ждёт звёзд за
+    оплаченный заказ. Отдельная лёгкая проверка нужна, чтобы сказать об этом
+    заранее, а не на кассе.
+
+    Признак входа — только `/logout` или личный раздел. Кнопка «Connect TON»
+    — признак ОБРАТНОГО, на этом детектор однажды уже ошибался.
+
+    Возвращает (жива, чем подтверждено). Секреты наружу не выходят: в
+    описании нет ни кук, ни адресов кошелька.
+    """
+    if not cookies:
+        return False, "куки Fragment не заданы"
+
+    # Сессия Fragment бывает привязана не только к куке: снятая с телефона, к
+    # десктопному User-Agent она может не подойти. Один заголовок объявил бы
+    # мёртвой рабочую сессию — и продавец пошёл бы переснимать куки без
+    # причины. Пробуем те же три строки, что и большая проба, но по очереди:
+    # первый же вход прекращает перебор, и в обычном случае запрос ровно один.
+    seen_page = False
+    last_err = ""
+    for label, agent in _USER_AGENTS:
+        session = _page_session(cookies, proxy)
+        session.headers["User-Agent"] = agent
+        try:
+            r = session.get("https://fragment.com/stars/buy", timeout=20)
+        except Exception as e:
+            last_err = str(e)[:80]
+            continue
+        seen_page = True
+        html = r.text or ""
+        if not _looks_logged_out(html):
+            what = ("вижу личный раздел" if "my assets" in html.lower()
+                    else "вижу ссылку выхода")
+            return True, f"{what} ({label})"
+    if not seen_page:
+        # Сеть не ответила — это не «сессия умерла». Разница важная: на
+        # мёртвой сессии куки надо переснимать, а на упавшей сети ничего
+        # делать не надо, и будить продавца незачем.
+        return True, f"проверить не вышло: {last_err}"
+    return False, "страница отдана гостю: ни ссылки выхода, ни «My assets»"
 
 
-def check_fragment_session_sync(cookies: dict) -> tuple[bool, str]:
-    """Light check that the Fragment cookies are alive."""
+_HASH_PATTERNS = (
+    r'ajInit\(\s*\{[^{}]*?"hash"\s*:\s*"([0-9a-zA-Z]{8,64})"',
+    r'api\?hash=([0-9a-zA-Z]{8,64})',
+    r'"apiHash"\s*:\s*"([0-9a-zA-Z]{8,64})"',
+    r'"hash"\s*:\s*"([0-9a-zA-Z]{8,64})"',
+    r"hash['\"]?\s*[:=]\s*['\"]([0-9a-f]{12,64})['\"]",
+    # Документация рабочего клиента ищет не только «hash»: у Fragment тот же
+    # ключ встречается под другими именами.
+    r"['\"](?:csrf|token|nonce|signature|sig)['\"]\s*:\s*['\"]([0-9a-f]{12,64})['\"]",
+)
+
+# Первой — страница покупки: именно её называет документация рабочего
+# клиента, и хеш, выданный на ней, точно годится для покупки. Хеш со
+# страницы витрины годился для поиска получателя, а дальше шёл «Access
+# denied» — возможно, ровно поэтому.
+_HASH_PAGES = ("https://fragment.com/stars/buy",
+               "https://fragment.com/stars",
+               "https://fragment.com/",
+               "https://fragment.com/premium")
+
+
+def _script_urls(html: str) -> list[str]:
+    """Адреса подключённых скриптов, абсолютные."""
+    urls: list[str] = []
+    for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', html or ""):
+        src = m.group(1)
+        if src.startswith("//"):
+            src = "https:" + src
+        elif src.startswith("/"):
+            src = "https://fragment.com" + src
+        elif not src.startswith("http"):
+            continue
+        if src not in urls:
+            urls.append(src)
+    return urls
+
+
+def collect_api_hashes_sync(cookies: dict, report: list | None = None,
+                            facts: dict | None = None,
+                            session: requests.Session | None = None
+                            ) -> list[str]:
+    """Все хеши, какие видны на страницах Fragment, — в порядке доверия.
+
+    Раньше брался первый совпавший, и этого не хватило: в разметке лежит не
+    один «hash», и подойти к API может не тот, что нашёлся первым. Перебрать
+    несколько дешевле, чем гадать.
+
+    `session` — чтобы читать страницу той же сессией, которой потом пойдут
+    запросы. В документации так и сделано: одна `requests.Session()` на
+    всё. У нас страницу читала отдельная сессия со своим User-Agent, а
+    куки, которые Fragment ставит на этой странице, оставались в ней и
+    пропадали. Хеш при этом уходил в запрос от другой сессии.
+
+    `facts` — то, что вызывающему нужно решать, а не показывать: вошли ли мы.
+    Вычитывать это обратно из текста отчёта значило бы управлять логикой по
+    прозе, а она меняется от любой правки формулировки.
+    """
+    session = session or _page_session(cookies or {})
+    found: list[str] = []
+    for url in _HASH_PAGES:
+        try:
+            r = session.get(url, timeout=20)
+        except Exception as e:
+            if report is not None:
+                report.append(f"{url}: {str(e)[:60]}")
+            continue
+        body = r.text or ""
+        if report is not None:
+            report.append(f"{url}: HTTP {r.status_code}, {len(body)} символов")
+            for line in page_signals(body):
+                report.append(f"  · {line}")
+        if facts is not None and "signed_in" not in facts:
+            facts["signed_in"] = not _looks_logged_out(body)
+        if r.status_code != 200:
+            continue
+        for pattern in _HASH_PATTERNS:
+            for m in re.finditer(pattern, body):
+                h = m.group(1)
+                if h and h not in found:
+                    found.append(h)
+        if not found:
+            # Документация ищет хеш и в подключённых JS-файлах: в разметке его
+            # может не быть вовсе. Только когда в самой странице пусто —
+            # лишние загрузки на каждый заказ ни к чему.
+            for src in _script_urls(body)[:6]:
+                try:
+                    js = session.get(src, timeout=15).text or ""
+                except Exception:
+                    continue
+                for pattern in _HASH_PATTERNS:
+                    for m in re.finditer(pattern, js):
+                        h = m.group(1)
+                        if h and h not in found:
+                            found.append(h)
+                if found:
+                    if report is not None:
+                        report.append(f"  · хеш найден в {src[:60]}")
+                    break
+        if found and report is not None:
+            report.append(f"кандидатов в хеш на этой странице: {len(found)}")
+        if found:
+            break
+    return found
+
+
+def fetch_api_hash_sync(cookies: dict, report: list | None = None,
+                        session: requests.Session | None = None) -> str:
+    """The api hash Fragment issued to this session, read off its own page.
+
+    Fragment stamps every request with a per-session hash, and a hash from
+    somebody else's session is answered with «Bad request» — which is what a
+    hardcoded one produced. It sits in the page's own JavaScript, so there is
+    no reason to make a seller find it by hand, let alone open developer tools
+    on a phone.
+
+    `session` передают, когда хеш и запросы должны идти одной сессией — как
+    в документации.
+    """
+    got = collect_api_hashes_sync(cookies, report, session=session)
+    return got[0] if got else ""
+
+
+# Адрес TON-кошелька на странице Fragment. Покупку разрешает не вход через
+# Telegram, а привязанный кошелёк, и его адрес виден в разметке. Границу
+# слова в конце не ставим: адрес может заканчиваться на «-» или «_», и \b
+# после них не срабатывает.
+_ADDR_RE = re.compile(r"(?<![A-Za-z0-9_-])([EU]Q[A-Za-z0-9_-]{46})")
+_RAW_ADDR_RE = re.compile(r"(?<![0-9a-fA-F:])(0:[0-9a-fA-F]{64})")
+
+
+def wallet_on_page_sync(cookies: dict, report: list | None = None) -> str:
+    """Какой TON-кошелёк Fragment считает привязанным к этой сессии.
+
+    «Access denied» на покупке означает не «куки протухли», а «этой сессии
+    покупать нельзя» — чаще всего потому, что кошелёк не подключён или
+    подключён другой. Пока оба адреса не видно рядом, различить нечем.
+    """
+    session = _page_session(cookies or {})
+    # Первой — страница профиля: документация рабочего клиента проверяет
+    # аккаунт и привязанный кошелёк именно на ней. Витрина показывает адрес
+    # не всегда, и «кошелёк не вижу» получалось на живой привязке.
+    for url in ("https://fragment.com/my/profile",
+                "https://fragment.com/stars/buy", "https://fragment.com/stars",
+                "https://fragment.com/"):
+        try:
+            r = session.get(url, timeout=20)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+        body = r.text or ""
+        found = _ADDR_RE.findall(body) or _RAW_ADDR_RE.findall(body)
+        if report is not None:
+            report.append(f"{url}: адресов в разметке {len(found)}")
+        if found:
+            return found[0]
+    return ""
+
+
+# Что документация читает с профиля: имя, ник, кошелёк и две отметки
+# проверки. Отметки мы не смотрели ни разу — а «Access denied» на покупке
+# при живой сессии и работающих куках объясняется ими не хуже прочего.
+_PROFILE_MARKS = (
+    ("Telegram-ник", r"@([A-Za-z0-9_]{4,32})"),
+    ("Identity Verified", r"(Identity\s+Verified)"),
+    ("Wallet Verified", r"(Wallet\s+Verified)"),
+    ("Not Verified", r"(Not\s+Verified)"),
+    ("KYC", r"(KYC|verification required|Verify)"),
+)
+
+
+def profile_facts_sync(cookies: dict) -> list[str]:
+    """Что Fragment пишет о самом аккаунте на `/my/profile`.
+
+    Документация рабочего клиента читает отсюда пять вещей: имя, ник,
+    TON-кошелёк, Identity Verified и Wallet Verified. Первые три мы читали,
+    последние две — ни разу, хотя именно они решают, что аккаунту разрешено.
+    Отсутствие фразы в разметке доказательством не считается: на этих
+    страницах не видно и работающих имён методов.
+    """
+    out: list[str] = []
+    session = _page_session(cookies or {})
+    try:
+        r = session.get("https://fragment.com/my/profile", timeout=20)
+    except Exception as e:
+        return [f"профиль: {str(e)[:60]}"]
+    body = r.text or ""
+    out.append(f"профиль: HTTP {r.status_code}, {len(body)} символов")
+    if r.status_code != 200 or not body:
+        return out
+    if _looks_logged_out(body):
+        out.append("  страница отдана как гостю — остальное читать нечего")
+        return out
+    seen: dict[str, bool] = {}
+    for label, pattern in _PROFILE_MARKS:
+        m = re.search(pattern, body, re.I)
+        seen[label] = bool(m)
+        out.append(f"  {label}: " + (f"есть — «{m.group(1)[:40]}»" if m
+                                     else "не встречается"))
+    addr = _ADDR_RE.findall(body) or _RAW_ADDR_RE.findall(body)
+    out.append("  кошелёк: " + (f"…{addr[0][-6:]}" if addr else "не видно"))
+    # Одна отметка есть, второй нет — это не шум разметки: обе фразы
+    # Fragment пишет одинаково, и раз одну мы видим, то увидели бы и
+    # вторую. Кошелёк при этом привязан — «привязан» и «проверен» у
+    # Fragment разные вещи, и покупку разрешает, судя по всему, вторая.
+    if seen.get("Identity Verified") and not seen.get("Wallet Verified"):
+        out.append("  ⚠️ Личность проверена, а кошелёк — нет. Из всего, что "
+                   "мы видели, это единственное невыполненное условие. "
+                   "Проверь кошелёк на fragment.com/my/profile и "
+                   "повтори — фактом это станет только после удавшейся "
+                   "покупки.")
+    return out
+
+
+def wallet_address_sync(mnemonic: str, wallet_version: str = "v4r2") -> str:
+    """Адрес кошелька бота — того, с которого он собирается платить."""
+    try:
+        wallet = _wallet_from_mnemonic(mnemonic, wallet_version)
+        return wallet.address.to_string(True, True, True)
+    except Exception:
+        return ""
+
+
+def wallet_hash(addr: str) -> str:
+    """Внутренний хеш адреса — то, чем один кошелёк отличается от другого.
+
+    У одного адреса три записи: EQ… и UQ… (base64url, различаются только
+    флагом bounceable) и сырая 0:hex. Сравнение строк объявляло их разными
+    кошельками — и бот уверенно сообщал «Fragment примет оплату только со
+    своего», глядя на два написания одного и того же.
+    """
+    v = str(addr or "").strip()
+    if not v:
+        return ""
+    if ":" in v:                                  # сырая форма 0:hex
+        tail = v.split(":", 1)[1].lower()
+        return tail if re.fullmatch(r"[0-9a-f]{64}", tail) else ""
+    try:
+        raw = base64.urlsafe_b64decode(v + "=" * (-len(v) % 4))
+    except Exception:
+        return ""
+    # метка(1) + workchain(1) + хеш(32) + crc(2)
+    return raw[2:34].hex() if len(raw) == 36 else ""
+
+
+def _same_wallet(a: str, b: str) -> bool:
+    """Один ли это кошелёк — по хешу, а не по написанию."""
+    ha, hb = wallet_hash(a), wallet_hash(b)
+    if ha and hb:
+        return ha == hb
+    return bool(a) and bool(b) and str(a).strip() == str(b).strip()
+
+
+def page_signals(html: str) -> list[str]:
+    """Что именно видно на странице — фактами, а не выводом.
+
+    Прежний детектор считал признаком входа строку «ton-auth», хотя это
+    кнопка «Connect TON», то есть признак ровно обратного: бот докладывал
+    «вход есть» на гостевой странице. Списку найденных маркеров соврать
+    труднее, чем одному слову.
+    """
+    text = html or ""
+    low = text.lower()
+    out: list[str] = []
+    # Заголовок — из оригинала: в нижнем регистре он читается как чужой.
+    m = re.search(r"<title[^>]*>(.{0,80}?)</title>", text, re.S | re.I)
+    if m:
+        out.append(f"заголовок: «{m.group(1).strip()}»")
+    checks = (
+        ("ссылка выхода", "/logout" in low),
+        ("кнопка «Log in»", "log in" in low or "sign in" in low),
+        ("кнопка «Connect TON»", "connect ton" in low or "ton-auth" in low),
+        ("раздел «My assets»", "my assets" in low),
+        ("форма покупки звёзд", "buystars" in low or "stars-form" in low),
+    )
+    for name, present in checks:
+        out.append(f"{name}: {'есть' if present else 'нет'}")
+    return out
+
+
+def page_rewrites_cookies_sync(cookies: dict, proxy: str = "") -> list[str]:
+    """Переписывает ли страница покупки наши куки. Только чтение.
+
+    Это проба под конкретную версию, а не украшение отчёта. Рабочий клиент
+    продавца страницу не читает вовсе — хеш у него в настройках, — а мы
+    читаем, и ответ страницы приносит свои `Set-Cookie` в ту же банку. Если
+    они ложатся поверх кук продавца, то дальше поиск получателя проходит (он
+    работает и без входа), а заявка отвечает «Access denied» одинаково на
+    живых и на протухших куках. Ровно это и наблюдалось.
+
+    Проверить версию можно бесплатно: открыть страницу и сравнить банку до и
+    после. Значения кук наружу не выходят — только имена.
+    """
+    out: list[str] = []
+    if not cookies:
+        return ["куки Fragment не заданы"]
+    session = _make_session(cookies, proxy)
+    before = dict(cookies)
+    try:
+        r = session.get("https://fragment.com/stars/buy", timeout=20)
+    except Exception as e:
+        return [f"страница не открылась: {str(e)[:80]}"]
+    after = {}
+    try:
+        after = dict(session.cookies)
+    except Exception:
+        pass
+    html = r.text or ""
+    # Вошли или нет — первым. Проба писалась под вопрос о куках, и первая
+    # её версия отвечала только на него: строчки про вход печатались среди
+    # прочих, а вывод внизу говорил «версия не подтвердилась». Продавец
+    # читал «не подтвердилась» и шёл дальше — мимо того, что страница вообще
+    # отдана гостю, а это и есть ответ на весь вопрос.
+    if _looks_logged_out(html):
+        out.append("❌ СТРАНИЦА ОТДАНА ГОСТЮ — Fragment не узнаёт сессию.")
+        out.append("Заявку на покупку он принимает только от вошедшего, "
+                   "поэтому «Access denied» здесь ожидаем, а проверять что-то "
+                   "ещё бессмысленно, пока это так.")
+    else:
+        out.append("✅ Вход есть — Fragment узнаёт сессию.")
+    out.append(f"страница: {len(html)} символов")
+    out += [f"  {line}" for line in page_signals(html)[:5]]
+    overwritten = sorted(k for k, v in before.items()
+                         if k in after and after[k] != v)
+    added = sorted(set(after) - set(before))
+    out.append(f"переписаны наши куки: {', '.join(overwritten) or 'нет'}")
+    out.append(f"добавлены страницей: {', '.join(added) or 'нет'}")
+    if overwritten:
+        out.append("⚠️ Подмена кук: заявку на покупку Fragment принимает "
+                   "только от вошедшего, а поиск получателя проходит и без "
+                   "входа. Бот возвращает твои куки на место сразу после "
+                   "чтения страницы.")
+    else:
+        out.append("Версия про подмену кук этой пробой не подтвердилась.")
+    if _looks_logged_out(html):
+        out.append("")
+        out.append("Что делать: переснять куки Fragment и повторить эту "
+                   "пробу. Если и с новыми страница гостевая — дело не в "
+                   "свежести, и следующий шаг /fragment_debug: он пробует "
+                   "три разных User-Agent, а сессия бывает привязана и к нему.")
+    return out
+
+
+def _looks_logged_out(html: str) -> bool:
+    """Похоже ли, что страница отдана гостю.
+
+    Вход подтверждает только то, что бывает лишь у вошедшего: ссылка выхода
+    или личный раздел. Кнопка подключения кошелька входом не является — на
+    этом прежняя версия и ошибалась.
+    """
+    low = (html or "").lower()
+    if not low:
+        return True
+    signed_in = "/logout" in low or "my assets" in low
+    return not signed_in
+
+
+# Чем бот может представиться. Сессию Fragment выдаёт браузеру, и она
+# бывает привязана не только к куке: куки, снятые с телефона, десктопному
+# User-Agent могут не подойти. Перебрать три строки дешевле, чем гадать.
+_USER_AGENTS = (
+    ("телефон Android", "Mozilla/5.0 (Linux; Android 13; SM-S911B) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Mobile Safari/537.36"),
+    ("iPhone", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) "
+               "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 "
+               "Mobile/15E148 Safari/604.1"),
+    ("компьютер", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0 Safari/537.36"),
+)
+
+
+def guess_cookie_name(value: str) -> str:
+    """На какую куку Fragment похоже это значение. Пусто — не похоже ни на что.
+
+    Куки вводятся по одной, и перепутать поля легко: у stel_ssid и
+    stel_token значения выглядят одинаково «технически». Отличаются они
+    надёжно — у ssid есть подчёркивание и он короткий, token — сплошной
+    hex, ton_token заметно длиннее и в base64url.
+    """
+    v = str(value or "").strip()
+    if not v:
+        return ""
+    if re.fullmatch(r"[0-9a-f]{8,32}_\d{6,30}", v):
+        return "stel_ssid"
+    if re.fullmatch(r"[0-9a-f]{40,400}", v):
+        return "stel_token"
+    if len(v) > 100 and re.fullmatch(r"[A-Za-z0-9_\-=]+", v):
+        return "stel_ton_token"
+    return ""
+
+
+def probe_session_sync(cookies: dict) -> list[str]:
+    """Почему Fragment не признаёт эту сессию — перебором, а не рассуждением.
+
+    Отвечает страница гостя: значит куки до Fragment либо не доходят, либо
+    им не подходят. Проверяем три вещи, которые можно проверить сами:
+    сколько кук задано и какой они длины, отвечает ли Fragment иначе на
+    другой User-Agent, и меняет ли что-то отсутствие XHR-заголовков.
+    """
+    out: list[str] = []
+    cookies = cookies or {}
+    out.append(f"Кук задано: {len(cookies)}")
+    # Типичные длины. Не проверка подлинности, а проверка правдоподобия:
+    # stel_token длиннее stel_ssid в разы, и обратное соотношение почти
+    # всегда значит, что значения попали не в свои поля.
+    typical = {"stel_token": (60, 400), "stel_ssid": (10, 40),
+               "stel_ton_token": (100, 2000)}
+    for name in ("stel_token", "stel_ssid", "stel_ton_token"):
+        value = str(cookies.get(name) or "")
+        # Значения не печатаем — это доступ к аккаунту. Длина скажет
+        # достаточно: обрезанная при копировании кука видна сразу.
+        if not value:
+            out.append(f"  · {name}: нет")
+            continue
+        low, high = typical[name]
+        mark = "" if low <= len(value) <= high else "  ⚠️ необычная длина"
+        out.append(f"  · {name}: {len(value)} символов "
+                   f"(обычно {low}–{high}){mark}")
+    # Не только по длине: у значений есть узнаваемый вид, и перепутанные
+    # поля видно наверняка, а не по подозрению.
+    wrong = []
+    for name in ("stel_token", "stel_ssid", "stel_ton_token"):
+        value = str(cookies.get(name) or "")
+        looks = guess_cookie_name(value)
+        if value and looks and looks != name:
+            wrong.append(f"в {name} лежит значение от {looks}")
+    if wrong:
+        out.append("⚠️ Значения попали не в свои поля: " + "; ".join(wrong)
+                   + ". Введи их заново по одному.")
+    else:
+        # Формат опознаётся не всегда — например, у значения непривычного
+        # вида. Соотношение длин остаётся вторым, более грубым признаком.
+        token, ssid = (str(cookies.get("stel_token") or ""),
+                       str(cookies.get("stel_ssid") or ""))
+        if token and ssid and len(ssid) > len(token):
+            out.append("⚠️ stel_ssid длиннее stel_token — обычно наоборот. "
+                       "Похоже, значения перепутаны местами.")
+    extra = [k for k in cookies if k not in
+             ("stel_token", "stel_ssid", "stel_ton_token")]
+    if extra:
+        out.append(f"  · ещё кук: {', '.join(sorted(extra)[:6])}")
+
+    for label, ua in _USER_AGENTS:
+        session = requests.Session()
+        session.cookies.update(cookies)
+        session.headers.update({
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru,en;q=0.9",
+        })
+        try:
+            r = session.get("https://fragment.com/stars", timeout=20)
+        except Exception as e:
+            out.append(f"{label}: ошибка сети {str(e)[:50]}")
+            continue
+        body = r.text or ""
+        signed = not _looks_logged_out(body)
+        out.append(f"{label}: HTTP {r.status_code}, {len(body)} символов, "
+                   + ("✅ вошли" if signed else "гость"))
+        if signed:
+            out.append("  ↑ вот с этим User-Agent сессия признаётся")
+        # Что Fragment ставит сам: имена кук, которые он на самом деле
+        # использует. Если среди них есть та, которой у нас нет, гадать о
+        # «неполном наборе» больше не придётся.
+        try:
+            names = sorted({c.name for c in session.cookies})
+        except Exception:
+            names = []
+        if names:
+            out.append(f"  куки после ответа: {', '.join(names[:8])}")
+    return out
+
+
+def probe_recipient_sync(cookies: dict, username: str, quantity: int = 50,
+                         api_hash: str = "", proxy: str = "") -> list[str]:
+    """Найдёт ли Fragment этого получателя и примет ли на него заявку.
+
+    Отдельно от большой пробы и без перебора вариантов: одна пара запросов,
+    ответ за секунду. Нужна затем, что «ник не находится» и «покупка
+    запрещена» — разные беды с разным лечением, а по одному прогону на
+    собственном аккаунте их не различить: на себе поиск проходит всегда.
+
+    Заявка денег не двигает: списание происходит только при отправке
+    подписанной транзакции, до неё здесь дело не доходит.
+    """
+    nick = (username or "").strip().lstrip("@")
+    if not cookies:
+        return ["Куки Fragment не заданы"]
+    if not nick:
+        return ["Пустой ник"]
+
+    session = _make_session(cookies, proxy)
+    h = (api_hash or "").strip() or fetch_api_hash_sync(
+        cookies, session=_page_session(cookies, proxy))
+    if not h:
+        return ["Не удалось прочитать api-hash со страницы Fragment — "
+                "скорее всего истекли куки"]
+
+    out: list[str] = []
+    search: dict = {}
+    recipient = ""
+    used = ""
+    for form in _query_forms(nick):
+        try:
+            search = session.post(
+                FRAGMENT_API_URL,
+                params={"method": "searchStarsRecipient", "hash": h,
+                        "query": form}, timeout=20).json()
+        except Exception as e:
+            return [f"Поиск не дошёл до Fragment: {str(e)[:60]}"]
+        recipient = _extract_recipient(search)
+        if recipient:
+            used = form
+            break
+
+    if not recipient:
+        err = str(search.get("error") or search.get("error_message")
+                  or search)[:120]
+        return [f"❌ @{nick} — не найден",
+                f"Fragment ответил: {err}",
+                "",
+                "Пробовали написания: " + ", ".join(_query_forms(nick)),
+                "Так отвечают и на несуществующий ник, и на тот, кому "
+                "звёзды слать нельзя. Что именно — Fragment не уточняет."]
+
+    found = search.get("found") if isinstance(search.get("found"), dict) else {}
+    out.append(f"✅ @{nick} — найден (написание «{used}»)")
+    if found.get("myself"):
+        out.append("⚠️ Это твой собственный аккаунт — покупку себе Fragment "
+                   "может разрешать иначе, чем чужому.")
+    out.append(f"recipient: {len(recipient)} знаков")
+
+    try:
+        init = session.post(
+            FRAGMENT_API_URL,
+            params={"method": "initBuyStarsRequest", "hash": h,
+                    "recipient": recipient, "quantity": quantity},
+            timeout=20).json()
+    except Exception as e:
+        return out + [f"Заявка не дошла: {str(e)[:60]}"]
+    out.append("")
+    if init.get("req_id") or init.get("id"):
+        out.append(f"✅ Заявка на {quantity}⭐ принята — Fragment готов "
+                   "продать. Денег пока не списано.")
+    else:
+        out.append(f"❌ Заявка на {quantity}⭐ — "
+                   f"{str(init.get('error') or init)[:100]}")
+    return out
+
+
+def probe_buy_sync(cookies: dict, username: str, quantity: int = 50,
+                   api_hash: str = "", control: str = "durov",
+                   proxy: str = "") -> list[str]:
+    """Где именно ломается покупка — перебором того, чем запросы отличаются.
+
+    Рабочий образец шлёт всё в строке запроса и ставит только User-Agent;
+    здесь параметры уехали в тело, а к ним добавились Origin и
+    X-Requested-With. Что из этого мешает — вопрос эксперимента, а не
+    рассуждения, тем более что поиск получателя проходит в обоих случаях.
+
+    Ничего не оплачивается: заявка денег не двигает, списание происходит
+    только при отправке подписанной транзакции после неё.
+    """
+    username = (username or "").strip().lstrip("@")
+    if not cookies or not username:
+        return ["нужны куки и ник"]
+
+    out: list[str] = []
+    # Какие куки вообще ушли — только имена и длины. Значения не печатаем
+    # никогда: это доступ к чужому аккаунту и кошельку.
+    names = ", ".join(f"{k} ({len(str(v))})"
+                      for k, v in sorted((cookies or {}).items()))
+    out.append("Куки: " + (names or "нет"))
+    # С какого адреса нас видит интернет. Куки Fragment выдаёт браузеру на
+    # конкретном адресе, а бот живёт в дата-центре — и пока этот адрес не
+    # напечатан, «прокси задан» ничего не значит: он мог и не примениться.
+    out.append(f"Прокси: {proxy_label(proxy)} · выходим с "
+               f"{outbound_ip(proxy)}")
+
+    # Признан ли вход — то единственное, чего проба до сих пор не показывала.
+    # Поиск получателя Fragment отдаёт и гостю, покупку — нет. Пока эта
+    # строка не напечатана, «Access denied» одинаково объясняется и
+    # транспортом, и тем, что сессии просто нельзя покупать.
+    facts: dict = {}
+    pages: list[str] = []
+    hashes = collect_api_hashes_sync(
+        cookies, pages, facts, session=_page_session(cookies, proxy)) or []
+    if "signed_in" in facts:
+        out.append("Вход: " + ("✅ признан (есть выход/личный раздел)"
+                               if facts["signed_in"]
+                               else "❌ страница отдана как гостю"))
+        if not facts["signed_in"]:
+            # Куки Fragment живут недолго: в этот же день проба сначала
+            # видела личный раздел, а через полчаса — гостевую страницу с
+            # теми же куками. Пока это не сказано вслух, продавец ищет
+            # причину в боте.
+            out.append("  Куки Fragment истекли. Сними их заново — они "
+                       "живут недолго, и вчерашние уже не годятся.")
+    wallet = wallet_on_page_sync(cookies)
+    out.append("Кошелёк на странице Fragment: "
+               + (f"…{wallet[-6:]}" if wallet else "не видно"))
+    out += [f"  · {line}" for line in pages[:6]]
+
+    stored = (api_hash or "").strip()
+    if stored and stored not in hashes:
+        hashes.insert(0, stored)
+    if not hashes:
+        return ["не нашёл ни одного api-hash на страницах Fragment"]
+    # Длину печатаем, а не только хвост. У рабочего образца хеш — ровно
+    # 18 знаков (af142ec36cafbbfa89). Среди наших шаблонов есть и «csrf», и
+    # «token»: под видом api-hash легко подобрать что-то чужой длины, и
+    # поиск такое может стерпеть, а покупка — нет. Хвоста для этого мало.
+    out.append("Хешей найдено: " + ", ".join(
+        f"…{h[-6:]} ({len(h)} знаков)" for h in hashes))
+
+    # Что отвечает Fragment на другие методы. Проверка, которой не хватало
+    # с самого начала: если «Access denied» приходит и на выдуманное имя
+    # метода, то это не «вам нельзя покупать», а «такого метода тут нет» —
+    # и вся линия рассуждений про права держалась на пустом месте.
+    out.append("")
+    out.append("Что отвечают другие методы:")
+    out += _probe_methods(cookies, hashes[0], username, quantity)
+
+    # Fragment различает «Invalid method», «Session expired» и «Access
+    # denied» — значит метод существует, и отказ не про мёртвую сессию:
+    # соседние методы на той же сессии отвечают иначе. Остаётся сам запрос.
+    # Меняем в нём по одному полю и смотрим, меняется ли ответ. Если не
+    # меняется ни от чего — Fragment до разбора параметров не доходит.
+    out.append("")
+    out.append("Что меняет каждое поле заявки:")
+    out += _probe_init_shapes(cookies, hashes[0], username, quantity)
+
+    # Дыра в прежней пробе: перебор вариантов начинался с поиска, и хеш,
+    # на котором поиск не проходит, отбрасывался целиком — заявку им не
+    # пробовали ни разу. А у Fragment хеш вполне может быть свой на каждый
+    # раздел: тогда поиску годится один, покупке другой, и «Access denied»
+    # это ровно «не тот хеш для этого метода».
+    out.append("")
+    out.append("Заявка каждым найденным хешем:")
+    out += _probe_every_hash(cookies, username, quantity, proxy, stored,
+                             extra=hashes)
+
+    # Ровно как в документации: одна сессия и на страницу, и на API. У нас
+    # страницу читала отдельная сессия со своим User-Agent, и куки, которые
+    # Fragment ставит при её открытии, терялись — а хеш он выдаёт сессии.
+    # Это последнее отличие от образца, и до сих пор оно не проверялось.
+    out.append("")
+    out.append("Одной сессией, как в документе:")
+    out += _probe_single_session(cookies, username, quantity)
+
+    plain = {"User-Agent": "Mozilla/5.0"}
+    rich = {"User-Agent": _USER_AGENTS[0][1],
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://fragment.com",
+            "Referer": "https://fragment.com/stars"}
+
+    # Перебор транспорта закрыт: шесть форм запроса дали побайтово один
+    # ответ, а различие ответов по методам показало, что дело и не в правах.
+    # Оставлена одна форма — та, что в документации, — как точка отсчёта.
+    variants = (
+        ("как в образце", True, plain, False, False),
+    )
+
+    def call(session, in_query, h, method, args):
+        if in_query:
+            return session.post(FRAGMENT_API_URL,
+                                params={"method": method, "hash": h, **args},
+                                timeout=20)
+        return session.post(FRAGMENT_API_URL, params={"hash": h},
+                            data={"method": method, **args}, timeout=20)
+
+    # Подробности печатаются один раз, а не по разу на каждый из десяти
+    # прогонов: иначе отчёт не влезет в сообщение.
+    shown = {"search": False, "init": False}
+
+    for label, in_query, headers, with_qty, warm in variants:
+        for h in hashes[:2]:
+            tag = f"{label} · хеш …{h[-6:]}"
+            session = requests.Session()
+            session.cookies.update(cookies)
+            session.headers.update(headers)
+            if warm:
+                try:
+                    session.get("https://fragment.com/stars/buy", timeout=20)
+                except Exception as e:
+                    out.append(f"{tag}: страница — ошибка {str(e)[:40]}")
+                    continue
+            # Написания перебираются и здесь. Перебор был вписан в покупку,
+            # а в пробу — нет, и контрольная заявка упёрлась в «Please enter
+            # a username assigned to a user» на живом нике.
+            search, recipient = {}, ""
+            for form in _query_forms(username):
+                args = {"query": form}
+                if with_qty:
+                    args["quantity"] = quantity
+                try:
+                    search = call(session, in_query, h,
+                                  "searchStarsRecipient", args).json()
+                except Exception as e:
+                    out.append(f"{tag}: поиск — ошибка {str(e)[:40]}")
+                    search = {}
+                    break
+                recipient = _extract_recipient(search)
+                if recipient:
+                    break
+            if not recipient:
+                out.append(f"{tag}: поиск — "
+                           f"{str(search.get('error') or search)[:60]}")
+                continue
+            # Что именно нашлось — важнее, чем «нашлось». Если сюда попал не
+            # тот идентификатор (например, флаг `myself` вместо recipient),
+            # заявка обязана отвечать отказом, и искать причину в транспорте
+            # можно бесконечно.
+            if not shown["search"]:
+                shown["search"] = True
+                found = search.get("found")
+                out.append(f"  поиск вернул поля: "
+                           f"{', '.join(sorted(search)) or '—'}")
+                out.append(f"  found: {str(found)[:120]}")
+                out.append(f"  recipient длиной {len(recipient)}: "
+                           f"«{recipient[:24]}…»")
+                if isinstance(found, dict) and found.get("myself"):
+                    out.append("  ⚠️ myself: это твой собственный аккаунт")
+            try:
+                resp = call(session, in_query, h, "initBuyStarsRequest",
+                            {"recipient": recipient, "quantity": quantity})
+                init = resp.json()
+            except Exception as e:
+                out.append(f"{tag}: заявка — ошибка {str(e)[:40]}")
+                continue
+            if init.get("req_id") or init.get("id"):
+                out.append(f"✅ {tag}: ЗАЯВКА ПРИНЯТА — вот рабочий вариант")
+                return out
+            out.append(f"{tag}: заявка — "
+                       f"{str(init.get('error') or init)[:70]}")
+            # Ответ целиком, один раз: «Access denied» бывает не единственным
+            # полем, и соседние объясняют, чего не хватает.
+            if not shown["init"]:
+                shown["init"] = True
+                out.append(f"  ответ заявки: HTTP {resp.status_code}, "
+                           f"поля: {', '.join(sorted(init)) or '—'}")
+                out.append(f"  целиком: {str(init)[:200]}")
+
+    # Ни один вариант не прошёл. Осталось различить две причины, которые до
+    # сих пор объясняли отказ одинаково: сессии вообще нельзя покупать —
+    # или нельзя покупать себе. Проверяется одной заявкой на чужой ник.
+    # В работе получатель всегда покупатель, а не продавец, так что второй
+    # случай означал бы, что выдача исправна, а сломан только наш способ
+    # её проверять.
+    live = (control or "").strip().lstrip("@")
+    if live and live.lower() != username.lower():
+        out.append("")
+        out.append(f"Контрольная заявка на чужой ник @{live}:")
+        out += _probe_control(cookies, live, quantity, hashes[0], username)
+
+    # То, что документация читает с профиля, а мы не читали ни разу:
+    # отметки проверки аккаунта. Живая сессия и работающие куки покупку не
+    # разрешили — значит дело в правах самого аккаунта либо в чём-то, чего
+    # мы ещё не видели. Профиль — единственное место, где Fragment о правах
+    # говорит словами.
+    out.append("")
+    out.append("Что Fragment пишет об аккаунте:")
+    out += [f"  {line}" for line in profile_facts_sync(cookies)]
+
+    out.append("")
+    out.append("Что меняет каждая кука:")
+    out += _probe_cookie_roles(cookies, username, quantity)
+    return out
+
+
+def _probe_methods(cookies: dict, api_hash: str, username: str,
+                   quantity: int) -> list[str]:
+    """Чем отличаются ответы Fragment на разные методы.
+
+    «Access denied» мы полторы недели читали как «этой сессии покупать
+    нельзя» — и ни разу не спросили, что Fragment отвечает на имя метода,
+    которого не существует вовсе. Если то же самое, значит это его общее
+    «нет», и никаких выводов о правах из него не следует: скорее всего мы
+    зовём метод, которого на этом хеше нет.
+
+    Все вызовы безобидны: заявка денег не двигает, у `getBuyStarsLink` и
+    `confirmReq` заведомо несуществующий `id`.
+    """
+    session = _make_session(cookies)
+
+    def ask(method: str, args: dict) -> str:
+        try:
+            r = session.post(FRAGMENT_API_URL,
+                             params={"method": method, "hash": api_hash,
+                                     **args}, timeout=20)
+        except Exception as e:
+            return f"ошибка сети {str(e)[:30]}"
+        try:
+            data = r.json()
+        except ValueError:
+            return f"HTTP {r.status_code}, не JSON ({len(r.text or '')} симв.)"
+        if not isinstance(data, dict):
+            return f"HTTP {r.status_code}, {str(data)[:40]}"
+        if data.get("error") or data.get("error_message"):
+            return str(data.get("error") or data.get("error_message"))[:50]
+        return "принято: " + ", ".join(sorted(data))[:50]
+
+    # Написания перебираются все, как в самой покупке. Проба брала только
+    # первое — «@ник» — и на его отказе писала «получателя не нашли», хотя
+    # покупка попробовала бы и «ник» без собаки. Диагностика, которая
+    # мрачнее проверяемого кода, отправляет искать несуществующую поломку:
+    # ровно это и случилось с @durov.
+    forms = _query_forms(username)
+    recipient = ""
+    used = ""
+    tried: list[str] = []
+    for form in forms:
+        try:
+            got = session.post(
+                FRAGMENT_API_URL,
+                params={"method": "searchStarsRecipient", "hash": api_hash,
+                        "query": form}, timeout=20).json()
+        except Exception as e:
+            tried.append(f"  «{form}» → ошибка сети {str(e)[:30]}")
+            continue
+        found = _extract_recipient(got) if isinstance(got, dict) else ""
+        if found:
+            recipient, used = found, form
+            tried.append(f"  «{form}» → найден")
+            break
+        err = ""
+        if isinstance(got, dict):
+            err = str(got.get("error") or got.get("error_message") or "")[:60]
+        tried.append(f"  «{form}» → {err or 'не найден'}")
+
+    out = ["Написания ника (как в покупке):"] + tried
+    if recipient:
+        out.append(f"  подошло: «{used}»")
+    else:
+        out.append("  ни одно написание не подошло — дальше проверять нечего, "
+                   "и это НЕ про права: заявку Fragment смотрит после "
+                   "получателя")
+    out.append("")
+    out.append("Что отвечают методы:")
+
+    first = forms[:1]
+    checks = [
+        ("searchStarsRecipient", {"query": used or (first[0] if first else "x")}),
+        ("initBuyStarsRequest", {"recipient": recipient or "x",
+                                 "quantity": quantity}),
+        ("getBuyStarsLink", {"id": "0", "transaction": 1}),
+        ("confirmReq", {"id": "0", "boc": "x"}),
+        # Двух выдуманных имён достаточно, чтобы увидеть, отличает ли
+        # Fragment «нельзя» от «нет такого».
+        ("thisMethodDoesNotExist", {}),
+        ("searchStarsRecipientX", {"query": first[0] if first else "x"}),
+    ]
+    for method, args in checks:
+        out.append(f"  {method}: {ask(method, args)}")
+    return out
+
+
+def _probe_single_session(cookies: dict, username: str,
+                          quantity: int) -> list[str]:
+    """Вся цепочка одной сессией — точь-в-точь как в документации.
+
+    Там одна `requests.Session()` с единственным заголовком User-Agent:
+    ею читается страница покупки, из неё берётся хеш, ею же уходят все
+    запросы. У нас страницу читала вторая сессия — со своим User-Agent и
+    своей банкой кук. Куки, которые Fragment ставит при открытии страницы,
+    в неё и оставались, а хеш, выданный ей, уходил в запрос от первой.
+    """
+    session = _make_session(cookies)
+    out: list[str] = []
+    try:
+        page = session.get("https://fragment.com/stars/buy", timeout=20)
+    except Exception as e:
+        return [f"  страница — ошибка {str(e)[:40]}"]
+    body = page.text or ""
+    # Что Fragment поставил сам, открывая страницу: если среди этих кук есть
+    # та, которой у нас не было, вот она и есть недостающее звено.
+    try:
+        got = sorted({c.name for c in session.cookies})
+    except Exception:
+        got = []
+    out.append(f"  страница: HTTP {page.status_code}, {len(body)} символов")
+    out.append(f"  куки после неё: {', '.join(got) or '—'}")
+    new = [n for n in got if n not in (cookies or {})]
+    if new:
+        out.append(f"  ↑ Fragment поставил сам: {', '.join(new)}")
+
+    h = ""
+    for pattern in _HASH_PATTERNS:
+        m = re.search(pattern, body)
+        if m:
+            h = m.group(1)
+            break
+    if not h:
+        return out + ["  хеша на странице нет — дальше идти не с чем"]
+    out.append(f"  хеш с этой страницы: …{h[-6:]} ({len(h)} знаков)")
+    out.append(f"  {_probe_two_calls(session, h, username, quantity)}")
+    return out
+
+
+def _probe_every_hash(cookies: dict, username: str, quantity: int,
+                      proxy: str = "", stored: str = "",
+                      extra: list[str] | None = None) -> list[str]:
+    """Заявка каждым хешем, какой удалось найти, — включая непроверенные.
+
+    Прежний перебор шёл от поиска: хеш, на котором поиск не проходит,
+    отбрасывался вместе с заявкой. Значит второй кандидат ни разу не
+    пробовался на покупке. У Fragment хеш вполне может быть свой на каждый
+    раздел — тогда поиску годится один, покупке другой, а «Access denied»
+    означает просто «не тот хеш для этого метода».
+
+    Заодно кандидаты собираются глубже: не только со страницы, но и из всех
+    её скриптов. Раньше скрипты читались, только если на странице не нашлось
+    ничего, — а нашлось там как раз то, что для покупки не годится.
+    """
+    session = _make_session(cookies, proxy)
+    try:
+        body = (session.get("https://fragment.com/stars/buy",
+                            timeout=30).text or "")
+    except Exception as e:
+        return [f"  страница — ошибка {str(e)[:40]}"]
+
+    # Первым — заданный руками: если продавец снял хеш в браузере, где
+    # покупка проходит, проверять надо в первую очередь его.
+    found: list[str] = [stored.strip()] if (stored or "").strip() else []
+    # Дальше — то, что уже нашла общая проверка. Без этого раздел работал
+    # вхолостую: страницы читаются двумя сессиями с разными User-Agent,
+    # Fragment отдаёт им разную разметку, и второй кандидат виден только
+    # одной из них. В отчёте стояло «найдено два», а до заявки доходил один.
+    for h in (extra or []):
+        if h and h not in found:
+            found.append(h)
+    for text in [body] + _scripts_of(session, body):
+        for pattern in _HASH_PATTERNS:
+            for m in re.finditer(pattern, text):
+                if m.group(1) and m.group(1) not in found:
+                    found.append(m.group(1))
+    if not found:
+        return ["  хешей на странице нет"]
+
+    # Получателя добываем любым хешем, который его отдаёт: он нужен всем
+    # заявкам одинаковый, и брать его чем попало здесь не грех.
+    recipient = ""
+    for h in found:
+        for form in _query_forms(username):
+            try:
+                got = session.post(
+                    FRAGMENT_API_URL,
+                    params={"method": "searchStarsRecipient", "hash": h,
+                            "query": form}, timeout=20).json()
+            except Exception:
+                continue
+            recipient = _extract_recipient(got)
+            if recipient:
+                break
+        if recipient:
+            break
+    if not recipient:
+        return [f"  кандидатов {len(found)}, но получателя не нашёл ни один"]
+
+    out = [f"  кандидатов в хеш: {len(found)}"]
+    for h in found[:8]:
+        try:
+            data = session.post(
+                FRAGMENT_API_URL,
+                params={"method": "initBuyStarsRequest", "hash": h,
+                        "recipient": recipient, "quantity": quantity},
+                timeout=20).json()
+        except Exception as e:
+            out.append(f"  …{h[-6:]} ({len(h)}): ошибка {str(e)[:30]}")
+            continue
+        if isinstance(data, dict) and data.get("req_id"):
+            out.append(f"  ✅ …{h[-6:]} ({len(h)} знаков): ЗАЯВКА ПРИНЯТА — "
+                       "вот он, рабочий хеш")
+            return out
+        out.append(f"  …{h[-6:]} ({len(h)}): "
+                   f"{str((data or {}).get('error') or data)[:40]}")
+    return out
+
+
+def _scripts_of(session, html: str) -> list[str]:
+    """Тексты подключённых скриптов страницы — сколько удалось прочитать."""
+    out: list[str] = []
+    for url in _script_urls(html)[:_MAX_SCRIPTS]:
+        try:
+            r = session.get(url, timeout=15)
+        except Exception:
+            continue
+        if r.status_code == 200 and r.text:
+            out.append(r.text)
+    return out
+
+
+def _probe_init_shapes(cookies: dict, api_hash: str, username: str,
+                       quantity: int) -> list[str]:
+    """Меняем в заявке по одному полю и смотрим, меняется ли ответ.
+
+    Fragment отвечает «Invalid method» на выдуманное имя и «Session
+    expired» соседним методам на мёртвой сессии — а `initBuyStarsRequest`
+    и там и там говорит «Access denied». На куки он, значит, не смотрит:
+    его не устраивает сам запрос. Осталось узнать, доходит ли он вообще до
+    разбора полей. Если ответ одинаков и на пустой запрос, и на мусор в
+    получателе — не доходит, и искать надо не в полях.
+
+    Ничего не оплачивается: заявка денег не двигает.
+    """
+    session = _make_session(cookies)
+    recipient = ""
+    forms = _query_forms(username)
+    if forms:
+        try:
+            got = session.post(
+                FRAGMENT_API_URL,
+                params={"method": "searchStarsRecipient", "hash": api_hash,
+                        "query": forms[0]}, timeout=20).json()
+            recipient = _extract_recipient(got)
+        except Exception:
+            recipient = ""
+    if not recipient:
+        return ["  получателя не нашли — сравнивать не с чем"]
+
+    shapes = (
+        ("как сейчас", {"recipient": recipient, "quantity": quantity}),
+        ("без quantity", {"recipient": recipient}),
+        ("без recipient", {"quantity": quantity}),
+        ("совсем пусто", {}),
+        ("мусор в recipient", {"recipient": "zzz", "quantity": quantity}),
+        ("quantity = 0", {"recipient": recipient, "quantity": 0}),
+        ("quantity = 1000", {"recipient": recipient, "quantity": 1000}),
+        # Поля, которые документация шлёт на соседнем шаге. Здесь их быть
+        # не должно — но если ответ от них меняется, значит Fragment всё же
+        # разбирает запрос, и это уже подсказка.
+        ("+ show_sender", {"recipient": recipient, "quantity": quantity,
+                           "show_sender": 1}),
+    )
+    out: list[str] = []
+    answers: list[str] = []
+    for label, args in shapes:
+        try:
+            data = session.post(
+                FRAGMENT_API_URL,
+                params={"method": "initBuyStarsRequest", "hash": api_hash,
+                        **args}, timeout=20).json()
+        except Exception as e:
+            out.append(f"  {label}: ошибка {str(e)[:30]}")
+            continue
+        if isinstance(data, dict) and (data.get("req_id") or data.get("id")):
+            out.append(f"  ✅ {label}: ПРИНЯТО — вот рабочая форма")
+            return out
+        said = str((data or {}).get("error") or data)[:50]
+        answers.append(said)
+        out.append(f"  {label}: {said}")
+    if answers and len(set(answers)) == 1:
+        out.append("  ↑ ответ один и тот же на всё, включая пустой запрос: "
+                   "до разбора полей Fragment не доходит, и дело не в них.")
+    return out
+
+
+def _probe_cookie_roles(cookies: dict, username: str,
+                        quantity: int) -> list[str]:
+    """Какая кука на что влияет — вычитанием, а не рассуждением.
+
+    «Connect TON» на странице значит либо «кошелёк не подключён», либо
+    «разметка окна лежит там всегда» — по HTML не различить, и на похожем
+    признаке (`ton-auth`) мы уже один раз ошиблись. Зато различить можно
+    опытом: убрать куку и посмотреть, изменилось ли хоть что-нибудь. Если
+    без `stel_ton_token` страница и ответы те же — значит она не работает,
+    и покупку запрещает именно это.
+    """
+    cookies = dict(cookies or {})
+    subsets = [("все куки", cookies)]
+    for name in ("stel_ton_token", "stel_token", "stel_ssid"):
+        if name in cookies:
+            subsets.append((f"без {name}",
+                            {k: v for k, v in cookies.items() if k != name}))
+    subsets.append(("без кук вовсе", {}))
+
+    out: list[str] = []
+    marks: list[str] = []
+    for label, sub in subsets:
+        try:
+            r = _page_session(sub).get("https://fragment.com/stars/buy",
+                                       timeout=20)
+            body = r.text or ""
+        except Exception as e:
+            out.append(f"  {label}: страница — {str(e)[:40]}")
+            continue
+        low = body.lower()
+        assets = "my assets" in low
+        h = ""
+        for pattern in _HASH_PATTERNS:
+            m = re.search(pattern, body)
+            if m:
+                h = m.group(1)
+                break
+        step = "хеша нет"
+        if h:
+            session = requests.Session()
+            session.cookies.update(sub)
+            session.headers.update({"User-Agent": "Mozilla/5.0"})
+            step = _probe_two_calls(session, h, username, quantity)
+        state = (f"{len(body)} симв., «My assets» "
+                 f"{'есть' if assets else 'нет'}, {step}")
+        marks.append(state)
+        out.append(f"  {label}: {state}")
+
+    # Вывод — только тот, который следует из сравнения, и только когда есть
+    # что сравнивать. Догадка сюда не пишется.
+    if len(marks) > 1 and marks[1] == marks[0] and "stel_ton_token" in cookies:
+        out.append("  ↑ без stel_ton_token не изменилось ничего — эта кука "
+                   "сейчас не работает. Подключи TON-кошелёк на "
+                   "fragment.com заново и сними её ещё раз.")
+    return out
+
+
+def _probe_two_calls(session, api_hash: str, username: str,
+                     quantity: int) -> str:
+    """Поиск и заявка одной строкой — «нашёл, заявка: …»."""
+    recipient = ""
+    search: dict = {}
+    for form in _query_forms(username):
+        try:
+            search = session.post(
+                FRAGMENT_API_URL,
+                params={"method": "searchStarsRecipient", "hash": api_hash,
+                        "query": form}, timeout=20).json()
+        except Exception as e:
+            return f"поиск — ошибка {str(e)[:30]}"
+        recipient = _extract_recipient(search)
+        if recipient:
+            break
+    if not recipient:
+        return f"поиск — {str(search.get('error') or search)[:40]}"
+    try:
+        init = session.post(
+            FRAGMENT_API_URL,
+            params={"method": "initBuyStarsRequest", "hash": api_hash,
+                    "recipient": recipient, "quantity": quantity},
+            timeout=20).json()
+    except Exception as e:
+        return f"нашёл, заявка — ошибка {str(e)[:30]}"
+    if init.get("req_id") or init.get("id"):
+        return "нашёл, ЗАЯВКА ПРИНЯТА"
+    return f"нашёл, заявка — {str(init.get('error') or init)[:40]}"
+
+
+# Кого пробовать контрольной заявкой, если заданный ник не нашёлся.
+# Fragment отвечает «Please enter a username assigned to a user» даже на
+# @durov, и почему — неизвестно; перебор дешевле догадок. В работе получатель
+# всегда покупатель, так что важно проверить хоть на кому-то, кто не «я».
+_CONTROL_FALLBACKS = ("telegram", "toncoin", "wallet", "durov")
+
+
+def _probe_control(cookies: dict, username: str, quantity: int,
+                   api_hash: str, myself_nick: str = "") -> list[str]:
+    """Заявка на чужой ник — тем же способом, что и основная.
+
+    Денег не двигает: списание происходит только при отправке подписанной
+    транзакции, а до неё дело здесь не доходит.
+    """
+    session = requests.Session()
+    session.cookies.update(cookies or {})
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    def post(method: str, extra: dict):
+        return session.post(FRAGMENT_API_URL,
+                            params={"method": method, "hash": api_hash,
+                                    **extra}, timeout=20)
+
+    # Заданный ник — первым, дальше запасные. Свой собственный из перебора
+    # исключён: на нём проверять нечего, это и есть основной случай.
+    nicks = [username] + [n for n in _CONTROL_FALLBACKS
+                          if n.lower() not in (username.lower(),
+                                               (myself_nick or "").lower())]
+    search: dict = {}
+    recipient = ""
+    tried: list[str] = []
+    for nick in nicks:
+        for form in _query_forms(nick):
+            try:
+                search = post("searchStarsRecipient", {"query": form}).json()
+            except Exception as e:
+                return [f"  поиск — ошибка {str(e)[:40]}"]
+            recipient = _extract_recipient(search)
+            if recipient:
+                break
+        if recipient:
+            break
+        tried.append(nick)
+    if not recipient:
+        return [f"  поиск — {str(search.get('error') or search)[:60]}",
+                "  Ни один ник не нашёлся: " + ", ".join(f"@{n}" for n in tried),
+                "  Задай живой ник третьим словом — лучше всего свой второй "
+                "аккаунт: /stars_probe NO0RD 50 второйник"]
+
+    out: list[str] = []
+    if nick != username:
+        out.append(f"  @{username} не нашёлся, взял @{nick}")
+    found = search.get("found")
+    mine = bool(isinstance(found, dict) and found.get("myself"))
+    out.append(f"  найден, myself: {'да' if mine else 'нет'}")
+    try:
+        resp = post("initBuyStarsRequest",
+                    {"recipient": recipient, "quantity": quantity})
+        init = resp.json()
+    except Exception as e:
+        return out + [f"  заявка — ошибка {str(e)[:40]}"]
+    if init.get("req_id") or init.get("id"):
+        out.append("  ✅ ЗАЯВКА ПРИНЯТА — Fragment не даёт покупать только "
+                   "себе. В работе получатель всегда покупатель, так что "
+                   "выдаче это не мешает.")
+    elif mine:
+        # Нашли снова себя — сравнивать не с чем, и говорить «дело не в
+        # себе» нельзя: это и есть «себе».
+        out.append(f"  ❌ {str(init.get('error') or init)[:70]}")
+        out.append("  Но это снова твой же аккаунт — версия «нельзя покупать "
+                   "себе» так и осталась непроверенной.")
+    else:
+        out.append(f"  ❌ {str(init.get('error') or init)[:70]}")
+        out.append("  Отказ и на чужом нике — дело не в «себе»: этой сессии "
+                   "покупать нельзя вообще.")
+    return out
+
+
+# Что ищем в коде самого сайта. Простыми подстроками, без кавычек и без
+# «method:» рядом: прежний поиск требовал и того и другого и не нашёл даже
+# searchStarsRecipient — метод, который у нас работает. Отрицательный
+# результат тогда ничего не значил, и два прогона ушли впустую.
+_SITE_NEEDLES = ("StarsRecipient", "BuyStars", "initBuy", "confirmReq",
+                 "ajInit", "stars/buy", "quantity")
+# Сколько скриптов читать. Шести не хватало: вызовы API у Fragment лежат не
+# в первых подключённых файлах.
+_MAX_SCRIPTS = 25
+
+
+def _window(text: str, at: int, width: int = 110) -> str:
+    """Кусок кода вокруг находки, в одну строку.
+
+    Нам нужны имена соседних параметров — по ним видно, чего мы не шлём.
+    """
+    start = max(0, at - width // 2)
+    chunk = text[start:at + width // 2]
+    return " ".join(chunk.split())
+
+
+def probe_page_api_sync(cookies: dict) -> list[str]:
+    """Как сайт зовёт свой API — по его собственному коду.
+
+    Шесть вариантов формы запроса получили один и тот же «Access denied», а
+    поиск получателя прошёл в каждом. Значит дело не в том, как мы шлём, и
+    догадываться дальше не о чем: надо прочитать, что именно шлёт сама
+    страница покупки. Имена методов и соседние параметры лежат в
+    подключаемых скриптах, и читать надо все, а не первые шесть.
+    """
+    out: list[str] = []
+    session = _page_session(cookies or {})
+    try:
+        r = session.get("https://fragment.com/stars/buy", timeout=20)
+    except Exception as e:
+        return [f"страница покупки: {str(e)[:60]}"]
+    if r.status_code != 200:
+        return [f"страница покупки: HTTP {r.status_code}"]
+    body = r.text or ""
+    out.append(f"страница: {len(body)} символов")
+
+    sources = [("страница", body)]
+    urls = _script_urls(body)
+    out.append(f"скриптов подключено: {len(urls)}")
+    for url in urls[:_MAX_SCRIPTS]:
+        try:
+            js = session.get(url, timeout=20)
+        except Exception as e:
+            out.append(f"  {url.rsplit('/', 1)[-1][:28]}: {str(e)[:30]}")
+            continue
+        if js.status_code == 200 and js.text:
+            sources.append((url.rsplit("/", 1)[-1][:28], js.text))
+    out.append(f"прочитано: {len(sources) - 1}")
+
+    hits = 0
+    for name, text in sources:
+        for needle in _SITE_NEEDLES:
+            at = text.find(needle)
+            if at < 0:
+                continue
+            hits += 1
+            out.append(f"{name} · {needle}:")
+            out.append(f"  …{_window(text, at)}…")
+            if hits >= 12:
+                out.append("(дальше обрезано — хватит и этого)")
+                return out
+    if not hits:
+        # Отрицательный результат теперь что-то значит: искали простыми
+        # подстроками по всем скриптам, а не по кавычкам в первых шести.
+        out.append("Ни одной из искомых строк нет ни на странице, ни в "
+                   "скриптах. Значит покупка на сайте работает не через "
+                   "этот код — либо страница отдана нам не та, что браузеру.")
+    return out
+
+
+def check_fragment_session_sync(cookies: dict,
+                                api_hash: str = "") -> tuple[bool, object]:
+    """Лёгкая проверка, жива ли сессия Fragment.
+
+    Отдаёт (ok, сообщение), а если по дороге удалось снять свежий хеш —
+    (True, {"message":…, "api_hash":…}), чтобы вызывающий его сохранил:
+    именно в хеше ошибалась прошлая версия, и его добыча — большая часть
+    починки.
+    """
     if not cookies:
         return False, "cookies не заданы"
     session = _make_session(cookies)
-    try:
-        r = session.post(FRAGMENT_API_URL,
-                         params={"method": "searchStarsRecipient",
-                                 "hash": DEFAULT_HASH, "query": "durov"},
-                         timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("ok") or data.get("found"):
-                return True, "cookies работают"
-            return False, f"Fragment ответил: {str(data)[:100]}"
-        return False, f"HTTP {r.status_code}"
-    except Exception as e:
-        return False, f"ошибка: {str(e)[:80]}"
+
+    def _try(h: str):
+        try:
+            r = _api_call(session, h, "searchStarsRecipient",
+                          {"query": "durov", "quantity": 50})
+        except Exception as e:
+            return None, f"ошибка сети: {str(e)[:80]}"
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}"
+        try:
+            return r.json(), ""
+        except ValueError:
+            return None, "Fragment ответил не JSON"
+
+    data, err = _try(api_hash or DEFAULT_HASH)
+    if data is not None and (data.get("ok") or data.get("found")):
+        return True, "сессия работает"
+
+    # «Bad request» — это ответ на чужой хеш. Собираем все, какие видны на
+    # странице, и пробуем каждый: в разметке их несколько, и подойти может не
+    # первый.
+    report: list[str] = []
+    facts: dict = {}
+    tried = {(api_hash or DEFAULT_HASH)}
+    fresh = ""
+    for candidate in collect_api_hashes_sync(cookies, report, facts):
+        if candidate in tried:
+            continue
+        tried.add(candidate)
+        data2, err2 = _try(candidate)
+        if data2 is not None and (data2.get("ok") or data2.get("found")):
+            return True, {"message": "сессия работает (обновил api-hash)",
+                          "api_hash": candidate}
+        data, err = data2, err2
+        fresh = candidate
+    checked = len(tried) - 1
+
+    if err:
+        return False, err
+    said = str((data or {}).get("error") or data)[:120]
+    if "bad request" in said.lower():
+        if facts.get("signed_in") is False:
+            why = "Куки Fragment больше не действуют — страница отдаётся как гостю."
+        elif checked:
+            # Хеши нашлись, но ни один не принят. Говорить «прочитать не
+            # удалось» здесь — прямая ложь, и она уводит от настоящей причины.
+            why = (f"Со страницы прочитано хешей: {checked}, и Fragment не "
+                   f"принял ни один. Обычно так отвечает сессия, которую "
+                   f"Fragment считает чужой: куки скопированы из другого "
+                   f"браузера или устарели.")
+        else:
+            why = "Хеш сессии со страницы Fragment прочитать не удалось."
+        return False, {
+            "message": f"Fragment: «Bad request». {why}",
+            "how": ("Хеш вводить руками не нужно — бот читает его сам. "
+                    "Нужно обновить куки: «🔑 Данные Fragment» → "
+                    "«🍪 Cookies» — там написано, как достать их с телефона."),
+            "report": report,
+        }
+    # Fragment ответил по существу — значит и хеш принят, и запрос дошёл
+    # целиком. Ругаться на такой ответ нельзя: пробный ник тут ни при чём, а
+    # продавец видел «⚠️» там, где всё в порядке. Осталось понять, от чьего
+    # имени с нами говорят — гостю Fragment отвечает так же охотно.
+    if any("не видно входа" in line for line in report):
+        return False, {
+            "message": "Куки Fragment больше не действуют — страница "
+                       "отдаётся как гостю.",
+            "how": ("Обнови куки: «🔑 Данные Fragment» → «🍪 Cookies» — "
+                    "там написано, как достать их с телефона."),
+            "report": report,
+        }
+    out: dict = {"message": f"сессия работает (Fragment на пробный запрос "
+                            f"ответил «{said}» — это нормально)"}
+    if fresh and fresh != (api_hash or DEFAULT_HASH):
+        out["api_hash"] = fresh
+    return True, out

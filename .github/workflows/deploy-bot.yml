@@ -1,0 +1,103 @@
+# Выкат бота на свой сервер по SSH.
+#
+# Зачем: чтобы обновление не делалось руками через Termius. Пуш в рабочую
+# ветку — сервер обновляется сам. С телефона то же самое доступно кнопкой
+# «Run workflow» на github.com, без терминала вообще.
+#
+# Вся работа — в scripts/deploy.sh, и он передаётся на сервер прямо отсюда
+# (`bash -s`), а не берётся с сервера: так выкатывается ровно тот скрипт,
+# который лежит в выкатываемом коммите.
+#
+# Настройка — один раз, в Settings → Secrets and variables → Actions:
+#   SSH_HOST         адрес сервера
+#   SSH_USER         пользователь
+#   SSH_KEY          приватный ключ целиком (сгенерируйте отдельный для
+#                    выката: ssh-keygen -t ed25519 -f deploy_key, публичный
+#                    добавьте в ~/.ssh/authorized_keys на сервере)
+#   DEPLOY_PATH      каталог репозитория на сервере, например /opt/yomarket
+# Необязательные:
+#   SSH_PORT         если не 22
+#   SSH_KNOWN_HOSTS  вывод `ssh-keyscan -p ПОРТ адрес` — тогда ключ сервера
+#                    проверяется, а не принимается на веру
+#   HEALTH_URL       чем сверять версию, например http://127.0.0.1:8080/health
+
+name: Выкат бота на сервер
+
+on:
+  push:
+    branches: [claude/where-we-left-off-mul8tu]
+    paths:
+      - 'bot/**'
+      - 'scripts/deploy.sh'
+      - '.github/workflows/deploy-bot.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-bot
+  cancel-in-progress: false     # выкаты не обгоняют друг друга
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Проверить, что доступ настроен
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ secrets.SSH_USER }}
+          KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          missing=""
+          [ -n "$HOST" ] || missing="$missing SSH_HOST"
+          [ -n "$USER" ] || missing="$missing SSH_USER"
+          [ -n "$KEY" ]  || missing="$missing SSH_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Автовыкат не настроен. Не заданы секреты:$missing"
+            echo "Settings → Secrets and variables → Actions → New repository secret."
+            echo "Красный крест здесь — это правда: сервер сейчас сам не обновляется."
+            exit 1
+          fi
+
+      - name: Подготовить ключ
+        env:
+          KEY: ${{ secrets.SSH_KEY }}
+          KNOWN: ${{ secrets.SSH_KNOWN_HOSTS }}
+          HOST: ${{ secrets.SSH_HOST }}
+          PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          if [ -n "$KNOWN" ]; then
+            printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+            echo "Ключ сервера проверяется по SSH_KNOWN_HOSTS."
+          else
+            ssh-keyscan -p "${PORT:-22}" -H "$HOST" > ~/.ssh/known_hosts 2>/dev/null
+            echo "::warning::SSH_KNOWN_HOSTS не задан — ключ сервера принят с первого"
+            echo "предъявления, без проверки. Отпечаток ниже, сверьте его с сервером:"
+            ssh-keygen -lf ~/.ssh/known_hosts || true
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Обновить бота
+        env:
+          HOST: ${{ secrets.SSH_HOST }}
+          USER: ${{ secrets.SSH_USER }}
+          PORT: ${{ secrets.SSH_PORT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          HEALTH_URL: ${{ secrets.HEALTH_URL }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          # Скрипт уезжает на сервер потоком: выкатывается ровно та версия,
+          # что в этом коммите, и на сервере ничего заранее лежать не должно.
+          ssh -i ~/.ssh/id_deploy -p "${PORT:-22}" \
+              -o BatchMode=yes -o ConnectTimeout=15 \
+              "$USER@$HOST" \
+              "DEPLOY_PATH='${DEPLOY_PATH}' DEPLOY_BRANCH='${BRANCH}' HEALTH_URL='${HEALTH_URL}' bash -s" \
+              < scripts/deploy.sh
+
+      - name: Убрать ключ
+        if: always()
+        run: rm -f ~/.ssh/id_deploy
