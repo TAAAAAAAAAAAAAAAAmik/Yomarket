@@ -31,6 +31,16 @@ OUT = ROOT / "build"
 FONTS = ROOT / "docs" / "assets" / "fonts.css"
 NAME = "Юмаркет-Менеджер-база-знаний"
 
+# Markdown кладётся в `docs/` и КОММИТИТСЯ — его скачивают с github.com, в
+# том числе с телефона, где склеивать сорок четыре файла нечем. PDF и HTML
+# остаются в `build/`: они тяжёлые (семь мегабайт против восьмисот
+# килобайт) и выводятся из этого же файла.
+#
+# Имя латиницей не из вредности: в адресе github.com кириллица уезжает
+# процентными кодами, и ссылку становится нечем передать голосом или
+# записать от руки. Название на русском стоит внутри, первой строкой.
+BOOK = ROOT / "docs" / "KNOWLEDGE_BASE.md"
+
 CHROME = [
     "/opt/pw-browsers/chromium-1194/chrome-linux/chrome",
     "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome",
@@ -246,9 +256,8 @@ def main() -> None:
 
     OUT.mkdir(exist_ok=True)
     md_text = build_markdown()
-    md_path = OUT / f"{NAME}.md"
-    md_path.write_text(md_text, encoding="utf-8")
-    print(f"✅ {md_path.relative_to(ROOT)} — "
+    BOOK.write_text(md_text, encoding="utf-8")
+    print(f"✅ {BOOK.relative_to(ROOT)} — "
           f"{md_text.count(chr(10)):,} строк, {len(md_text):,} знаков"
           .replace(",", " "))
 
