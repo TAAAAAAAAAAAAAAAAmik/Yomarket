@@ -2991,6 +2991,15 @@ async def gift_field_input(message: Message, state: FSMContext) -> None:
         await message.answer("Экран устарел — открой карту заново.")
         return
     value = (message.text or "").strip()
+    # Точка очищает настройку. Пустое сообщение Telegram отправить не даёт,
+    # и без этого очистить поле нечем вовсе. Переезд Robux на общий движок
+    # эту обработку потерял, а подсказки на экранах её обещают — и обе
+    # пропажи денежные: `keyword` из одной точки перестаёт узнавать «Apple
+    # Gift Card 10$» (точки в названии нет) и начинает забирать чужие заказы
+    # с точкой в названии, а `greeting` из одной точки уходит ПОКУПАТЕЛЮ
+    # голосом магазина — и этих сообщений продавец не видит.
+    if value == ".":
+        value = ""
     if field == "region":
         value = value.upper()
     uid = message.from_user.id

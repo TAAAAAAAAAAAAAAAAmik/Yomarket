@@ -515,8 +515,6 @@ class TheSixCardsAddedOnTheSellersWord(unittest.TestCase):
         for card in gc.cards():
             self.assertTrue(card.activation.strip(), card.slug)
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ATousandsSeparatorIsNotADecimalPoint(unittest.TestCase):
@@ -590,3 +588,7 @@ class TwoProductsMustNotShareOneRegion(unittest.TestCase):
         self.assertEqual(
             gc.region_of({"name": "Apple Gift Card | TR", "countryCode": "TR"}),
             "TR")
+
+
+if __name__ == "__main__":
+    unittest.main()

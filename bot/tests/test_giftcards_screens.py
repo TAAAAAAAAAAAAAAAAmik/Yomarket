@@ -398,8 +398,99 @@ class EveryPluginIntroducesItself(unittest.TestCase):
         for claim in ("звёзды уходят сам", "звёзды летят", "придут сами"):
             self.assertNotIn(claim, got)
 
-if __name__ == "__main__":
-    unittest.main()
+
+class ADotClearsTheSetting(unittest.TestCase):
+    """Пустое сообщение Telegram отправить не даёт, поэтому очистка поля
+    обещана точкой — и подсказки на экранах это обещают прямым текстом.
+
+    Переезд Robux на общий движок обработку потерял: `gift_field_input`
+    клал точку как обычный текст. Обе пропажи денежные.
+
+    `keyword` из одной точки — это **требование** «в названии есть точка»:
+    «Apple Gift Card 10$» перестаёт узнаваться вовсе (точки в нём нет), а
+    чужой «OZON.ru Gift Card» начинает уходить в выдачу Apple. Снаружи это
+    «автовыдача сама выключилась» — при включённой карте.
+
+    `greeting` из одной точки уходит ПОКУПАТЕЛЮ голосом магазина, и этих
+    сообщений продавец не видит никогда.
+    """
+
+    def setUp(self):
+        self.saved: dict = {}
+        self._real_get = P.get_settings
+        self._real_save = P.save_settings
+        P.get_settings = lambda uid: self.saved
+        P.save_settings = lambda uid, s: self.saved.update(s)
+
+    def tearDown(self):
+        P.get_settings = self._real_get
+        P.save_settings = self._real_save
+
+    def _type(self, slug: str, field: str, text: str) -> None:
+        class FSM:
+            async def get_data(_self):
+                return {"gc_slug": slug, "gc_field": field}
+
+            async def clear(_self):
+                pass
+
+        class Msg:
+            from_user = type("U", (), {"id": 1})()
+
+            def __init__(_self):
+                _self.text = text
+
+            async def answer(_self, *a, **kw):
+                return None
+
+        asyncio.run(P.gift_field_input(Msg(), FSM()))
+
+    def test_a_dot_typed_into_the_keyword_brings_back_recognition_by_name(self):
+        apple = gc.card("apple")
+        self._type(apple.slug, "keyword", "эпл")
+        self.assertFalse(gc.is_card_order(
+            apple, "Apple Gift Card 10$",
+            gc.card_conf(self.saved, apple.slug)["keyword"]))
+
+        self._type(apple.slug, "keyword", ".")
+        kw = gc.card_conf(self.saved, apple.slug)["keyword"]
+        self.assertEqual(kw, "")
+        # Следствие, ради которого всё: карта снова узнаёт свой заказ...
+        self.assertTrue(gc.is_card_order(apple, "Apple Gift Card 10$", kw))
+        # ...и не забирает чужой только потому, что в названии есть точка.
+        self.assertFalse(gc.is_card_order(apple, "OZON.ru Gift Card 1000", kw))
+
+    def test_a_dot_typed_into_the_greeting_sends_nothing_to_the_buyer(self):
+        apple = gc.card("apple")
+        self._type(apple.slug, "greeting", ".")
+        # Фоновая выдача шлёт автоответ только при непустом `greeting`.
+        self.assertFalse(
+            str(gc.card_conf(self.saved, apple.slug)["greeting"]).strip())
+
+    def test_a_dot_clears_every_text_field_the_screens_offer(self):
+        """Обещание одно на все поля — разойдясь, оно соврёт на одном."""
+        apple = gc.card("apple")
+        for _action, field in P._GIFT_FIELDS.values():
+            with self.subTest(field):
+                self._type(apple.slug, field, "что-нибудь")
+                self._type(apple.slug, field, ".")
+                self.assertEqual(gc.card_conf(self.saved, apple.slug)[field],
+                                 "", f"поле {field} точкой не очищается")
+
+    def test_the_screens_that_promise_the_dot_are_the_ones_that_honour_it(self):
+        """Подсказка, обещающая очистку там, где её нет, — то же враньё."""
+        for action, (prompt, field) in P._GIFT_FIELDS.items():
+            if "точка" not in prompt.lower():
+                continue
+            with self.subTest(action):
+                apple = gc.card("apple")
+                self._type(apple.slug, field, "что-нибудь")
+                self._type(apple.slug, field, ".")
+                self.assertEqual(gc.card_conf(self.saved, apple.slug)[field],
+                                 "", f"экран {action} обещает очистку точкой, "
+                                     f"а поле {field} её не делает")
+
+
 
 
 class AnEnabledCardGetsItsOwnButton(unittest.TestCase):
@@ -550,3 +641,7 @@ class TheKeywordIsExplainedWhereItIsMisread(unittest.TestCase):
         """Совет «задайте всегда» отправил бы продавца делать лишнее."""
         from handlers.plugins import _GIFT_FIELDS
         self.assertIn("только если", _GIFT_FIELDS["kw"][0].lower())
+
+
+if __name__ == "__main__":
+    unittest.main()
